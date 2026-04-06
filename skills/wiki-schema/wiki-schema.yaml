@@ -1,0 +1,43 @@
+# deep-wiki Schema Definition
+# Machine-readable rules for wiki page structure and validation
+
+page:
+  frontmatter:
+    required:
+      - title        # Page title
+      - sources      # List of source slugs that contributed
+      - tags         # Classification tags
+    optional:
+      - aliases      # Alternative names for dedup/search
+
+  link_format: markdown  # Standard markdown links: [Title](page-name.md)
+
+  naming:
+    format: kebab-case   # e.g., react-hooks.md, postgres-indexing.md
+    extension: .md
+
+source:
+  location: .wiki-meta/sources/
+  format: yaml
+  required_fields:
+    - id             # Unique slug
+    - title          # Human-readable name
+    - ingested_at    # ISO 8601 timestamp
+    - type           # url | file | text | deep-work-report
+    - origin         # URL, file path, or description
+    - pages_created  # List of page filenames created
+    - pages_updated  # List of page filenames updated
+  optional_fields:
+    - content_hash   # SHA-256 hash of source content at ingest time
+
+index:
+  location: .wiki-meta/index.json
+  rebuild_from: pages  # Can always be regenerated from page frontmatter
+
+log:
+  location: log.jsonl
+  format: jsonl        # Each line: {"ts": "...", "action": "...", "pages": [...], "source": "..."}
+
+versions:
+  location: .wiki-meta/.versions/
+  keep: 3              # Versions to retain per page before pruning

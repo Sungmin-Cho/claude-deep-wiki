@@ -1,0 +1,17 @@
+{
+  "name": "deep-wiki",
+  "version": "0.1.0",
+  "description": "LLM-managed markdown wiki for persistent knowledge accumulation — based on Karpathy's LLM Wiki philosophy",
+  "author": {
+    "name": "sungmin"
+  },
+  "license": "MIT",
+  "keywords": [
+    "wiki",
+    "knowledge-management",
+    "obsidian",
+    "markdown",
+    "llm-wiki",
+    "karpathy"
+  ]
+}

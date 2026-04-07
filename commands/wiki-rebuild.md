@@ -1,7 +1,7 @@
 ---
 allowed-tools: Read, Write, Bash, Glob, Grep
 description: Regenerate derived wiki files (index.json) from page frontmatter. Use when the index is out of sync or corrupted.
-argument-hint: ""
+argument-hint:
 ---
 
 # /wiki-rebuild — Regenerate Wiki Index

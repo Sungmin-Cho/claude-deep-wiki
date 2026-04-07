@@ -4,15 +4,15 @@
     "name": "sungmin"
   },
   "metadata": {
-    "description": "LLM-managed markdown wiki plugin marketplace",
-    "version": "0.1.0"
+    "description": "Local marketplace for the deep-wiki plugin",
+    "version": "1.0.0"
   },
   "plugins": [
     {
       "name": "deep-wiki",
       "source": ".",
       "description": "LLM-managed markdown wiki for persistent knowledge accumulation — based on Karpathy's LLM Wiki philosophy",
-      "version": "0.1.0",
+      "version": "1.0.0",
       "author": {
         "name": "sungmin"
       },

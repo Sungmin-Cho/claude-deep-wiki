@@ -1,11 +1,9 @@
 {
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "deep-wiki",
+  "description": "Local marketplace for the deep-wiki plugin",
   "owner": {
     "name": "sungmin"
-  },
-  "metadata": {
-    "description": "Local marketplace for the deep-wiki plugin",
-    "version": "1.0.0"
   },
   "plugins": [
     {

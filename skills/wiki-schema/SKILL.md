@@ -135,7 +135,17 @@ Acquire a `mkdir`-based directory lock at `.wiki-meta/.wiki-lock` before any wri
 
 ## Versioning
 
-Before overwriting an existing page, copy the current version to `.wiki-meta/.versions/<page-name>.v<N>.md`. Keep the last 3 versions. Prune older versions during `wiki-lint`. See `references/storage-layout.md` for details.
+Before overwriting an existing page, copy the current version to `.wiki-meta/.versions/<page-name>.v<N>.md`. Keep the last 3 versions. Prune older versions during auto-lint. See `references/storage-layout.md` for details.
+
+## Auto-Lint
+
+Lint runs **automatically** after every write operation (`wiki-ingest`, `wiki-rebuild`, and `wiki-query` auto-filing). Users do not need to invoke `/wiki-lint` manually — it is only needed for on-demand deep inspection or `--fix` on legacy issues.
+
+Auto-lint checks: schema compliance, broken links, index drift, orphan detection. It auto-fixes structural issues (index drift, excess versions) silently and only reports issues requiring human judgment.
+
+## Query Auto-Filing
+
+When `/wiki-query` produces a synthesis that draws from 2+ pages and creates novel cross-page insights, the result is automatically filed back into the wiki as a `query-synthesis` tagged page. This implements Karpathy's principle that valuable query results should compound back into the wiki. Pages created this way use the `query-derived` source slug and `query-<topic>.md` naming convention.
 
 ## Additional Resources
 
@@ -147,3 +157,4 @@ Before overwriting an existing page, copy the current version to `.wiki-meta/.ve
 
 ### References
 - **`references/storage-layout.md`** — Detailed storage structure rationale, source provenance format, and concurrency lock protocol
+- **`references/recommended-tools.md`** — CLI tools (qmd, Marp) and Obsidian plugins (Dataview, Web Clipper) that enhance the wiki workflow

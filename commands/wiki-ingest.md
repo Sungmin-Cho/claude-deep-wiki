@@ -128,13 +128,37 @@ These files are wiki artifacts written by the LLM for human readers, alongside t
 rmdir "<wiki_root>/.wiki-meta/.wiki-lock" 2>/dev/null
 ```
 
-### 13. Report
+### 13. Auto-Lint
+
+Run an automatic health check after the ingest completes. This ensures the wiki stays healthy without the user needing to manually invoke `/wiki-lint`.
+
+Perform these lint checks silently:
+
+1. **Schema compliance** — verify all affected pages have required frontmatter
+2. **Broken links** — check links in new/updated pages
+3. **Index drift** — verify `index.json` matches actual page files
+4. **Orphan detection** — check if any new pages are unlinked
+
+**Auto-fix** what can be fixed without human judgment:
+- Add missing pages to `index.json`
+- Remove ghost entries from `index.json`
+- Prune excess page versions (keep last 3)
+
+**Report issues** that require human judgment (only if found):
+- Schema violations (missing frontmatter)
+- Broken links
+- Orphan pages
+
+If no issues are found, stay silent — do not output a lint report for a clean wiki.
+
+### 14. Report
 
 Show the user:
 - Source: what was ingested
 - Pages created: list with titles
 - Pages updated: list with what changed
 - Total wiki pages: count from index.json
+- Lint issues (only if any were found)
 
 ## Multi-Source Synthesis
 

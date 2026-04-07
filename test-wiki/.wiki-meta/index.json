@@ -1,0 +1,39 @@
+{
+  "pages": [
+    {
+      "file": "llm-wiki-philosophy.md",
+      "title": "LLM Wiki Philosophy",
+      "tags": [
+        "knowledge-management",
+        "llm",
+        "architecture"
+      ],
+      "aliases": [
+        "karpathy wiki"
+      ]
+    },
+    {
+      "file": "rag-vs-wiki.md",
+      "title": "RAG vs Wiki Approach",
+      "tags": [
+        "knowledge-management",
+        "rag",
+        "comparison"
+      ],
+      "aliases": [
+        "rag comparison"
+      ]
+    },
+    {
+      "file": "welcome.md",
+      "title": "Welcome to Deep-Wiki",
+      "tags": [
+        "meta"
+      ],
+      "aliases": [
+        "home"
+      ]
+    }
+  ],
+  "generated_at": "2026-04-06T07:17:38Z"
+}

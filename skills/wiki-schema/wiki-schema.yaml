@@ -37,7 +37,64 @@ index:
 log:
   location: log.jsonl
   format: jsonl        # Each line: {"ts": "...", "action": "...", "pages": [...], "source": "..."}
+  actions:             # Valid action values
+    - ingest
+    - update
+    - lint
+    - rebuild
+    - delete
+    - query-filed      # Auto-filed query synthesis
 
 versions:
   location: .wiki-meta/.versions/
   keep: 3              # Versions to retain per page before pruning
+
+auto_lint:
+  trigger_after:         # Auto-lint runs after these operations
+    - ingest
+    - rebuild
+    - query-filed
+  checks:
+    - schema_compliance
+    - broken_links
+    - index_drift
+    - orphan_detection
+  auto_fix:              # Fix silently without user action
+    - index_drift
+    - excess_versions
+  report_only:           # Only report if issues found (no noise)
+    - schema_violations
+    - broken_links
+    - orphan_pages
+
+query_auto_filing:
+  criteria:              # ALL must be true to auto-file
+    - min_source_pages: 2
+    - has_cross_page_insight: true
+    - is_substantive: true
+  filename_prefix: "query-"
+  source_slug: "query-derived"
+  default_tags:
+    - query-synthesis
+
+recommended_tools:
+  cli:
+    - name: qmd
+      package: "@tobilu/qmd"
+      purpose: "Local markdown search with BM25/vector search and LLM re-ranking"
+      check: "which qmd"
+    - name: marp
+      package: "@marp-team/marp-cli"
+      purpose: "Generate slide presentations from markdown pages"
+      check: "which marp"
+  obsidian_plugins:
+    - name: Dataview
+      directory: dataview
+      purpose: "Query page frontmatter for dynamic tables and lists"
+    - name: Marp Slides
+      directory: marp-slides
+      purpose: "Render Marp slide decks in Obsidian"
+    - name: Obsidian Web Clipper
+      type: browser-extension
+      url: "https://obsidian.md/clipper"
+      purpose: "Clip web articles as markdown for quick ingest"

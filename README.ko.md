@@ -84,19 +84,19 @@ claude plugin install deep-wiki@<marketplace-name>
 |--------|------|
 | `/wiki-setup` | 위키 초기화 및 디렉토리 구조 생성 |
 | `/wiki-ingest` | 소스(URL, 파일, 텍스트)를 읽어 위키 페이지 생성/업데이트 |
-| `/wiki-query` | 위키에서 검색하고 근거 있는 답변 생성 |
-| `/wiki-lint` | 건강 점검 — 스키마 위반, 고아 페이지, 깨진 링크, 모순 탐지 |
+| `/wiki-query` | 위키에서 검색하고 근거 있는 답변 생성; 교차 페이지 합성 결과를 자동으로 위키에 환류 |
+| `/wiki-lint` | 건강 점검 — 스키마 위반, 고아 페이지, 깨진 링크, 모순 탐지 (ingest/rebuild 후 자동 실행) |
 | `/wiki-rebuild` | index.json을 페이지 frontmatter에서 재생성 |
 
 ### 연산 상세
 
-**Ingest** — 새 소스를 추가하면 LLM이 처리합니다. 소스를 읽고, 요약 페이지를 작성하고, 인덱스를 업데이트하고, 위키 전반의 관련 페이지를 갱신하고, 로그에 기록합니다. 하나의 소스가 여러 위키 페이지에 영향을 줄 수 있습니다. 새 정보는 기존 콘텐츠와 병합됩니다 — 페이지는 ingest할수록 풍부해집니다.
+**Ingest** — 새 소스를 추가하면 LLM이 처리합니다. 소스를 읽고, 요약 페이지를 작성하고, 인덱스를 업데이트하고, 위키 전반의 관련 페이지를 갱신하고, 로그에 기록합니다. 하나의 소스가 여러 위키 페이지에 영향을 줄 수 있습니다. 새 정보는 기존 콘텐츠와 병합됩니다 — 페이지는 ingest할수록 풍부해집니다. **매 ingest 후 자동 lint가 실행**되어 위키를 건강하게 유지합니다.
 
-**Query** — 위키에 질문합니다. LLM이 3계층 전략(인덱스 스캔 → 콘텐츠 검색 → 후보 읽기)으로 관련 페이지를 찾고, 위키 콘텐츠에 근거한 답변을 인용과 함께 합성합니다.
+**Query** — 위키에 질문합니다. LLM이 3계층 전략(인덱스 스캔 → 콘텐츠 검색 → 후보 읽기)으로 관련 페이지를 찾고, 위키 콘텐츠에 근거한 답변을 인용과 함께 합성합니다. **2개 이상의 페이지에서 교차 합성된 인사이트는 자동으로 위키에 환류**됩니다 — 지식이 복리로 쌓입니다.
 
-**Lint** — 위키 건강 점검. 스키마 위반, 페이지 간 모순, 인바운드 링크 없는 고아 페이지, 깨진 링크, 오래된 버전, 인덱스 불일치를 탐지합니다. `--fix` 플래그로 구조적 문제를 자동 수정할 수 있습니다.
+**Lint** — 위키 건강 점검. 스키마 위반, 페이지 간 모순, 인바운드 링크 없는 고아 페이지, 깨진 링크, 오래된 버전, 인덱스 불일치를 탐지합니다. `--fix` 플래그로 구조적 문제를 자동 수정할 수 있습니다. **ingest와 rebuild 후 자동 실행** — 수동 실행은 깊은 점검이 필요할 때만 사용합니다.
 
-**Rebuild** — 페이지 frontmatter에서 `index.json`을 재생성합니다. 인덱스가 동기화되지 않거나 손상되었을 때 사용합니다.
+**Rebuild** — 페이지 frontmatter에서 `index.json`을 재생성합니다. 인덱스가 동기화되지 않거나 손상되었을 때 사용합니다. rebuild 후 자동 lint가 실행됩니다.
 
 ## 저장 구조
 
@@ -125,6 +125,30 @@ claude plugin install deep-wiki@<marketplace-name>
 wiki_root: ~/Obsidian/MyVault/wiki
 ```
 
+## 추천 도구
+
+[Karpathy의 LLM Wiki 글](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)에서 언급된 위키 워크플로우 향상 도구들입니다.
+
+### CLI 도구
+
+| 도구 | 용도 | 설치 |
+|------|------|------|
+| **qmd** | BM25/벡터 검색 및 LLM 리랭킹을 지원하는 로컬 마크다운 검색 엔진. MCP 서버로도 사용 가능. | `npm install -g @tobilu/qmd` |
+| **marp** | 마크다운 위키 페이지에서 슬라이드 프레젠테이션(HTML/PDF/PPTX) 생성. | `npm install -g @marp-team/marp-cli` |
+
+```bash
+# qmd로 위키 인덱싱
+qmd collection add ~/Obsidian/MyVault/wiki/pages
+
+# 위키 페이지에서 슬라이드 생성
+marp wiki-page.md -o slides.html
+
+# 에이전트 연동을 위한 MCP 서버 실행
+qmd mcp --http
+```
+
+> `/wiki-setup` 실행 시 이 도구들의 설치 여부를 자동으로 확인하고, 미설치 도구의 설치 명령어를 안내합니다.
+
 ## Obsidian 호환성
 
 - Obsidian 볼트 안에 위키를 생성하면 그래프 뷰, 백링크, 검색을 활용할 수 있습니다
@@ -132,10 +156,13 @@ wiki_root: ~/Obsidian/MyVault/wiki
 - `.wiki-meta/` 디렉토리는 Obsidian에서 자동으로 숨겨집니다
 - 표준 마크다운 링크 사용 (wikilink 아님)으로 이식성 보장
 
+`/wiki-setup`이 위키가 Obsidian 볼트 내부에 있음을 감지하면, 추천 플러그인의 설치 여부를 자동으로 확인하고 상태를 보고합니다.
+
 **추천 Obsidian 플러그인:**
 - **Graph view** — 위키의 형태, 허브, 고아 페이지를 시각적으로 확인
 - **Dataview** — 페이지 frontmatter(태그, 소스)를 쿼리하여 동적 테이블 생성
-- **Marp** — 위키 콘텐츠에서 슬라이드 덱 생성
+- **Marp Slides** — Obsidian 내에서 Marp 슬라이드 덱을 직접 렌더링
+- **Obsidian Web Clipper** — 웹 기사를 마크다운으로 클리핑하는 브라우저 확장 프로그램, 빠른 ingest에 유용 (https://obsidian.md/clipper 에서 설치)
 
 ## deep-work 연동
 

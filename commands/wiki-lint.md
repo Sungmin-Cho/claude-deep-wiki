@@ -81,7 +81,7 @@ This is a semantic check — read the actual page content, not just metadata. Fl
 
 Count versions in `.wiki-meta/.versions/` per page. Report pages with more than 3 versions (candidates for pruning).
 
-### 8. Index Drift Detection
+### 9. Index Drift Detection
 
 Compare `index.json` entries against actual page files:
 - Pages in index but not on disk (ghost entries)
@@ -111,7 +111,7 @@ Present a structured report:
 - Review orphan pages: page-a.md, page-b.md, page-c.md
 ```
 
-### 10. Auto-Fix (if --fix flag)
+### 11. Auto-Fix (if --fix flag)
 
 If the user passed `--fix`:
 - Prune excess versions (keep last 3)

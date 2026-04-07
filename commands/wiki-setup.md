@@ -102,7 +102,56 @@ This wiki is managed by Claude Code using the deep-wiki plugin.
 Knowledge accumulates here over time, creating a persistent knowledge base.
 ```
 
-### 5. Log the Setup Event
+### 5. Check Recommended Tools
+
+#### 5a. CLI Tools
+
+Check if the following CLI tools are installed:
+
+```bash
+which qmd 2>/dev/null   # markdown search engine (BM25 + vector search)
+which marp 2>/dev/null   # markdown slide generator
+```
+
+Report the status of each tool and provide install commands for any that are missing:
+
+| Tool | Purpose | Install |
+|------|---------|---------|
+| **qmd** | Local markdown search with BM25/vector search and LLM re-ranking. Can be used as an MCP server for tighter agent integration. | `npm install -g @tobilu/qmd` |
+| **marp** | Generate slide presentations from markdown wiki pages. | `npm install -g @marp-team/marp-cli` |
+
+#### 5b. Obsidian Plugin Check (if Obsidian vault)
+
+If the wiki root is inside an Obsidian vault (i.e., a `.obsidian/` directory exists in a parent directory), check for recommended Obsidian plugins:
+
+```bash
+# Find the vault root (nearest ancestor with .obsidian/)
+VAULT_ROOT="<detected_vault_root>"
+PLUGINS_DIR="$VAULT_ROOT/.obsidian/plugins"
+```
+
+Check for these plugins:
+
+| Plugin | Directory Name | Purpose |
+|--------|---------------|---------|
+| **Dataview** | `dataview` | Query page frontmatter to generate dynamic tables and lists from wiki metadata |
+| **Marp Slides** | `marp-slides` | Render Marp slide decks directly in Obsidian |
+| **Obsidian Web Clipper** | — (browser extension) | Browser extension to clip web articles as markdown for quick ingest |
+
+For each missing plugin, print a recommendation:
+
+```
+Recommended Obsidian plugins:
+  ✓ Dataview — installed
+  ✗ Marp Slides — not found
+    → Install from Obsidian Settings > Community Plugins > Browse > "Marp Slides"
+  ℹ Obsidian Web Clipper — browser extension
+    → Install from https://obsidian.md/clipper
+```
+
+If the wiki is NOT inside an Obsidian vault, skip this check entirely.
+
+### 6. Log the Setup Event
 
 Append to `log.jsonl`:
 
@@ -110,7 +159,7 @@ Append to `log.jsonl`:
 {"ts":"<iso_timestamp>","action":"setup","source":"deep-wiki-init","pages_created":["welcome.md"],"pages_updated":[]}
 ```
 
-### 6. Confirm
+### 7. Confirm
 
 Report to the user:
 - Wiki root location

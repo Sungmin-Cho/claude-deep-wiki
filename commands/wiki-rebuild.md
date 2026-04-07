@@ -55,9 +55,20 @@ Sort pages alphabetically by filename.
 {"ts":"<iso_timestamp>","action":"rebuild","source":"manual","pages_created":[],"pages_updated":[]}
 ```
 
-### 5. Release Lock and Report
+### 5. Auto-Lint
+
+After rebuilding, run an automatic health check (same as wiki-ingest auto-lint):
+
+1. **Schema compliance** — verify all pages have required frontmatter
+2. **Broken links** — check links across all pages
+3. **Orphan detection** — find pages with no inbound links
+
+Auto-fix structural issues silently (prune excess versions, remove ghost index entries). Only report issues that need human judgment.
+
+### 6. Release Lock and Report
 
 Release the lock directory. Report:
 - Total pages indexed
 - Any pages with missing or malformed frontmatter (could not be indexed)
 - Comparison: previous page count vs. current count
+- Lint issues (only if any were found)

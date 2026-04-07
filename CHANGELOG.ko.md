@@ -2,6 +2,13 @@
 
 deep-wiki의 주요 변경사항을 기록합니다.
 
+## [1.0.1] — 2026-04-07
+
+### 추가
+
+- **자동 ingest SessionStart hook** — Claude Code 세션 시작 시 Obsidian vault의 새로운/수정된 파일을 자동 감지하고 위키에 ingest. 수동 작업 불필요.
+- **일괄 ingest 지원** — `/wiki-ingest`가 auto-ingest hook의 다중 파일을 일괄 처리 지원. 단일 lock, 그룹별 로그 기록.
+
 ## [1.0.0] — 2026-04-07
 
 ### 마일스톤
@@ -10,8 +17,6 @@ deep-wiki의 주요 변경사항을 기록합니다.
 
 ### 추가 (0.2.0 이후)
 
-- **자동 ingest SessionStart hook** — Claude Code 세션 시작 시 Obsidian vault의 새로운/수정된 파일을 자동 감지하고 위키에 ingest. 수동 작업 불필요.
-- **일괄 ingest 지원** — `/wiki-ingest`가 auto-ingest hook의 다중 파일을 일괄 처리 지원. 단일 lock, 그룹별 로그 기록.
 - **실전 검증** — PARA 구조의 Obsidian vault 전체(PROJECT, RESOURCE, AREA, ARCHIVE, DAILY 노트)를 deep-wiki로 마이그레이션하여 대규모 운영 가능성을 입증.
 
 ---

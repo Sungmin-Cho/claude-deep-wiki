@@ -10,7 +10,7 @@
       "name": "deep-wiki",
       "source": ".",
       "description": "LLM-managed markdown wiki for persistent knowledge accumulation — based on Karpathy's LLM Wiki philosophy",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "author": {
         "name": "sungmin"
       },

@@ -35,29 +35,24 @@ Raw Sources  →  Wiki (마크다운 페이지)  →  Schema (관리 규칙)
 
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI 설치 및 설정 완료
 
-### Git을 통한 설치
+### Deep Suite 마켓플레이스 (권장)
 
 ```bash
-# 1. 플러그인 리포지토리 클론
-git clone https://github.com/Sungmin-Cho/claude-deep-wiki.git
+# 1. 마켓플레이스 추가
+/plugin marketplace add Sungmin-Cho/claude-deep-suite
 
-# 2. 로컬 마켓플레이스에 추가
-claude plugin marketplace add /path/to/claude-deep-wiki
-
-# 3. 플러그인 설치
-claude plugin install deep-wiki@<marketplace-name>
+# 2. 플러그인 설치
+/plugin install deep-wiki@Sungmin-Cho-claude-deep-suite
 ```
 
-이미 로컬 마켓플레이스가 설정되어 있다면:
+### 단독 설치
 
 ```bash
-# 1. 로컬 마켓플레이스 plugins 디렉토리에 클론
-git clone https://github.com/Sungmin-Cho/claude-deep-wiki.git ~/.claude/local-marketplace/plugins/deep-wiki
+# 1. 이 레포를 마켓플레이스로 추가
+/plugin marketplace add Sungmin-Cho/claude-deep-wiki
 
-# 2. marketplace.json에 플러그인 항목 추가
-# 3. 업데이트 및 설치
-claude plugin marketplace update <marketplace-name>
-claude plugin install deep-wiki@<marketplace-name>
+# 2. 설치
+/plugin install deep-wiki@Sungmin-Cho-claude-deep-wiki
 ```
 
 ## 시작하기

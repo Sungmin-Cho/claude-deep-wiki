@@ -35,29 +35,24 @@ Raw Sources  →  Wiki (markdown pages)  →  Schema (management rules)
 
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI installed and configured
 
-### Install via Git
+### Via Deep Suite marketplace (recommended)
 
 ```bash
-# 1. Clone the plugin repository
-git clone https://github.com/Sungmin-Cho/claude-deep-wiki.git
+# 1. Add the marketplace
+/plugin marketplace add Sungmin-Cho/claude-deep-suite
 
-# 2. Add it as a local marketplace
-claude plugin marketplace add /path/to/claude-deep-wiki
-
-# 3. Install the plugin
-claude plugin install deep-wiki@<marketplace-name>
+# 2. Install the plugin
+/plugin install deep-wiki@Sungmin-Cho-claude-deep-suite
 ```
 
-Alternatively, if you already have a local marketplace configured:
+### Standalone
 
 ```bash
-# 1. Clone into your local marketplace plugins directory
-git clone https://github.com/Sungmin-Cho/claude-deep-wiki.git ~/.claude/local-marketplace/plugins/deep-wiki
+# 1. Add this repo as a marketplace
+/plugin marketplace add Sungmin-Cho/claude-deep-wiki
 
-# 2. Add the plugin entry to your marketplace.json
-# 3. Update and install
-claude plugin marketplace update <marketplace-name>
-claude plugin install deep-wiki@<marketplace-name>
+# 2. Install
+/plugin install deep-wiki@Sungmin-Cho-claude-deep-wiki
 ```
 
 ## Quick Start

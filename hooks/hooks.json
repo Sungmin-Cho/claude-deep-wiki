@@ -1,0 +1,17 @@
+{
+  "description": "deep-wiki auto-ingest: scans Obsidian vault for new/modified files on session start",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/scripts/scan-vault-changes.sh",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

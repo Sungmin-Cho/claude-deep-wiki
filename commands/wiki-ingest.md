@@ -166,6 +166,23 @@ When the `--synthesize` flag is provided, or when multiple sources are given:
 
 Spawn the `wiki-synthesizer` agent to handle cross-source analysis in a separate context window. Pass the source content and existing relevant pages to the agent. The agent returns page content; this command handles all wiki metadata (index, log, provenance, lock).
 
+## Auto-Ingest (SessionStart Hook)
+
+When the deep-wiki plugin's SessionStart hook detects new or modified files in the Obsidian vault, it provides a list of files via systemMessage. In this case:
+
+1. Read the file list from the hook message
+2. Group related files by directory/topic
+3. For each group, follow the standard ingest workflow (Steps 1-14)
+4. Use the `--synthesize` flag internally if multiple files cover related topics
+5. After all files are processed, update `.wiki-meta/.last-scan` with the current timestamp
+
+**Batch behavior:**
+- Process files sequentially by group, not one-by-one
+- Acquire the lock once for the entire batch, not per-file
+- Append one log entry per source group, not per-file
+- Run auto-lint once at the end, not after each file
+- Keep the report concise — summarize what was ingested, not individual file details
+
 ## Error Handling
 
 - If the lock cannot be acquired, report the error and stop

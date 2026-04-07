@@ -164,6 +164,18 @@ When `/wiki-setup` detects that the wiki is inside an Obsidian vault, it automat
 - **Marp Slides** — render Marp slide decks directly in Obsidian
 - **Obsidian Web Clipper** — browser extension to clip web articles as markdown for quick ingest (install from https://obsidian.md/clipper)
 
+## Auto-Ingest (SessionStart Hook)
+
+The plugin includes a SessionStart hook that **automatically detects new or modified files** in the Obsidian vault every time a Claude Code session starts. No manual action needed — just write notes as usual, and the wiki stays up to date.
+
+**How it works:**
+1. On session start, the hook scans the vault for `.md` files modified since the last scan
+2. If new files are found, Claude is instructed to auto-ingest them
+3. Files are grouped by topic and batch-processed
+4. The wiki is updated with new knowledge, and auto-lint runs afterward
+
+**Excluded from scanning:** To-do files, VPN passwords, `.obsidian/` internals, the wiki itself.
+
 ## deep-work Integration
 
 Ingest deep-work session reports into the wiki:

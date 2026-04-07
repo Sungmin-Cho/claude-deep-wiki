@@ -164,6 +164,18 @@ qmd mcp --http
 - **Marp Slides** — Obsidian 내에서 Marp 슬라이드 덱을 직접 렌더링
 - **Obsidian Web Clipper** — 웹 기사를 마크다운으로 클리핑하는 브라우저 확장 프로그램, 빠른 ingest에 유용 (https://obsidian.md/clipper 에서 설치)
 
+## 자동 Ingest (SessionStart Hook)
+
+플러그인에 포함된 SessionStart hook이 Claude Code 세션이 시작될 때마다 Obsidian vault에서 **새로운/수정된 파일을 자동으로 감지**합니다. 수동 작업 없이 평소대로 노트를 작성하면 위키가 자동으로 최신 상태를 유지합니다.
+
+**동작 방식:**
+1. 세션 시작 시, 마지막 스캔 이후 수정된 `.md` 파일을 vault에서 탐색
+2. 새 파일이 발견되면 Claude에게 자동 ingest를 지시
+3. 파일을 주제별로 그룹화하여 일괄 처리
+4. 위키에 새 지식이 반영되고, 자동 lint 실행
+
+**스캔 제외 대상:** To-do 파일, VPN 비밀번호, `.obsidian/` 내부, 위키 자체.
+
 ## deep-work 연동
 
 deep-work 세션 리포트를 위키에 추가:

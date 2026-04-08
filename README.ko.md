@@ -168,7 +168,7 @@ qmd mcp --http
 | 기능 | CLI 명령 | 폴백 |
 |------|----------|------|
 | 콘텐츠 검색 | `obsidian search:context` | Grep |
-| 고아 페이지 감지 | `obsidian orphans all` | 정규식 링크 스캔 |
+| 고아 페이지 감지 | `obsidian orphans` | 정규식 링크 스캔 |
 | 깨진 링크 감지 | `obsidian unresolved` | 파일 존재 확인 |
 | 백링크 분석 | `obsidian backlinks` | 사용 불가 |
 | 태그 통계 | `obsidian tags counts` | frontmatter 파싱 |

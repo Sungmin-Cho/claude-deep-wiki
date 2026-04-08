@@ -168,7 +168,7 @@ When detected by `/wiki-setup`, the Obsidian CLI enhances wiki operations:
 | Feature | CLI Command | Fallback |
 |---------|------------|----------|
 | Content search | `obsidian search:context` | Grep |
-| Orphan detection | `obsidian orphans all` | Regex link scan |
+| Orphan detection | `obsidian orphans` | Regex link scan |
 | Broken link detection | `obsidian unresolved` | File existence check |
 | Backlink analysis | `obsidian backlinks` | Not available |
 | Tag statistics | `obsidian tags counts` | Frontmatter parsing |

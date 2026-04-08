@@ -45,16 +45,24 @@ else
 fi
 
 # 3b. Check if Obsidian CLI is available (from config, not hardcoded)
-HAS_OBS_CLI=$(grep 'available: true' "$CONFIG" 2>/dev/null)
-WIKI_PREFIX=$(grep 'wiki_prefix:' "$CONFIG" 2>/dev/null | sed 's/wiki_prefix: *//' | tr -d '"' | tr -d "'")
+# NOTE: || true prevents set -e from aborting when config has no obsidian_cli block
+HAS_OBS_CLI=$(grep 'available: true' "$CONFIG" 2>/dev/null || true)
+WIKI_PREFIX=$(grep 'wiki_prefix:' "$CONFIG" 2>/dev/null | sed 's/wiki_prefix: *//' | tr -d '"' | tr -d "'" || true)
 
 # 3c. Collect candidates from obsidian recents (supplement, not replacement)
 # recents returns "recently opened" files — may include unmodified files.
 # All candidates MUST pass mtime verification below.
 RECENTS_FILES=()
 if [ -n "$HAS_OBS_CLI" ] && [ -n "$WIKI_PREFIX" ]; then
-  RECENTS_OUTPUT=$(timeout 3 obsidian recents 2>/dev/null)
-  if [ $? -eq 0 ] && [ -n "$RECENTS_OUTPUT" ]; then
+  # macOS lacks `timeout`; use gtimeout (from coreutils) or run without timeout
+  TIMEOUT_CMD=""
+  if command -v timeout &>/dev/null; then
+    TIMEOUT_CMD="timeout 3"
+  elif command -v gtimeout &>/dev/null; then
+    TIMEOUT_CMD="gtimeout 3"
+  fi
+  RECENTS_OUTPUT=$($TIMEOUT_CMD obsidian recents 2>/dev/null || true)
+  if [ -n "$RECENTS_OUTPUT" ]; then
     while IFS= read -r rel_path; do
       # Exclude wiki pages and system dirs using config-based prefix (never hardcode)
       case "$rel_path" in

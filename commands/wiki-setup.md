@@ -178,6 +178,7 @@ Extract the vault name and path from the output. If the output format is unexpec
 
 Strip `vault_path` from `wiki_root` to get the vault-relative path:
 - Example: vault_path=`/path/to/vault`, wiki_root=`/path/to/vault/deep-wiki` → prefix=`deep-wiki`
+- **Edge case: wiki at vault root** — If `wiki_root == vault_path`, the prefix is empty. In this case, store `wiki_prefix: "."` and ensure all downstream path compositions use `pages/...` directly (not `./pages/...` or `/pages/...`). Callers must normalize: when `wiki_prefix` is `"."`, emit `pages/<page>.md` instead of `./<pages>/<page>.md`.
 
 **Step 4 — Update config:**
 

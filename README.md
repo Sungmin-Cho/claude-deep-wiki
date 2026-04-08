@@ -118,6 +118,13 @@ Key design decisions:
 
 ```yaml
 wiki_root: ~/Obsidian/MyVault/wiki
+
+# Auto-detected by /wiki-setup when Obsidian CLI is available (optional)
+obsidian_cli:
+  available: true
+  vault_name: "My Vault"
+  vault_path: ~/Obsidian/MyVault
+  wiki_prefix: "wiki"
 ```
 
 ## Recommended Tools
@@ -130,6 +137,7 @@ Tools referenced in [Karpathy's LLM Wiki gist](https://gist.github.com/karpathy/
 |------|---------|---------|
 | **qmd** | Local markdown search engine with BM25/vector search and LLM re-ranking. Also works as an MCP server. | `npm install -g @tobilu/qmd` |
 | **marp** | Generate slide presentations (HTML/PDF/PPTX) from markdown wiki pages. | `npm install -g @marp-team/marp-cli` |
+| **obsidian** | Obsidian CLI — search, backlinks, tags, properties via running Obsidian app. Auto-detected by `/wiki-setup`. | [Obsidian CLI](https://github.com/anthropics/obsidian-cli) |
 
 ```bash
 # Index your wiki with qmd
@@ -151,7 +159,21 @@ qmd mcp --http
 - `.wiki-meta/` is automatically hidden from Obsidian
 - Standard markdown links (not wikilinks) ensure portability
 
-When `/wiki-setup` detects that the wiki is inside an Obsidian vault, it automatically checks for recommended plugins and reports their status.
+When `/wiki-setup` detects that the wiki is inside an Obsidian vault, it automatically checks for recommended plugins and reports their status. If the Obsidian CLI is installed and the app is running, it also enables enhanced features:
+
+### Obsidian CLI Integration
+
+When detected by `/wiki-setup`, the Obsidian CLI enhances wiki operations:
+
+| Feature | CLI Command | Fallback |
+|---------|------------|----------|
+| Content search | `obsidian search:context` | Grep |
+| Orphan detection | `obsidian orphans all` | Regex link scan |
+| Broken link detection | `obsidian unresolved` | File existence check |
+| Backlink analysis | `obsidian backlinks` | Not available |
+| Tag statistics | `obsidian tags counts` | Frontmatter parsing |
+
+All vault-wide CLI results are filtered to the wiki boundary. The CLI is optional — all commands work without it via filesystem fallback.
 
 **Recommended Obsidian plugins:**
 - **Graph view** — see the shape of your wiki, hubs, and orphans
@@ -165,9 +187,10 @@ The plugin includes a SessionStart hook that **automatically detects new or modi
 
 **How it works:**
 1. On session start, the hook scans the vault for `.md` files modified since the last scan
-2. If new files are found, Claude is instructed to auto-ingest them
-3. Files are grouped by topic and batch-processed
-4. The wiki is updated with new knowledge, and auto-lint runs afterward
+2. If Obsidian CLI is available, `obsidian recents` supplements the scan (union + deduplicate, with mtime verification)
+3. If new files are found, Claude is instructed to auto-ingest them
+4. Files are grouped by topic and batch-processed
+5. The wiki is updated with new knowledge, and auto-lint runs afterward
 
 **Excluded from scanning:** To-do files, VPN passwords, `.obsidian/` internals, the wiki itself.
 

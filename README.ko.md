@@ -118,6 +118,13 @@ Raw Sources  →  Wiki (마크다운 페이지)  →  Schema (관리 규칙)
 
 ```yaml
 wiki_root: ~/Obsidian/MyVault/wiki
+
+# Obsidian CLI 사용 가능 시 /wiki-setup이 자동 감지 (선택 사항)
+obsidian_cli:
+  available: true
+  vault_name: "My Vault"
+  vault_path: ~/Obsidian/MyVault
+  wiki_prefix: "wiki"
 ```
 
 ## 추천 도구
@@ -130,6 +137,7 @@ wiki_root: ~/Obsidian/MyVault/wiki
 |------|------|------|
 | **qmd** | BM25/벡터 검색 및 LLM 리랭킹을 지원하는 로컬 마크다운 검색 엔진. MCP 서버로도 사용 가능. | `npm install -g @tobilu/qmd` |
 | **marp** | 마크다운 위키 페이지에서 슬라이드 프레젠테이션(HTML/PDF/PPTX) 생성. | `npm install -g @marp-team/marp-cli` |
+| **obsidian** | Obsidian CLI — 실행 중인 Obsidian 앱을 통해 검색, 백링크, 태그, 속성 조작. `/wiki-setup`이 자동 감지. | [Obsidian CLI](https://github.com/anthropics/obsidian-cli) |
 
 ```bash
 # qmd로 위키 인덱싱
@@ -151,7 +159,21 @@ qmd mcp --http
 - `.wiki-meta/` 디렉토리는 Obsidian에서 자동으로 숨겨집니다
 - 표준 마크다운 링크 사용 (wikilink 아님)으로 이식성 보장
 
-`/wiki-setup`이 위키가 Obsidian 볼트 내부에 있음을 감지하면, 추천 플러그인의 설치 여부를 자동으로 확인하고 상태를 보고합니다.
+`/wiki-setup`이 위키가 Obsidian 볼트 내부에 있음을 감지하면, 추천 플러그인의 설치 여부를 자동으로 확인하고 상태를 보고합니다. Obsidian CLI가 설치되어 있고 앱이 실행 중이면 향상된 기능도 활성화합니다:
+
+### Obsidian CLI 통합
+
+`/wiki-setup`에서 감지되면 Obsidian CLI가 위키 작업을 향상합니다:
+
+| 기능 | CLI 명령 | 폴백 |
+|------|----------|------|
+| 콘텐츠 검색 | `obsidian search:context` | Grep |
+| 고아 페이지 감지 | `obsidian orphans all` | 정규식 링크 스캔 |
+| 깨진 링크 감지 | `obsidian unresolved` | 파일 존재 확인 |
+| 백링크 분석 | `obsidian backlinks` | 사용 불가 |
+| 태그 통계 | `obsidian tags counts` | frontmatter 파싱 |
+
+모든 vault-wide CLI 결과는 위키 경계로 필터링됩니다. CLI는 선택 사항이며 — 모든 명령어는 CLI 없이도 파일시스템 폴백으로 동작합니다.
 
 **추천 Obsidian 플러그인:**
 - **Graph view** — 위키의 형태, 허브, 고아 페이지를 시각적으로 확인
@@ -165,9 +187,10 @@ qmd mcp --http
 
 **동작 방식:**
 1. 세션 시작 시, 마지막 스캔 이후 수정된 `.md` 파일을 vault에서 탐색
-2. 새 파일이 발견되면 Claude에게 자동 ingest를 지시
-3. 파일을 주제별로 그룹화하여 일괄 처리
-4. 위키에 새 지식이 반영되고, 자동 lint 실행
+2. Obsidian CLI 사용 가능 시, `obsidian recents`가 스캔을 보충 (합집합 + 중복 제거, mtime 검증 포함)
+3. 새 파일이 발견되면 Claude에게 자동 ingest를 지시
+4. 파일을 주제별로 그룹화하여 일괄 처리
+5. 위키에 새 지식이 반영되고, 자동 lint 실행
 
 **스캔 제외 대상:** To-do 파일, VPN 비밀번호, `.obsidian/` 내부, 위키 자체.
 

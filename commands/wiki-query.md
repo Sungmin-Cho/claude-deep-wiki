@@ -12,6 +12,17 @@ Search wiki pages and generate an answer grounded in the wiki's accumulated know
 
 Read `~/.claude/deep-wiki-config.yaml` to get `wiki_root`. If missing, tell the user to run `/wiki-setup` first.
 
+#### Obsidian CLI Liveness Check
+
+If the config contains `obsidian_cli.available: true`, check if the Obsidian app is running:
+
+```bash
+obsidian version 2>/dev/null
+```
+
+- **Success** → `OBS_LIVE=true`, read `wiki_prefix` from config.
+- **Failure** → `OBS_LIVE=false`, use filesystem-only mode silently.
+
 ## Steps
 
 ### 1. Parse Question
@@ -27,6 +38,24 @@ Read `.wiki-meta/index.json`. Match the query against page titles, tags, and ali
 
 **Layer 2 — Content search:**
 Use Grep to search `pages/` directory for keywords from the query. Add matching files to candidates.
+
+**If `OBS_LIVE`**, supplement or replace Grep with Obsidian's full-text search:
+
+```bash
+obsidian search:context query="<query keywords>" path="<wiki_prefix>/pages" format=json
+```
+
+This leverages Obsidian's text index for broader matching than exact keyword grep.
+
+**Layer 2.5 — Graph-based expansion (OBS_LIVE only):**
+
+For each candidate page found in Layer 1-2, check its backlinks to discover related pages that may not contain the exact keywords:
+
+```bash
+obsidian backlinks path="<wiki_prefix>/pages/<candidate>.md" format=json
+```
+
+Add linked pages to the candidate list. This graph traversal is only available with Obsidian CLI.
 
 **Layer 3 — Read candidates:**
 Read the top candidate pages (up to 10). Prioritize pages that matched in both Layer 1 and Layer 2.

@@ -151,6 +151,65 @@ Recommended Obsidian plugins:
 
 If the wiki is NOT inside an Obsidian vault, skip this check entirely.
 
+#### 5c. Obsidian CLI Detection
+
+If the wiki root is inside an Obsidian vault (detected in 5b), check for the Obsidian CLI:
+
+**Step 1 — Detect CLI and running app:**
+
+```bash
+obsidian version 2>/dev/null
+```
+
+- If a version string is returned → CLI is installed and Obsidian app is running
+- If the command fails or returns empty → CLI not installed or app not running → skip to step 6
+
+**Step 2 — Get vault info:**
+
+```bash
+obsidian vault
+```
+
+Extract the vault name and path from the output. If the output format is unexpected, fall back to:
+- `vault_path` = the `.obsidian/` parent directory already detected in Step 5b
+- `vault_name` = the directory name of `vault_path`
+
+**Step 3 — Compute `wiki_prefix`:**
+
+Strip `vault_path` from `wiki_root` to get the vault-relative path:
+- Example: vault_path=`/path/to/vault`, wiki_root=`/path/to/vault/deep-wiki` → prefix=`deep-wiki`
+- **Edge case: wiki at vault root** — If `wiki_root == vault_path`, the prefix is empty. In this case, store `wiki_prefix: "."` and ensure all downstream path compositions use `pages/...` directly (not `./pages/...` or `/pages/...`). Callers must normalize: when `wiki_prefix` is `"."`, emit `pages/<page>.md` instead of `./<pages>/<page>.md`.
+
+**Step 4 — Update config:**
+
+If the config already contains an `obsidian_cli` block, **remove it first** (handles re-runs and CLI removal).
+
+If CLI detection succeeded, append to `~/.claude/deep-wiki-config.yaml`:
+
+```yaml
+obsidian_cli:
+  available: true
+  vault_name: "<detected_vault_name>"
+  vault_path: <detected_vault_path>
+  wiki_prefix: "<computed_prefix>"
+```
+
+If CLI detection failed and an old `obsidian_cli` block exists, **delete it** to prevent stale config.
+
+**Report in Step 7:**
+
+If detected:
+```
+Obsidian CLI: ✓ detected (vault: "<vault_name>")
+  → Wiki operations will use Obsidian CLI for search, backlinks, and orphan detection when available
+```
+
+If not detected:
+```
+Obsidian CLI: ✗ not detected
+  → Using filesystem access only (install Obsidian CLI for enhanced search and graph features)
+```
+
 ### 6. Log the Setup Event
 
 Append to `log.jsonl`:

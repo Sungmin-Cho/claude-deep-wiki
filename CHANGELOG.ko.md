@@ -2,6 +2,29 @@
 
 deep-wiki의 주요 변경사항을 기록합니다.
 
+## [1.1.0] — 2026-04-08
+
+### 추가
+
+- **Obsidian CLI 통합** — `/wiki-setup`이 위키가 Obsidian vault 안에 있을 때 Obsidian CLI(`obs`)를 자동 감지합니다. 감지되면 위키 명령어들이 Obsidian의 전문 텍스트 검색, 백링크 그래프, 고아 페이지 감지, 미해결 링크 추적을 활용하여 더 정확한 결과를 제공합니다.
+- **향상된 검색** — `/wiki-ingest`와 `/wiki-query`에서 Obsidian CLI 사용 가능 시 Grep 대신 `obsidian search:context`로 겹침 감지 및 콘텐츠 검색을 수행합니다.
+- **그래프 기반 쿼리 확장** — `/wiki-query`에 Layer 2.5 추가. 백링크를 따라가 키워드 매칭을 넘어선 관련 페이지를 발견합니다 (Obsidian CLI 전용).
+- **개선된 lint 검사** — `/wiki-lint`, `/wiki-ingest` auto-lint, `/wiki-rebuild` auto-lint가 `obsidian orphans`, `obsidian unresolved`, `obsidian backlinks`를 활용하여 더 정확한 구조 건강 검사를 수행합니다. 모든 vault-wide 결과는 위키 경계로 후처리 필터링됩니다.
+- **하이브리드 SessionStart 스캔** — auto-ingest hook이 `find` 기반 스캔에 `obsidian recents`를 보충합니다 (합집합 + 중복 제거). 모든 후보는 mtime 검증을 통과해야 미수정 파일의 불필요한 ingest를 방지합니다.
+- **추천 도구에 `obsidian` 추가** — `wiki-schema.yaml` CLI 도구 목록에 추가.
+
+### 변경
+
+- **Config 스키마 확장** — `~/.claude/deep-wiki-config.yaml`에 선택적 `obsidian_cli` 블록 추가 (`available`, `vault_name`, `vault_path`, `wiki_prefix` 필드). 이 블록이 없으면 파일시스템 전용 모드 (완전 하위 호환).
+- **`/wiki-setup` 재실행 안전성** — 재실행 시 기존 `obsidian_cli` config 블록을 삭제 후 재감지하여, CLI 제거 시 stale config 방지.
+- **macOS 호환성** — SessionStart hook이 GNU coreutils를 가정하지 않고 `timeout`/`gtimeout` 가용성을 자동 감지.
+
+### 설계 원칙
+
+- **점진적 향상** — Obsidian CLI는 파일시스템 작업을 향상할 뿐 대체하지 않습니다. 모든 명령어는 앱 미실행 시 graceful 폴백.
+- **위키 경계 필터링** — 모든 vault-wide CLI 결과(`orphans`, `unresolved`, `tags`)는 `wiki_prefix/pages/`로 후처리 필터링하여 비관련 vault 노트가 리포트를 오염시키지 않도록 합니다.
+- **쓰기는 파일시스템 유지** — 페이지 생성/수정, lock 관리, index/log 업데이트는 모두 Write/Edit 도구로 정밀 제어.
+
 ## [1.0.1] — 2026-04-07
 
 ### 추가

@@ -14,6 +14,19 @@ Read `~/.claude/deep-wiki-config.yaml` to get `wiki_root`. If it does not exist,
 
 Load the `wiki-schema` skill for page structure rules.
 
+#### Obsidian CLI Liveness Check
+
+If the config contains `obsidian_cli.available: true`, check if the Obsidian app is currently running:
+
+```bash
+obsidian version 2>/dev/null
+```
+
+- **Success** → Set `OBS_LIVE=true`. Read `wiki_prefix` from config for CLI path scoping.
+- **Failure** → Set `OBS_LIVE=false`. Note in the final report: "Obsidian CLI unavailable (app not running) — using filesystem fallback."
+
+If the config does not contain `obsidian_cli`, set `OBS_LIVE=false` (filesystem-only mode).
+
 ## Steps
 
 ### 1. Identify Source Type
@@ -28,6 +41,14 @@ Determine the source type from the argument:
 ### 2. Read Existing Wiki State
 
 Read `.wiki-meta/index.json` to know existing pages, titles, tags, and aliases. This prevents duplicate page creation.
+
+**If `OBS_LIVE`**, supplement the index scan with Obsidian's full-text search to find overlapping pages more accurately:
+
+```bash
+obsidian search:context query="<topic keywords extracted from source>" path="<wiki_prefix>/pages" format=json
+```
+
+This uses Obsidian's text index to detect semantic overlap beyond just title/alias matching.
 
 ### 3. Acquire Lock
 
@@ -45,6 +66,14 @@ Read the source content and determine:
 - What new concepts/topics are covered?
 - Do any existing pages overlap? (check `index.json` titles and aliases)
 - Should this create new pages or update existing ones?
+
+**If `OBS_LIVE`**, use Obsidian search to supplement or replace Grep-based keyword matching:
+
+```bash
+obsidian search:context query="<keywords>" path="<wiki_prefix>/pages" format=json
+```
+
+This provides matching line context from Obsidian's index for more accurate overlap analysis.
 
 ### 5. Generate Source Slug
 
@@ -138,6 +167,25 @@ Perform these lint checks silently:
 2. **Broken links** — check links in new/updated pages
 3. **Index drift** — verify `index.json` matches actual page files
 4. **Orphan detection** — check if any new pages are unlinked
+
+**If `OBS_LIVE`**, enhance checks 2 and 4 with Obsidian CLI:
+
+```bash
+# Orphan detection — use Obsidian's link graph (more accurate than regex)
+# NOTE: orphans returns vault-wide results, format=json not supported
+obsidian orphans all 2>/dev/null
+# → Parse line-by-line, keep ONLY entries starting with "<wiki_prefix>/pages/"
+# → Discard all other vault notes. On parse failure, fall back to regex scan.
+
+# Broken link detection — use Obsidian's unresolved link tracking
+obsidian unresolved format=json 2>/dev/null
+# → Filter: keep only entries where source OR target is under "<wiki_prefix>/pages/"
+
+# Backlink analysis for new/updated pages
+obsidian backlinks path="<wiki_prefix>/pages/<page>.md" format=json
+```
+
+> **Wiki boundary filtering is mandatory.** `obsidian orphans` and `obsidian unresolved` return vault-wide results. Always post-filter against `<wiki_prefix>/pages/` to avoid reporting unrelated vault notes as wiki issues.
 
 **Auto-fix** what can be fixed without human judgment:
 - Add missing pages to `index.json`

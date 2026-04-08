@@ -87,6 +87,10 @@ recommended_tools:
       package: "@marp-team/marp-cli"
       purpose: "Generate slide presentations from markdown pages"
       check: "which marp"
+    - name: obsidian
+      purpose: "Obsidian CLI — search, backlinks, tags, properties via running Obsidian app"
+      check: "obsidian version"
+      note: "Requires Obsidian app to be running. Detected automatically by /wiki-setup."
   obsidian_plugins:
     - name: Dataview
       directory: dataview

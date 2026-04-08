@@ -12,6 +12,17 @@ Rebuild derived artifacts from the source-of-truth page files.
 
 Read `~/.claude/deep-wiki-config.yaml` to get `wiki_root`. If missing, tell the user to run `/wiki-setup` first.
 
+#### Obsidian CLI Liveness Check
+
+If the config contains `obsidian_cli.available: true`, check if the Obsidian app is running:
+
+```bash
+obsidian version 2>/dev/null
+```
+
+- **Success** → `OBS_LIVE=true`, read `wiki_prefix` from config.
+- **Failure** → `OBS_LIVE=false`, use filesystem-only checks.
+
 ## Steps
 
 ### 1. Acquire Lock
@@ -62,6 +73,12 @@ After rebuilding, run an automatic health check (same as wiki-ingest auto-lint):
 1. **Schema compliance** — verify all pages have required frontmatter
 2. **Broken links** — check links across all pages
 3. **Orphan detection** — find pages with no inbound links
+
+**If `OBS_LIVE`**, enhance checks 2 and 3 with Obsidian CLI (same as wiki-ingest auto-lint):
+- Orphan detection: `obsidian orphans all` → post-filter to `<wiki_prefix>/pages/`
+- Broken links: `obsidian unresolved format=json` → post-filter to `<wiki_prefix>/pages/`
+
+> Wiki boundary filtering is mandatory for all vault-wide CLI results.
 
 Auto-fix structural issues silently (prune excess versions, remove ghost index entries). Only report issues that need human judgment.
 

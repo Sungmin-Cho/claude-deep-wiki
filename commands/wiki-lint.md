@@ -14,6 +14,17 @@ Read `~/.claude/deep-wiki-config.yaml` to get `wiki_root`. If missing, tell the 
 
 Load the `wiki-schema` skill for validation rules. Read `wiki-schema.yaml` for the machine-readable schema definition.
 
+#### Obsidian CLI Liveness Check
+
+If the config contains `obsidian_cli.available: true`, check if the Obsidian app is running:
+
+```bash
+obsidian version 2>/dev/null
+```
+
+- **Success** → `OBS_LIVE=true`, read `wiki_prefix` from config.
+- **Failure** → `OBS_LIVE=false`, use filesystem-only checks.
+
 ## Steps
 
 ### 1. Gather Wiki Stats (Status Dashboard)
@@ -26,6 +37,14 @@ Report these metrics first:
 - **Last activity**: Most recent `ts` in `log.jsonl`
 - **Tags**: Unique tags across all pages with counts
 - **Version backups**: Count of files in `.wiki-meta/.versions/`
+
+**If `OBS_LIVE`**, enhance tag statistics:
+
+```bash
+obsidian tags counts sort=count format=json
+```
+
+> **Wiki boundary filter required.** The tags command may return vault-wide results (`path=` may not support folder scoping). Post-filter the output to include only tags from files under `<wiki_prefix>/pages/`.
 
 ### 2. Schema Compliance Check
 
@@ -45,11 +64,27 @@ An orphan page is one that:
 
 Exclude `welcome.md` from orphan detection (it is the entry point).
 
+**If `OBS_LIVE`**, use Obsidian's link graph for more accurate orphan detection:
+
+```bash
+obsidian orphans all 2>/dev/null
+```
+
+> **Wiki boundary filter required.** This command returns vault-wide results and does not support `path=` scoping or `format=json`. Parse line-by-line and keep **only** entries starting with `<wiki_prefix>/pages/`. Discard all other vault notes. On parse failure, fall back to the regex-based scan above.
+
 ### 4. Broken Link Detection
 
 For each markdown link `[text](target.md)` found in pages:
 - Check if `target.md` exists in `pages/`
 - Report any broken links with the source page and target
+
+**If `OBS_LIVE`**, supplement with Obsidian's unresolved link tracking:
+
+```bash
+obsidian unresolved format=json 2>/dev/null
+```
+
+> **Wiki boundary filter required.** This returns vault-wide results. Keep only entries where the source **or** target is under `<wiki_prefix>/pages/`. Discard unrelated vault entries.
 
 ### 5. Duplicate/Alias Conflict Detection
 

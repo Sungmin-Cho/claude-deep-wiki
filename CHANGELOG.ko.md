@@ -6,7 +6,7 @@ deep-wiki의 주요 변경사항을 기록합니다.
 
 ### 추가
 
-- **Obsidian CLI 통합** — `/wiki-setup`이 위키가 Obsidian vault 안에 있을 때 Obsidian CLI(`obs`)를 자동 감지합니다. 감지되면 위키 명령어들이 Obsidian의 전문 텍스트 검색, 백링크 그래프, 고아 페이지 감지, 미해결 링크 추적을 활용하여 더 정확한 결과를 제공합니다.
+- **Obsidian CLI 통합** — `/wiki-setup`이 위키가 Obsidian vault 안에 있을 때 Obsidian CLI(`obsidian`)를 자동 감지합니다. 감지되면 위키 명령어들이 Obsidian의 전문 텍스트 검색, 백링크 그래프, 고아 페이지 감지, 미해결 링크 추적을 활용하여 더 정확한 결과를 제공합니다.
 - **향상된 검색** — `/wiki-ingest`와 `/wiki-query`에서 Obsidian CLI 사용 가능 시 Grep 대신 `obsidian search:context`로 겹침 감지 및 콘텐츠 검색을 수행합니다.
 - **그래프 기반 쿼리 확장** — `/wiki-query`에 Layer 2.5 추가. 백링크를 따라가 키워드 매칭을 넘어선 관련 페이지를 발견합니다 (Obsidian CLI 전용).
 - **개선된 lint 검사** — `/wiki-lint`, `/wiki-ingest` auto-lint, `/wiki-rebuild` auto-lint가 `obsidian orphans`, `obsidian unresolved`, `obsidian backlinks`를 활용하여 더 정확한 구조 건강 검사를 수행합니다. 모든 vault-wide 결과는 위키 경계로 후처리 필터링됩니다.

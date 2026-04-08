@@ -173,7 +173,7 @@ Perform these lint checks silently:
 ```bash
 # Orphan detection — use Obsidian's link graph (more accurate than regex)
 # NOTE: orphans returns vault-wide results, format=json not supported
-obsidian orphans all 2>/dev/null
+obsidian orphans 2>/dev/null
 # → Parse line-by-line, keep ONLY entries starting with "<wiki_prefix>/pages/"
 # → Discard all other vault notes. On parse failure, fall back to regex scan.
 

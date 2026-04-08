@@ -67,7 +67,7 @@ Exclude `welcome.md` from orphan detection (it is the entry point).
 **If `OBS_LIVE`**, use Obsidian's link graph for more accurate orphan detection:
 
 ```bash
-obsidian orphans all 2>/dev/null
+obsidian orphans 2>/dev/null
 ```
 
 > **Wiki boundary filter required.** This command returns vault-wide results and does not support `path=` scoping or `format=json`. Parse line-by-line and keep **only** entries starting with `<wiki_prefix>/pages/`. Discard all other vault notes. On parse failure, fall back to the regex-based scan above.

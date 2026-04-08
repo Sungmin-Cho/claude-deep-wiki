@@ -75,7 +75,7 @@ After rebuilding, run an automatic health check (same as wiki-ingest auto-lint):
 3. **Orphan detection** — find pages with no inbound links
 
 **If `OBS_LIVE`**, enhance checks 2 and 3 with Obsidian CLI (same as wiki-ingest auto-lint):
-- Orphan detection: `obsidian orphans all` → post-filter to `<wiki_prefix>/pages/`
+- Orphan detection: `obsidian orphans` → post-filter to `<wiki_prefix>/pages/`
 - Broken links: `obsidian unresolved format=json` → post-filter to `<wiki_prefix>/pages/`
 
 > Wiki boundary filtering is mandatory for all vault-wide CLI results.

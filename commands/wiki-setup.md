@@ -207,7 +207,9 @@ Obsidian CLI: ✓ detected (vault: "<vault_name>")
 If not detected:
 ```
 Obsidian CLI: ✗ not detected
-  → Using filesystem access only (install Obsidian CLI for enhanced search and graph features)
+  → Using filesystem access only (enhanced search and graph features unavailable)
+  → To enable: Obsidian 1.12.7+ required, then Settings → General → Command line interface
+  → Troubleshooting: https://obsidian.md/help/cli#Troubleshooting
 ```
 
 ### 6. Log the Setup Event

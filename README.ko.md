@@ -7,6 +7,10 @@ LLM이 관리하는 마크다운 위키 — [Karpathy의 LLM Wiki](https://gist.
 > *"대부분의 사람들이 LLM과 문서를 사용하는 방식은 RAG입니다. 파일 모음을 업로드하면 LLM이 쿼리 시점에 관련 청크를 검색하고 답변을 생성합니다. 이건 작동하지만, LLM은 매번 질문할 때마다 지식을 처음부터 재발견하고 있습니다. 축적이 없습니다."*
 > — Andrej Karpathy
 
+### 하네스 엔지니어링에서의 역할
+
+deep-wiki는 [Deep Suite](https://github.com/Sungmin-Cho/claude-deep-suite) 생태계의 **지속적 지식 레이어**입니다. [Harness Engineering](https://martinfowler.com/articles/harness-engineering.html) 프레임워크의 2×2 매트릭스에서 **Inferential Guide**로 동작 — Phase 1 Research에서 에이전트의 이해를 형성하는 축적된 프로젝트 지식을 제공하며, 반복적인 RAG 쿼리를 복리로 쌓이는 지식 베이스로 대체합니다.
+
 ## 핵심 아이디어
 
 매번 지식을 재발견하는 RAG 대신, Claude Code가 **점진적으로 영구 위키를 구축하고 유지**합니다 — 구조화되고 상호 연결된 마크다운 파일 모음입니다. 새 소스를 추가하면 LLM이 읽고, 핵심 정보를 추출하고, 기존 위키에 통합합니다. 지식은 한 번 컴파일되고 최신 상태로 유지되며, 매 쿼리마다 다시 도출되지 않습니다.

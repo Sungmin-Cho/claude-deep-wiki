@@ -7,6 +7,10 @@ An LLM-managed markdown wiki for persistent knowledge accumulation — a Claude 
 > *"Most people's experience with LLMs and documents looks like RAG: you upload a collection of files, the LLM retrieves relevant chunks at query time, and generates an answer. This works, but the LLM is rediscovering knowledge from scratch on every question. There's no accumulation."*
 > — Andrej Karpathy
 
+### Role in Harness Engineering
+
+deep-wiki serves as the **persistent knowledge layer** in the [Deep Suite](https://github.com/Sungmin-Cho/claude-deep-suite) ecosystem. In the [Harness Engineering](https://martinfowler.com/articles/harness-engineering.html) framework's 2×2 matrix, it operates as an **Inferential Guide** — providing accumulated project knowledge that shapes the agent's understanding during Phase 1 Research, replacing the need for repeated RAG queries with a compounding knowledge base.
+
 ## The Idea
 
 Instead of re-discovering knowledge each time (RAG), Claude Code **incrementally builds and maintains a persistent wiki** — a structured, interlinked collection of markdown files. When you add a new source, the LLM reads it, extracts key information, and integrates it into the existing wiki. The knowledge is compiled once and kept current, not re-derived on every query.

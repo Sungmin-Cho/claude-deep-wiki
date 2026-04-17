@@ -18,6 +18,8 @@ If an argument is provided, use it as the wiki root path. Otherwise, prompt the 
 > A) Inside an Obsidian vault (provide path, e.g., ~/Obsidian/MyVault/wiki)
 > B) A standalone directory (provide path, e.g., ~/wiki)
 
+**Platform note:** On Windows, the wiki_root path MUST be in POSIX form (e.g. `/c/Users/name/wiki` under Git Bash, `/mnt/c/Users/name/wiki` under WSL2). The SessionStart hook rejects Windows-native paths (`C:\...` or `C:/...`). If the user provides a Windows-native path, normalize it before writing to config.
+
 ### 2. Create Config File
 
 Write the configuration to `~/.claude/deep-wiki-config.yaml`:
@@ -154,6 +156,8 @@ Recommended Obsidian plugins:
 If the wiki is NOT inside an Obsidian vault, skip this check entirely.
 
 #### 5c. Obsidian CLI Detection
+
+> **Windows note:** The `obsidian` command must be on PATH within the shell running Claude Code. Typical install location: `%LOCALAPPDATA%\Programs\Obsidian\`. If `obsidian version` fails in Git Bash, the user must add the directory containing `obsidian.exe` to PATH before re-running setup.
 
 If the wiki root is inside an Obsidian vault (detected in 5b), check for the Obsidian CLI:
 

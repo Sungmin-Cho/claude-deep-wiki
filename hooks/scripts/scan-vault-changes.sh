@@ -64,24 +64,41 @@ if [ -n "$HAS_OBS_CLI" ] && [ -n "$WIKI_PREFIX" ]; then
   RECENTS_OUTPUT=$($TIMEOUT_CMD obsidian recents 2>/dev/null || true)
   if [ -n "$RECENTS_OUTPUT" ]; then
     while IFS= read -r rel_path; do
-      # Exclude wiki pages and system dirs using config-based prefix (never hardcode)
+      # Exclude system dirs first (always).
       case "$rel_path" in
-        ${WIKI_PREFIX}/*|.obsidian/*|.trash/*) continue ;;
-        *.md)
-          # mtime verification: only include actually modified files
-          FULL_PATH="$VAULT_ROOT/$rel_path"
-          if [ -f "$FULL_PATH" ]; then
-            if [[ "$(uname)" == "Darwin" ]]; then
-              FILE_EPOCH=$(stat -f %m "$FULL_PATH" 2>/dev/null || echo 0)
-            else
-              FILE_EPOCH=$(stat -c %Y "$FULL_PATH" 2>/dev/null || echo 0)
-            fi
-            if [ "$FILE_EPOCH" -gt "$LAST_EPOCH" ]; then
-              RECENTS_FILES+=("$rel_path")
-            fi
-          fi
-          ;;
+        .obsidian/*|.trash/*) continue ;;
       esac
+
+      # Exclude wiki-scoped paths. When wiki_prefix is "." (wiki at vault
+      # root), explicitly exclude pages/, .wiki-meta/, and wiki artifacts.
+      if [ "$WIKI_PREFIX" = "." ]; then
+        case "$rel_path" in
+          pages/*|.wiki-meta/*|index.md|log.md|log.jsonl) continue ;;
+        esac
+      else
+        case "$rel_path" in
+          "${WIKI_PREFIX}"/*) continue ;;
+        esac
+      fi
+
+      # Only consider markdown files.
+      case "$rel_path" in
+        *.md) ;;
+        *) continue ;;
+      esac
+
+      # mtime verification: only include actually modified files.
+      FULL_PATH="$VAULT_ROOT/$rel_path"
+      if [ -f "$FULL_PATH" ]; then
+        if [[ "$(uname)" == "Darwin" ]]; then
+          FILE_EPOCH=$(stat -f %m "$FULL_PATH" 2>/dev/null || echo 0)
+        else
+          FILE_EPOCH=$(stat -c %Y "$FULL_PATH" 2>/dev/null || echo 0)
+        fi
+        if [ "$FILE_EPOCH" -gt "$LAST_EPOCH" ]; then
+          RECENTS_FILES+=("$rel_path")
+        fi
+      fi
     done <<< "$RECENTS_OUTPUT"
   fi
 fi
@@ -115,15 +132,19 @@ done < <(find "$VAULT_ROOT" \
   -print0 2>/dev/null)
 
 # 4b. Merge recents candidates with find results (union + deduplicate)
+# NOTE: bash 3.2 (macOS default) aborts on "${ARR[@]}" when ARR is empty
+# under `set -u`, so guard with ${#ARR[@]} checks before iterating.
 if [ ${#RECENTS_FILES[@]} -gt 0 ]; then
   for rf in "${RECENTS_FILES[@]}"; do
     ALREADY_FOUND=false
-    for nf in "${NEW_FILES[@]}"; do
-      if [ "$rf" = "$nf" ]; then
-        ALREADY_FOUND=true
-        break
-      fi
-    done
+    if [ ${#NEW_FILES[@]} -gt 0 ]; then
+      for nf in "${NEW_FILES[@]}"; do
+        if [ "$rf" = "$nf" ]; then
+          ALREADY_FOUND=true
+          break
+        fi
+      done
+    fi
     if [ "$ALREADY_FOUND" = false ]; then
       NEW_FILES+=("$rf")
     fi

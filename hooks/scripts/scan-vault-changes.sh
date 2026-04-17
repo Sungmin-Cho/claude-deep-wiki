@@ -1,8 +1,15 @@
 #!/bin/bash
 set -euo pipefail
 
-# deep-wiki SessionStart hook: scan Obsidian vault for new/modified files
-# Outputs a systemMessage listing files to auto-ingest
+# deep-wiki SessionStart hook: scan Obsidian vault for new/modified files.
+#
+# This script is invoked by hooks.json's SessionStart hook with a 15-second
+# command timeout (see hooks.json:"timeout": 15 — the unit is seconds, per
+# Claude Code plugin spec). If this script does not finish within that
+# budget it will be SIGTERM'd — all I/O operations should be either bounded
+# (e.g. `timeout N obsidian recents`) or idempotent on retry.
+#
+# Outputs a systemMessage listing files to auto-ingest.
 
 CONFIG="$HOME/.claude/deep-wiki-config.yaml"
 
@@ -265,11 +272,11 @@ if [ "$TOTAL" -gt 20 ]; then
 fi
 
 # Output systemMessage for Claude
-cat << EOJSON
+cat << EOMSG
 [deep-wiki] ${TOTAL}개의 새로운/수정된 파일이 Obsidian vault에서 감지되었습니다.
 
 자동 ingest 대상:
 $(echo -e "$FILE_LIST")
 
 이 파일들을 /wiki-ingest로 위키에 자동 반영하세요. 각 파일을 읽고 기존 위키 페이지에 병합하거나 새 페이지를 생성하세요. vault 경로: $VAULT_ROOT
-EOJSON
+EOMSG

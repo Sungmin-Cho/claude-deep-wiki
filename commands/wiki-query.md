@@ -121,6 +121,9 @@ Search `index.json` for a page that already covers this topic (by title or alias
 **5d. Update Index and Log**
 
 - Add/update the page entry in `.wiki-meta/index.json`
+
+> **Timestamp format:** All `ts` and `generated_at` values MUST be UTC ISO 8601 with a `Z` suffix. Generate with `date -u +"%Y-%m-%dT%H:%M:%SZ"`. Never use local timezone offsets (e.g. `+09:00`) — the wiki's log is consumed by tooling that assumes a single canonical timezone.
+
 - Append to `log.jsonl`:
   ```json
   {"ts":"<iso_timestamp>","action":"query-filed","source":"query-derived","pages_created":["query-topic.md"],"pages_updated":[]}

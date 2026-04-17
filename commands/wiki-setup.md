@@ -42,6 +42,8 @@ Create the initial machine-readable files:
 touch "<wiki_root>/log.jsonl"
 ```
 
+> **Timestamp format:** All `ts` and `generated_at` values MUST be UTC ISO 8601 with a `Z` suffix. Generate with `date -u +"%Y-%m-%dT%H:%M:%SZ"`. Never use local timezone offsets (e.g. `+09:00`) — the wiki's log is consumed by tooling that assumes a single canonical timezone.
+
 ```json
 // <wiki_root>/.wiki-meta/index.json
 {
@@ -215,6 +217,8 @@ Obsidian CLI: ✗ not detected
 ### 6. Log the Setup Event
 
 Append to `log.jsonl`:
+
+> **Timestamp format:** All `ts` and `generated_at` values MUST be UTC ISO 8601 with a `Z` suffix. Generate with `date -u +"%Y-%m-%dT%H:%M:%SZ"`. Never use local timezone offsets (e.g. `+09:00`) — the wiki's log is consumed by tooling that assumes a single canonical timezone.
 
 ```json
 {"ts":"<iso_timestamp>","action":"setup","source":"deep-wiki-init","pages_created":["welcome.md"],"pages_updated":[]}

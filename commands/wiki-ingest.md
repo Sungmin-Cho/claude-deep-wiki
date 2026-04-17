@@ -109,6 +109,8 @@ Merge new information with existing content. Do not discard existing content. Th
 
 ### 8. Write Source Provenance
 
+> **Timestamp format:** All `ts` and `generated_at` values MUST be UTC ISO 8601 with a `Z` suffix. Generate with `date -u +"%Y-%m-%dT%H:%M:%SZ"`. Never use local timezone offsets (e.g. `+09:00`) — the wiki's log is consumed by tooling that assumes a single canonical timezone.
+
 Create `.wiki-meta/sources/<slug>.yaml`:
 
 ```yaml
@@ -128,9 +130,15 @@ Compute the content hash using: `echo -n "<content>" | shasum -a 256 | cut -d' '
 
 ### 9. Update Index
 
+> **Timestamp format:** All `ts` and `generated_at` values MUST be UTC ISO 8601 with a `Z` suffix. Generate with `date -u +"%Y-%m-%dT%H:%M:%SZ"`. Never use local timezone offsets (e.g. `+09:00`) — the wiki's log is consumed by tooling that assumes a single canonical timezone.
+
 Read the current `.wiki-meta/index.json`, add/update entries for affected pages, update `generated_at` timestamp, write back.
 
+> **Classification rule:** A page filename belongs in `pages_created` ONLY if the page did not exist in `pages/` at the start of this ingest. If the page already existed (even if this is the first time *this source* contributed to it), classify it under `pages_updated`. Rationale: `log.jsonl` is used to reconstruct per-page creation history; a page must have exactly one `pages_created` entry across the entire log.
+
 ### 10. Append to Log
+
+> **Timestamp format:** All `ts` and `generated_at` values MUST be UTC ISO 8601 with a `Z` suffix. Generate with `date -u +"%Y-%m-%dT%H:%M:%SZ"`. Never use local timezone offsets (e.g. `+09:00`) — the wiki's log is consumed by tooling that assumes a single canonical timezone.
 
 Append one line to `log.jsonl`:
 

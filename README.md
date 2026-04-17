@@ -33,6 +33,44 @@ Raw Sources  →  Wiki (markdown pages)  →  Schema (management rules)
 | **Wiki** | LLM-generated markdown pages with cross-references | LLM writes, you read |
 | **Schema** | Rules governing how the wiki is structured and maintained | Co-evolved |
 
+## Platform Support
+
+| OS | Status | Notes |
+|---|---|---|
+| macOS | ✅ Primary | Developed and tested on Darwin 25+. |
+| Linux | ✅ Supported | Requires bash 4+, GNU coreutils. |
+| Windows | ⚠️ Experimental | Requires **Git Bash** or **WSL2**. Native `cmd.exe` / PowerShell not supported for the SessionStart hook. See "Windows Setup" below. |
+
+### Windows Setup (Git Bash or WSL2)
+
+1. Install Git for Windows (includes Git Bash) or enable WSL2.
+2. Set `wiki_root` using POSIX paths — **never** Windows-native form:
+   - ✅ `/c/Users/name/Obsidian/MyVault/wiki` (Git Bash)
+   - ✅ `/mnt/c/Users/name/Obsidian/MyVault/wiki` (WSL2)
+   - ❌ `C:\Users\name\Obsidian\MyVault\wiki` (rejected by the hook)
+3. If Obsidian CLI is installed, ensure `obsidian version` succeeds in Git Bash (you may need to add the Obsidian install directory, typically under `%LOCALAPPDATA%\Programs\Obsidian\`, to `PATH`).
+4. Google Drive mounted volumes (e.g. `G:\내 드라이브\...`) work in Git Bash as `/g/내 드라이브/...`. Prefer offline-mirrored mode to avoid placeholder-file mtime quirks.
+5. Enable long-path support on Windows 10 1607+ if your wiki path approaches 260 characters (required for `.wiki-meta/.versions/<long-name>.vN.md` depth).
+
+> Known Windows-only limitations: NTFS is case-insensitive (kebab-case naming enforced by the schema avoids conflicts); some Unix-only commands in command docs (`which`, `mkdir -p`) require bash.
+
+### Upgrading from 1.0.x / 1.1.0 → 1.1.1
+
+1. **Re-run `/wiki-setup`** if you did not do so after installing Obsidian CLI — v1.1.0's CLI integration requires an `obsidian_cli` block in `~/.claude/deep-wiki-config.yaml` that setup writes automatically.
+2. **If you cloned on Windows before 1.1.1** (i.e. before `.gitattributes` was added), your shell scripts may have been CRLF-converted. Re-normalize from a **clean working tree**:
+   ```bash
+   # Ensure nothing is uncommitted first:
+   git status                    # must show no changes
+   # If you have in-progress work, stash it:
+   git stash --include-untracked
+   # Re-normalize:
+   git add --renormalize .
+   git commit -m "chore: normalize line endings"
+   # Restore in-progress work:
+   git stash pop
+   ```
+   > ⚠️ Do **not** use `git rm --cached -r . && git reset --hard` — it destroys all uncommitted changes in the worktree.
+
 ## Installation
 
 ### Prerequisites

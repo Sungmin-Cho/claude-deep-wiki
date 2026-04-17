@@ -109,6 +109,8 @@ Merge new information with existing content. Do not discard existing content. Th
 
 ### 8. Write Source Provenance
 
+> **Timestamp format:** All `ts` and `generated_at` values MUST be UTC ISO 8601 with a `Z` suffix. Generate with `date -u +"%Y-%m-%dT%H:%M:%SZ"`. Never use local timezone offsets (e.g. `+09:00`) — the wiki's log is consumed by tooling that assumes a single canonical timezone.
+
 Create `.wiki-meta/sources/<slug>.yaml`:
 
 ```yaml
@@ -128,9 +130,15 @@ Compute the content hash using: `echo -n "<content>" | shasum -a 256 | cut -d' '
 
 ### 9. Update Index
 
+> **Timestamp format:** All `ts` and `generated_at` values MUST be UTC ISO 8601 with a `Z` suffix. Generate with `date -u +"%Y-%m-%dT%H:%M:%SZ"`. Never use local timezone offsets (e.g. `+09:00`) — the wiki's log is consumed by tooling that assumes a single canonical timezone.
+
 Read the current `.wiki-meta/index.json`, add/update entries for affected pages, update `generated_at` timestamp, write back.
 
+> **Classification rule:** A page filename belongs in `pages_created` ONLY if the page did not exist in `pages/` at the start of this ingest. If the page already existed (even if this is the first time *this source* contributed to it), classify it under `pages_updated`. Rationale: `log.jsonl` is used to reconstruct per-page creation history; a page must have exactly one `pages_created` entry across the entire log.
+
 ### 10. Append to Log
+
+> **Timestamp format:** All `ts` and `generated_at` values MUST be UTC ISO 8601 with a `Z` suffix. Generate with `date -u +"%Y-%m-%dT%H:%M:%SZ"`. Never use local timezone offsets (e.g. `+09:00`) — the wiki's log is consumed by tooling that assumes a single canonical timezone.
 
 Append one line to `log.jsonl`:
 
@@ -216,13 +224,50 @@ Spawn the `wiki-synthesizer` agent to handle cross-source analysis in a separate
 
 ## Auto-Ingest (SessionStart Hook)
 
-When the deep-wiki plugin's SessionStart hook detects new or modified files in the Obsidian vault, it provides a list of files via systemMessage. In this case:
+When the deep-wiki plugin's SessionStart hook detects new or modified files in the Obsidian vault, it writes a *pending* scan timestamp to `.wiki-meta/.pending-scan` (NOT `.last-scan`) and emits a systemMessage listing the candidates. This command is responsible for promoting the pending timestamp to committed only after the batch succeeds.
+
+In this case:
 
 1. Read the file list from the hook message
-2. Group related files by directory/topic
-3. For each group, follow the standard ingest workflow (Steps 1-14)
-4. Use the `--synthesize` flag internally if multiple files cover related topics
-5. After all files are processed, update `.wiki-meta/.last-scan` with the current timestamp
+2. **Capture the pending timestamp at the start of the batch**:
+   ```bash
+   BATCH_PENDING=$(cat "<wiki_root>/.wiki-meta/.pending-scan" 2>/dev/null || true)
+   ```
+   This "snapshot" lets us detect concurrent hook activity: if another session's hook runs and overwrites `.pending-scan` during our batch, we must NOT promote a timestamp later than what we actually covered.
+3. Group related files by directory/topic
+4. For each group, follow the standard ingest workflow (Steps 1-14)
+5. Use the `--synthesize` flag internally if multiple files cover related topics
+6. **After all files are processed successfully, and before the `rmdir` that releases the `.wiki-lock` directory** (i.e. between writing the last page/log entry and releasing the lock), promote `.pending-scan` → `.last-scan` with race and size guards:
+   ```bash
+   PENDING_FILE="<wiki_root>/.wiki-meta/.pending-scan"
+   LAST_FILE="<wiki_root>/.wiki-meta/.last-scan"
+   if [ -s "$PENDING_FILE" ]; then
+     CURRENT_PENDING=$(cat "$PENDING_FILE")
+     # TS_RE mirrors hooks/scripts/scan-vault-changes.sh — keep in sync.
+     TS_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
+     if [[ "$CURRENT_PENDING" =~ $TS_RE ]]; then
+       if [ -n "$BATCH_PENDING" ] && [ "$CURRENT_PENDING" = "$BATCH_PENDING" ]; then
+         # No concurrent hook overwrote .pending-scan during this batch;
+         # safe to commit the full pending window.
+         mv "$PENDING_FILE" "$LAST_FILE"
+       else
+         # Another hook ran during our batch. We processed files up to
+         # BATCH_PENDING only — commit that, leave the newer pending
+         # timestamp in place so the next session processes the remainder.
+         # Validate BATCH_PENDING against TS_RE before writing: it was
+         # captured with `cat ... || true` (no validation), so garbage
+         # residue in .pending-scan could otherwise be written raw to
+         # .last-scan until the next hook's read-side regex rejects it.
+         if [[ "$BATCH_PENDING" =~ $TS_RE ]]; then
+           echo "$BATCH_PENDING" > "$LAST_FILE"
+         fi
+       fi
+     fi
+   fi
+   ```
+   **Promotion ordering**: this promotion block MUST run before the `rmdir "<wiki_root>/.wiki-meta/.wiki-lock"` call, so that a crashing session cannot leave `.last-scan` advanced past what was actually ingested. If ingest partially fails or is skipped, do NOT promote — `.pending-scan` remains and the next session's hook will re-detect the same window (no data loss).
+
+**Manual ingest (no hook):** If `/wiki-ingest` is invoked directly (no preceding SessionStart hook), `$BATCH_PENDING` is empty and the promotion block is a no-op. This is intentional — `.last-scan` advances only via hook-driven batches. Manual ingests process whatever source path the user specifies and do not modify scan-window tracking.
 
 **Batch behavior:**
 - Process files sequentially by group, not one-by-one

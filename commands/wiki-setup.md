@@ -18,6 +18,8 @@ If an argument is provided, use it as the wiki root path. Otherwise, prompt the 
 > A) Inside an Obsidian vault (provide path, e.g., ~/Obsidian/MyVault/wiki)
 > B) A standalone directory (provide path, e.g., ~/wiki)
 
+**Platform note:** On Windows, the wiki_root path MUST be in POSIX form (e.g. `/c/Users/name/wiki` under Git Bash, `/mnt/c/Users/name/wiki` under WSL2). The SessionStart hook rejects Windows-native paths (`C:\...` or `C:/...`). If the user provides a Windows-native path, normalize it before writing to config.
+
 ### 2. Create Config File
 
 Write the configuration to `~/.claude/deep-wiki-config.yaml`:
@@ -41,6 +43,8 @@ Create the initial machine-readable files:
 ```bash
 touch "<wiki_root>/log.jsonl"
 ```
+
+> **Timestamp format:** All `ts` and `generated_at` values MUST be UTC ISO 8601 with a `Z` suffix. Generate with `date -u +"%Y-%m-%dT%H:%M:%SZ"`. Never use local timezone offsets (e.g. `+09:00`) — the wiki's log is consumed by tooling that assumes a single canonical timezone.
 
 ```json
 // <wiki_root>/.wiki-meta/index.json
@@ -153,6 +157,8 @@ If the wiki is NOT inside an Obsidian vault, skip this check entirely.
 
 #### 5c. Obsidian CLI Detection
 
+> **Windows note:** The `obsidian` command must be on PATH within the shell running Claude Code. Typical install location: `%LOCALAPPDATA%\Programs\Obsidian\`. If `obsidian version` fails in Git Bash, the user must add the directory containing `obsidian.exe` to PATH before re-running setup.
+
 If the wiki root is inside an Obsidian vault (detected in 5b), check for the Obsidian CLI:
 
 **Step 1 — Detect CLI and running app:**
@@ -215,6 +221,8 @@ Obsidian CLI: ✗ not detected
 ### 6. Log the Setup Event
 
 Append to `log.jsonl`:
+
+> **Timestamp format:** All `ts` and `generated_at` values MUST be UTC ISO 8601 with a `Z` suffix. Generate with `date -u +"%Y-%m-%dT%H:%M:%SZ"`. Never use local timezone offsets (e.g. `+09:00`) — the wiki's log is consumed by tooling that assumes a single canonical timezone.
 
 ```json
 {"ts":"<iso_timestamp>","action":"setup","source":"deep-wiki-init","pages_created":["welcome.md"],"pages_updated":[]}

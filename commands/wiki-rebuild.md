@@ -42,6 +42,8 @@ Read every `.md` file in `pages/`. For each page, parse the YAML frontmatter to 
 
 ### 3. Regenerate index.json
 
+> **Timestamp format:** All `ts` and `generated_at` values MUST be UTC ISO 8601 with a `Z` suffix. Generate with `date -u +"%Y-%m-%dT%H:%M:%SZ"`. Never use local timezone offsets (e.g. `+09:00`) — the wiki's log is consumed by tooling that assumes a single canonical timezone.
+
 Build a new `index.json` from the scanned data:
 
 ```json
@@ -61,6 +63,8 @@ Build a new `index.json` from the scanned data:
 Sort pages alphabetically by filename.
 
 ### 4. Append to Log
+
+> **Timestamp format:** All `ts` and `generated_at` values MUST be UTC ISO 8601 with a `Z` suffix. Generate with `date -u +"%Y-%m-%dT%H:%M:%SZ"`. Never use local timezone offsets (e.g. `+09:00`) — the wiki's log is consumed by tooling that assumes a single canonical timezone.
 
 ```json
 {"ts":"<iso_timestamp>","action":"rebuild","source":"manual","pages_created":[],"pages_updated":[]}

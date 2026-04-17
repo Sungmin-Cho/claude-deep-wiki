@@ -93,11 +93,25 @@ Check `index.json` for:
 - Pages where one page's title matches another page's alias
 - Suggest merge candidates
 
-### 6. Source Provenance Check
+### 6. Log Invariant Check — `pages_created` Duplication
+
+Parse `log.jsonl` and flag any page filename that appears in `pages_created` **more than once** across all entries. By invariant, each page is "created" exactly once over the entire history; duplicates indicate a prior ingest misclassified an update as a create.
+
+Example jq query (reference):
+```bash
+jq -r '.pages_created[]? | select(type=="string")' "<wiki_root>/log.jsonl" \
+  | sort | uniq -c | awk '$1 > 1 { print $2, "appears " $1 " times in pages_created" }'
+```
+
+> The invariant applies to every log entry that emits `pages_created` — including `setup` (seeds `welcome.md`), `ingest`, `query-filed`, and any future action. Do not filter by `.action`; any duplicate filename across the whole log is a violation.
+
+Report findings as `[LOG-INVARIANT]` — no auto-fix (historical log is append-only). Fix forward in future ingests by respecting the pages_created classification rule.
+
+### 7. Source Provenance Check
 
 For each page, check that every slug in `sources:` frontmatter has a corresponding `.wiki-meta/sources/<slug>.yaml` file. Report missing source provenance.
 
-### 7. Semantic Contradiction Detection
+### 8. Semantic Contradiction Detection
 
 Read pages that share the same tags or source slugs. For each group of related pages, check if any statements directly contradict each other. Focus on:
 
@@ -112,11 +126,11 @@ For each detected contradiction, report:
 
 This is a semantic check — read the actual page content, not just metadata. Flag contradictions as `[CONTRADICTION]` in the report. If the wiki has many pages, prioritize pages with overlapping tags.
 
-### 8. Stale Version Pruning Check
+### 9. Stale Version Pruning Check
 
 Count versions in `.wiki-meta/.versions/` per page. Report pages with more than 3 versions (candidates for pruning).
 
-### 9. Index Drift Detection
+### 10. Index Drift Detection
 
 Compare `index.json` entries against actual page files:
 - Pages in index but not on disk (ghost entries)
@@ -124,7 +138,7 @@ Compare `index.json` entries against actual page files:
 
 If drift is found, suggest running `/wiki-rebuild`.
 
-### 10. Report
+### 11. Report
 
 Present a structured report:
 
@@ -146,7 +160,7 @@ Present a structured report:
 - Review orphan pages: page-a.md, page-b.md, page-c.md
 ```
 
-### 11. Auto-Fix (if --fix flag)
+### 12. Auto-Fix (if --fix flag)
 
 If the user passed `--fix`:
 - Prune excess versions (keep last 3)

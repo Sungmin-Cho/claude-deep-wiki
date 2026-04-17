@@ -1,2 +1,9 @@
+.claude/settings.local.json
+.claude/.sensor-detection-cache.json
+.claude/**/*.local.*
 .claude/*.local.md
 .DS_Store
+
+# Local-only development docs — plans, ultrareview reports, backlog, etc.
+# These are author-local artifacts and must never reach the remote.
+docs/

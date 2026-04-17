@@ -33,6 +33,44 @@ Raw Sources  →  Wiki (마크다운 페이지)  →  Schema (관리 규칙)
 | **Wiki** | LLM이 생성한 교차 참조 마크다운 페이지 | LLM이 작성, 사용자가 읽음 |
 | **Schema** | 위키 구조와 유지 방법을 규정하는 규칙 | 함께 발전 |
 
+## 플랫폼 지원
+
+| OS | 상태 | 비고 |
+|---|---|---|
+| macOS | ✅ 기본 지원 | Darwin 25+에서 개발·검증. |
+| Linux | ✅ 지원 | bash 4+ 와 GNU coreutils 필요. |
+| Windows | ⚠️ 실험 단계 | **Git Bash** 또는 **WSL2** 필요. 네이티브 `cmd.exe` / PowerShell은 SessionStart hook 실행 불가. 아래 "Windows 설정" 참고. |
+
+### Windows 설정 (Git Bash 또는 WSL2)
+
+1. Git for Windows (Git Bash 포함) 설치 또는 WSL2 활성화.
+2. `wiki_root`는 반드시 POSIX 형식으로 지정 — Windows 네이티브 경로는 **거부됨**:
+   - ✅ `/c/Users/name/Obsidian/MyVault/wiki` (Git Bash)
+   - ✅ `/mnt/c/Users/name/Obsidian/MyVault/wiki` (WSL2)
+   - ❌ `C:\Users\name\Obsidian\MyVault\wiki` (hook이 거부)
+3. Obsidian CLI 설치 시 Git Bash에서 `obsidian version`이 성공하는지 확인 (필요 시 `%LOCALAPPDATA%\Programs\Obsidian\`을 `PATH`에 추가).
+4. Google Drive 마운트 볼륨(`G:\내 드라이브\...`)은 Git Bash에서 `/g/내 드라이브/...`로 접근. placeholder 파일 mtime 이슈 회피를 위해 **오프라인 미러 모드** 권장.
+5. Windows 10 1607+에서 long-path 지원 활성화 (`.wiki-meta/.versions/<long-name>.vN.md` 깊이가 260자에 근접할 때 필요).
+
+> Windows 한정 제약: NTFS는 대소문자 구분 없음(스키마의 kebab-case 소문자 규칙 덕에 실제 충돌 위험 낮음). 커맨드 문서의 일부 Unix 전용 명령(`which`, `mkdir -p`)은 bash 환경 필요.
+
+### 1.0.x / 1.1.0 → 1.1.1 업그레이드
+
+1. **`/wiki-setup` 재실행** — Obsidian CLI 설치 후 `/wiki-setup`을 다시 실행하지 않았다면 지금 재실행하세요. v1.1.0 CLI 통합 기능은 `~/.claude/deep-wiki-config.yaml`에 `obsidian_cli` 블록이 있어야 활성화되며, setup이 자동으로 기록합니다.
+2. **Windows에서 1.1.1 이전 clone을 사용 중이라면** (즉 `.gitattributes` 추가 이전) shell script가 CRLF로 변환되어 있을 수 있습니다. **clean working tree 상태**에서 재정규화하세요:
+   ```bash
+   # 먼저 커밋 안 된 변경이 없는지 확인
+   git status                    # 변경 없음 상태여야 함
+   # 진행 중 작업이 있으면 stash
+   git stash --include-untracked
+   # 재정규화
+   git add --renormalize .
+   git commit -m "chore: normalize line endings"
+   # 진행 중 작업 복원
+   git stash pop
+   ```
+   > ⚠️ `git rm --cached -r . && git reset --hard`는 사용하지 마세요 — worktree의 모든 커밋되지 않은 변경을 파괴합니다.
+
 ## 설치
 
 ### 사전 요구사항

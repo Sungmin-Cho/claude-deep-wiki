@@ -37,6 +37,13 @@ index:
 log:
   location: log.jsonl
   format: jsonl        # Each line: {"ts": "...", "action": "...", "pages": [...], "source": "..."}
+  ts_format: "ISO 8601 UTC with Z suffix, e.g. 2026-04-06T15:00:00Z (NEVER use local time offsets like +09:00)"
+  classification:
+    pages_created:
+      rule: "File did not exist in pages/ at the start of this action"
+      invariant: "Each page filename appears in pages_created at most once across the entire log"
+    pages_updated:
+      rule: "File existed before this action (regardless of whether this source contributed before)"
   actions:             # Valid action values
     - ingest
     - update

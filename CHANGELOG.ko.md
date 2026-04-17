@@ -2,6 +2,50 @@
 
 deep-wiki의 주요 변경사항을 기록합니다.
 
+## [1.1.1] — 2026-04-17
+
+### 보안
+
+- **로컬 권한 오버라이드 실수 커밋 방지** — `.gitignore`에 `.claude/settings.local.json`과 `.claude/.sensor-detection-cache.json`을 추가. 이 파일들은 저장소 범위의 파일시스템/실행 권한을 부여할 수 있어 다른 기여자에게 전파되어선 안 됨. (R3, Codex adversarial review)
+- **파괴적 `git rm --cached -r . && git reset --hard` 지시 제거** — 업그레이드 문서에서 해당 명령을 삭제하고, clean working tree 전제의 안전한 `git add --renormalize` 절차로 교체. (R2)
+
+### 수정
+
+- **macOS bash 3.2에서 SessionStart hook 크래시** — `"${ARR[@]}"` 순회 전마다 `${#ARR[@]}` 가드를 추가하여 `NEW_FILES`가 비어 있는 recents 병합 단계에서 `unbound variable` 오류로 훅이 중단되지 않도록 함. (C1)
+- **자동 ingest 스킵 시 파일 유실 위험** — 훅이 감지 시각을 `.last-scan`에 바로 쓰지 않고 `.wiki-meta/.pending-scan`에 **원자적으로**(`mktemp` + `mv`) 기록. `wiki-ingest`가 배치 성공 후에만 pending → committed 승격하며, 배치 시작 시점의 pending 값을 snapshot해 동시 세션이 `.last-scan`을 실제 처리 범위 너머로 진격시키지 못하도록 race 보호. (H1, 원자성·레이스 하드닝 포함)
+- **`wiki_prefix: "."` 엣지 케이스** — 위키가 vault 루트에 있을 때 `pages/`, `.wiki-meta/`, `index.md`, `log.md`, `log.jsonl`을 훅이 명시적으로 제외하여 위키가 자기 자신을 ingest하는 루프를 방지. (H3)
+- **YAML config 파싱 블록 경계 인식** — `wiki_root`, `obsidian_cli.available`, `wiki_prefix` 파싱을 awk state machine으로 교체. 다른 top-level 키 아래의 `available: true`가 `obsidian_cli` 블록으로 잘못 귀속되지 않도록 블록 경계를 엄격히 준수. 인라인 주석·따옴표 제거. (H2)
+- **로그 타임스탬프 일관성** — 모든 커맨드가 UTC ISO 8601 + `Z` 접미사(`date -u +"%Y-%m-%dT%H:%M:%SZ"`) 사용을 강제. `wiki-schema.yaml`에 `ts_format` 명시. 과거의 `+09:00` 항목은 그대로 읽기 가능. (M1)
+- **`pages_created` 중복** — 분류 규칙 명문화: 파일명은 ingest 시작 시점에 존재하지 않았을 때만 `pages_created`에 포함되며, 이미 있던 파일은 `pages_updated`에 기록. 로그 전체에서 동일 파일명은 `pages_created`에 최대 1회만 출현. `wiki-lint`에 중복을 `[LOG-INVARIANT]`로 보고하는 체크 추가. (M4)
+
+### Windows 호환성
+
+- **CRLF 라인 엔딩** — `.gitattributes`를 추가해 모든 shell/YAML/JSON/Markdown에 LF 강제. README/CHANGELOG에 1.1.1 이전 clone을 위한 안전한 재정규화 절차를 문서화. (W-C1)
+- **`timeout.exe` 충돌** — 훅이 `/windows/system32/timeout[.exe]$` 경로 경계 앵커 regex로 Windows native timeout을 감지·skip. "windows"를 이름에 포함한 무관한 경로(`/Users/alice/Windows-related/...`)의 정당한 GNU timeout은 false-positive 없이 그대로 사용. (W-H1)
+- **셸 의존성 명시** — README/README.ko에 Windows는 Experimental로 표기되고 Git Bash 또는 WSL2 필요함을 명시. (W-H2, 부분 해결 — Known Limitations 참조)
+- **Windows 네이티브 경로 거부** — `C:\Users\...` 또는 `C:/Users/...` 형태 `wiki_root`에 대해 친절한 오류 메시지와 POSIX 형식 안내. (W-H3)
+- **Obsidian CLI (Windows)** — `wiki-setup`이 `%LOCALAPPDATA%\Programs\Obsidian\`을 PATH에 추가하는 방법을 안내. (W-M2)
+- **Google Drive + 로케일** — README가 Git Bash에서의 Google Drive 마운트 컨벤션을 문서화하고 placeholder 파일 mtime 이슈 회피를 위한 오프라인 미러 모드 권장. (W-M3)
+
+### 변경
+
+- **훅 heredoc 태그** `EOJSON` → `EOMSG` (출력은 JSON이 아닌 plain text systemMessage). (L1)
+- **hook command timeout 단위**를 스크립트 헤더 주석에 문서화 (15초). 사용자에게 노출되는 `hooks.json` `description`에는 섞지 않음. (L4)
+- **`case` 패턴** 이 `"${WIKI_PREFIX}"`를 인용하여 향후 공백 포함 값에 대비. (L2)
+- **업그레이드 안내 추가** — 1.0.x / 1.1.0에서 올라온 사용자는 `/wiki-setup`을 재실행하여 Obsidian CLI 자동 감지를 반영. (M3 — 부분 해결, Known Limitations 참조)
+
+### 알려진 한계 (부분 해결; 잔여 작업은 1.2.0으로 이월)
+
+- **M2 CLI timeout fallback**: Windows `timeout.exe`는 skip되지만, 범용 POSIX fallback(`perl -e 'alarm N'` 등)은 추가되지 않음. coreutils가 없는 macOS 사용자는 `obsidian recents`가 여전히 timeout 없이 실행될 수 있음.
+- **M3 런타임 재-setup 안내**: README 문서화는 완료되었으나, 각 커맨드가 "CLI 감지되었는데 config 미등록 — `/wiki-setup` 재실행 권장" 1회성 노티스를 출력하지는 않음.
+- **W-H2 shell 부재 대응**: Windows는 Experimental로 표기되었으나, `bash`가 PATH에 없을 때 훅이 친절한 오류를 내는 기능이나 PowerShell 포트는 포함되지 않음.
+- **과거 로그 마이그레이션**: 기존 `log.jsonl`의 `+09:00` 항목은 그대로 유지. UTC 정규화 마이그레이션 스크립트는 포함되지 않음.
+- **wiki_prefix='.' end-to-end**: 훅의 recents 필터는 vault-root 모드에서 wiki artifact를 올바르게 제외하지만(1.1.1에서 추가), `find` 경로는 여전히 `VAULT_ROOT = dirname(WIKI_ROOT)`를 사용해 `wiki_root`의 부모를 탐색한다. vault=wiki의 end-to-end 지원은 `find` 단계 분기 추가가 필요하며 후속 수정 대상.
+
+### 비고
+
+모든 변경은 하위 호환. `.pending-scan`은 추가형 파일이며 기존 `.last-scan` 동작을 보존. 과거 타임존 혼재 로그도 그대로 읽히며, UTC 강제는 신규 항목에만 적용.
+
 ## [1.1.0] — 2026-04-08
 
 ### 추가

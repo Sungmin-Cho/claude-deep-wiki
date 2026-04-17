@@ -216,13 +216,43 @@ Spawn the `wiki-synthesizer` agent to handle cross-source analysis in a separate
 
 ## Auto-Ingest (SessionStart Hook)
 
-When the deep-wiki plugin's SessionStart hook detects new or modified files in the Obsidian vault, it provides a list of files via systemMessage. In this case:
+When the deep-wiki plugin's SessionStart hook detects new or modified files in the Obsidian vault, it writes a *pending* scan timestamp to `.wiki-meta/.pending-scan` (NOT `.last-scan`) and emits a systemMessage listing the candidates. This command is responsible for promoting the pending timestamp to committed only after the batch succeeds.
+
+In this case:
 
 1. Read the file list from the hook message
-2. Group related files by directory/topic
-3. For each group, follow the standard ingest workflow (Steps 1-14)
-4. Use the `--synthesize` flag internally if multiple files cover related topics
-5. After all files are processed, update `.wiki-meta/.last-scan` with the current timestamp
+2. **Capture the pending timestamp at the start of the batch**:
+   ```bash
+   BATCH_PENDING=$(cat "<wiki_root>/.wiki-meta/.pending-scan" 2>/dev/null || true)
+   ```
+   This "snapshot" lets us detect concurrent hook activity: if another session's hook runs and overwrites `.pending-scan` during our batch, we must NOT promote a timestamp later than what we actually covered.
+3. Group related files by directory/topic
+4. For each group, follow the standard ingest workflow (Steps 1-14)
+5. Use the `--synthesize` flag internally if multiple files cover related topics
+6. **After all files are processed successfully, AND before releasing the wiki-lock (Step 12 equivalent)**, promote `.pending-scan` → `.last-scan` with race and size guards:
+   ```bash
+   PENDING_FILE="<wiki_root>/.wiki-meta/.pending-scan"
+   LAST_FILE="<wiki_root>/.wiki-meta/.last-scan"
+   if [ -s "$PENDING_FILE" ]; then
+     CURRENT_PENDING=$(cat "$PENDING_FILE")
+     TS_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
+     if [[ "$CURRENT_PENDING" =~ $TS_RE ]]; then
+       if [ -n "$BATCH_PENDING" ] && [ "$CURRENT_PENDING" = "$BATCH_PENDING" ]; then
+         # No concurrent hook overwrote .pending-scan during this batch;
+         # safe to commit the full pending window.
+         mv "$PENDING_FILE" "$LAST_FILE"
+       else
+         # Another hook ran during our batch. We processed files up to
+         # BATCH_PENDING only — commit that, leave the newer pending
+         # timestamp in place so the next session processes the remainder.
+         if [ -n "$BATCH_PENDING" ]; then
+           echo "$BATCH_PENDING" > "$LAST_FILE"
+         fi
+       fi
+     fi
+   fi
+   ```
+   **Promotion ordering**: this step MUST run **before** lock release so that a crashing session cannot leave `.last-scan` advanced past what was actually ingested. If ingest partially fails or is skipped, do NOT promote — `.pending-scan` remains and the next session's hook will re-detect the same window (no data loss).
 
 **Batch behavior:**
 - Process files sequentially by group, not one-by-one

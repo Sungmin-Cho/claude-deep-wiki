@@ -26,14 +26,38 @@ if [ ! -d "$VAULT_ROOT" ]; then
 fi
 
 # 3. Get last scan timestamp
+# Priority: committed (.last-scan) > pending (.pending-scan) > first-run fallback.
+# A pending-but-not-yet-committed scan means the previous session detected
+# candidates but did not finish /wiki-ingest; fall back to its timestamp so
+# we don't double-scan the same window, but also don't lose coverage.
 LAST_SCAN_FILE="$WIKI_ROOT/.wiki-meta/.last-scan"
+PENDING_SCAN_FILE="$WIKI_ROOT/.wiki-meta/.pending-scan"
+# Regex matches ISO-8601 UTC "YYYY-MM-DDTHH:MM:SSZ" — any other content
+# (empty file from an interrupted write, garbage, or tampered value) is
+# rejected and we fall through to the next priority.
+TS_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
 
-if [ -f "$LAST_SCAN_FILE" ]; then
-  LAST_SCAN=$(cat "$LAST_SCAN_FILE")
-else
-  # First run: set to 1 hour ago to avoid ingesting everything
-  LAST_SCAN=$(date -u -v-1H +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -d "1 hour ago" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "2026-04-07T00:00:00Z")
+LAST_SCAN=""
+if [ -s "$LAST_SCAN_FILE" ]; then
+  _candidate=$(cat "$LAST_SCAN_FILE")
+  if [[ "$_candidate" =~ $TS_RE ]]; then
+    LAST_SCAN="$_candidate"
+  fi
 fi
+if [ -z "$LAST_SCAN" ] && [ -s "$PENDING_SCAN_FILE" ]; then
+  _candidate=$(cat "$PENDING_SCAN_FILE")
+  if [[ "$_candidate" =~ $TS_RE ]]; then
+    LAST_SCAN="$_candidate"
+  fi
+fi
+if [ -z "$LAST_SCAN" ]; then
+  # First run (or both files missing/invalid): use 1 hour ago to avoid
+  # ingesting the entire vault on first enrollment.
+  LAST_SCAN=$(date -u -v-1H +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
+              || date -u -d "1 hour ago" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
+              || echo "2026-04-07T00:00:00Z")
+fi
+unset _candidate
 
 # Convert to epoch for comparison
 if command -v gdate &>/dev/null; then
@@ -151,9 +175,22 @@ if [ ${#RECENTS_FILES[@]} -gt 0 ]; then
   done
 fi
 
-# 5. Update last scan timestamp
-mkdir -p "$(dirname "$LAST_SCAN_FILE")"
-date -u +"%Y-%m-%dT%H:%M:%SZ" > "$LAST_SCAN_FILE"
+# 5. Write pending scan timestamp atomically. wiki-ingest promotes this
+# to .last-scan only after a successful batch. If ingest is skipped or
+# fails, the next session re-scans the same window and candidates are
+# not lost.
+#
+# Atomic write protocol: write into a temp file, fsync via mv.
+# This prevents partial-write residue if the hook is SIGTERM'd (e.g.
+# the 15s hook timeout) mid-write on Google Drive-backed volumes.
+META_DIR="$(dirname "$LAST_SCAN_FILE")"
+mkdir -p "$META_DIR"
+TMP_SCAN=$(mktemp "$META_DIR/.pending-scan.XXXXXX")
+if date -u +"%Y-%m-%dT%H:%M:%SZ" > "$TMP_SCAN"; then
+  mv "$TMP_SCAN" "$PENDING_SCAN_FILE"
+else
+  rm -f "$TMP_SCAN"
+fi
 
 # 6. Output result
 if [ ${#NEW_FILES[@]} -eq 0 ]; then

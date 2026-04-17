@@ -27,7 +27,7 @@ case "$WIKI_ROOT" in
   [A-Za-z]:\\*|[A-Za-z]:/*)
     echo "[deep-wiki] wiki_root is a Windows-native path ($WIKI_ROOT)." >&2
     echo "[deep-wiki] Convert to POSIX form (e.g. /c/Users/...) and re-run /wiki-setup." >&2
-    exit 0
+    exit 1
     ;;
 esac
 

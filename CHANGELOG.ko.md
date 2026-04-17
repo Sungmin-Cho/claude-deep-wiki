@@ -22,10 +22,11 @@ deep-wiki의 주요 변경사항을 기록합니다.
 
 - **CRLF 라인 엔딩** — `.gitattributes`를 추가해 모든 shell/YAML/JSON/Markdown에 LF 강제. README/CHANGELOG에 1.1.1 이전 clone을 위한 안전한 재정규화 절차를 문서화. (W-C1)
 - **`timeout.exe` 충돌** — 훅이 `/windows/system32/timeout[.exe]$` 경로 경계 앵커 regex로 Windows native timeout을 감지·skip. "windows"를 이름에 포함한 무관한 경로(`/Users/alice/Windows-related/...`)의 정당한 GNU timeout은 false-positive 없이 그대로 사용. (W-H1)
-- **셸 의존성 명시** — README/README.ko에 Windows는 Experimental로 표기되고 Git Bash 또는 WSL2 필요함을 명시. (W-H2, 부분 해결 — Known Limitations 참조)
+- **셸 의존성 명시** — README/README.ko에 Windows는 Experimental로 표기되고 Git Bash 또는 WSL2 필요함을 명시. (W-H2, W-M1, 부분 해결 — Known Limitations 참조)
 - **Windows 네이티브 경로 거부** — `C:\Users\...` 또는 `C:/Users/...` 형태 `wiki_root`에 대해 친절한 오류 메시지와 POSIX 형식 안내. (W-H3)
 - **Obsidian CLI (Windows)** — `wiki-setup`이 `%LOCALAPPDATA%\Programs\Obsidian\`을 PATH에 추가하는 방법을 안내. (W-M2)
 - **Google Drive + 로케일** — README가 Git Bash에서의 Google Drive 마운트 컨벤션을 문서화하고 placeholder 파일 mtime 이슈 회피를 위한 오프라인 미러 모드 권장. (W-M3)
+- **NTFS 대소문자 비구분 + long-path 안내** — README Windows 설정에 스키마의 kebab-case 규칙이 NTFS 대소문자 충돌을 방지함을 명시하고, `.wiki-meta/.versions/` 깊은 경로를 위한 Windows 10 1607+ long-path 지원 활성화를 안내. (W-L1, W-L2)
 
 ### 변경
 

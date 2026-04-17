@@ -35,6 +35,7 @@ PENDING_SCAN_FILE="$WIKI_ROOT/.wiki-meta/.pending-scan"
 # Regex matches ISO-8601 UTC "YYYY-MM-DDTHH:MM:SSZ" — any other content
 # (empty file from an interrupted write, garbage, or tampered value) is
 # rejected and we fall through to the next priority.
+# TS_RE mirrors the regex in commands/wiki-ingest.md's promote snippet — keep in sync.
 TS_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
 
 LAST_SCAN=""

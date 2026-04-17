@@ -229,12 +229,13 @@ In this case:
 3. Group related files by directory/topic
 4. For each group, follow the standard ingest workflow (Steps 1-14)
 5. Use the `--synthesize` flag internally if multiple files cover related topics
-6. **After all files are processed successfully, AND before releasing the wiki-lock (Step 12 equivalent)**, promote `.pending-scan` → `.last-scan` with race and size guards:
+6. **After all files are processed successfully, and before the `rmdir` that releases the `.wiki-lock` directory** (i.e. between writing the last page/log entry and releasing the lock), promote `.pending-scan` → `.last-scan` with race and size guards:
    ```bash
    PENDING_FILE="<wiki_root>/.wiki-meta/.pending-scan"
    LAST_FILE="<wiki_root>/.wiki-meta/.last-scan"
    if [ -s "$PENDING_FILE" ]; then
      CURRENT_PENDING=$(cat "$PENDING_FILE")
+     # TS_RE mirrors hooks/scripts/scan-vault-changes.sh — keep in sync.
      TS_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
      if [[ "$CURRENT_PENDING" =~ $TS_RE ]]; then
        if [ -n "$BATCH_PENDING" ] && [ "$CURRENT_PENDING" = "$BATCH_PENDING" ]; then
@@ -252,7 +253,9 @@ In this case:
      fi
    fi
    ```
-   **Promotion ordering**: this step MUST run **before** lock release so that a crashing session cannot leave `.last-scan` advanced past what was actually ingested. If ingest partially fails or is skipped, do NOT promote — `.pending-scan` remains and the next session's hook will re-detect the same window (no data loss).
+   **Promotion ordering**: this promotion block MUST run before the `rmdir "<wiki_root>/.wiki-meta/.wiki-lock"` call, so that a crashing session cannot leave `.last-scan` advanced past what was actually ingested. If ingest partially fails or is skipped, do NOT promote — `.pending-scan` remains and the next session's hook will re-detect the same window (no data loss).
+
+**Manual ingest (no hook):** If `/wiki-ingest` is invoked directly (no preceding SessionStart hook), `$BATCH_PENDING` is empty and the promotion block is a no-op. This is intentional — `.last-scan` advances only via hook-driven batches. Manual ingests process whatever source path the user specifies and do not modify scan-window tracking.
 
 **Batch behavior:**
 - Process files sequentially by group, not one-by-one

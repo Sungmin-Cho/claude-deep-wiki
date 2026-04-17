@@ -1,0 +1,15 @@
+# Enforce LF line endings so shell scripts execute correctly on Windows
+# (Git for Windows defaults to core.autocrlf=true which otherwise converts
+# *.sh to CRLF, breaking #!/bin/bash interpretation.)
+* text=auto eol=lf
+
+*.sh        text eol=lf
+*.yaml      text eol=lf
+*.yml       text eol=lf
+*.json      text eol=lf
+*.md        text eol=lf
+
+# Binary files (none currently, but be explicit for safety)
+*.png       binary
+*.jpg       binary
+*.pdf       binary

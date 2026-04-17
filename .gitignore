@@ -1,2 +1,5 @@
+.claude/settings.local.json
+.claude/.sensor-detection-cache.json
+.claude/**/*.local.*
 .claude/*.local.md
 .DS_Store

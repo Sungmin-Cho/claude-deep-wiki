@@ -104,19 +104,20 @@ fi
 # correct parser that respects block boundaries.
 
 HAS_OBS_CLI=$(awk '
-  /^obsidian_cli:[[:space:]]*$/ { in_block=1; next }
-  /^[^[:space:]#]/              { in_block=0 }
+  /^obsidian_cli:[[:space:]]*(#.*)?$/ { in_block=1; next }
+  /^[^[:space:]#]/                    { in_block=0 }
   in_block && /^[[:space:]]+available:[[:space:]]*true[[:space:]]*(#.*)?$/ {
     print "1"; exit
   }
 ' "$CONFIG" 2>/dev/null)
 
 WIKI_PREFIX=$(awk '
-  /^obsidian_cli:[[:space:]]*$/ { in_block=1; next }
-  /^[^[:space:]#]/              { in_block=0 }
+  /^obsidian_cli:[[:space:]]*(#.*)?$/ { in_block=1; next }
+  /^[^[:space:]#]/                    { in_block=0 }
   in_block && /^[[:space:]]+wiki_prefix:[[:space:]]*/ {
     sub(/^[[:space:]]+wiki_prefix:[[:space:]]*/, "")
     sub(/[[:space:]]+#.*$/, "")
+    sub(/[[:space:]]+$/, "")
     gsub(/^["'"'"']|["'"'"']$/, "")
     print; exit
   }
@@ -233,22 +234,42 @@ if [ ${#RECENTS_FILES[@]} -gt 0 ]; then
   done
 fi
 
-# 5. Write pending scan timestamp atomically. wiki-ingest promotes this
-# to .last-scan only after a successful batch. If ingest is skipped or
-# fails, the next session re-scans the same window and candidates are
-# not lost.
+# 5. Write pending scan timestamp — BUT only if no valid pending window is
+# already in place. .pending-scan represents "the oldest detection window
+# awaiting ingest promotion". Advancing it on every hook fire would erase
+# the lower bound and let files detected in an earlier session drop below
+# the next LAST_EPOCH whenever /wiki-ingest was skipped (H1 regression on
+# fresh installs without .last-scan — reported by ultrareview bug_006).
 #
 # Atomic write protocol: write into a temp file, fsync via mv.
-# This prevents partial-write residue if the hook is SIGTERM'd (e.g.
-# the 15s hook timeout) mid-write on Google Drive-backed volumes.
+# - mktemp failure is treated as a soft skip (consistent with the other
+#   "skip silently if infra unavailable" exits above) rather than letting
+#   set -e abort the hook and surface as a SessionStart failure banner.
+# - A trap on TMP_SCAN ensures the temp file is cleaned up if SIGTERM
+#   interrupts the date-redirect before mv completes (the 15s hook budget
+#   on Google Drive-backed volumes is the motivating case).
 META_DIR="$(dirname "$LAST_SCAN_FILE")"
 mkdir -p "$META_DIR"
-TMP_SCAN=$(mktemp "$META_DIR/.pending-scan.XXXXXX")
-if date -u +"%Y-%m-%dT%H:%M:%SZ" > "$TMP_SCAN"; then
-  mv "$TMP_SCAN" "$PENDING_SCAN_FILE"
-else
-  rm -f "$TMP_SCAN"
+
+_pending_ok=""
+if [ -s "$PENDING_SCAN_FILE" ]; then
+  _existing=$(cat "$PENDING_SCAN_FILE" 2>/dev/null || true)
+  if [[ "$_existing" =~ $TS_RE ]]; then
+    _pending_ok=1
+  fi
 fi
+
+if [ -z "$_pending_ok" ]; then
+  TMP_SCAN=$(mktemp "$META_DIR/.pending-scan.XXXXXX" 2>/dev/null) || exit 0
+  trap 'rm -f -- "$TMP_SCAN" 2>/dev/null' EXIT
+  if date -u +"%Y-%m-%dT%H:%M:%SZ" > "$TMP_SCAN"; then
+    mv "$TMP_SCAN" "$PENDING_SCAN_FILE"
+  else
+    rm -f -- "$TMP_SCAN"
+  fi
+  trap - EXIT
+fi
+unset _existing _pending_ok
 
 # 6. Output result
 if [ ${#NEW_FILES[@]} -eq 0 ]; then

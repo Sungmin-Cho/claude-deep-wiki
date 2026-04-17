@@ -11,7 +11,25 @@ if [ ! -f "$CONFIG" ]; then
   exit 0  # No wiki configured, skip silently
 fi
 
-WIKI_ROOT=$(grep 'wiki_root:' "$CONFIG" | sed 's/wiki_root: *//' | sed "s|~|$HOME|")
+# Parse wiki_root from top-level YAML key only (ignore comments and nested keys).
+# Accept "wiki_root: value" at column 0, strip inline comments and quotes.
+WIKI_ROOT=$(grep -E '^wiki_root:[[:space:]]*' "$CONFIG" \
+  | head -1 \
+  | sed -E 's/^wiki_root:[[:space:]]*//' \
+  | sed -E 's/[[:space:]]+#.*$//' \
+  | sed -E 's/^["'\'']//; s/["'\'']$//' \
+  | sed "s|^~|$HOME|")
+
+# Reject Windows-native paths ("C:\..." or "C:/...") because the rest of
+# the script relies on POSIX semantics. Users on Windows should configure
+# wiki_root using MSYS/Git-Bash form (e.g. /c/Users/name/wiki).
+case "$WIKI_ROOT" in
+  [A-Za-z]:\\*|[A-Za-z]:/*)
+    echo "[deep-wiki] wiki_root is a Windows-native path ($WIKI_ROOT)." >&2
+    echo "[deep-wiki] Convert to POSIX form (e.g. /c/Users/...) and re-run /wiki-setup." >&2
+    exit 0
+    ;;
+esac
 
 if [ ! -d "$WIKI_ROOT" ]; then
   exit 0  # Wiki root doesn't exist, skip
@@ -69,19 +87,51 @@ else
   LAST_EPOCH=$(date -d "$LAST_SCAN" +%s 2>/dev/null || echo 0)
 fi
 
-# 3b. Check if Obsidian CLI is available (from config, not hardcoded)
-# NOTE: || true prevents set -e from aborting when config has no obsidian_cli block
-HAS_OBS_CLI=$(grep 'available: true' "$CONFIG" 2>/dev/null || true)
-WIKI_PREFIX=$(grep 'wiki_prefix:' "$CONFIG" 2>/dev/null | sed 's/wiki_prefix: *//' | tr -d '"' | tr -d "'" || true)
+# 3b. Detect obsidian_cli.available and obsidian_cli.wiki_prefix using a
+# block-aware awk state machine.
+# - Enter the obsidian_cli block on "^obsidian_cli:".
+# - Leave the block when any non-indented line appears (next top-level
+#   YAML key) — this prevents "available: true" in an unrelated block
+#   from being mis-attributed.
+# Full YAML parsing would require a dependency; this is the minimal
+# correct parser that respects block boundaries.
+
+HAS_OBS_CLI=$(awk '
+  /^obsidian_cli:[[:space:]]*$/ { in_block=1; next }
+  /^[^[:space:]#]/              { in_block=0 }
+  in_block && /^[[:space:]]+available:[[:space:]]*true[[:space:]]*(#.*)?$/ {
+    print "1"; exit
+  }
+' "$CONFIG" 2>/dev/null)
+
+WIKI_PREFIX=$(awk '
+  /^obsidian_cli:[[:space:]]*$/ { in_block=1; next }
+  /^[^[:space:]#]/              { in_block=0 }
+  in_block && /^[[:space:]]+wiki_prefix:[[:space:]]*/ {
+    sub(/^[[:space:]]+wiki_prefix:[[:space:]]*/, "")
+    sub(/[[:space:]]+#.*$/, "")
+    gsub(/^["'"'"']|["'"'"']$/, "")
+    print; exit
+  }
+' "$CONFIG" 2>/dev/null)
 
 # 3c. Collect candidates from obsidian recents (supplement, not replacement)
 # recents returns "recently opened" files — may include unmodified files.
 # All candidates MUST pass mtime verification below.
 RECENTS_FILES=()
 if [ -n "$HAS_OBS_CLI" ] && [ -n "$WIKI_PREFIX" ]; then
-  # macOS lacks `timeout`; use gtimeout (from coreutils) or run without timeout
+  # Pick a POSIX "run-command-with-timeout" wrapper. Windows ships
+  # C:\Windows\System32\timeout.exe which has a completely different
+  # CLI ("timeout /T N") and cannot run a child command, so detect and
+  # skip it when running under Git Bash / MSYS2.
+  #
+  # IMPORTANT: anchor the match to the Windows system path structure
+  # (/windows/system32/timeout[.exe]$) so that a legitimate GNU timeout
+  # installed under an unrelated directory containing the word "windows"
+  # (e.g. /Users/alice/Windows-related/bin/timeout) is NOT skipped.
   TIMEOUT_CMD=""
-  if command -v timeout &>/dev/null; then
+  TIMEOUT_BIN=$(command -v timeout 2>/dev/null || true)
+  if [ -n "$TIMEOUT_BIN" ] && ! echo "$TIMEOUT_BIN" | grep -qiE '/windows/system32/timeout(\.exe)?$'; then
     TIMEOUT_CMD="timeout 3"
   elif command -v gtimeout &>/dev/null; then
     TIMEOUT_CMD="gtimeout 3"

@@ -254,7 +254,11 @@ In this case:
          # Another hook ran during our batch. We processed files up to
          # BATCH_PENDING only — commit that, leave the newer pending
          # timestamp in place so the next session processes the remainder.
-         if [ -n "$BATCH_PENDING" ]; then
+         # Validate BATCH_PENDING against TS_RE before writing: it was
+         # captured with `cat ... || true` (no validation), so garbage
+         # residue in .pending-scan could otherwise be written raw to
+         # .last-scan until the next hook's read-side regex rejects it.
+         if [[ "$BATCH_PENDING" =~ $TS_RE ]]; then
            echo "$BATCH_PENDING" > "$LAST_FILE"
          fi
        fi

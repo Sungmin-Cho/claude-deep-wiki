@@ -99,10 +99,11 @@ Parse `log.jsonl` and flag any page filename that appears in `pages_created` **m
 
 Example jq query (reference):
 ```bash
-jq -r 'select(.action=="ingest" or .action=="query-filed")
-       | .pages_created[]? | select(type=="string")' "<wiki_root>/log.jsonl" \
+jq -r '.pages_created[]? | select(type=="string")' "<wiki_root>/log.jsonl" \
   | sort | uniq -c | awk '$1 > 1 { print $2, "appears " $1 " times in pages_created" }'
 ```
+
+> The invariant applies to every log entry that emits `pages_created` — including `setup` (seeds `welcome.md`), `ingest`, `query-filed`, and any future action. Do not filter by `.action`; any duplicate filename across the whole log is a violation.
 
 Report findings as `[LOG-INVARIANT]` — no auto-fix (historical log is append-only). Fix forward in future ingests by respecting the pages_created classification rule.
 

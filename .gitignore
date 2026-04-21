@@ -7,3 +7,4 @@
 # Local-only development docs — plans, ultrareview reports, backlog, etc.
 # These are author-local artifacts and must never reach the remote.
 docs/
+.deep-review/

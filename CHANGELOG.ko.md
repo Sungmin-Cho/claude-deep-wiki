@@ -2,6 +2,29 @@
 
 deep-wiki의 주요 변경사항을 기록합니다.
 
+## [1.1.2] — 2026-04-21
+
+### 변경
+
+- **`/wiki-ingest`가 페이지 I/O를 항상 `wiki-synthesizer` subagent(sonnet)로 위임** — 이전에는 멀티소스 배치이거나 `--synthesize` 플래그가 주어진 경우에만 subagent가 호출되고, 나머지는 메인 세션에서 인라인 처리되어 소스 본문과 기존 페이지 바디가 모두 메인 컨텍스트로 유입되었습니다. 이제 모든 ingest(단일/멀티 소스, URL/파일/deep-work 리포트, 수동/자동 모두)가 Step 7에서 `wiki-synthesizer`로 dispatch됩니다. 메인 세션은 작은 메타데이터 작업(`index.json`, `log.jsonl`, `sources/*.yaml`, 락, auto-lint)만 수행. SessionStart 훅으로 여러 Obsidian 파일이 한 번에 들어오는 자동 ingest에서 체감 절감이 가장 큽니다.
+- **버전 백업을 메인 command에서 `wiki-synthesizer`로 이관** — 기존 페이지를 덮어쓰기 전 `.wiki-meta/.versions/<name>.v<N>.md`로 스냅샷하는 작업이, create-vs-update 판단을 내리는 바로 그 pass 안에서 agent에 의해 수행됩니다. "쓰기 + 백업"이라는 단일 책임을 한 컨텍스트에 묶는 방향. 보관 정책(last-3 프루닝)은 메인의 auto-lint가 그대로 담당 — 변경 없음.
+- **Agent 입출력 계약 명문화** — `wiki-synthesizer`는 `{wiki_root, sources: [{slug, origin, type}], candidates}`를 입력으로 받고, `{created, updated, versioned, failed}` JSON manifest를 반환합니다. 호출자는 dispatch 직전에 캡처한 `ls pages/` 스냅샷과 manifest를 교차 검증하여 `pages_created` vs `pages_updated` 분류의 최종 권위자 역할을 합니다. agent가 잘못 self-classify하면 스냅샷이 우선이고 불일치는 리포트에 기록됩니다.
+- **`--synthesize` 플래그 의미 축소 (힌트 전용)** — backward compatibility를 위해 여전히 수용하지만 어떤 분기 로직도 이 플래그에 의존하지 않습니다. synthesis 동작은 이제 모든 배치의 디폴트.
+
+### 유지 (기능 불변)
+
+- 락(`.wiki-meta/.wiki-lock` mkdir/rmdir atomicity) — 불변
+- `.pending-scan → .last-scan` 승격 + `BATCH_PENDING` 레이스 가드 + `TS_RE` 크기 가드 + rmdir 이전 승격 순서 — 불변
+- 부분/전체 실패 시맨틱 — 어떤 실패에서도 `.pending-scan` 승격 안 함. 다음 세션의 훅이 동일 윈도우를 재탐지
+- `index.json` / `log.jsonl` / `sources/*.yaml` 스키마 — 온디스크 출력 동일
+- `.wiki-meta/.versions/` last-3 보관 정책 — 메인 auto-lint auto-fix에서 그대로 처리
+- Auto-lint(스키마 준수, broken link, index drift, orphan 탐지) — 불변
+- UTC ISO 8601 `Z` 타임스탬프 요구 — 불변
+
+### 마이그레이션
+
+별도 조치 불필요. 기존 wiki는 그대로 동작하며, 관찰 가능한 변화는 ingest 중 메인 세션 컨텍스트 사용량 감소뿐입니다. `--synthesize` 플래그 사용도 그대로 동작합니다.
+
 ## [1.1.1] — 2026-04-17
 
 ### 보안

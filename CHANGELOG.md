@@ -2,6 +2,29 @@
 
 All notable changes to deep-wiki are documented here.
 
+## [1.1.2] — 2026-04-21
+
+### Changed
+
+- **`/wiki-ingest` always delegates page I/O to `wiki-synthesizer` subagent (sonnet)** — Previously the subagent was only invoked for multi-source batches or when `--synthesize` was passed; everything else happened inline in the main session, which pulled source content and existing page bodies into the main context window. Now every ingest (single-source, multi-source, URL, file, deep-work report, manual, or auto-ingest) dispatches to `wiki-synthesizer` at Step 7. Main session keeps only the small metadata footprint (`index.json`, `log.jsonl`, `sources/*.yaml`, lock, auto-lint). This materially reduces context pressure for SessionStart hook auto-ingests where multiple Obsidian vault files land together.
+- **Version backup moved from main command to `wiki-synthesizer`** — Pre-overwrite snapshot copies to `.wiki-meta/.versions/<name>.v<N>.md` are now written by the agent as part of the same pass that decides create-vs-update, keeping the "write + backup" responsibility in a single context. Retention (last-3 pruning) stays in main via auto-lint — unchanged.
+- **Agent input/output contract is now formal** — `wiki-synthesizer` accepts `{wiki_root, sources: [{slug, origin, type}], candidates}` and returns a JSON manifest `{created, updated, versioned, failed}`. The caller cross-references the manifest against a pre-batch `ls pages/` snapshot and is authoritative for `pages_created` vs `pages_updated` classification — if the agent mis-self-classifies, the snapshot wins and the discrepancy is surfaced in the report.
+- **`--synthesize` flag demoted to a hint** — Accepted for backward compatibility but no longer gates any branching logic; synthesis behavior is now the default for any batch the agent receives.
+
+### Preserved (functional parity)
+
+- Lock (`.wiki-meta/.wiki-lock` mkdir/rmdir atomicity) — unchanged
+- `.pending-scan → .last-scan` promotion with `BATCH_PENDING` race guard + `TS_RE` size guard + promotion-before-rmdir ordering — unchanged
+- Partial / full failure semantics — no `.pending-scan` promotion on any failure; next session's hook re-detects the window
+- `index.json` / `log.jsonl` / `sources/*.yaml` schemas — identical on-disk output
+- `.wiki-meta/.versions/` last-3 retention — still handled by main's auto-lint auto-fix
+- Auto-lint (schema compliance, broken links, index drift, orphan detection) — unchanged
+- UTC ISO 8601 `Z` timestamp requirement — unchanged
+
+### Migration
+
+No action required. Existing wikis continue to work; the only observable change is that main session context usage drops during ingest. `--synthesize` flag invocations continue to work unchanged.
+
 ## [1.1.1] — 2026-04-17
 
 ### Security

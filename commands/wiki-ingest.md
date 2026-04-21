@@ -31,24 +31,18 @@ If the config does not contain `obsidian_cli`, set `OBS_LIVE=false` (filesystem-
 
 ### 1. Identify Source Type
 
-Determine the source type from the argument:
+Determine the source type from the argument **without reading the content** — the agent is responsible for source I/O:
 
-- **URL**: Starts with `http://` or `https://` — fetch with WebFetch. If WebFetch is unavailable, use Bash with `curl` as fallback
-- **File path**: Exists on filesystem — read with Read tool
-- **Deep-work report**: Path contains a deep-work session folder with `report.md` — read the report
+- **URL**: Starts with `http://` or `https://` → type `url`. For deep-work session folders, the folder path contains `report.md` → type `deep-work-report`. If the path looks like a deep-work session (contains `.claude/deep-work/sessions/` or similar), resolve to its `report.md`.
+- **File path**: Exists on filesystem → type `file`
+- **Deep-work report**: Path resolves to a `report.md` inside a deep-work session folder → type `deep-work-report`
 - **No argument**: Ask the user to paste text or provide a path/URL
+
+Main does NOT fetch URL bodies or read file contents at this step. It only classifies the source so the correct `type` can be written to provenance later.
 
 ### 2. Read Existing Wiki State
 
-Read `.wiki-meta/index.json` to know existing pages, titles, tags, and aliases. This prevents duplicate page creation.
-
-**If `OBS_LIVE`**, supplement the index scan with Obsidian's full-text search to find overlapping pages more accurately:
-
-```bash
-obsidian search:context query="<topic keywords extracted from source>" path="<wiki_prefix>/pages" format=json
-```
-
-This uses Obsidian's text index to detect semantic overlap beyond just title/alias matching.
+Read `.wiki-meta/index.json` to know existing pages, titles, tags, and aliases. This is a small, low-context read used for the overlap filter in Step 4 and for index updates in Step 9.
 
 ### 3. Acquire Lock
 
@@ -59,21 +53,18 @@ mkdir "$LOCK_DIR" 2>/dev/null || { echo "ERROR: Wiki is locked by another sessio
 
 Set up cleanup: the lock MUST be released when done (success or failure).
 
-### 4. Analyze Source
+### 4. Pre-filter Overlap Candidates
 
-Read the source content and determine:
+Identify existing pages that *might* overlap with the incoming sources. This is a coarse filter to narrow what the agent needs to read — the agent makes the final create-vs-update decision.
 
-- What new concepts/topics are covered?
-- Do any existing pages overlap? (check `index.json` titles and aliases)
-- Should this create new pages or update existing ones?
+- From `index.json`, collect pages whose `title`, `aliases`, or `tags` match keywords extracted from the source (title, URL slug, deep-work session name, etc.).
+- **If `OBS_LIVE`**, supplement with Obsidian search:
+  ```bash
+  obsidian search:context query="<keywords>" path="<wiki_prefix>/pages" format=json
+  ```
+- Deduplicate into a list of page filenames (basename only, e.g. `system-architecture.md`). This list may be empty for fresh topics.
 
-**If `OBS_LIVE`**, use Obsidian search to supplement or replace Grep-based keyword matching:
-
-```bash
-obsidian search:context query="<keywords>" path="<wiki_prefix>/pages" format=json
-```
-
-This provides matching line context from Obsidian's index for more accurate overlap analysis.
+Main MUST NOT read page bodies at this step — only metadata from `index.json` and the Obsidian index. Page bodies are for the agent.
 
 ### 5. Generate Source Slug
 
@@ -82,36 +73,51 @@ Create a kebab-case slug from the source title or URL:
 - File: `architecture-doc-2026`
 - Deep-work: `deep-work-session-2026-04-06`
 
-### 6. Version Existing Pages (if updating)
+### 6. Snapshot Pre-batch State
 
-For each page that will be updated, copy the current version to `.wiki-meta/.versions/`:
+Before dispatching to the agent, capture which pages exist in `pages/` right now. This snapshot is used in Step 9 to classify agent output into `pages_created` vs `pages_updated` authoritatively, regardless of what the agent itself reports.
 
 ```bash
-cp "<wiki_root>/pages/<page>.md" "<wiki_root>/.wiki-meta/.versions/<page>.v<N>.md"
+PRE_BATCH_PAGES=$(ls "<wiki_root>/pages/" 2>/dev/null | sort)
 ```
 
-Increment N based on existing versions. Prune versions beyond the last 3.
+### 7. Dispatch to wiki-synthesizer (always)
 
-### 7. Write Pages
+Spawn the `wiki-synthesizer` agent via the Agent tool. This happens for **every** ingest — single-source, multi-source, URL, file, or deep-work report alike. The main session does not read source content or page bodies; it only passes paths and the candidate list.
 
-For each new or updated page:
+Pass the following input to the agent:
 
-- Follow the page template from `wiki-schema` skill
-- Include required frontmatter: `title`, `sources`, `tags`, `aliases`
-- Add the current source slug to the `sources` list
-- Write clear, factual content grounded in the source material
-- When **creating a new page**, only include information present in the source
-- When **updating an existing page**, synthesize across all contributing sources — cross-source insights and connections are encouraged as long as every claim traces to at least one source
-- Link to related existing pages using standard markdown links
-- If the new source contradicts existing content, note both perspectives with attribution: "According to [Source A], X. However, [Source B] states Y."
+- `wiki_root` — absolute wiki root path
+- `sources` — list of `{slug, origin, type}` descriptors (one per source in this batch)
+- `candidates` — filenames from Step 4
 
-Merge new information with existing content. Do not discard existing content. The page should grow richer with each ingest — this is the core accumulation principle.
+The agent reads sources, reads candidates, decides create-vs-update per topic, versions any page it will overwrite into `.wiki-meta/.versions/<name>.v<N>.md`, and writes pages under `pages/`. It returns a JSON manifest:
 
-### 8. Write Source Provenance
+```json
+{
+  "created":   ["..."],
+  "updated":   ["..."],
+  "versioned": [".wiki-meta/.versions/..."],
+  "failed":    [{"file": "...", "reason": "..."}]
+}
+```
+
+If `failed` is non-empty, continue with metadata updates for whatever succeeded and include the failures in the final report (Step 14). Always release the lock. **In auto-ingest mode, do NOT promote `.pending-scan → .last-scan` on any partial or full failure** — the next session's hook will re-detect the window. See Error Handling below.
+
+### 8. Classify Agent Output and Write Source Provenance
 
 > **Timestamp format:** All `ts` and `generated_at` values MUST be UTC ISO 8601 with a `Z` suffix. Generate with `date -u +"%Y-%m-%dT%H:%M:%SZ"`. Never use local timezone offsets (e.g. `+09:00`) — the wiki's log is consumed by tooling that assumes a single canonical timezone.
 
-Create `.wiki-meta/sources/<slug>.yaml`:
+**Classify first.** Using `PRE_BATCH_PAGES` from Step 6 as the authority (NOT the agent's self-report), split the union of the agent's `created` and `updated` into two canonical lists:
+
+- `CREATED` — filenames absent from `PRE_BATCH_PAGES`
+- `UPDATED` — filenames present in `PRE_BATCH_PAGES`
+
+If the agent's self-classification disagrees (e.g. agent claimed `created` for a pre-existing file), trust the snapshot and note the discrepancy in the final report.
+
+> **Classification rule:** A page filename belongs in `pages_created` ONLY if the page did not exist in `pages/` at the start of this ingest. If the page already existed (even if this is the first time *this source* contributed to it), classify it under `pages_updated`. Rationale: `log.jsonl` is used to reconstruct per-page creation history; a page must have exactly one `pages_created` entry across the entire log.
+
+**Write provenance.** Create `.wiki-meta/sources/<slug>.yaml`:
 
 ```yaml
 id: <slug>
@@ -121,29 +127,31 @@ type: <url|file|text|deep-work-report>
 origin: "<url_or_path>"
 content_hash: "<sha256_of_content>"
 pages_created:
-  - <new_page_filenames>
+  - <CREATED filenames>
 pages_updated:
-  - <updated_page_filenames>
+  - <UPDATED filenames>
 ```
 
-Compute the content hash using: `echo -n "<content>" | shasum -a 256 | cut -d' ' -f1`
+Compute the content hash without loading source content into main's context — pipe directly to `shasum`:
+
+- File: `shasum -a 256 "<path>" | cut -d' ' -f1`
+- URL: `curl -sL "<url>" | shasum -a 256 | cut -d' ' -f1`
+- Inline text: `printf '%s' "<text>" | shasum -a 256 | cut -d' ' -f1`
 
 ### 9. Update Index
 
 > **Timestamp format:** All `ts` and `generated_at` values MUST be UTC ISO 8601 with a `Z` suffix. Generate with `date -u +"%Y-%m-%dT%H:%M:%SZ"`. Never use local timezone offsets (e.g. `+09:00`) — the wiki's log is consumed by tooling that assumes a single canonical timezone.
 
-Read the current `.wiki-meta/index.json`, add/update entries for affected pages, update `generated_at` timestamp, write back.
-
-> **Classification rule:** A page filename belongs in `pages_created` ONLY if the page did not exist in `pages/` at the start of this ingest. If the page already existed (even if this is the first time *this source* contributed to it), classify it under `pages_updated`. Rationale: `log.jsonl` is used to reconstruct per-page creation history; a page must have exactly one `pages_created` entry across the entire log.
+Read the current `.wiki-meta/index.json`, add entries for each filename in `CREATED` and update entries for each in `UPDATED`, update `generated_at` timestamp, write back.
 
 ### 10. Append to Log
 
 > **Timestamp format:** All `ts` and `generated_at` values MUST be UTC ISO 8601 with a `Z` suffix. Generate with `date -u +"%Y-%m-%dT%H:%M:%SZ"`. Never use local timezone offsets (e.g. `+09:00`) — the wiki's log is consumed by tooling that assumes a single canonical timezone.
 
-Append one line to `log.jsonl`:
+Append one line to `log.jsonl` using the classified `CREATED` / `UPDATED` lists from Step 8:
 
 ```json
-{"ts":"<iso_timestamp>","action":"ingest","source":"<slug>","pages_created":["..."],"pages_updated":["..."]}
+{"ts":"<iso_timestamp>","action":"ingest","source":"<slug>","pages_created":[...CREATED],"pages_updated":[...UPDATED]}
 ```
 
 ### 11. Update Human-Readable Wiki Artifacts
@@ -216,11 +224,11 @@ Show the user:
 - Total wiki pages: count from index.json
 - Lint issues (only if any were found)
 
-## Multi-Source Synthesis
+## Agent Delegation (always on)
 
-When the `--synthesize` flag is provided, or when multiple sources are given:
+Every ingest — single-source, multi-source, URL, file, or deep-work report — dispatches to the `wiki-synthesizer` agent at Step 7. The agent owns source reading, page-body reading, create-vs-update judgment, page writing, and version backup; this command owns lock, pre-batch snapshot, metadata (index.json, log.jsonl, sources/*.yaml), human artifacts (index.md, log.md), and auto-lint. This separation keeps page content out of main's context window, which matters especially for batch auto-ingests (see below).
 
-Spawn the `wiki-synthesizer` agent to handle cross-source analysis in a separate context window. Pass the source content and existing relevant pages to the agent. The agent returns page content; this command handles all wiki metadata (index, log, provenance, lock).
+The `--synthesize` flag remains accepted for backward compatibility but is now a **hint only**: it signals the caller expects cross-source synthesis, which the agent already performs for any batch with multiple sources. No branching logic is gated on this flag.
 
 ## Auto-Ingest (SessionStart Hook)
 
@@ -235,8 +243,8 @@ In this case:
    ```
    This "snapshot" lets us detect concurrent hook activity: if another session's hook runs and overwrites `.pending-scan` during our batch, we must NOT promote a timestamp later than what we actually covered.
 3. Group related files by directory/topic
-4. For each group, follow the standard ingest workflow (Steps 1-14)
-5. Use the `--synthesize` flag internally if multiple files cover related topics
+4. For each group, follow the standard ingest workflow (Steps 1-14). Each group is a full ingest cycle minus lock acquisition — critically, `PRE_BATCH_PAGES` (Step 6) is captured **per group** (NOT once for the whole batch), so pages created by an earlier group are correctly classified as `pages_updated` if a later group touches them.
+5. Each group is dispatched to `wiki-synthesizer` as a multi-source batch (Step 7) — no flag needed
 6. **After all files are processed successfully, and before the `rmdir` that releases the `.wiki-lock` directory** (i.e. between writing the last page/log entry and releasing the lock), promote `.pending-scan` → `.last-scan` with race and size guards:
    ```bash
    PENDING_FILE="<wiki_root>/.wiki-meta/.pending-scan"
@@ -279,6 +287,6 @@ In this case:
 ## Error Handling
 
 - If the lock cannot be acquired, report the error and stop
-- If source cannot be read, report the error and stop
+- If the `wiki-synthesizer` agent cannot be spawned or returns an unparseable response, release the lock and report the error. Do NOT promote `.pending-scan` — the next session will re-detect the window
 - Always release the lock in case of errors (use trap in bash operations)
-- If a page write fails, release the lock and report which pages were/weren't written
+- If the agent returns `failed` entries (partial success): proceed with metadata updates for the succeeded pages and include the failures in the Step 14 report. **Do NOT promote `.pending-scan` on any partial or full failure** — the next session's hook will re-detect and re-process the window (no data loss). This matches the original "process all files successfully before promoting" semantics

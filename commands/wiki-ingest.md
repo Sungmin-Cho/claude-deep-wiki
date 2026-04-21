@@ -31,14 +31,14 @@ If the config does not contain `obsidian_cli`, set `OBS_LIVE=false` (filesystem-
 
 ### 1. Identify Source Type
 
-Determine the source type from the argument **without reading the content** — the agent is responsible for source I/O:
+Determine the source type from the argument **without reading file bodies or fetching URLs** — the agent is responsible for source I/O and hashing:
 
-- **URL**: Starts with `http://` or `https://` → type `url`. For deep-work session folders, the folder path contains `report.md` → type `deep-work-report`. If the path looks like a deep-work session (contains `.claude/deep-work/sessions/` or similar), resolve to its `report.md`.
-- **File path**: Exists on filesystem → type `file`
-- **Deep-work report**: Path resolves to a `report.md` inside a deep-work session folder → type `deep-work-report`
-- **No argument**: Ask the user to paste text or provide a path/URL
+- **URL**: Starts with `http://` or `https://` → type `url`, origin = the URL.
+- **Deep-work report**: Path resolves to a `report.md` inside a deep-work session folder (contains `.claude/deep-work/sessions/` or similar) → type `deep-work-report`, origin = resolved `report.md` path.
+- **File path**: Exists on filesystem and is not a deep-work report → type `file`, origin = absolute path.
+- **No argument (pasted text)**: Ask the user to paste text, generate a slug (from the first non-empty line or a timestamp), and record `{slug, pending_text, type: "text"}` — but do NOT write the inbox file yet. The inbox write happens in Step 6.5 after lock acquisition so concurrent sessions can't race on the same `.inbox/<slug>.txt` path.
 
-Main does NOT fetch URL bodies or read file contents at this step. It only classifies the source so the correct `type` can be written to provenance later.
+Main does NOT fetch URL bodies or read source file contents at this step. It only classifies sources and defers pasted-text materialization until after the lock is held.
 
 ### 2. Read Existing Wiki State
 
@@ -75,49 +75,59 @@ Create a kebab-case slug from the source title or URL:
 
 ### 6. Snapshot Pre-batch State
 
-Before dispatching to the agent, capture which pages exist in `pages/` right now. This snapshot is used in Step 9 to classify agent output into `pages_created` vs `pages_updated` authoritatively, regardless of what the agent itself reports.
+Before dispatching to the agent, capture which pages exist in `pages/` right now. This snapshot is used in Step 8 to classify agent output into `pages_created` vs `pages_updated` authoritatively, regardless of what the agent itself reports.
 
 ```bash
 PRE_BATCH_PAGES=$(ls "<wiki_root>/pages/" 2>/dev/null | sort)
 ```
 
+### 6.5. Materialize Inbox Files (type: text only)
+
+For each pasted-text source recorded in Step 1 (`type: text`), write its content to `<wiki_root>/.wiki-meta/.inbox/<slug>.txt` now — under the lock — and set its `origin` to the absolute path. Track each path in `INBOX_FILES` so the trap from Step 12 (and Error Handling) can delete exactly these files on exit.
+
+```bash
+mkdir -p "<wiki_root>/.wiki-meta/.inbox"
+INBOX_FILES=()
+# For each text source (pseudo-code):
+#   printf '%s' "$pending_text" > "<wiki_root>/.wiki-meta/.inbox/$slug.txt"
+#   INBOX_FILES+=("<wiki_root>/.wiki-meta/.inbox/$slug.txt")
+```
+
+Sources of other types (`url`, `file`, `deep-work-report`) are unchanged and have their `origin` already set from Step 1.
+
 ### 7. Dispatch to wiki-synthesizer (always)
 
-Spawn the `wiki-synthesizer` agent via the Agent tool. This happens for **every** ingest — single-source, multi-source, URL, file, or deep-work report alike. The main session does not read source content or page bodies; it only passes paths and the candidate list.
+Spawn the `wiki-synthesizer` agent via the Agent tool. This happens for **every** ingest — single-source, multi-source, URL, file, pasted text, or deep-work report alike. The main session does not read source content or page bodies; it only passes paths and the candidate list.
 
-Pass the following input to the agent:
+**Input and output contracts are defined in `agents/wiki-synthesizer.md` (Input contract / Output contract sections). That file is the single source of truth. This step summarizes what the caller does with the returned manifest; for field semantics, see the agent file.**
 
-- `wiki_root` — absolute wiki root path
-- `sources` — list of `{slug, origin, type}` descriptors (one per source in this batch)
-- `candidates` — filenames from Step 4
+Input (summary):
+- `wiki_root`
+- `sources` — list of `{slug, origin, type}`
+- `candidates` — filenames from Step 4 (hint only; agent widens when needed per its Rule 5)
 
-The agent reads sources, reads candidates, decides create-vs-update per topic, versions any page it will overwrite into `.wiki-meta/.versions/<name>.v<N>.md`, and writes pages under `pages/`. It returns a JSON manifest:
-
-```json
-{
-  "created":   ["..."],
-  "updated":   ["..."],
-  "versioned": [".wiki-meta/.versions/..."],
-  "failed":    [{"file": "...", "reason": "..."}]
-}
-```
+Output (summary): structured entries for `created` / `updated` carrying `{file, title, tags, aliases, sources}`, plus `versioned`, `source_hashes` (per-slug sha256), and `failed` (may include `orphan_version`).
 
 If `failed` is non-empty, continue with metadata updates for whatever succeeded and include the failures in the final report (Step 14). Always release the lock. **In auto-ingest mode, do NOT promote `.pending-scan → .last-scan` on any partial or full failure** — the next session's hook will re-detect the window. See Error Handling below.
 
-### 8. Classify Agent Output and Write Source Provenance
+### 8. Reconcile, Classify, and Write Source Provenance
 
 > **Timestamp format:** All `ts` and `generated_at` values MUST be UTC ISO 8601 with a `Z` suffix. Generate with `date -u +"%Y-%m-%dT%H:%M:%SZ"`. Never use local timezone offsets (e.g. `+09:00`) — the wiki's log is consumed by tooling that assumes a single canonical timezone.
 
-**Classify first.** Using `PRE_BATCH_PAGES` from Step 6 as the authority (NOT the agent's self-report), split the union of the agent's `created` and `updated` into two canonical lists:
+**a. Reconcile against disk.** For each entry in the agent's `created` ∪ `updated`, verify `<wiki_root>/pages/<file>` actually exists (`test -f`). Any entry whose file is missing is moved to `failed` with reason `"agent reported written but file not present"`, and its `orphan_version` (if any) is carried over. This catches agent crashes or manifest lies without re-reading any page body.
 
-- `CREATED` — filenames absent from `PRE_BATCH_PAGES`
-- `UPDATED` — filenames present in `PRE_BATCH_PAGES`
+**b. Validate filenames.** Every `file` value must match `^[a-z0-9][a-z0-9-]*\.md$`. Reject (move to `failed`) any entry with a filename containing path separators or escape sequences. Defense in depth against manifest corruption.
+
+**c. Classify authoritatively.** Using `PRE_BATCH_PAGES` from Step 6 as the authority (NOT the agent's self-report), split the union of surviving `created` ∪ `updated` entries into two canonical groups by `file`:
+
+- `CREATED_ENTRIES` — entries whose `file` was absent from `PRE_BATCH_PAGES`
+- `UPDATED_ENTRIES` — entries whose `file` was present in `PRE_BATCH_PAGES`
 
 If the agent's self-classification disagrees (e.g. agent claimed `created` for a pre-existing file), trust the snapshot and note the discrepancy in the final report.
 
 > **Classification rule:** A page filename belongs in `pages_created` ONLY if the page did not exist in `pages/` at the start of this ingest. If the page already existed (even if this is the first time *this source* contributed to it), classify it under `pages_updated`. Rationale: `log.jsonl` is used to reconstruct per-page creation history; a page must have exactly one `pages_created` entry across the entire log.
 
-**Write provenance.** Create `.wiki-meta/sources/<slug>.yaml`:
+**d. Write per-source provenance.** For **each** source in the batch, create `<wiki_root>/.wiki-meta/sources/<slug>.yaml`:
 
 ```yaml
 id: <slug>
@@ -125,34 +135,34 @@ title: "<source_title>"
 ingested_at: "<iso_timestamp>"
 type: <url|file|text|deep-work-report>
 origin: "<url_or_path>"
-content_hash: "<sha256_of_content>"
+content_hash: "<source_hashes[slug] from agent manifest>"
 pages_created:
-  - <CREATED filenames>
+  - <files in CREATED_ENTRIES whose entry.sources contains this slug>
 pages_updated:
-  - <UPDATED filenames>
+  - <files in UPDATED_ENTRIES whose entry.sources contains this slug>
 ```
 
-Compute the content hash without loading source content into main's context — pipe directly to `shasum`:
+Per-slug `pages_created`/`pages_updated` filtering uses each entry's `sources` list — a page only lists a slug if that slug actually contributed to it. This preserves per-source provenance in multi-source batches (`wiki-lint`'s source-provenance invariant continues to hold: every page's frontmatter `sources:` slug has a matching `.wiki-meta/sources/<slug>.yaml` whose `pages_*` includes that page).
 
-- File: `shasum -a 256 "<path>" | cut -d' ' -f1`
-- URL: `curl -sL "<url>" | shasum -a 256 | cut -d' ' -f1`
-- Inline text: `printf '%s' "<text>" | shasum -a 256 | cut -d' ' -f1`
+`content_hash` comes directly from the agent's `source_hashes` map — the caller does NOT re-fetch the URL or re-read the file. This guarantees the hash reflects exactly the bytes the agent ingested.
 
 ### 9. Update Index
 
 > **Timestamp format:** All `ts` and `generated_at` values MUST be UTC ISO 8601 with a `Z` suffix. Generate with `date -u +"%Y-%m-%dT%H:%M:%SZ"`. Never use local timezone offsets (e.g. `+09:00`) — the wiki's log is consumed by tooling that assumes a single canonical timezone.
 
-Read the current `.wiki-meta/index.json`, add entries for each filename in `CREATED` and update entries for each in `UPDATED`, update `generated_at` timestamp, write back.
+Read the current `.wiki-meta/index.json`. For each entry in `CREATED_ENTRIES` ∪ `UPDATED_ENTRIES`, use the entry's `{file, title, tags, aliases}` directly — do NOT re-read the page body. `CREATED_ENTRIES` produce new index entries; `UPDATED_ENTRIES` overwrite existing ones. Update `generated_at` to the current UTC timestamp, write back.
 
 ### 10. Append to Log
 
 > **Timestamp format:** All `ts` and `generated_at` values MUST be UTC ISO 8601 with a `Z` suffix. Generate with `date -u +"%Y-%m-%dT%H:%M:%SZ"`. Never use local timezone offsets (e.g. `+09:00`) — the wiki's log is consumed by tooling that assumes a single canonical timezone.
 
-Append one line to `log.jsonl` using the classified `CREATED` / `UPDATED` lists from Step 8:
+Append one log line **per source in the batch**, using the per-slug filtered lists from Step 8d:
 
 ```json
-{"ts":"<iso_timestamp>","action":"ingest","source":"<slug>","pages_created":[...CREATED],"pages_updated":[...UPDATED]}
+{"ts":"<iso_timestamp>","action":"ingest","source":"<slug>","pages_created":[...filtered_for_slug],"pages_updated":[...filtered_for_slug]}
 ```
+
+For a single-source ingest this is one line; for multi-source batch it is one line per source, identical `ts`. This matches the per-source yaml written in Step 8d — any page whose frontmatter `sources:` field lists a given slug MUST appear under that slug's log line (`pages_created` or `pages_updated`).
 
 ### 11. Update Human-Readable Wiki Artifacts
 
@@ -167,11 +177,18 @@ Created "LLM Wiki Philosophy" and "RAG vs Wiki Approach" pages covering the 3-la
 
 These files are wiki artifacts written by the LLM for human readers, alongside the machine-readable `index.json` and `log.jsonl`.
 
-### 12. Release Lock
+### 12. Release Lock (and Inbox Cleanup)
+
+On the success path: delete each inbox file this invocation wrote (tracked in `INBOX_FILES` from Step 6.5), then release the lock.
 
 ```bash
+# Delete only the inbox files this invocation created — never a wildcard,
+# to avoid deleting files from a concurrent session that holds the lock next.
+for f in "${INBOX_FILES[@]}"; do rm -f "$f"; done
 rmdir "<wiki_root>/.wiki-meta/.wiki-lock" 2>/dev/null
 ```
+
+The same two operations (inbox cleanup + rmdir) must also run on any error exit — register them in a bash `trap` set up at lock-acquisition time. See Error Handling.
 
 ### 13. Auto-Lint
 
@@ -287,6 +304,8 @@ In this case:
 ## Error Handling
 
 - If the lock cannot be acquired, report the error and stop
-- If the `wiki-synthesizer` agent cannot be spawned or returns an unparseable response, release the lock and report the error. Do NOT promote `.pending-scan` — the next session will re-detect the window
+- If the `wiki-synthesizer` agent cannot be spawned or returns an unparseable response, release the lock and report the error. Do NOT promote `.pending-scan` — the next session will re-detect the window. "Unparseable" means one of: (a) not valid JSON, (b) missing any of `created`/`updated`/`versioned`/`source_hashes`/`failed` at the top level, (c) entries in `created`/`updated` missing required fields (`file`/`title`/`tags`/`aliases`/`sources`), (d) `source_hashes` missing a slug the caller passed in
 - Always release the lock in case of errors (use trap in bash operations)
+- **Inbox cleanup (type: text)**: The trap that releases the lock also deletes each file in `INBOX_FILES` (populated in Step 6.5). Never use `.inbox/*.txt` wildcards — stale inbox files from a prior crashed session belong to that session and may still be needed for recovery. This cleanup runs on success AND failure so pasted text never lingers on disk
+- **Orphan versions**: If any `failed` entry carries an `orphan_version`, surface it in the Step 14 report so the user knows a backup exists for a page that did NOT get overwritten. Auto-lint's retention prune (Step 13) handles actual cleanup — no special action here
 - If the agent returns `failed` entries (partial success): proceed with metadata updates for the succeeded pages and include the failures in the Step 14 report. **Do NOT promote `.pending-scan` on any partial or full failure** — the next session's hook will re-detect and re-process the window (no data loss). This matches the original "process all files successfully before promoting" semantics

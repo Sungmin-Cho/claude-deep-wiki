@@ -8,22 +8,29 @@ deep-wiki의 주요 변경사항을 기록합니다.
 
 - **`/wiki-ingest`가 페이지 I/O를 항상 `wiki-synthesizer` subagent(sonnet)로 위임** — 이전에는 멀티소스 배치이거나 `--synthesize` 플래그가 주어진 경우에만 subagent가 호출되고, 나머지는 메인 세션에서 인라인 처리되어 소스 본문과 기존 페이지 바디가 모두 메인 컨텍스트로 유입되었습니다. 이제 모든 ingest(단일/멀티 소스, URL/파일/deep-work 리포트, 수동/자동 모두)가 Step 7에서 `wiki-synthesizer`로 dispatch됩니다. 메인 세션은 작은 메타데이터 작업(`index.json`, `log.jsonl`, `sources/*.yaml`, 락, auto-lint)만 수행. SessionStart 훅으로 여러 Obsidian 파일이 한 번에 들어오는 자동 ingest에서 체감 절감이 가장 큽니다.
 - **버전 백업을 메인 command에서 `wiki-synthesizer`로 이관** — 기존 페이지를 덮어쓰기 전 `.wiki-meta/.versions/<name>.v<N>.md`로 스냅샷하는 작업이, create-vs-update 판단을 내리는 바로 그 pass 안에서 agent에 의해 수행됩니다. "쓰기 + 백업"이라는 단일 책임을 한 컨텍스트에 묶는 방향. 보관 정책(last-3 프루닝)은 메인의 auto-lint가 그대로 담당 — 변경 없음.
-- **Agent 입출력 계약 명문화** — `wiki-synthesizer`는 `{wiki_root, sources: [{slug, origin, type}], candidates}`를 입력으로 받고, `{created, updated, versioned, failed}` JSON manifest를 반환합니다. 호출자는 dispatch 직전에 캡처한 `ls pages/` 스냅샷과 manifest를 교차 검증하여 `pages_created` vs `pages_updated` 분류의 최종 권위자 역할을 합니다. agent가 잘못 self-classify하면 스냅샷이 우선이고 불일치는 리포트에 기록됩니다.
+- **Agent 입출력 계약 구조화** — `wiki-synthesizer`는 `{wiki_root, sources: [{slug, origin, type}], candidates}`를 입력으로 받고, 구조화된 manifest를 반환합니다: `created`/`updated` 각 엔트리가 `{file, title, tags, aliases, sources}`를 담고, `versioned`, `source_hashes`(slug별 sha256), `failed`(orphan_version 포함 가능)도 반환. 호출자는 pre-batch `ls pages/` 스냅샷과 교차 검증하고, 실제 파일시스템에 대해 reconcile하며, `^[a-z0-9][a-z0-9-]*\.md$` 정규식으로 filename validation을 수행한 뒤 `pages_created` vs `pages_updated`를 권위적으로 분류합니다.
+- **`index.json` 업데이트가 manifest frontmatter를 직접 사용** — 메인이 더 이상 페이지를 쓰지 않으므로, agent의 `created`/`updated` 각 엔트리는 페이지 frontmatter에 쓴 정확한 `title`/`tags`/`aliases`를 담습니다. 메인은 이 값들을 그대로 `index.json`에 반영 — 페이지 바디 재독 없이 index가 항상 agent가 쓴 내용과 동기화됩니다.
+- **멀티소스 배치의 per-source provenance** — 배치 내 각 source는 자신의 `.wiki-meta/sources/<slug>.yaml`과 자신의 `log.jsonl` 라인을 갖습니다. agent가 entry별로 반환하는 `sources` 리스트가 slug별 filtering을 수행하므로, 어떤 slug가 실제로 기여한 페이지만 그 slug의 `pages_created`/`pages_updated`에 나타납니다. `wiki-lint`의 source-provenance 불변(페이지 frontmatter의 `sources:` slug는 모두 `.wiki-meta/sources/<slug>.yaml`의 `pages_*`에 포함되어야 함)이 멀티소스 배치에서도 유지됩니다.
+- **`content_hash`를 agent가 fetch/read 시점에 계산** — 이전에는 메인이 agent의 작업 이후 URL을 `curl`로 재fetch하거나 파일을 다시 `shasum`하여 hash drift 리스크(동적 콘텐츠, cookie, UA 차이 등)와 2배의 네트워크/디스크 비용이 발생했습니다. 이제 agent가 각 소스를 ingest하며 sha256을 계산하고 `source_hashes` map으로 반환 — 메인은 이 값을 그대로 `sources/<slug>.yaml`에 기록합니다. hash는 실제로 ingest된 바이트를 정확히 반영.
 - **`--synthesize` 플래그 의미 축소 (힌트 전용)** — backward compatibility를 위해 여전히 수용하지만 어떤 분기 로직도 이 플래그에 의존하지 않습니다. synthesis 동작은 이제 모든 배치의 디폴트.
+- **Agent tool scope 확장** — `wiki-synthesizer`에 `WebFetch` 추가 (`type: url` 소스를 직접 읽음). `Read`/`Write`/`Glob`/`Grep`은 기존 유지. Write 권한은 여전히 `<wiki_root>/pages/`와 `<wiki_root>/.wiki-meta/.versions/`로만 제한.
+- **Pasted-text ingest 경로 통일** — `type: text`의 경우 `/wiki-ingest`가 붙여넣은 텍스트를 `<wiki_root>/.wiki-meta/.inbox/<slug>.txt`로 먼저 저장한 뒤 dispatch하므로, agent는 다른 파일과 동일한 방식으로 읽습니다. inbox 파일은 락을 해제하는 동일 trap에서 삭제 (성공/실패 무관).
+- **Pre-filter 누락에 대비한 overlap 탐지 강화** — agent에 전달되는 `candidates` 리스트는 이제 exhaustive가 아닌 힌트임이 명시됩니다. `wiki-synthesizer` Rule 5는 agent가 부여하려는 topic 이름이 candidate list 외의 기존 페이지와 overlap할 가능성이 있으면 `Glob "<wiki_root>/pages/*.md"` + `Grep`으로 범위를 넓히도록 요구합니다. filename/URL 기반 pre-filter가 semantic overlap을 놓치더라도 "merge, don't duplicate" 불변이 유지됩니다.
+- **Post-write reconciliation 추가** — agent가 반환한 뒤 메인은 `created`/`updated`의 각 `file`이 실제로 디스크에 존재하는지 `test -f`로 검증합니다. 없는 파일은 `failed`로 이동하며 reason은 `"agent reported written but file not present"`. agent crash나 manifest 거짓 보고를 metadata 오염 전에 탐지.
 
 ### 유지 (기능 불변)
 
 - 락(`.wiki-meta/.wiki-lock` mkdir/rmdir atomicity) — 불변
 - `.pending-scan → .last-scan` 승격 + `BATCH_PENDING` 레이스 가드 + `TS_RE` 크기 가드 + rmdir 이전 승격 순서 — 불변
 - 부분/전체 실패 시맨틱 — 어떤 실패에서도 `.pending-scan` 승격 안 함. 다음 세션의 훅이 동일 윈도우를 재탐지
-- `index.json` / `log.jsonl` / `sources/*.yaml` 스키마 — 온디스크 출력 동일
+- `index.json` / `log.jsonl` / `sources/*.yaml` 온디스크 스키마 — 불변. 멀티소스 배치의 data quality는 오히려 **강화됨** (per-source attribution이 이전 암묵적 추론에서 권위적 보장으로 전환).
 - `.wiki-meta/.versions/` last-3 보관 정책 — 메인 auto-lint auto-fix에서 그대로 처리
 - Auto-lint(스키마 준수, broken link, index drift, orphan 탐지) — 불변
 - UTC ISO 8601 `Z` 타임스탬프 요구 — 불변
 
 ### 마이그레이션
 
-별도 조치 불필요. 기존 wiki는 그대로 동작하며, 관찰 가능한 변화는 ingest 중 메인 세션 컨텍스트 사용량 감소뿐입니다. `--synthesize` 플래그 사용도 그대로 동작합니다.
+별도 조치 불필요. 기존 wiki는 그대로 동작하며, 관찰 가능한 변화는 ingest 중 메인 세션 컨텍스트 사용량 감소와 멀티소스 배치의 per-source provenance 정확도 향상입니다 (v1.1.1은 `--synthesize`를 거의 쓰지 않아 이 불명확성이 표면화되지 않았음). `--synthesize` 플래그 사용도 그대로 동작합니다 (1.2.0에서 제거 예정).
 
 ## [1.1.1] — 2026-04-17
 

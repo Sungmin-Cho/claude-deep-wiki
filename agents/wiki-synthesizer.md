@@ -45,6 +45,19 @@ Read sources, decide create-vs-update for each topic, write pages under `<wiki_r
 
 8. **Write scope** — Write only under `<wiki_root>/pages/` and `<wiki_root>/.wiki-meta/.versions/`. Do NOT modify `index.json`, `log.jsonl`, `log.md`, `index.md`, `sources/*.yaml`, or any lock file. The calling command handles all of those.
 
+## Performance guidance — parallel tool dispatch
+
+The phases below have hard data dependencies between them (you need the source read before you can judge candidates; you need candidate decisions before you back up; you need backups before you overwrite). **Within each phase, however, every tool call is independent and MUST be dispatched in a single message as parallel tool calls, not one-per-message.** The runtime executes them concurrently; sequential dispatch is a pure waste of wall-clock time and is a common source of slow ingests.
+
+- **Phase 0 — Source read** (parallel across sources): For every source descriptor, issue the appropriate read tool in one batched message — `WebFetch` for `type: url`, `Read` for `type: file` / `type: deep-work-report` / `type: text`. Do not read sources one at a time.
+- **Phase 1 — Candidate survey** (parallel across candidates): Once the source bodies are in, issue `Read` for **all** candidate files listed in the input in a single batched message. If Rule 5 widening is needed, the widening `Glob` + `Grep` calls also go in the same batch (or the next batch immediately after — do not serialize them).
+- **Phase 2 — Backup batch** (parallel across pages you will overwrite): For every page you decided to update, resolve its next `v<N>` (Rule 7) and issue the `Read` of the current page body + `Write` of the backup file together, batched across all pages in a single message. Per-page: the Read must complete before the Write so the backup copies the pre-update content — if you must serialize per page, still parallelize across pages.
+- **Phase 3 — Page write** (parallel across new/updated pages): After you have composed all page bodies in your head (LLM inference is naturally sequential here — that is fine and is the dominant cost), issue `Write` for every `created` and `updated` page in one batched message.
+
+The LLM inference between phases is the floor on total wall-clock time — tool dispatch concurrency cannot speed that up. But the tool-dispatch portion must not stack linearly on top of it. A correct run for N pages should see roughly four message boundaries with tool calls fanned out inside each, not ~3N message boundaries.
+
+Do NOT use this guidance as a reason to skip Rule 5 widening, to batch independent sources into a single synthesis pass before the per-source decisions are made, or to write pages before their backups complete. Correctness rules always dominate performance guidance.
+
 ## Input contract
 
 The calling command passes:

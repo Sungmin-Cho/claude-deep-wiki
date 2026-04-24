@@ -169,6 +169,8 @@ obsidian_cli:
   wiki_prefix: "wiki"
 ```
 
+> **⚠️ Cloud-synced `wiki_root`는 느립니다.** wiki를 iCloud Drive, Google Drive, Dropbox 등 sync daemon 기반 경로에 두면 매 `Write`마다 sync daemon이 깨어나 수백 ms의 지연이 추가됩니다. 대화형 ingest 속도를 위해서는 `wiki_root`를 로컬 디스크에 두고 sync client가 백그라운드에서 동기화하도록 구성하거나, wiki 폴더에 대해 오프라인 미러 / "오프라인에서 사용 가능" 모드를 활성화해 쓰기가 로컬 replica에 먼저 적중하도록 하세요. 이는 플러그인 제어 밖의 환경 요인입니다.
+
 ## 추천 도구
 
 [Karpathy의 LLM Wiki 글](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)에서 언급된 위키 워크플로우 향상 도구들입니다.

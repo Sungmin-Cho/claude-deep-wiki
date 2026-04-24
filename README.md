@@ -169,6 +169,8 @@ obsidian_cli:
   wiki_prefix: "wiki"
 ```
 
+> **⚠️ Cloud-synced `wiki_root` is slow.** Placing the wiki on iCloud Drive, Google Drive, Dropbox, or similar sync-daemon-backed paths adds hundreds of ms per `Write` because every page write wakes the sync daemon. For interactive ingest speed, keep `wiki_root` on local disk and let the sync client propagate changes in the background; alternatively, use offline-mirror / "available offline" mode for the wiki folder so writes hit the local replica first. This is an environment-level concern outside the plugin's control.
+
 ## Recommended Tools
 
 Tools referenced in [Karpathy's LLM Wiki gist](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) that enhance the wiki workflow.

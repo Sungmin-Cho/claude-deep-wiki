@@ -2,6 +2,24 @@
 
 deep-wiki의 주요 변경사항을 기록합니다.
 
+## [1.1.3] — 2026-04-24
+
+### 성능
+
+- **`wiki-synthesizer`가 각 phase 내부의 tool call을 병렬로 발행** — 이전 버전은 agent 워크플로우에 명시적인 동시성 지시가 없어, Claude가 자연스럽게 한 메시지에 한 개의 tool call만 발행했습니다 (소스 Read → candidate A Read → candidate B Read → …). 일반적인 5-10 페이지 ingest에서 이 패턴은 round-trip이 ~3N번 직렬화되어, LLM inference cost를 넘어서는 wall-clock 시간의 지배적 원인이 됐습니다. 이제 `agents/wiki-synthesizer.md`에 "Performance guidance — parallel tool dispatch" 섹션이 추가되어 워크플로우를 4 phase로 분할하고 (source read / candidate survey / backup batch / page write), 각 phase 내부의 모든 tool call은 반드시 한 메시지에 묶어서 발행하도록 요구합니다. phase 간 data dependency 순서는 그대로이며, phase **내부**의 fan-out만 추가됐습니다. 순수 prompt 변경 — 런타임, tool contract, input/output 스키마, lock, provenance 동작은 모두 불변입니다.
+- **Cloud-synced `wiki_root`의 latency 비용 문서화** — README(EN/KO)에 `wiki_root`를 iCloud Drive, Google Drive, Dropbox 같은 sync-daemon 기반 경로에 두면 매 `Write`마다 sync daemon이 깨어나 수백 ms의 지연이 추가된다는 안내를 추가했습니다. 권장 사항: `wiki_root`는 로컬 디스크에 두고, sync client의 자체 파일 동기화로 전파하도록 구성. 이는 플러그인 제어 밖의 환경 요인이므로 사용자 인프라 영역으로 명시 스코프.
+
+### 유지 (기능 불변)
+
+- Agent 입출력 계약(`{wiki_root, sources, candidates}` → `{created, updated, versioned, source_hashes, failed}`) — 불변
+- 모든 정합성 규칙: grounded content, page template, kebab-case filename, merge-don't-duplicate, conflict notation, version-before-overwrite, write scope — 불변
+- Rule 5 widening (`Glob`/`Grep` 확장 탐색) 여전히 필수 — 병렬 가이드는 정합성이 성능에 우선하며 이를 약화해선 안 됨을 명시
+- Lock / `.pending-scan → .last-scan` 승격 / auto-lint / index.json 스키마 — 불변
+
+### 마이그레이션
+
+별도 조치 불필요. 플러그인 사용자는 wiki나 config를 업데이트할 필요 없음. 관찰 가능한 유일한 변화는 3개 이상 페이지를 작성/업데이트하는 ingest에서 체감 속도 향상 (작성할 페이지가 많을수록 linear-dispatch 낭비가 크게 제거됨).
+
 ## [1.1.2] — 2026-04-21
 
 ### 변경

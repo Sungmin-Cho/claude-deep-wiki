@@ -127,7 +127,23 @@ If the agent's self-classification disagrees (e.g. agent claimed `created` for a
 
 > **Classification rule:** A page filename belongs in `pages_created` ONLY if the page did not exist in `pages/` at the start of this ingest. If the page already existed (even if this is the first time *this source* contributed to it), classify it under `pages_updated`. Rationale: `log.jsonl` is used to reconstruct per-page creation history; a page must have exactly one `pages_created` entry across the entire log.
 
-**d. Write per-source provenance.** For **each** source in the batch, create `<wiki_root>/.wiki-meta/sources/<slug>.yaml`:
+**d. Normalize `source_hashes`.** The agent returns `source_hashes` with one entry per source slug (the caller rejected the manifest in Step 7 / Error Handling if any passed-in slug was missing). The *values*, however, may not all be valid sha256 digests: the default `wiki-synthesizer` agent has no shell/hashing capability (its tool scope is `Read, Write, Glob, Grep, WebFetch`), so it returns a sentinel placeholder value for each slug. The caller is responsible for normalizing these to real digests before Step 8e.
+
+For each slug, validate its value against `^[0-9a-f]{64}$` (case-insensitive — authoritative agent-computed digest). If it matches, use it verbatim as the `content_hash`. If it does NOT match (sentinel, empty, wrong length, non-hex chars, etc.), recompute from the source's `origin`:
+
+- **`type: file` / `type: deep-work-report`** — hash the file bytes:
+  ```bash
+  shasum -a 256 "$origin" | awk '{print $1}'   # macOS / BSD
+  sha256sum "$origin" | awk '{print $1}'       # Linux (use whichever is present)
+  ```
+- **`type: text`** — hash the inbox file at `<wiki_root>/.wiki-meta/.inbox/<slug>.txt`. This runs BEFORE Step 12's inbox cleanup so the file is still present.
+- **`type: url`** — `curl -sSL "$origin" | shasum -a 256 | awk '{print $1}'`. URL content may drift between the agent's `WebFetch` and this recompute; this is best-effort for the agent-without-hashing case and is acceptable for static resources. Dynamic URLs are inherently unstable under any hashing strategy.
+
+Replace the agent's `source_hashes` with this normalized map for the rest of the step. Log (at debug level, not in the final report) which slugs were recomputed, so future agents that *do* provide authoritative hashes can be detected by auditing logs.
+
+This preserves v1.1.2's invariant that `content_hash` reflects bytes *that could be ingested*, even when the agent itself cannot hash. If a future agent runtime grants the agent a hashing capability (e.g. narrowly scoped Bash), its digests will pass the regex and flow through verbatim — backward compatible.
+
+**e. Write per-source provenance.** For **each** source in the batch, create `<wiki_root>/.wiki-meta/sources/<slug>.yaml`:
 
 ```yaml
 id: <slug>
@@ -135,7 +151,7 @@ title: "<source_title>"
 ingested_at: "<iso_timestamp>"
 type: <url|file|text|deep-work-report>
 origin: "<url_or_path>"
-content_hash: "<source_hashes[slug] from agent manifest>"
+content_hash: "sha256:<normalized_hashes[slug] from Step 8d>"
 pages_created:
   - <files in CREATED_ENTRIES whose entry.sources contains this slug>
 pages_updated:
@@ -144,7 +160,7 @@ pages_updated:
 
 Per-slug `pages_created`/`pages_updated` filtering uses each entry's `sources` list — a page only lists a slug if that slug actually contributed to it. This preserves per-source provenance in multi-source batches (`wiki-lint`'s source-provenance invariant continues to hold: every page's frontmatter `sources:` slug has a matching `.wiki-meta/sources/<slug>.yaml` whose `pages_*` includes that page).
 
-`content_hash` comes directly from the agent's `source_hashes` map — the caller does NOT re-fetch the URL or re-read the file. This guarantees the hash reflects exactly the bytes the agent ingested.
+`content_hash` comes from the Step 8d normalized map. When the agent could compute its own sha256, this exactly matches the bytes it ingested. When the agent could not, main's post-hoc hash reflects the bytes *available on disk / at the URL* at reconciliation time — for `type: file` and `type: text` this is effectively identical (the file does not change between the agent's read and main's hash in a single ingest), and for `type: url` it is best-effort.
 
 ### 9. Update Index
 
@@ -262,34 +278,48 @@ In this case:
 3. Group related files by directory/topic
 4. For each group, follow the standard ingest workflow (Steps 1-14). Each group is a full ingest cycle minus lock acquisition — critically, `PRE_BATCH_PAGES` (Step 6) is captured **per group** (NOT once for the whole batch), so pages created by an earlier group are correctly classified as `pages_updated` if a later group touches them.
 5. Each group is dispatched to `wiki-synthesizer` as a multi-source batch (Step 7) — no flag needed
-6. **After all files are processed successfully, and before the `rmdir` that releases the `.wiki-lock` directory** (i.e. between writing the last page/log entry and releasing the lock), promote `.pending-scan` → `.last-scan` with race and size guards:
+6. **After all files are processed successfully, and before the `rmdir` that releases the `.wiki-lock` directory** (i.e. between writing the last page/log entry and releasing the lock), promote `.pending-scan` → `.last-scan` with race, size, and regression guards:
    ```bash
    PENDING_FILE="<wiki_root>/.wiki-meta/.pending-scan"
    LAST_FILE="<wiki_root>/.wiki-meta/.last-scan"
-   if [ -s "$PENDING_FILE" ]; then
+   # TS_RE mirrors hooks/scripts/scan-vault-changes.sh — keep in sync.
+   TS_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
+   if [ -n "$BATCH_PENDING" ] && [ -s "$PENDING_FILE" ]; then
      CURRENT_PENDING=$(cat "$PENDING_FILE")
-     # TS_RE mirrors hooks/scripts/scan-vault-changes.sh — keep in sync.
-     TS_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
-     if [[ "$CURRENT_PENDING" =~ $TS_RE ]]; then
-       if [ -n "$BATCH_PENDING" ] && [ "$CURRENT_PENDING" = "$BATCH_PENDING" ]; then
-         # No concurrent hook overwrote .pending-scan during this batch;
-         # safe to commit the full pending window.
-         mv "$PENDING_FILE" "$LAST_FILE"
-       else
-         # Another hook ran during our batch. We processed files up to
-         # BATCH_PENDING only — commit that, leave the newer pending
-         # timestamp in place so the next session processes the remainder.
-         # Validate BATCH_PENDING against TS_RE before writing: it was
-         # captured with `cat ... || true` (no validation), so garbage
-         # residue in .pending-scan could otherwise be written raw to
-         # .last-scan until the next hook's read-side regex rejects it.
-         if [[ "$BATCH_PENDING" =~ $TS_RE ]]; then
-           echo "$BATCH_PENDING" > "$LAST_FILE"
-         fi
+     CURRENT_LAST=$(cat "$LAST_FILE" 2>/dev/null || echo "")
+     # Validate inputs. If either fails the regex, bail without touching files.
+     if [[ "$CURRENT_PENDING" =~ $TS_RE ]] && [[ "$BATCH_PENDING" =~ $TS_RE ]]; then
+       # Step A — advance .last-scan to BATCH_PENDING, but NEVER regress it.
+       # Cases this handles:
+       #   (a) Normal — no concurrent hook: BATCH_PENDING == CURRENT_PENDING,
+       #       CURRENT_LAST < BATCH_PENDING ⇒ advance LAST to BATCH_PENDING.
+       #   (b) Concurrent hook wrote newer pending during this batch:
+       #       CURRENT_PENDING > BATCH_PENDING > CURRENT_LAST ⇒ still advance
+       #       LAST to BATCH_PENDING (the window we actually covered); leave
+       #       the newer pending for the next session.
+       #   (c) Stale pending left by a prior interrupted session:
+       #       CURRENT_LAST > BATCH_PENDING ⇒ do NOT regress LAST. Skip the
+       #       advance; Step B will drop the now-obsolete pending.
+       if [[ -z "$CURRENT_LAST" ]] || ! [[ "$CURRENT_LAST" =~ $TS_RE ]] || ! [[ "$CURRENT_LAST" > "$BATCH_PENDING" ]]; then
+         echo "$BATCH_PENDING" > "$LAST_FILE"
+       fi
+       # Step B — drop .pending-scan if its window is already covered by LAST.
+       # Re-read LAST since Step A may have just advanced it.
+       # Keep PENDING only when it is strictly newer than LAST (case (b) above —
+       # the remainder window a concurrent hook detected that this batch did
+       # not cover). In case (a) PENDING == LAST and is dropped; in case (c)
+       # PENDING < LAST and is dropped.
+       CURRENT_LAST=$(cat "$LAST_FILE" 2>/dev/null || echo "")
+       if [[ "$CURRENT_LAST" =~ $TS_RE ]] && ! [[ "$CURRENT_PENDING" > "$CURRENT_LAST" ]]; then
+         rm -f "$PENDING_FILE"
        fi
      fi
    fi
    ```
+   **Lexicographic comparison note**: `[[ "$A" > "$B" ]]` compares strings lexicographically in bash. Because the UTC ISO 8601 `Z`-suffix format is fixed-width and sortable as text, `[[ "2026-04-20T00:00:00Z" > "2026-04-17T06:57:34Z" ]]` evaluates as the numeric "newer than" comparison we want — this holds for every well-formed TS_RE value and is why the script does not parse timestamps numerically.
+
+   **Regression guard rationale**: without this guard, a prior session that left a stale `.pending-scan` (older than the current `.last-scan`) would cause the next ingest to regress `.last-scan` — the next hook would then re-detect every file modified since the stale pending timestamp, producing duplicate `log.jsonl` entries and wasted wall-clock. The guard is strictly defensive; under normal hook/ingest interleaving (case (a) or (b) above) the behavior is unchanged from prior releases.
+
    **Promotion ordering**: this promotion block MUST run before the `rmdir "<wiki_root>/.wiki-meta/.wiki-lock"` call, so that a crashing session cannot leave `.last-scan` advanced past what was actually ingested. If ingest partially fails or is skipped, do NOT promote — `.pending-scan` remains and the next session's hook will re-detect the same window (no data loss).
 
 **Manual ingest (no hook):** If `/wiki-ingest` is invoked directly (no preceding SessionStart hook), `$BATCH_PENDING` is empty and the promotion block is a no-op. This is intentional — `.last-scan` advances only via hook-driven batches. Manual ingests process whatever source path the user specifies and do not modify scan-window tracking.
@@ -304,7 +334,7 @@ In this case:
 ## Error Handling
 
 - If the lock cannot be acquired, report the error and stop
-- If the `wiki-synthesizer` agent cannot be spawned or returns an unparseable response, release the lock and report the error. Do NOT promote `.pending-scan` — the next session will re-detect the window. "Unparseable" means one of: (a) not valid JSON, (b) missing any of `created`/`updated`/`versioned`/`source_hashes`/`failed` at the top level, (c) entries in `created`/`updated` missing required fields (`file`/`title`/`tags`/`aliases`/`sources`), (d) `source_hashes` missing a slug the caller passed in
+- If the `wiki-synthesizer` agent cannot be spawned or returns an unparseable response, release the lock and report the error. Do NOT promote `.pending-scan` — the next session will re-detect the window. "Unparseable" means one of: (a) not valid JSON, (b) missing any of `created`/`updated`/`versioned`/`source_hashes`/`failed` at the top level, (c) entries in `created`/`updated` missing required fields (`file`/`title`/`tags`/`aliases`/`sources`), (d) `source_hashes` missing a slug the caller passed in. Note that invalid-format `source_hashes` *values* (sentinels, empty strings, non-hex) are NOT fatal — Step 8d normalizes them via main-side recompute. Only a missing key for a slug the caller passed in is fatal.
 - Always release the lock in case of errors (use trap in bash operations)
 - **Inbox cleanup (type: text)**: The trap that releases the lock also deletes each file in `INBOX_FILES` (populated in Step 6.5). Never use `.inbox/*.txt` wildcards — stale inbox files from a prior crashed session belong to that session and may still be needed for recovery. This cleanup runs on success AND failure so pasted text never lingers on disk
 - **Orphan versions**: If any `failed` entry carries an `orphan_version`, surface it in the Step 14 report so the user knows a backup exists for a page that did NOT get overwritten. Auto-lint's retention prune (Step 13) handles actual cleanup — no special action here

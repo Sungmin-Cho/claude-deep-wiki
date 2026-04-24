@@ -2,6 +2,25 @@
 
 deep-wiki의 주요 변경사항을 기록합니다.
 
+## [1.1.4] — 2026-04-24
+
+### 수정
+
+- **`content_hash` 에 agent sentinel 을 그대로 기록하던 문제 수정** (v1.1.3 follow-up 의 D1) — v1.1.2 가 sha256 계산을 `wiki-synthesizer` 로 이관했지만, agent 의 tool scope (`Read, Write, Glob, Grep, WebFetch`) 에는 해싱 수단이 전무해 manifest 가 항상 placeholder 문자열을 반환하고 있었고, 호출자는 이를 그대로 `sources/<slug>.yaml:content_hash` 에 기록해 왔습니다. 즉 v1.1.2 이후 모든 ingest 의 `content_hash` 가 실질적으로 무의미한 상태였으며, 재-ingest 감지와 provenance 감사가 모두 신뢰 불가능. `/wiki-ingest` 에 Step 8d "Normalize `source_hashes`" 를 명시적으로 추가해 manifest 값을 `^[0-9a-f]{64}$` (대소문자 무시) 로 검증하고, 비-hex 값은 소스의 `origin` 에서 post-hoc 재계산 (`shasum -a 256`, text 는 inbox 파일, URL 은 `curl | shasum`) 후 Step 8e 의 yaml 작성에 사용. `wiki-synthesizer.md` 는 sentinel 컨벤션 (`"main-computes"`) 과 비-hex 값이 호출자에게 fatal 이 아님을 contract 에 명문화. 권위 있는 agent digest (실제 64-hex) 는 변경 없이 passthrough 되므로, 향후 해싱 가능한 tool scope 의 agent 가 등장하면 v1.1.2 본래 의미를 그대로 복원.
+- **`.pending-scan → .last-scan` promotion 이 stale pending 존재 시 `.last-scan` 을 역행시키던 버그 수정** (v1.1.3 follow-up 의 D2) — 이전 중단된 세션이 `.pending-scan` 을 남긴 채 별도 ingest 가 `.last-scan` 을 전진시킨 상태라면, v1.1.1 에서 도입된 promotion block 의 `mv PENDING LAST` 가 `.last-scan` 을 **역행**시킵니다. 이후 hook 은 stale pending timestamp 이후의 모든 파일을 재-탐지해 `log.jsonl` 에 중복 entry 를 양산. promotion block 이 이제 `.last-scan` 을 먼저 읽어 `CURRENT_LAST > BATCH_PENDING` (UTC ISO 8601 `Z`-suffix 포맷의 고정폭 성질상 lexicographic 비교가 숫자 순서와 일치) 인 경우 advance 를 skip 하고, 같은 블록에서 window 가 이미 covered 된 `.pending-scan` 을 제거. 정상 동시-hook 시나리오 (mid-batch 에 `.pending-scan` 이 newer timestamp 로 덮어쓰기된 경우) 의 의미는 이전 릴리즈와 동일.
+
+### 유지 (기능 불변)
+
+- Agent 입출력 계약 — 불변 (sentinel 은 이미 관측된 실제 동작이었고, 이번에 contract 가 이를 정직하게 문서화)
+- v1.1.3 의 parallel tool dispatch 가이드 — 불변
+- 정상 (non-stale) hook/ingest interleaving 하의 `.pending-scan` promotion — 불변; regression guard 는 방어적 추가
+- Manual (no-hook) ingest 경로 — 불변; `BATCH_PENDING=""` 는 여전히 promotion block 의 no-op
+- Lock 프로토콜, 버전 백업, auto-lint, per-source yaml 스키마, `log.jsonl` 스키마 — 모두 불변
+
+### 마이그레이션
+
+별도 조치 불필요. placeholder `content_hash` 로 기록된 기존 `sources/<slug>.yaml` 는 그대로 두고 (역사 기록), 같은 source 가 다시 ingest 되면 그때부터 유효한 sha256 digest 가 기록됩니다. 기존 `.pending-scan` 은 다음 ingest 시 새 promotion 로직이 처리.
+
 ## [1.1.3] — 2026-04-24
 
 ### 성능

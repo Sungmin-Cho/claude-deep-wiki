@@ -75,7 +75,7 @@ The agent is responsible for:
 3. Deciding per topic: create new page, update existing page (from candidates or widened search), or skip (no new information).
 4. Versioning any page it will overwrite (Rule 7).
 5. Writing page content grounded in sources.
-6. Computing a stable sha256 of each source's raw bytes **at fetch/read time** and reporting it in `source_hashes` (see Output contract). This avoids forcing the caller to re-fetch the same URL for provenance hashing.
+6. Computing a stable sha256 of each source's raw bytes **at fetch/read time** and reporting it in `source_hashes` (see Output contract) — **only if your runtime gives you a hashing capability** (e.g. a Bash/shell tool with `shasum`/`sha256sum`). If it does not (the default `wiki-synthesizer` tool scope of `Read/Write/Glob/Grep/WebFetch` does not), return a short sentinel string such as `"main-computes"` for every slug in `source_hashes`. The caller recognizes non-hex values in Step 8d and recomputes sha256 from each source's `origin`. Every slug the caller passed in MUST still be present as a key — missing keys are a fatal parse error.
 
 ## Output contract
 
@@ -103,8 +103,8 @@ Return a single JSON object as your final message (no prose around it):
   ],
   "versioned": [".wiki-meta/.versions/existing-page.v3.md"],
   "source_hashes": {
-    "slug-a": "<sha256 hex of slug-a's raw source bytes>",
-    "slug-b": "<sha256 hex of slug-b's raw source bytes>"
+    "slug-a": "<64-char sha256 hex, or sentinel like \"main-computes\" when your runtime lacks hashing>",
+    "slug-b": "<64-char sha256 hex, or sentinel like \"main-computes\" when your runtime lacks hashing>"
   },
   "failed": [
     {
@@ -122,7 +122,7 @@ Return a single JSON object as your final message (no prose around it):
   - `sources` — subset of the input `sources[].slug` values whose content actually contributed to this page (enables per-source provenance reconstruction in the caller, critical for multi-source batches)
 - `updated` — same structure as `created`, for pages that already existed and were overwritten.
 - `versioned` — paths (relative to `wiki_root`) of backup snapshots created under `.wiki-meta/.versions/`, in 1:1 correspondence with entries in `updated`.
-- `source_hashes` — map from source `slug` to sha256 hex of the exact bytes the agent fetched/read for that source. For `type: url`, hash the WebFetch response body. For `type: file` / `type: deep-work-report` / `type: text`, hash the file bytes. The caller uses these for `sources/<slug>.yaml:content_hash` — it does NOT re-fetch.
+- `source_hashes` — map from source `slug` to sha256 hex of the exact bytes the agent fetched/read for that source. For `type: url`, hash the WebFetch response body. For `type: file` / `type: deep-work-report` / `type: text`, hash the file bytes. The caller uses these values for `sources/<slug>.yaml:content_hash` after Step 8d normalization. **Values that are NOT a valid 64-char hex digest (e.g. `"main-computes"`, `""`, `"unavailable-no-shell-tool"`) are not rejected** — the caller recomputes them post-hoc from the source's `origin`. But every slug the caller passed in MUST appear as a key (missing keys are fatal). Only return real hex digests when your runtime actually provides a hashing capability; otherwise use a clearly-non-hex sentinel so the caller does the right thing.
 - `failed` — pages the agent intended to write but could not. If the agent versioned a backup for a page whose write then failed, include the backup path in `orphan_version` so the caller can surface it in the report (auto-lint's retention prune will remove it). If non-empty, the caller treats the ingest as partial.
 
 A filename appears in `created` XOR `updated`, never both (and never also in `failed`). The caller cross-references against its own pre-batch snapshot of `pages/` — if the agent claims `created` for a file that existed, the caller reclassifies it as `updated` and logs a warning. The caller also verifies each `file` in `created ∪ updated` actually exists on disk after the agent returns; missing files are moved to `failed` with reason `"agent reported written but file not present"`.
@@ -132,12 +132,12 @@ A filename appears in `created` XOR `updated`, never both (and never also in `fa
 <example>
 Context: Single URL source, no overlapping candidates — but agent widens search before creating.
 Input: sources=[{slug: "react-rsc-blog", origin: "https://...", type: "url"}], candidates=[]
-Agent: WebFetch the URL (hash while fetching). Topic name would be "React Server Components". Candidates is empty, but that name could overlap — Glob `pages/*.md` + Grep for `react|server component` yields no hits. Create `react-server-components.md`.
+Agent: WebFetch the URL. Topic name would be "React Server Components". Candidates is empty, but that name could overlap — Glob `pages/*.md` + Grep for `react|server component` yields no hits. Create `react-server-components.md`. No hashing capability in tool scope, so emit a sentinel for the slug — caller recomputes.
 Output:
 {
   "created": [{"file":"react-server-components.md","title":"React Server Components","tags":["react","ssr"],"aliases":["RSC"],"sources":["react-rsc-blog"]}],
   "updated": [], "versioned": [],
-  "source_hashes": {"react-rsc-blog":"abc123..."},
+  "source_hashes": {"react-rsc-blog":"main-computes"},
   "failed": []
 }
 </example>
@@ -145,13 +145,13 @@ Output:
 <example>
 Context: Single file source, one overlapping candidate.
 Input: sources=[{slug: "architecture-doc", origin: "/path/to/doc.md", type: "file"}], candidates=["system-architecture.md"]
-Agent: Read source and candidate. Candidate overlaps — will update. Glob `.wiki-meta/.versions/system-architecture.v*.md` shows v1 is the max, so next is v2. Copy current `pages/system-architecture.md` → `.wiki-meta/.versions/system-architecture.v2.md`. Write merged content. Hash the source file bytes.
+Agent: Read source and candidate. Candidate overlaps — will update. Glob `.wiki-meta/.versions/system-architecture.v*.md` shows v1 is the max, so next is v2. Copy current `pages/system-architecture.md` → `.wiki-meta/.versions/system-architecture.v2.md`. Write merged content. Emit sentinel for `source_hashes` since no hashing tool is in scope.
 Output:
 {
   "created": [],
   "updated": [{"file":"system-architecture.md","title":"System Architecture","tags":["architecture"],"aliases":[],"sources":["architecture-doc"]}],
   "versioned": [".wiki-meta/.versions/system-architecture.v2.md"],
-  "source_hashes": {"architecture-doc":"def456..."},
+  "source_hashes": {"architecture-doc":"main-computes"},
   "failed": []
 }
 </example>
@@ -159,13 +159,13 @@ Output:
 <example>
 Context: Two related blog posts (multi-source synthesis), one candidate — per-source attribution matters.
 Input: sources=[{slug:"post-a",...,type:"url"}, {slug:"post-b",...,type:"url"}], candidates=["rendering-models.md"]
-Agent: Fetch both posts (hash each). Read candidate. Create `react-server-components.md` with content from both. Update `rendering-models.md` to cross-reference it. New page draws on both sources; rendering-models update only uses post-a's framing.
+Agent: Fetch both posts. Read candidate. Create `react-server-components.md` with content from both. Update `rendering-models.md` to cross-reference it. New page draws on both sources; rendering-models update only uses post-a's framing. Sentinel `source_hashes` — caller recomputes.
 Output:
 {
   "created": [{"file":"react-server-components.md","title":"React Server Components","tags":["react","ssr"],"aliases":["RSC"],"sources":["post-a","post-b"]}],
   "updated": [{"file":"rendering-models.md","title":"Rendering Models","tags":["react"],"aliases":[],"sources":["post-a"]}],
   "versioned": [".wiki-meta/.versions/rendering-models.v4.md"],
-  "source_hashes": {"post-a":"aaa...","post-b":"bbb..."},
+  "source_hashes": {"post-a":"main-computes","post-b":"main-computes"},
   "failed": []
 }
 </example>
@@ -182,7 +182,7 @@ Output:
     {"file":"topic-c.md","title":"Topic C","tags":["deep-work"],"aliases":[],"sources":["deep-work-2026-04-06"]}
   ],
   "updated": [], "versioned": [],
-  "source_hashes": {"deep-work-2026-04-06":"ccc..."},
+  "source_hashes": {"deep-work-2026-04-06":"main-computes"},
   "failed": []
 }
 </example>
@@ -194,7 +194,7 @@ Agent: Read source and candidate, will update. Write backup `.wiki-meta/.version
 Output:
 {
   "created": [], "updated": [], "versioned": [],
-  "source_hashes": {"doc-v2":"ddd..."},
+  "source_hashes": {"doc-v2":"main-computes"},
   "failed": [{"file":"flaky-topic.md","reason":"write permission denied","orphan_version":".wiki-meta/.versions/flaky-topic.v5.md"}]
 }
 </example>

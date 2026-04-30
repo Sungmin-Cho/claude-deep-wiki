@@ -169,7 +169,31 @@ obsidian_cli:
   wiki_prefix: "wiki"
 ```
 
-> **⚠️ Cloud-synced `wiki_root`는 느립니다.** wiki를 iCloud Drive, Google Drive, Dropbox 등 sync daemon 기반 경로에 두면 매 `Write`마다 sync daemon이 깨어나 수백 ms의 지연이 추가됩니다. 대화형 ingest 속도를 위해서는 `wiki_root`를 로컬 디스크에 두고 sync client가 백그라운드에서 동기화하도록 구성하거나, wiki 폴더에 대해 오프라인 미러 / "오프라인에서 사용 가능" 모드를 활성화해 쓰기가 로컬 replica에 먼저 적중하도록 하세요. 이는 플러그인 제어 밖의 환경 요인입니다.
+### 클라우드 백엔드 `wiki_root` + Mirror-and-Sync 워크플로우 (v1.2.0+)
+
+Obsidian 볼트 — 따라서 `wiki_root` — 가 iCloud Drive, Google Drive, Dropbox 또는 유사한 sync daemon이 마운트한 경로에 있다면, 위키에 쓰기 작업을 할 때마다 sync 클라이언트가 깨어나 `Read`/`Write` 당 수백 밀리초의 지연이 발생합니다. 일반적인 5-10 페이지 ingest에서 LLM 추론 시간에 더해 순수 I/O 대기만으로 15-30초가 추가될 수 있습니다.
+
+**클라우드 백엔드 볼트를 위한 권장 워크플로우:**
+
+1. **위키를 로컬 디스크에서 실행하세요.** 동기화되지 않는 경로(예: `~/deep-wiki-local/`)를 선택하고, `~/.claude/deep-wiki-config.yaml`의 `wiki_root`를 해당 경로로 지정합니다.
+2. **스케줄에 따라 볼트로 미러링하세요.** launchd (macOS) 또는 cron을 통해 `rsync`를 사용하여 10-30분마다 로컬 위키를 볼트로 푸시합니다. **추가 sync만 사용하세요 — `--delete`는 의도적으로 제외됩니다**:
+   ```bash
+   # Additive only. The plugin currently has no external-edit conflict
+   # detection (W5 review finding); --delete would silently destroy edits
+   # made on other devices (phone Obsidian, another computer) before the
+   # next ingest sees them. cache_local automation in v1.3.0+ will add
+   # explicit conflict detection — until then, additive is the only safe default.
+   rsync -a --backup --backup-dir="$HOME/.deep-wiki-rsync-backups/$(date +%Y%m%d-%H%M%S)" \
+     ~/deep-wiki-local/ \
+     "$HOME/Library/CloudStorage/GoogleDrive-.../내 드라이브/Obsidian/Personal Vault/deep-wiki/"
+   ```
+3. **멀티 디바이스 편집 시에는 먼저 수동 역방향 sync가 필요합니다** — v1.2.0에는 **자동 충돌 감지가 없습니다**. 다른 기기(휴대폰 Obsidian, 다른 컴퓨터)에서 페이지를 편집한 경우, 다음 예약된 푸시 *이전에* 역방향 rsync로 해당 편집 내용을 로컬로 가져오세요:
+   ```bash
+   rsync -a "$HOME/Library/CloudStorage/.../deep-wiki/" ~/deep-wiki-local/
+   ```
+   또는 `~/.claude/deep-wiki-config.yaml`에서 `auto_ingest:` 블록을 제거하여 자동 ingest를 일시적으로 중지할 수 있습니다.
+
+**왜 플러그인에서 자동화하지 않나요?** 이를 투명하게 처리하는 `cache_local` 설정 옵션은 v1.3.0+에서 계획되어 있습니다. 로컬 편집과 rsync 푸시 사이의 경쟁 창(race window) 트레이드오프는 암묵적 동작보다 명시적 설정 옵션이 적합합니다. v1.2.0은 수동 워크플로우를 문서화하고 지연 관련 관찰 사항만 제공합니다.
 
 ## 추천 도구
 

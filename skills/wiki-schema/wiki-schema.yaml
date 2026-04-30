@@ -84,6 +84,20 @@ query_auto_filing:
   default_tags:
     - query-synthesis
 
+auto_ingest:
+  optional: true
+  config_block: ~/.claude/deep-wiki-config.yaml
+  filters:
+    ignore_globs:
+      type: list
+      element: glob_pattern
+      semantics: "Path glob (relative to vault root). Matching files are excluded from SessionStart auto-detect."
+    require_tag:
+      type: string
+      default: ""
+      semantics: "If non-empty, only files whose frontmatter tags contain this tag are auto-detected."
+  default_behavior: "When auto_ingest block is absent or both keys are empty/missing, all modified .md files are detected (v1.1.x behavior)."
+
 recommended_tools:
   cli:
     - name: qmd

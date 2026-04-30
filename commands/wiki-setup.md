@@ -28,6 +28,19 @@ Write the configuration to `~/.claude/deep-wiki-config.yaml`:
 wiki_root: <resolved_absolute_path>
 ```
 
+> **Optional: auto-ingest scope filter (v1.2.0+).** To exclude high-frequency low-value paths from auto-ingest, add an `auto_ingest:` block:
+>
+> ```yaml
+> wiki_root: <resolved_absolute_path>
+> auto_ingest:
+>   ignore_globs:                  # path globs (relative to vault root) to exclude
+>     - "NOTES/DAILY/*"
+>     - "Home/3. RESOURCE/재무/경제 뉴스/*"
+>   require_tag: ""                # if non-empty, only ingest files with this frontmatter tag
+> ```
+>
+> Without this block, all modified `.md` files in the vault are detected (legacy behavior). Filtering happens in the SessionStart hook before /wiki-ingest is invoked. **Note (I1):** the bash 3.2 `case` glob used by the hook treats `*` as matching any character including `/`, so `Home/Daily/*` and `Home/Daily/**` are functionally equivalent. The single-`*` form is preferred for clarity since `**` does not have its conventional fnmatch globstar semantics here. Filters are evaluated in order: `ignore_globs` first (path glob match, no I/O), `require_tag` second (frontmatter read). A path is included only if it passes both.
+
 ### 3. Scaffold Wiki Structure
 
 Create the directory structure at the wiki root:

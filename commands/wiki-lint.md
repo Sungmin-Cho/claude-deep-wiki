@@ -138,7 +138,56 @@ Compare `index.json` entries against actual page files:
 
 If drift is found, suggest running `/wiki-rebuild`.
 
-### 11. Report
+### 11. Scan-Window Invariant Check (v1.2.0+)
+
+Inspect `<wiki_root>/.wiki-meta/.last-scan` and `<wiki_root>/.wiki-meta/.pending-scan` for three pathological states. Reports as `[SCAN-WINDOW]`.
+
+```bash
+LAST_FILE="<wiki_root>/.wiki-meta/.last-scan"
+PEND_FILE="<wiki_root>/.wiki-meta/.pending-scan"
+TS_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
+
+LAST=$(cat "$LAST_FILE" 2>/dev/null || true)
+PEND=$(cat "$PEND_FILE" 2>/dev/null || true)
+
+# State A: invalid TS regex on either file
+if [ -s "$LAST_FILE" ] && ! [[ "$LAST" =~ $TS_RE ]]; then
+  echo "[SCAN-WINDOW] .last-scan content is not valid UTC ISO 8601 with Z suffix: $(printf '%q' "$LAST")"
+fi
+if [ -s "$PEND_FILE" ] && ! [[ "$PEND" =~ $TS_RE ]]; then
+  echo "[SCAN-WINDOW] .pending-scan content is not valid UTC ISO 8601 with Z suffix: $(printf '%q' "$PEND")"
+fi
+
+# State B: PENDING < LAST (stale pending, would have caused regression in v1.1.3)
+if [[ "$LAST" =~ $TS_RE ]] && [[ "$PEND" =~ $TS_RE ]] && [[ "$PEND" < "$LAST" ]]; then
+  echo "[SCAN-WINDOW] .pending-scan ($PEND) is older than .last-scan ($LAST) — stale pending will be dropped on next ingest by v1.1.4 guard"
+fi
+
+# State C: LAST is more than 48h old AND PENDING is newer (auto-ingest stalled)
+if [[ "$LAST" =~ $TS_RE ]]; then
+  # tri-branch (I2 review note): GNU coreutils gdate / BSD-macOS / Linux.
+  # Mirror of hooks/scripts/scan-vault-changes.sh:89-95 — without this,
+  # Linux runs always get LAST_EPOCH=0 and a State C warning of ~half-a-million hours.
+  if command -v gdate >/dev/null 2>&1; then
+    LAST_EPOCH=$(gdate -d "$LAST" +%s 2>/dev/null || echo 0)
+  elif [[ "$(uname)" == "Darwin" ]]; then
+    LAST_EPOCH=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$LAST" +%s 2>/dev/null || echo 0)
+  else
+    LAST_EPOCH=$(date -d "$LAST" +%s 2>/dev/null || echo 0)
+  fi
+  NOW=$(date -u +%s)
+  AGE_HOURS=$(( (NOW - LAST_EPOCH) / 3600 ))
+  if [ "$AGE_HOURS" -gt 48 ] && [[ "$PEND" =~ $TS_RE ]]; then
+    echo "[SCAN-WINDOW] .last-scan is ${AGE_HOURS}h old and .pending-scan exists — auto-ingest may have stalled. Inspect log.jsonl for recent ingest activity."
+  fi
+fi
+```
+
+These are health signals; State B and the invalid-TS variant are auto-fixable in Step 13.
+
+> **Note on Step renumbering:** This insertion shifts the existing Step 11 (Report) → Step 12, and the existing Step 12 (Auto-Fix) → Step 13.
+
+### 12. Report
 
 Present a structured report:
 
@@ -160,10 +209,27 @@ Present a structured report:
 - Review orphan pages: page-a.md, page-b.md, page-c.md
 ```
 
-### 12. Auto-Fix (if --fix flag)
+### 13. Auto-Fix (if --fix flag)
 
 If the user passed `--fix`:
 - Prune excess versions (keep last 3)
 - Add missing pages to index.json
 - Remove ghost entries from index.json
 - Do NOT auto-fix content issues (schema violations, orphans, broken links) — these require human judgment
+- Drop stale `.pending-scan` (State B from Step 11 — `PENDING < LAST`)
+- Drop invalid `.pending-scan` content (State A on `.pending-scan`); leave `.last-scan` intact (State A on `.last-scan` requires manual intervention because dropping it would trigger first-run fallback).
+
+```bash
+# In the --fix path (SCAN-WINDOW auto-fix, v1.2.0+):
+LAST=$(cat "$WIKI_ROOT/.wiki-meta/.last-scan" 2>/dev/null || true)
+PEND=$(cat "$WIKI_ROOT/.wiki-meta/.pending-scan" 2>/dev/null || true)
+TS_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
+
+if [ -s "$WIKI_ROOT/.wiki-meta/.pending-scan" ] && ! [[ "$PEND" =~ $TS_RE ]]; then
+  rm -f "$WIKI_ROOT/.wiki-meta/.pending-scan"
+  echo "  --fix: dropped invalid .pending-scan"
+elif [[ "$LAST" =~ $TS_RE ]] && [[ "$PEND" =~ $TS_RE ]] && [[ "$PEND" < "$LAST" ]]; then
+  rm -f "$WIKI_ROOT/.wiki-meta/.pending-scan"
+  echo "  --fix: dropped stale .pending-scan (older than .last-scan)"
+fi
+```

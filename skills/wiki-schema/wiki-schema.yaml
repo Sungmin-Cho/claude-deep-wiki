@@ -67,9 +67,11 @@ auto_lint:
     - broken_links
     - index_drift
     - orphan_detection
+    - scan_window_invariant   # v1.2.0+
   auto_fix:              # Fix silently without user action
     - index_drift
     - excess_versions
+    - stale_pending_scan      # v1.2.0+ (drops .pending-scan when older than .last-scan)
   report_only:           # Only report if issues found (no noise)
     - schema_violations
     - broken_links

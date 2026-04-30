@@ -119,7 +119,8 @@ Identify existing pages that *might* overlap with the incoming sources. This is 
   ```bash
   obsidian search:context query="<keywords>" path="<wiki_prefix>/pages" format=json
   ```
-- Deduplicate into a list of page filenames (basename only, e.g. `system-architecture.md`). This list may be empty for fresh topics.
+- Deduplicate into a list of candidate descriptors `{file, title, tags, aliases}` (not just filenames). The agent uses these for Phase 1 skim without an extra Read of `index.json`.
+- **Obsidian search enrichment (I4 review note):** when `OBS_LIVE=true` and `obsidian search:context` surfaces a candidate filename that is NOT present in the `index.json` title/alias/tag pre-filter, the caller MUST look up that filename in `index.json` and emit a `{file, title, tags, aliases}` descriptor for it. If the filename is also missing from `index.json` (rare wiki/Obsidian out-of-sync edge case), pass `{file, title: "", tags: [], aliases: []}` so the synthesizer at least sees the filename and can decide to deep-read.
 
 Main MUST NOT read page bodies at this step — only metadata from `index.json` and the Obsidian index. Page bodies are for the agent.
 
@@ -161,7 +162,7 @@ Spawn the `wiki-synthesizer` agent via the Agent tool. This happens for **every*
 Input (summary):
 - `wiki_root`
 - `sources` — list of `{slug, origin, type}`
-- `candidates` — filenames from Step 4 (hint only; agent widens when needed per its Rule 5)
+- `candidates` — descriptors from Step 4 `{file, title, tags, aliases}` (hint only; agent widens when needed per its Rule 5)
 
 Output (summary): structured entries for `created` / `updated` carrying `{file, title, tags, aliases, sources}`, plus `versioned`, `source_hashes` (per-slug sha256), and `failed` (may include `orphan_version`).
 

@@ -46,6 +46,7 @@ log:
       rule: "File existed before this action (regardless of whether this source contributed before)"
   actions:             # Valid action values
     - ingest
+    - ingest-skip      # v1.2.0+: source dropped from batch because content_hash unchanged
     - update
     - lint
     - rebuild

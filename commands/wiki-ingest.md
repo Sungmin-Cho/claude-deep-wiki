@@ -40,6 +40,63 @@ Determine the source type from the argument **without reading file bodies or fet
 
 Main does NOT fetch URL bodies or read source file contents at this step. It only classifies sources and defers pasted-text materialization until after the lock is held.
 
+### 1.5. Re-Ingest Hash Skip (v1.2.0+)
+
+For each source identified in Step 1 with `type ∈ {file, deep-work-report}`, check whether its current bytes' sha256 matches `<wiki_root>/.wiki-meta/sources/<slug>.yaml:content_hash`. If a match is found, **drop the source from the batch** and append one log entry recording the skip.
+
+> **Slug derivation prerequisite (NC1 review note):** the pre-v1.2.0 `/wiki-ingest` generated slugs only in Step 5 (after this Step 1.5). The hash-skip lookup needs a slug to find the existing yaml — therefore **move slug generation to the END of Step 1** (apply the same kebab-case algorithm Step 5 uses: URL → `karpathy-llm-wiki-gist`, file path → `architecture-doc-2026`, deep-work session → `deep-work-session-2026-04-06`). Each source descriptor in `$SOURCES` MUST carry a `slug` field by the time this Step 1.5 runs. Step 5 then becomes a no-op (or emits the same pre-computed slugs to a downstream variable). Slug derivation is deterministic on `origin`, so this re-ordering does not change provenance semantics.
+
+```bash
+# Pre-condition: each source descriptor already has a slug, computed at end of
+# Step 1 using Step 5's algorithm (NC1 fix). The encoding shown below is one
+# possible tuple serialization — adjust to your /wiki-ingest implementation.
+for src in "${SOURCES[@]}"; do
+  slug="${src%%|*}"             # 'slug|origin|type' tuple — set in Step 1
+  origin="${src#*|}"; origin="${origin%|*}"
+  type="${src##*|}"
+
+  # URL and text types have unstable bytes between hook and ingest; skip the skip-check for them
+  case "$type" in
+    url|text) continue ;;
+  esac
+
+  yaml="$WIKI_ROOT/.wiki-meta/sources/$slug.yaml"
+  [ ! -f "$yaml" ] && continue   # First-time ingest — proceed normally
+
+  prev_hash=$(grep '^content_hash:' "$yaml" | sed -E 's/^content_hash:[[:space:]]*"?(sha256:)?([0-9a-f]{64})"?.*$/\2/')
+  # bash 3.2: =~ requires [[ ]]; single [ ] does not support it (runtime error).
+  [[ "$prev_hash" =~ ^[0-9a-f]{64}$ ]] || continue   # Pre-v1.1.4 sentinel → fall through to recompute path
+
+  # shasum on macOS/BSD; sha256sum on Linux. Mirror of Step 8d's dual-form.
+  curr_hash=$( { shasum -a 256 "$origin" 2>/dev/null || sha256sum "$origin" 2>/dev/null; } | awk '{print $1}')
+  [ -z "$curr_hash" ] && continue
+
+  if [ "$curr_hash" = "$prev_hash" ]; then
+    # Skip this source — same bytes already ingested
+    SKIPPED+=("$slug")
+    # remove from $SOURCES — implementation-dependent on encoding
+  fi
+done
+```
+
+After filtering: if `SOURCES` is now empty, **briefly acquire the wiki lock (Step 3 protocol — `mkdir <wiki>/.wiki-meta/.wiki-lock` + trap)**, append **one `log.jsonl` line per skipped slug** using the canonical schema (NC2 review note — `wiki-lint` Step 1 reads `.ts` for "Last activity", Step 6 LOG-INVARIANT reads `.pages_created[]`; any new action MUST preserve `{ts, action, source, pages_created, pages_updated}` shape):
+
+```jsonc
+{"ts":"<iso>","action":"ingest-skip","source":"<slug>","pages_created":[],"pages_updated":[],"skip_reason":"content_hash unchanged"}
+```
+
+Use the same UTC ISO 8601 `Z` timestamp for every line in the batch (matches multi-source ingest emission rule from `commands/wiki-ingest.md` Step 10). Then run the v1.1.4 `.pending-scan → .last-scan` promotion block (same block that runs at the end of a normal ingest), release the lock, and report "All N sources skipped — bytes unchanged since last ingest". Content processing (Steps 2–13) is bypassed; only lock acquisition, skip-log append, and scan-window promotion are observed so:
+
+- concurrent writers cannot race on `log.jsonl`,
+- `.pending-scan` does not become permanently stale (which would cause the next hook to redetect the same N files and skip-log them again indefinitely),
+- the auto-ingest contract "every detected window is either ingested or recorded as such" is preserved.
+
+If at least one source remains, proceed to Step 2 with the reduced `SOURCES` list. The skipped slugs go into the final report (Step 14) as a separate "Unchanged (skipped)" section so the user knows the call was not entirely wasted.
+
+> **Why URL/text types are exempt:** URL bytes can drift between the SessionStart fetch (none — main doesn't fetch in Step 1) and the agent's WebFetch, and pasted text is by definition new content. Only file/deep-work-report sources have stable byte semantics that justify the skip.
+
+> **Why this is safe:** the agent has no observable side effect on the wiki when given an empty source list. Skipping a source is equivalent to never having included it. Per-source provenance for skipped slugs is already authoritative on disk.
+
 ### 2. Read Existing Wiki State
 
 Read `.wiki-meta/index.json` to know existing pages, titles, tags, and aliases. This is a small, low-context read used for the overlap filter in Step 4 and for index updates in Step 9.

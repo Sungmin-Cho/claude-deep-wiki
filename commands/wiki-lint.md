@@ -62,7 +62,80 @@ An orphan page is one that:
 - Is not linked from any other page (search all pages for `(<filename>)` pattern)
 - Has no inbound references
 
-Exclude `welcome.md` from orphan detection (it is the entry point).
+**Exclusions (NOT reported as orphans):**
+
+1. `welcome.md` — entry-point page.
+2. Pages whose frontmatter `tags:` includes `leaf` — author-marked intentional leaf (archive index, milestone summary, personal log).
+3. Pages whose filename matches a glob in `~/.claude/deep-wiki-config.yaml:lint.orphan_ignore` (optional config block).
+
+```yaml
+# Optional config block in ~/.claude/deep-wiki-config.yaml
+lint:
+  orphan_ignore:
+    - "archive-*.md"
+    - "daily-note-*.md"
+    - "personal-*.md"
+```
+
+The exclusions are union — any one match exempts the page.
+
+```bash
+# Detect frontmatter tag 'leaf' across all pages (B3 review note).
+TAGGED_LEAVES=$(for f in "$WIKI_ROOT/pages"/*.md; do
+  awk '
+    BEGIN{infm=0; intags=0; found=0}
+    /^---[[:space:]]*$/ { fm++; if(fm==1) infm=1; else if(fm==2){exit} }
+    infm && /^tags:[[:space:]]*\[/ {
+      line=$0; sub(/^tags:[[:space:]]*\[/,"",line); sub(/\][[:space:]]*$/,"",line)
+      n=split(line,arr,",")
+      for(i=1;i<=n;i++){ gsub(/^[[:space:]"\x27]+|[[:space:]"\x27]+$/,"",arr[i]); if(arr[i]=="leaf"){found=1;exit} }
+      next
+    }
+    infm && /^tags:[[:space:]]*$/ { intags=1; next }
+    infm && intags && /^[[:space:]]+-[[:space:]]*leaf[[:space:]]*$/ { found=1; exit }
+    infm && intags && !/^[[:space:]]+-/ { intags=0 }
+    END{ if(found) print FILENAME }
+  ' "$f" 2>/dev/null
+done | xargs -I{} basename {} | sort -u)
+
+# Orphan ignore globs from ~/.claude/deep-wiki-config.yaml — block-aware awk
+# (mirror of Task 2.2's auto_ingest.ignore_globs parser) (I3 review note).
+ORPHAN_IGNORE_GLOBS=()
+while IFS= read -r line; do
+  [ -z "$line" ] && continue
+  ORPHAN_IGNORE_GLOBS+=("$line")
+done < <(awk '
+  /^lint:[[:space:]]*(#.*)?$/ { in_block=1; next }
+  /^[^[:space:]#]/             { in_block=0 }
+  in_block && /^[[:space:]]+orphan_ignore:[[:space:]]*(#.*)?$/ { in_list=1; next }
+  in_block && in_list && /^[[:space:]]+-[[:space:]]*/ {
+    sub(/^[[:space:]]+-[[:space:]]*/, "")
+    sub(/[[:space:]]+#.*$/, "")
+    sub(/[[:space:]]+$/, "")
+    gsub(/^["'"'"']|["'"'"']$/, "")
+    print
+  }
+  in_block && in_list && !/^[[:space:]]+-/ { in_list=0 }
+' "$CONFIG" 2>/dev/null)
+
+# Apply: filter $ORPHANS by removing welcome.md, $TAGGED_LEAVES, glob matches.
+NEW_ORPHANS=""
+for f in $ORPHANS; do
+  [ "$f" = "welcome.md" ] && continue
+  printf '%s\n' "$TAGGED_LEAVES" | grep -Fxq "$f" && continue
+  matched=false
+  if [ ${#ORPHAN_IGNORE_GLOBS[@]} -gt 0 ]; then
+    for pat in "${ORPHAN_IGNORE_GLOBS[@]}"; do
+      case "$f" in
+        $pat) matched=true; break ;;
+      esac
+    done
+  fi
+  $matched && continue
+  NEW_ORPHANS="$NEW_ORPHANS$f"$'\n'
+done
+ORPHANS="$NEW_ORPHANS"
+```
 
 **If `OBS_LIVE`**, use Obsidian's link graph for more accurate orphan detection:
 

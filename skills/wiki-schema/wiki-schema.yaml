@@ -77,6 +77,16 @@ auto_lint:
     - broken_links
     - orphan_pages
 
+lint:
+  orphan_ignore:
+    type: list
+    element: glob_pattern
+    default: []
+    semantics: "Page filenames matching any glob are not reported as orphans by /wiki-lint Step 3."
+  leaf_tag:
+    name: leaf
+    semantics: "Frontmatter tags containing 'leaf' marks the page as an intentional orphan (archive, milestone, personal log)."
+
 query_auto_filing:
   criteria:              # ALL must be true to auto-file
     - min_source_pages: 2

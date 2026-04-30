@@ -2,6 +2,44 @@
 
 deep-wiki의 주요 변경사항을 기록합니다.
 
+## [1.2.0] — 2026-04-30
+
+### 성능
+
+- **SessionStart 자동 ingest 범위 필터** — `~/.claude/deep-wiki-config.yaml`에 선택적 `auto_ingest:` 블록이 추가됩니다. `ignore_globs` (경로 glob 제외)와 `require_tag` (프론트매터 태그 opt-in)를 지원합니다. SessionStart hook이 /wiki-ingest 호출 전에 이 필터를 적용해, Daily notes나 아카이브 폴더 같은 고빈도·저가치 경로의 호출 빈도를 줄입니다. 하위 호환 — 블록은 선택 사항이며, 없으면 기존 동작을 유지합니다. (A1)
+- **재-ingest hash skip** — `/wiki-ingest` Step 1.5에서 각 `file`/`deep-work-report` 소스의 sha256을 기존 `.wiki-meta/sources/<slug>.yaml:content_hash`와 비교합니다. 일치하는 소스는 lock 획득 전에 배치에서 제외됩니다. 배치 전체가 skip된 경우에도 lock을 잠깐 획득해 per-slug `ingest-skip` 로그 항목을 추가하고 `.pending-scan → .last-scan` promotion을 실행한 뒤 종료합니다. 새 `ingest-skip` 로그 액션이 감사용 skip 슬러그를 기록합니다 (canonical 스키마 유지: `{ts, action, source, pages_created:[], pages_updated:[], skip_reason}`). Step 1.5가 기존 yaml을 찾을 수 있도록 슬러그 파생을 Step 5에서 Step 1 끝으로 이동했습니다. **Hash 일치만으로는 skip 불충분 (IC1 review fix):** Step 1.5는 wiki 측 상태 무결성도 검증합니다 (`pages_created`∪`pages_updated`의 모든 페이지가 존재, 각 페이지 frontmatter `sources:`에 슬러그 포함, 슬러그의 가장 최근 로그 항목이 clean terminal action). 어느 하나 실패 시 정상 ingest로 fall-through하여 자가 복구하며, 새 `ingest-repair` 로그 액션으로 기록됩니다. `ingest-repair` 라인은 `pages_created:[]`를 emit하고 모든 touched 페이지를 `pages_updated`로 분류하여 wiki-lint Step 6 LOG-INVARIANT (각 파일명이 `pages_created`에 한 번만 등장) 무결성을 보존합니다 (R3C1 review fix); wiki-lint Step 6도 defense-in-depth로 `select(.action != "ingest-repair")` 필터를 추가합니다. (A2)
+- **`wiki-synthesizer` 내 skim-first 후보 필터링** — Phase 1 후보 탐색이 이제 2단계입니다: (1a) I/O 없이 후보 descriptor(`{file, title, tags, aliases}`)를 표면 겹침으로 skim, (1b) 상위 K≤5개 후보 본문만 `Read` (일반 K=3). Rule 5 광범위 검색은 정확성 보강망으로 유지됩니다. 5개 이상 후보 배치에서 **per-call 벽시계 시간 ~15-25% 감소 예상** (v1.1.4 follow-up 예측; 실측값은 dogfood 후 확정 예정). 호출자 변경: Step 4가 이제 단순 파일명 대신 enriched 후보 descriptor를 생성합니다. (A3)
+- **클라우드 스토리지 미러-동기화 워크플로우 가이드** — README(EN/KO)에 iCloud/Google Drive/Dropbox vault 사용자를 위한 3단계 수동 워크플로우를 문서화합니다: `wiki_root`를 로컬 디스크에 두기, 예약된 additive rsync(`--delete` 없음)로 vault에 미러링, 다른 기기에서 편집 시 먼저 수동 역-rsync 실행 (자동 충돌 감지 없음). 자동 `cache_local` 설정 옵션은 v1.3.0+로 보류됩니다. (A5)
+
+### Lint 강화
+
+- **`[SCAN-WINDOW]` 불변식 검사 + `--fix` 자동 정리** — `/wiki-lint`에 Step 11이 추가되어 `.pending-scan`/`.last-scan`의 세 가지 병적 상태를 감지합니다 (유효하지 않은 TS 정규식, `PENDING < LAST` 역행 위험, `LAST > 48h`인 자동 ingest 정체). `--fix`는 stale 및 유효하지 않은 `.pending-scan`을 자동으로 삭제합니다; 48h 초과 정보성 경고는 수동 판단이 필요합니다. gdate / Darwin / Linux를 지원하는 삼중 분기 날짜 파싱으로 이식 가능한 에포크 비교를 구현합니다. v1.1.4 follow-up 문서의 보류된 권고사항을 구현합니다. (B1+B2)
+- **`[ORPHAN]` 분류** — `/wiki-lint` Step 3이 이제 프론트매터에 `tags: [leaf]`가 있는 페이지와 `~/.claude/deep-wiki-config.yaml:lint.orphan_ignore` glob에 매칭되는 페이지를 제외합니다. 의도된 아카이브/마일스톤 leaf가 있는 wiki의 노이즈를 줄입니다. (B3)
+- **`[BROKEN]` 코드 블록 제외** — `/wiki-lint` Step 4가 `[text](target.md)` 패턴을 grep하기 전에 **fenced** 코드 블록(```...```)을 제거해, 코드 샘플 내에 `.md` 파일명이 언급된 문서 페이지의 false positive를 제거합니다. **4-space 들여쓰기 블록은 의도적으로 제거하지 않습니다** (NW3 리뷰 참고): CommonMark는 목록 내 4-space를 item-continuation으로 처리하므로, 무조건 제거하면 `- top\n    - nested with [link](other.md)` 같은 유효한 링크를 삭제할 수 있습니다. (B4)
+- **`pages_created` 동일 배치 중복 제거 가드** — `/wiki-ingest` Step 8c가 이제 배치 내 중복(한 배치에서 두 소스가 동일한 `file`을 생성)을 재분류해 첫 번째만 `created`로, 나머지는 `updated`로 처리합니다. v1.2.0+ ingest에서 "로그 전체에서 정확히 한 번" 불변식을 복원합니다. 기존 로그 항목은 변경되지 않습니다(append-only). bash 3.2 호환: 개행 구분 문자열 + `grep -Fxq` 사용(`declare -A` 미사용). (B5)
+
+### Wiki 데이터 정리 (one-off)
+
+- **Broken-link 발견사항 (5개)** — lint가 표시한 broken link 5개 전체 분석 결과, 전부 false positive — `.md`로 끝나는 외부 URL (예: `https://github.com/.../ARCHITECTURE.md`, `https://code.claude.com/docs/en/hooks.md`). vault 변경 없음. **참고:** wiki-lint Step 4의 URL 제외 (skip `http(s)://...` targets)는 이 false-positive 클래스를 구조적으로 제거하는 v1.3.0+ 후보입니다.
+- **버전 백업 체인 (4페이지 정리)** — `cross-model-3way-review-synthesis`, `deep-suite-marketplace`, `plan-review-as-integration-test`, `quant-monitor-watcher`를 보존 한도(페이지당 최근 3버전)로 수동 정리. 정리 전 backup tarball 저장.
+- **Orphan 분류 (36페이지)** — 사용자에게 보류. v1.2.0의 B3 도구(`leaf` 태그 + `lint.orphan_ignore` config)가 준비 완료 상태로 출시됩니다. 사용자는 적절한 glob/태그를 사용해 orphan 목록을 자신의 일정에 맞게 정리할 수 있습니다.
+- **`pages_created` 과거 위반 (28개)** — `log.jsonl`에 그대로 유지됩니다(append-only). B5가 미래 재발을 방지합니다; v1.2.0+ ingest는 새로운 위반을 생성하지 않습니다.
+
+### 보존 (기능 동등성)
+
+- Agent 입출력 계약 — `candidates` 형태가 `[filename]`에서 `[{file,title,tags,aliases}]`로 변경됨 (호출자와 agent 모두 업데이트됨; 이 계약의 서드파티 소비자 없음)
+- Lock 프로토콜, 버전 백업, source provenance 스키마 — 불변
+- v1.2.0 이전 wiki: `auto_ingest:` 및 `lint.orphan_ignore:` 블록은 선택 사항이며, 없으면 v1.1.x 동작을 유지
+
+### 마이그레이션
+
+별도 조치 불필요. 기존 wiki는 계속 동작합니다. v1.2.0 성능 향상을 활용하려면:
+
+1. 고빈도 경로를 `ignore_globs`에 설정한 `auto_ingest:` 블록을 `~/.claude/deep-wiki-config.yaml`에 추가합니다.
+2. `/wiki-lint --fix`를 한 번 실행해 stale `.pending-scan` 파일을 정리하고 과잉 버전 백업을 정리합니다.
+3. (선택) README 클라우드 스토리지 섹션에 따라 `wiki_root`를 로컬 디스크로 이전합니다.
+4. (선택) 의도적인 orphan 페이지에 `lint.orphan_ignore` glob 및/또는 `tags: [leaf]`를 추가해 `[ORPHAN]` lint 보고서를 정리합니다.
+
 ## [1.1.4] — 2026-04-24
 
 ### 수정

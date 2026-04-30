@@ -123,6 +123,39 @@ WIKI_PREFIX=$(awk '
   }
 ' "$CONFIG" 2>/dev/null)
 
+# 3d. Parse auto_ingest block (optional)
+# - ignore_globs: list of glob patterns to exclude
+# - require_tag: if non-empty, only include files with this tag in frontmatter
+IGNORE_GLOBS=()
+while IFS= read -r line; do
+  [ -z "$line" ] && continue
+  IGNORE_GLOBS+=("$line")
+done < <(awk '
+  /^auto_ingest:[[:space:]]*(#.*)?$/ { in_block=1; next }
+  /^[^[:space:]#]/                    { in_block=0 }
+  in_block && /^[[:space:]]+ignore_globs:[[:space:]]*(#.*)?$/ { in_list=1; next }
+  in_block && in_list && /^[[:space:]]+-[[:space:]]*/ {
+    sub(/^[[:space:]]+-[[:space:]]*/, "")
+    sub(/[[:space:]]+#.*$/, "")
+    sub(/[[:space:]]+$/, "")
+    gsub(/^["'"'"']|["'"'"']$/, "")
+    print
+  }
+  in_block && in_list && !/^[[:space:]]+-/ { in_list=0 }
+' "$CONFIG" 2>/dev/null)
+
+REQUIRE_TAG=$(awk '
+  /^auto_ingest:[[:space:]]*(#.*)?$/ { in_block=1; next }
+  /^[^[:space:]#]/                    { in_block=0 }
+  in_block && /^[[:space:]]+require_tag:[[:space:]]*/ {
+    sub(/^[[:space:]]+require_tag:[[:space:]]*/, "")
+    sub(/[[:space:]]+#.*$/, "")
+    sub(/[[:space:]]+$/, "")
+    gsub(/^["'"'"']|["'"'"']$/, "")
+    print; exit
+  }
+' "$CONFIG" 2>/dev/null)
+
 # 3c. Collect candidates from obsidian recents (supplement, not replacement)
 # recents returns "recently opened" files — may include unmodified files.
 # All candidates MUST pass mtime verification below.
@@ -186,6 +219,53 @@ if [ -n "$HAS_OBS_CLI" ] && [ -n "$WIKI_PREFIX" ]; then
   fi
 fi
 
+# Helper: returns 0 (true) if rel_path passes both filters, non-zero otherwise.
+auto_ingest_passes() {
+  local rel="$1"
+  local full="$2"
+
+  # ignore_globs check
+  if [ ${#IGNORE_GLOBS[@]} -gt 0 ]; then
+    for pat in "${IGNORE_GLOBS[@]}"; do
+      # bash extended-glob matching using case (POSIX-portable)
+      case "$rel" in
+        $pat) return 1 ;;
+      esac
+    done
+  fi
+
+  # require_tag check (read first ~50 lines of frontmatter)
+  # IW2 review fix (v1.2.1+): hard line-count guard. Files without frontmatter
+  # (or with missing closing `---`) would otherwise scan to EOF, which can
+  # exceed the 15s SessionStart hook timeout on cloud-backed vaults with large
+  # untagged notes. 50 lines is well beyond any realistic frontmatter window.
+  if [ -n "$REQUIRE_TAG" ] && [ -f "$full" ]; then
+    if ! awk -v want="$REQUIRE_TAG" '
+      BEGIN{infm=0; intags=0; found=0; line=0}
+      { line++; if(line > 50) exit }
+      /^---[[:space:]]*$/ { fm++; if(fm==1) infm=1; else if(fm==2){exit} }
+      infm && /^tags:[[:space:]]*$/ { intags=1; next }
+      infm && /^tags:[[:space:]]*\[/ {
+        # inline list form: tags: [a, b, c]
+        body=$0; sub(/^tags:[[:space:]]*\[/,"",body); sub(/\][[:space:]]*$/,"",body)
+        n=split(body,arr,",")
+        for(i=1;i<=n;i++){ gsub(/^[[:space:]"\x27]+|[[:space:]"\x27]+$/,"",arr[i]); if(arr[i]==want){found=1; exit} }
+        next
+      }
+      infm && intags && /^[[:space:]]+-[[:space:]]*/ {
+        v=$0; sub(/^[[:space:]]+-[[:space:]]*/,"",v); sub(/[[:space:]]+$/,"",v); gsub(/^["\x27]+|["\x27]+$/,"",v)
+        if(v==want){found=1; exit}
+      }
+      infm && intags && !/^[[:space:]]+-/ { intags=0 }
+      END{ exit (found ? 0 : 1) }
+    ' "$full" 2>/dev/null; then
+      return 1
+    fi
+  fi
+
+  return 0
+}
+
 # 4. Find modified .md files in vault (excluding wiki itself, .obsidian, .trash)
 NEW_FILES=()
 
@@ -200,6 +280,9 @@ while IFS= read -r -d '' file; do
   if [ "$FILE_EPOCH" -gt "$LAST_EPOCH" ]; then
     # Get relative path from vault root
     REL_PATH="${file#$VAULT_ROOT/}"
+    if ! auto_ingest_passes "$REL_PATH" "$file"; then
+      continue
+    fi
     NEW_FILES+=("$REL_PATH")
   fi
 done < <(find "$VAULT_ROOT" \
@@ -219,6 +302,10 @@ done < <(find "$VAULT_ROOT" \
 # under `set -u`, so guard with ${#ARR[@]} checks before iterating.
 if [ ${#RECENTS_FILES[@]} -gt 0 ]; then
   for rf in "${RECENTS_FILES[@]}"; do
+    FULL_PATH="$VAULT_ROOT/$rf"
+    if ! auto_ingest_passes "$rf" "$FULL_PATH"; then
+      continue
+    fi
     ALREADY_FOUND=false
     if [ ${#NEW_FILES[@]} -gt 0 ]; then
       for nf in "${NEW_FILES[@]}"; do

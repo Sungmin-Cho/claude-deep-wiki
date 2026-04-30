@@ -169,7 +169,31 @@ obsidian_cli:
   wiki_prefix: "wiki"
 ```
 
-> **⚠️ Cloud-synced `wiki_root` is slow.** Placing the wiki on iCloud Drive, Google Drive, Dropbox, or similar sync-daemon-backed paths adds hundreds of ms per `Write` because every page write wakes the sync daemon. For interactive ingest speed, keep `wiki_root` on local disk and let the sync client propagate changes in the background; alternatively, use offline-mirror / "available offline" mode for the wiki folder so writes hit the local replica first. This is an environment-level concern outside the plugin's control.
+### Cloud-Backed `wiki_root` and the Mirror-and-Sync Workflow (v1.2.0+)
+
+If your Obsidian vault — and therefore `wiki_root` — lives on iCloud Drive, Google Drive, Dropbox, or a similar sync-daemon-mounted path, every wiki write wakes the sync client and incurs hundreds of milliseconds of latency per `Read`/`Write`. For a typical 5-10 page ingest this can add 15-30s of pure I/O wait on top of LLM inference time.
+
+**Recommended workflow for cloud-backed vaults:**
+
+1. **Run the wiki on local disk.** Choose a non-synced path, e.g. `~/deep-wiki-local/`, and point `wiki_root` there in `~/.claude/deep-wiki-config.yaml`.
+2. **Mirror to the vault on a schedule.** Use `rsync` from launchd (macOS) or cron to push the local wiki into the vault every 10-30 minutes. **Use additive sync only — `--delete` is INTENTIONALLY OMITTED**:
+   ```bash
+   # Additive only. The plugin currently has no external-edit conflict
+   # detection (W5 review finding); --delete would silently destroy edits
+   # made on other devices (phone Obsidian, another computer) before the
+   # next ingest sees them. cache_local automation in v1.3.0+ will add
+   # explicit conflict detection — until then, additive is the only safe default.
+   rsync -a --backup --backup-dir="$HOME/.deep-wiki-rsync-backups/$(date +%Y%m%d-%H%M%S)" \
+     ~/deep-wiki-local/ \
+     "$HOME/Library/CloudStorage/GoogleDrive-.../내 드라이브/Obsidian/Personal Vault/deep-wiki/"
+   ```
+3. **Multi-device editing requires manual reverse-sync first** — there is **no automated conflict detection** in v1.2.0. If you edit pages in Obsidian on a phone or another computer, run reverse-rsync to bring those edits into local *before* the next scheduled push:
+   ```bash
+   rsync -a "$HOME/Library/CloudStorage/.../deep-wiki/" ~/deep-wiki-local/
+   ```
+   Or pause auto-ingest temporarily by removing the `auto_ingest:` block from `~/.claude/deep-wiki-config.yaml`.
+
+**Why not automate this in the plugin?** The `cache_local` config option that does this transparently is planned for v1.3.0+. The trade-off (race window between local edit and rsync push) deserves a deliberate config knob rather than implicit behavior. v1.2.0 documents the manual workflow and ships only the latency-related observations.
 
 ## Recommended Tools
 

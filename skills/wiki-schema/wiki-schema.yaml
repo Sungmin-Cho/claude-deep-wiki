@@ -40,12 +40,14 @@ log:
   ts_format: "ISO 8601 UTC with Z suffix, e.g. 2026-04-06T15:00:00Z (NEVER use local time offsets like +09:00)"
   classification:
     pages_created:
-      rule: "File did not exist in pages/ at the start of this action"
-      invariant: "Each page filename appears in pages_created at most once across the entire log"
+      rule: "File did not exist in pages/ at the start of this action AND has not yet been emitted to pages_created within this batch (intra-batch dedup, v1.2.0+)."
+      invariant: "Each page filename appears in pages_created at most once across the entire log — including within a single multi-source batch."
     pages_updated:
-      rule: "File existed before this action (regardless of whether this source contributed before)"
+      rule: "File existed before this action OR was already classified as created earlier in this batch (regardless of whether this source contributed before)."
   actions:             # Valid action values
     - ingest
+    - ingest-skip      # v1.2.0+: source dropped from batch because content_hash unchanged AND wiki-side state intact
+    - ingest-repair    # v1.2.1+ (IC1 review fix): hash unchanged but wiki state drift detected (missing page, page-missing-slug, or non-terminal last log) — full ingest forced as self-repair. R3C1 review fix: pages_created MUST be [] (a self-repair restores an existing page's lifecycle, not a new creation; the historical `ingest` line is the canonical pages_created entry). All touched pages go to pages_updated regardless of PRE_BATCH_PAGES classification. wiki-lint Step 6 LOG-INVARIANT scan filters out ingest-repair lines as defense-in-depth.
     - update
     - lint
     - rebuild
@@ -66,13 +68,25 @@ auto_lint:
     - broken_links
     - index_drift
     - orphan_detection
+    - scan_window_invariant   # v1.2.0+
   auto_fix:              # Fix silently without user action
     - index_drift
     - excess_versions
+    - stale_pending_scan      # v1.2.0+ (drops .pending-scan when older than .last-scan)
   report_only:           # Only report if issues found (no noise)
     - schema_violations
     - broken_links
     - orphan_pages
+
+lint:
+  orphan_ignore:
+    type: list
+    element: glob_pattern
+    default: []
+    semantics: "Page filenames matching any glob are not reported as orphans by /wiki-lint Step 3."
+  leaf_tag:
+    name: leaf
+    semantics: "Frontmatter tags containing 'leaf' marks the page as an intentional orphan (archive, milestone, personal log)."
 
 query_auto_filing:
   criteria:              # ALL must be true to auto-file
@@ -83,6 +97,20 @@ query_auto_filing:
   source_slug: "query-derived"
   default_tags:
     - query-synthesis
+
+auto_ingest:
+  optional: true
+  config_block: ~/.claude/deep-wiki-config.yaml
+  filters:
+    ignore_globs:
+      type: list
+      element: glob_pattern
+      semantics: "Path glob (relative to vault root). Matching files are excluded from SessionStart auto-detect."
+    require_tag:
+      type: string
+      default: ""
+      semantics: "If non-empty, only files whose frontmatter tags contain this tag are auto-detected."
+  default_behavior: "When auto_ingest block is absent or both keys are empty/missing, all modified .md files are detected (v1.1.x behavior)."
 
 recommended_tools:
   cli:

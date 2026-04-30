@@ -50,7 +50,12 @@ Read sources, decide create-vs-update for each topic, write pages under `<wiki_r
 The phases below have hard data dependencies between them (you need the source read before you can judge candidates; you need candidate decisions before you back up; you need backups before you overwrite). **Within each phase, however, every tool call is independent and MUST be dispatched in a single message as parallel tool calls, not one-per-message.** The runtime executes them concurrently; sequential dispatch is a pure waste of wall-clock time and is a common source of slow ingests.
 
 - **Phase 0 — Source read** (parallel across sources): For every source descriptor, issue the appropriate read tool in one batched message — `WebFetch` for `type: url`, `Read` for `type: file` / `type: deep-work-report` / `type: text`. Do not read sources one at a time.
-- **Phase 1 — Candidate survey** (parallel across candidates): Once the source bodies are in, issue `Read` for **all** candidate files listed in the input in a single batched message. If Rule 5 widening is needed, the widening `Glob` + `Grep` calls also go in the same batch (or the next batch immediately after — do not serialize them).
+- **Phase 1 — Candidate survey (skim-then-deep, with safety net for skim-skipped)**:
+  Phase 1a (skim, no I/O): Score each candidate descriptor `{file, title, tags, aliases}` against the source's topic by surface signals only (title token overlap, tag intersection, alias match). No tool calls.
+  Phase 1b (deep-read, parallel batched): For the top **K ≤ 5** candidates whose skim score suggests plausible overlap (typical K=3; raise to 5 only when score distribution does not separate cleanly), issue `Read` for all of them in a single batched message.
+  **Phase 1c — supplied-but-skim-skipped safety net (IW1 review fix, v1.2.1+):** For supplied candidates that did NOT make the K cap (skim score too low to be a likely overlap), do NOT silently exclude them from dedup consideration. Before deciding to **create** a new page, run a cheap `Grep` against the file content of every skim-skipped candidate (in a single parallel batch), looking for the source's distinctive title tokens or 1-2 sentence body keywords. If any skim-skipped candidate matches, escalate it to a deep `Read` (Phase 1b) before finalizing the create-vs-update decision. This closes the gap where a candidate has weak surface signals (generic title, empty tags, no alias) but real body overlap.
+  **Trade-off (W8 review note):** the K=3 cap from the v1.1.4 follow-up was based on a single 11-candidate sample. K=5 is a soft adaptive cap — if 5 candidates all show high overlap, prefer reading them over Rule 5 widening (which is slower than 5 parallel candidate reads).
+  Rule 5 widening (Glob/Grep) covers existing pages **outside** the candidate set; Phase 1c above covers the orthogonal gap of **inside** the candidate set but skim-skipped. Both are required for the duplicate-prevention invariant; skim is for **ordering** of deep-read budget, not for **excluding** pages from dedup consideration.
 - **Phase 2 — Backup batch** (parallel across pages you will overwrite): For every page you decided to update, resolve its next `v<N>` (Rule 7) and issue the `Read` of the current page body + `Write` of the backup file together, batched across all pages in a single message. Per-page: the Read must complete before the Write so the backup copies the pre-update content — if you must serialize per page, still parallelize across pages.
 - **Phase 3 — Page write** (parallel across new/updated pages): After you have composed all page bodies in your head (LLM inference is naturally sequential here — that is fine and is the dominant cost), issue `Write` for every `created` and `updated` page in one batched message.
 
@@ -67,7 +72,7 @@ The calling command passes:
   - `slug` — kebab-case source identifier (for the `sources:` frontmatter field)
   - `origin` — URL (for `type: url`), absolute file path (for `type: file`, `type: deep-work-report`, or `type: text`), never inline content. For pasted text, the caller writes the text to `<wiki_root>/.wiki-meta/.inbox/<slug>.txt` and passes that path as `origin` — the agent reads it with `Read` just like any other file. The caller deletes the inbox file after the agent returns (success or failure).
   - `type` — `url` | `file` | `text` | `deep-work-report`
-- `candidates` — list of existing page filenames (under `pages/`) that *might* overlap with the sources, pre-filtered by the caller from `index.json` title/alias matching and (when available) Obsidian search. A hint only — see Rule 5.
+- `candidates` — list of candidate descriptors. Each descriptor: `{file, title, tags, aliases}`. The caller pre-filters from `index.json` title/alias/tag matching and (when available) Obsidian search; descriptors include enough metadata for Phase 1a skim without re-reading `index.json`. A hint only — see Rule 5.
 
 The agent is responsible for:
 1. Reading source content (use `WebFetch` for `type: url`, `Read` for all other types).
@@ -144,7 +149,7 @@ Output:
 
 <example>
 Context: Single file source, one overlapping candidate.
-Input: sources=[{slug: "architecture-doc", origin: "/path/to/doc.md", type: "file"}], candidates=["system-architecture.md"]
+Input: sources=[{slug: "architecture-doc", origin: "/path/to/doc.md", type: "file"}], candidates=[{file:"system-architecture.md", title:"System Architecture", tags:["architecture"], aliases:[]}]
 Agent: Read source and candidate. Candidate overlaps — will update. Glob `.wiki-meta/.versions/system-architecture.v*.md` shows v1 is the max, so next is v2. Copy current `pages/system-architecture.md` → `.wiki-meta/.versions/system-architecture.v2.md`. Write merged content. Emit sentinel for `source_hashes` since no hashing tool is in scope.
 Output:
 {
@@ -158,7 +163,7 @@ Output:
 
 <example>
 Context: Two related blog posts (multi-source synthesis), one candidate — per-source attribution matters.
-Input: sources=[{slug:"post-a",...,type:"url"}, {slug:"post-b",...,type:"url"}], candidates=["rendering-models.md"]
+Input: sources=[{slug:"post-a",...,type:"url"}, {slug:"post-b",...,type:"url"}], candidates=[{file:"rendering-models.md", title:"Rendering Models", tags:["react"], aliases:[]}]
 Agent: Fetch both posts. Read candidate. Create `react-server-components.md` with content from both. Update `rendering-models.md` to cross-reference it. New page draws on both sources; rendering-models update only uses post-a's framing. Sentinel `source_hashes` — caller recomputes.
 Output:
 {
@@ -189,7 +194,7 @@ Output:
 
 <example>
 Context: Partial failure — backup succeeded but page write failed.
-Input: sources=[{slug:"doc-v2", origin:"/path/to/doc.md", type:"file"}], candidates=["flaky-topic.md"]
+Input: sources=[{slug:"doc-v2", origin:"/path/to/doc.md", type:"file"}], candidates=[{file:"flaky-topic.md", title:"Flaky Topic", tags:[], aliases:[]}]
 Agent: Read source and candidate, will update. Write backup `.wiki-meta/.versions/flaky-topic.v5.md`. Then Write to `pages/flaky-topic.md` fails (permission, disk, etc.). The backup is now orphaned.
 Output:
 {

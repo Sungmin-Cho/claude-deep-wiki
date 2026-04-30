@@ -2,6 +2,44 @@
 
 All notable changes to deep-wiki are documented here.
 
+## [1.2.0] — 2026-04-30
+
+### Performance
+
+- **SessionStart auto-ingest scope filter** — `~/.claude/deep-wiki-config.yaml` now accepts an optional `auto_ingest:` block with `ignore_globs` (path glob exclusions) and `require_tag` (frontmatter-tag opt-in). The SessionStart hook applies these filters before /wiki-ingest is invoked, reducing call frequency for high-volume low-value paths (Daily notes, archive folders). Backwards compatible — block is optional, default behavior unchanged. (A1)
+- **Re-ingest hash skip** — `/wiki-ingest` Step 1.5 now compares each `file`/`deep-work-report` source's sha256 against the existing `.wiki-meta/sources/<slug>.yaml:content_hash`. Matching sources are dropped from the batch before lock acquisition; an entirely-skipped batch still acquires the lock briefly to append a per-slug `ingest-skip` log entry and run the `.pending-scan → .last-scan` promotion before exit. New `ingest-skip` log action records skipped slugs for audit (canonical schema preserved: `{ts, action, source, pages_created:[], pages_updated:[], skip_reason}`). Slug derivation moved from Step 5 to end of Step 1 so Step 1.5 can locate the existing yaml. (A2)
+- **Skim-first candidate filtering in `wiki-synthesizer`** — Phase 1 candidate survey is now two-stage: (1a) skim candidate descriptors (`{file, title, tags, aliases}`) by surface overlap with no I/O, (1b) `Read` only top-K ≤ 5 candidate bodies (typical K=3). Rule 5 wide-search remains the correctness net; per-call wall-clock is **expected to drop ~15-25% for batches with 5+ candidates** (projection from the v1.1.4 follow-up; measured number TBD pending dogfood). Caller-side change: Step 4 now produces enriched candidate descriptors instead of bare filenames. (A3)
+- **Cloud-storage mirror-and-sync workflow guide** — README (EN/KO) now documents a 3-step manual workflow for users on iCloud/Google Drive/Dropbox vaults: keep `wiki_root` on local disk, additive rsync (NO `--delete`) to vault on a schedule, manual reverse-rsync first when editing on other devices (no automated conflict detection). Automated `cache_local` config option deferred to v1.3.0+. (A5)
+
+### Lint Hardening
+
+- **`[SCAN-WINDOW]` invariant check + `--fix` auto-cleanup** — `/wiki-lint` gains Step 11 detecting three pathological states of `.pending-scan`/`.last-scan` (invalid TS regex, `PENDING < LAST` regression risk, stalled auto-ingest with `LAST > 48h`). `--fix` drops stale and invalid `.pending-scan` automatically; the >48h informational warning requires manual judgment. Includes tri-branch date parsing (gdate / Darwin / Linux) for portable epoch comparison. Implements the v1.1.4 follow-up doc's deferred recommendation. (B1+B2)
+- **`[ORPHAN]` classification** — `/wiki-lint` Step 3 now exempts pages with frontmatter `tags: [leaf]` and pages matching `~/.claude/deep-wiki-config.yaml:lint.orphan_ignore` globs. Reduces noise on wikis with intentional archive/milestone leaves. (B3)
+- **`[BROKEN]` code-block exclusion** — `/wiki-lint` Step 4 now strips **fenced** code blocks (```...```) before grep'ing for `[text](target.md)` patterns, eliminating false positives from documentation pages that mention `.md` filenames inside code samples. **4-space-indented blocks are intentionally NOT stripped** (NW3 review note): CommonMark treats 4-space inside lists as item-continuation, and unconditional stripping would silently swallow valid links like `- top\n    - nested with [link](other.md)`. (B4)
+- **`pages_created` same-batch dedup guard** — `/wiki-ingest` Step 8c now reclassifies within-batch duplicates (the same `file` produced by two sources in one batch) so only the first is `created` and the rest are `updated`, restoring the "exactly once across log" invariant for v1.2.0+ ingests. Past log entries are unmodified (append-only). bash 3.2 compatible: uses newline-delimited string + `grep -Fxq` (NOT `declare -A`). (B5)
+
+### Wiki Data Cleanup (one-off)
+
+- **Broken-link findings (5)** — All 5 lint-flagged broken links analyzed; ALL turned out to be false positives — external URLs whose path ends in `.md` (e.g. `https://github.com/.../ARCHITECTURE.md`, `https://code.claude.com/docs/en/hooks.md`). Vault unchanged. **Note:** wiki-lint Step 4 URL exclusion (skip `http(s)://...` targets) is a v1.3.0+ candidate to eliminate this false-positive class structurally.
+- **Version backup chains (4 pages pruned)** — `cross-model-3way-review-synthesis`, `deep-suite-marketplace`, `plan-review-as-integration-test`, `quant-monitor-watcher` reduced to retention limit (last 3 versions per page) by manual prune. Backup tarball saved before prune as safety net.
+- **Orphan classification (36 pages)** — Deferred to user. v1.2.0's B3 tooling (`leaf` tag + `lint.orphan_ignore` config) ships ready; user can run a one-off pass with the appropriate globs/tags to clear the orphan list at their pace.
+- **Historical `pages_created` violations (28)** — Remain in `log.jsonl` (append-only). B5 closes the future-recurrence path; v1.2.0+ ingests will not produce new ones.
+
+### Preserved (functional parity)
+
+- Agent input/output contract — `candidates` shape changed from `[filename]` to `[{file,title,tags,aliases}]` (caller and agent both updated; no third-party consumers of this contract)
+- Lock protocol, version backup, source provenance schema — unchanged
+- Pre-v1.2.0 wikis: `auto_ingest:` and `lint.orphan_ignore:` blocks are optional; absence yields v1.1.x behavior
+
+### Migration
+
+No action required. Existing wikis continue to work. To opt into v1.2.0 perf gains:
+
+1. Add `auto_ingest:` block to `~/.claude/deep-wiki-config.yaml` with high-volume paths in `ignore_globs`.
+2. Run `/wiki-lint --fix` once to clear stale `.pending-scan` files and prune excess version backups.
+3. (Optional) Migrate `wiki_root` to local disk per the README cloud-storage section.
+4. (Optional) Add `lint.orphan_ignore` globs and/or `tags: [leaf]` to intentional-orphan pages to clean up the `[ORPHAN]` lint report.
+
 ## [1.1.4] — 2026-04-24
 
 ### Fixed

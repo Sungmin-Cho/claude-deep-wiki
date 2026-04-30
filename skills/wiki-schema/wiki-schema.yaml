@@ -40,10 +40,10 @@ log:
   ts_format: "ISO 8601 UTC with Z suffix, e.g. 2026-04-06T15:00:00Z (NEVER use local time offsets like +09:00)"
   classification:
     pages_created:
-      rule: "File did not exist in pages/ at the start of this action"
-      invariant: "Each page filename appears in pages_created at most once across the entire log"
+      rule: "File did not exist in pages/ at the start of this action AND has not yet been emitted to pages_created within this batch (intra-batch dedup, v1.2.0+)."
+      invariant: "Each page filename appears in pages_created at most once across the entire log — including within a single multi-source batch."
     pages_updated:
-      rule: "File existed before this action (regardless of whether this source contributed before)"
+      rule: "File existed before this action OR was already classified as created earlier in this batch (regardless of whether this source contributed before)."
   actions:             # Valid action values
     - ingest
     - ingest-skip      # v1.2.0+: source dropped from batch because content_hash unchanged

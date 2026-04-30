@@ -185,6 +185,31 @@ If the agent's self-classification disagrees (e.g. agent claimed `created` for a
 
 > **Classification rule:** A page filename belongs in `pages_created` ONLY if the page did not exist in `pages/` at the start of this ingest. If the page already existed (even if this is the first time *this source* contributed to it), classify it under `pages_updated`. Rationale: `log.jsonl` is used to reconstruct per-page creation history; a page must have exactly one `pages_created` entry across the entire log.
 
+**c.1. Within-batch deduplication of `CREATED_ENTRIES` (v1.2.0+).**
+
+If two or more entries in `CREATED_ENTRIES` share the same `file` value, this means two sources in this same batch each independently produced the same page name. The first sequential entry remains in `CREATED_ENTRIES` (as the originator); subsequent duplicates are moved to `UPDATED_ENTRIES`. This matches the `log.jsonl` invariant ("each page filename appears in `pages_created` at most once across the entire log") even within a multi-source batch where the agent's per-source attribution would otherwise emit it N times.
+
+```bash
+# Pseudo-logic — bash 3.2 호환 (macOS 기본 /bin/bash). 연관 배열(declare -A)은 bash 4+ 전용이며
+# v1.1.4 D1 fix가 이미 같은 이유로 TSV 패턴을 도입했음 — 같은 원칙을 따른다.
+SEEN_CREATED=""    # newline-delimited "이미 created로 분류된 파일명" 집합
+NEW_CREATED=()
+EXTRA_UPDATED=()
+for entry in "${CREATED_ENTRIES[@]}"; do
+  file="$(jq -r '.file' <<<"$entry")"
+  if printf '%s\n' "$SEEN_CREATED" | grep -Fxq "$file"; then
+    EXTRA_UPDATED+=("$entry")
+  else
+    SEEN_CREATED="$SEEN_CREATED"$'\n'"$file"
+    NEW_CREATED+=("$entry")
+  fi
+done
+CREATED_ENTRIES=("${NEW_CREATED[@]}")
+UPDATED_ENTRIES+=("${EXTRA_UPDATED[@]}")
+```
+
+The classification change emits a one-line note in the Step 14 report ("N entries reclassified from created to updated due to same-batch dedup") so the user can spot legitimate "two sources created the same NEW page" cases that this guard masks. **Per-source provenance trade-off (W6):** the per-source `sources/<slug>.yaml` is generated from each entry's `sources` list (Step 8e) — `slug2`'s yaml will record `pages_updated:[X.md]` even though `slug2` co-created the page. Operators who care about co-creation attribution should keep `pages_created` in BOTH per-source yamls (drive dedup at log-emission time only). v1.2.0 takes the simpler path (dedup at classification) for log-invariant strictness; full per-source-preserving variant is tracked as a v1.3.0 candidate.
+
 **d. Normalize `source_hashes`.** The agent returns `source_hashes` with one entry per source slug (the caller rejected the manifest in Step 7 / Error Handling if any passed-in slug was missing). The *values*, however, may not all be valid sha256 digests: the default `wiki-synthesizer` agent has no shell/hashing capability (its tool scope is `Read, Write, Glob, Grep, WebFetch`), so it returns a sentinel placeholder value for each slug. The caller is responsible for normalizing these to real digests before Step 8e.
 
 For each slug, validate its value against `^[0-9a-f]{64}$` (case-insensitive — authoritative agent-computed digest). If it matches, use it verbatim as the `content_hash`. If it does NOT match (sentinel, empty, wrong length, non-hex chars, etc.), recompute from the source's `origin`:

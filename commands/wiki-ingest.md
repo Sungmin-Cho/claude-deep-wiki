@@ -166,10 +166,12 @@ If at least one source remains, proceed to Step 2 with the reduced `SOURCES` lis
 
 ```jsonc
 {"ts":"<iso>","action":"ingest-skip","source":"<slug>","pages_created":[],"pages_updated":[],"skip_reason":"content_hash unchanged"}
-{"ts":"<iso>","action":"ingest-repair","source":"<slug>","pages_created":[...],"pages_updated":[...],"repair_reason":"<from REPAIR array>"}
+{"ts":"<iso>","action":"ingest-repair","source":"<slug>","pages_created":[],"pages_updated":[<all pages this self-repair touched>],"repair_reason":"<from REPAIR array>"}
 ```
 
-`ingest-repair` lines use the same `pages_created`/`pages_updated` filter rule as regular `ingest` lines (Step 10) — i.e. the reason this slug got fall-through is recorded but the `pages_*` fields reflect what the *current* ingest cycle actually produced for that slug, not a historical state. The skipped slugs go into the final report (Step 14) as a separate "Unchanged (skipped)" section, and repaired slugs as "Repaired (state drift detected)".
+> **Critical (R3C1 review fix, v1.2.1+):** For slugs in `REPAIR`, the `ingest-repair` line **REPLACES** the normal Step 10 `ingest` line — do NOT emit both for the same slug, and do NOT classify any page as `pages_created` in the `ingest-repair` line (always `[]`). All pages this self-repair cycle touched go to `pages_updated` regardless of what `PRE_BATCH_PAGES` (Step 6) would otherwise classify. **Rationale:** a self-repair re-creates a page that historically already had its `pages_created` entry from the original `ingest`; emitting another `pages_created` would duplicate the filename across log history and trip `wiki-lint` Step 6 LOG-INVARIANT (which scans all entries with no action filter). The repair is a *restoration* of a page lifecycle, not a *new* creation.
+
+The skipped slugs go into the final report (Step 14) as a separate "Unchanged (skipped)" section, and repaired slugs as "Repaired (state drift detected)".
 
 > **Why URL/text types are exempt:** URL bytes can drift between the SessionStart fetch (none — main doesn't fetch in Step 1) and the agent's WebFetch, and pasted text is by definition new content. Only file/deep-work-report sources have stable byte semantics that justify the skip.
 
@@ -342,6 +344,13 @@ Append one log line **per source in the batch**, using the per-slug filtered lis
 ```
 
 For a single-source ingest this is one line; for multi-source batch it is one line per source, identical `ts`. This matches the per-source yaml written in Step 8e — any page whose frontmatter `sources:` field lists a given slug MUST appear under that slug's log line (`pages_created` or `pages_updated`).
+
+> **(v1.2.1+, R3C1 + IW3 review fixes) Slugs in `SKIPPED` and `REPAIR` from Step 1.5 emit different action types and bypass the normal `ingest` line:**
+>
+> - For each slug in `SKIPPED` (bytes unchanged AND wiki state intact): emit `{"ts":"<iso>","action":"ingest-skip","source":"<slug>","pages_created":[],"pages_updated":[],"skip_reason":"content_hash unchanged"}`. Same `ts` as the rest of the batch.
+> - For each slug in `REPAIR` (bytes unchanged BUT wiki state drift forced fall-through): emit `{"ts":"<iso>","action":"ingest-repair","source":"<slug>","pages_created":[],"pages_updated":[<all touched pages for this slug>],"repair_reason":"<from REPAIR array>"}` **INSTEAD OF** the normal `ingest` line. `pages_created` MUST be `[]`; all touched pages go to `pages_updated`. This preserves wiki-lint Step 6 LOG-INVARIANT (each filename appears in `pages_created` exactly once across history; the historical `ingest` line is the canonical creation record, the `ingest-repair` line records the lifecycle restoration).
+>
+> The Step 8e per-source yaml is updated normally for both `SKIPPED` (no-op — yaml is already authoritative) and `REPAIR` slugs (yaml's `pages_created`/`pages_updated` reflect the current cycle's restoration; the `pages_created` field there does NOT need to match the log line's `pages_created:[]` — yaml is per-source historical record, log line is event record).
 
 ### 11. Update Human-Readable Wiki Artifacts
 

@@ -47,7 +47,7 @@ log:
   actions:             # Valid action values
     - ingest
     - ingest-skip      # v1.2.0+: source dropped from batch because content_hash unchanged AND wiki-side state intact
-    - ingest-repair    # v1.2.1+ (IC1 review fix): hash unchanged but wiki state drift detected (missing page, page-missing-slug, or non-terminal last log) — full ingest forced as self-repair
+    - ingest-repair    # v1.2.1+ (IC1 review fix): hash unchanged but wiki state drift detected (missing page, page-missing-slug, or non-terminal last log) — full ingest forced as self-repair. R3C1 review fix: pages_created MUST be [] (a self-repair restores an existing page's lifecycle, not a new creation; the historical `ingest` line is the canonical pages_created entry). All touched pages go to pages_updated regardless of PRE_BATCH_PAGES classification. wiki-lint Step 6 LOG-INVARIANT scan filters out ingest-repair lines as defense-in-depth.
     - update
     - lint
     - rebuild

@@ -197,11 +197,11 @@ Parse `log.jsonl` and flag any page filename that appears in `pages_created` **m
 
 Example jq query (reference):
 ```bash
-jq -r '.pages_created[]? | select(type=="string")' "<wiki_root>/log.jsonl" \
+jq -r 'select(.action != "ingest-repair") | .pages_created[]? | select(type=="string")' "<wiki_root>/log.jsonl" \
   | sort | uniq -c | awk '$1 > 1 { print $2, "appears " $1 " times in pages_created" }'
 ```
 
-> The invariant applies to every log entry that emits `pages_created` — including `setup` (seeds `welcome.md`), `ingest`, `query-filed`, and any future action. Do not filter by `.action`; any duplicate filename across the whole log is a violation.
+> The invariant applies to every log entry that emits `pages_created` — including `setup` (seeds `welcome.md`), `ingest`, `query-filed`, and any future action. **Exception (R3C1 review fix, v1.2.1+):** `ingest-repair` lines are excluded from the duplicate scan because they always emit `pages_created:[]` (per `commands/wiki-ingest.md` Step 10 spec) — a self-repair is a restoration of a previously-created page's lifecycle, not a new creation. The `select(.action != "ingest-repair")` filter is defense-in-depth in case any legacy or out-of-spec entry slips a non-empty `pages_created` into an `ingest-repair` line.
 
 Report findings as `[LOG-INVARIANT]` — no auto-fix (historical log is append-only). Fix forward in future ingests by respecting the pages_created classification rule.
 

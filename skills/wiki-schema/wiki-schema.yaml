@@ -46,7 +46,8 @@ log:
       rule: "File existed before this action OR was already classified as created earlier in this batch (regardless of whether this source contributed before)."
   actions:             # Valid action values
     - ingest
-    - ingest-skip      # v1.2.0+: source dropped from batch because content_hash unchanged
+    - ingest-skip      # v1.2.0+: source dropped from batch because content_hash unchanged AND wiki-side state intact
+    - ingest-repair    # v1.2.1+ (IC1 review fix): hash unchanged but wiki state drift detected (missing page, page-missing-slug, or non-terminal last log) — full ingest forced as self-repair
     - update
     - lint
     - rebuild

@@ -38,7 +38,9 @@ Determine the source type from the argument **without reading file bodies or fet
 - **File path**: Exists on filesystem and is not a deep-work report → type `file`, origin = absolute path.
 - **No argument (pasted text)**: Ask the user to paste text, generate a slug (from the first non-empty line or a timestamp), and record `{slug, pending_text, type: "text"}` — but do NOT write the inbox file yet. The inbox write happens in Step 6.5 after lock acquisition so concurrent sessions can't race on the same `.inbox/<slug>.txt` path.
 
-Main does NOT fetch URL bodies or read source file contents at this step. It only classifies sources and defers pasted-text materialization until after the lock is held.
+**(v1.2.0+) Derive `slug` for every source at end of Step 1** (IW4 review fix — formerly Step 5's responsibility, moved here so Step 1.5's hash-skip can locate `<wiki>/.wiki-meta/sources/<slug>.yaml`). Apply Step 5's algorithm now: URL → `karpathy-llm-wiki-gist`-style kebab from the URL slug; file path → kebab from `basename` minus `.md`; deep-work session → `deep-work-session-<YYYY-MM-DD>`. Each tuple in `$SOURCES` MUST carry `{slug, origin, type}` (or your equivalent encoding) by the time Step 1.5 runs. Step 5 is now a no-op for sources already carrying a `slug` (kept in the spec only for backward-readability with v1.1.x docs).
+
+Main does NOT fetch URL bodies or read source file contents at this step. It only classifies sources, derives slugs, and defers pasted-text materialization until after the lock is held.
 
 ### 1.5. Re-Ingest Hash Skip (v1.2.0+)
 
@@ -72,14 +74,83 @@ for src in "${SOURCES[@]}"; do
   [ -z "$curr_hash" ] && continue
 
   if [ "$curr_hash" = "$prev_hash" ]; then
-    # Skip this source — same bytes already ingested
-    SKIPPED+=("$slug")
-    # remove from $SOURCES — implementation-dependent on encoding
+    # IC1 review fix (v1.2.1+): bytes hash match ALONE is not sufficient to skip.
+    # The wiki may be in a broken state from a prior partial-failure or external
+    # edit (sync conflict, manual deletion). Verify wiki-side integrity before
+    # declaring this source skippable. If ANY check fails, fall through to
+    # normal ingest as a self-repair path (logged as `ingest-repair`, NOT
+    # `ingest-skip`) — this lets the next ingest restore the wiki state for
+    # this source even though its bytes have not changed.
+    state_ok=true
+    repair_reason=""
+
+    # Check 1: every page this source has contributed to (pages_created ∪
+    # pages_updated in the YAML) still exists in <wiki>/pages/.
+    pages_in_yaml=$(awk '
+      /^pages_created:[[:space:]]*$/ { in_list=1; next }
+      /^pages_updated:[[:space:]]*$/ { in_list=1; next }
+      /^[a-zA-Z]/ { in_list=0 }
+      in_list && /^[[:space:]]+-[[:space:]]*/ {
+        v=$0; sub(/^[[:space:]]+-[[:space:]]*/, "", v); sub(/[[:space:]]+$/, "", v); gsub(/["]/, "", v); print v
+      }
+    ' "$yaml" | sort -u)
+    for page in $pages_in_yaml; do
+      [ -z "$page" ] && continue
+      if [ ! -f "$WIKI_ROOT/pages/$page" ]; then
+        state_ok=false
+        repair_reason="missing-page:$page"
+        break
+      fi
+      # Check 2: each surviving page's frontmatter `sources:` still lists this slug.
+      if ! awk -v slug="$slug" '
+        BEGIN{found=0}
+        /^---[[:space:]]*$/ { fm++; if(fm==2) exit }
+        fm==1 && /^sources:[[:space:]]*$/ { in_src=1; next }
+        fm==1 && in_src && /^[[:space:]]+-[[:space:]]*/ {
+          v=$0; sub(/^[[:space:]]+-[[:space:]]*/, "", v); sub(/[[:space:]]+$/, "", v); gsub(/["]/, "", v)
+          if (v == slug) found=1
+        }
+        fm==1 && in_src && !/^[[:space:]]+-/ { in_src=0 }
+        END { exit (found ? 0 : 1) }
+      ' "$WIKI_ROOT/pages/$page" 2>/dev/null; then
+        state_ok=false
+        repair_reason="page-missing-slug:$page"
+        break
+      fi
+    done
+
+    # Check 3: most recent log.jsonl entry for this slug must be a clean
+    # terminal action (ingest, ingest-skip, ingest-repair). Anything else
+    # (or absence) suggests a partial failure/interruption — re-ingest to
+    # close the gap rather than skip.
+    if $state_ok && [ -f "$WIKI_ROOT/log.jsonl" ]; then
+      last_action=$(grep -F "\"source\":\"$slug\"" "$WIKI_ROOT/log.jsonl" 2>/dev/null \
+        | tail -1 \
+        | sed -E 's/.*"action":"([^"]+)".*/\1/')
+      case "$last_action" in
+        ingest|ingest-skip|ingest-repair) ;;        # clean terminal
+        '') ;;                                      # no log entry (first ingest); allow skip
+        *)
+          state_ok=false
+          repair_reason="last-action-not-terminal:$last_action"
+          ;;
+      esac
+    fi
+
+    if $state_ok; then
+      # Skip safe — bytes unchanged AND wiki state intact.
+      SKIPPED+=("$slug")
+      # remove from $SOURCES — implementation-dependent on encoding
+    else
+      # Fall through to normal ingest as self-repair. Track the reason for
+      # the `ingest-repair` log line emitted alongside the normal ingest.
+      REPAIR+=("$slug:$repair_reason")
+    fi
   fi
 done
 ```
 
-After filtering: if `SOURCES` is now empty, **briefly acquire the wiki lock (Step 3 protocol — `mkdir <wiki>/.wiki-meta/.wiki-lock` + trap)**, append **one `log.jsonl` line per skipped slug** using the canonical schema (NC2 review note — `wiki-lint` Step 1 reads `.ts` for "Last activity", Step 6 LOG-INVARIANT reads `.pages_created[]`; any new action MUST preserve `{ts, action, source, pages_created, pages_updated}` shape):
+After filtering: if `SOURCES` is now empty (entirely skip-eligible — note: a `REPAIR` slug forces fall-through and means SOURCES is NOT empty), **briefly acquire the wiki lock (Step 3 protocol — `mkdir <wiki>/.wiki-meta/.wiki-lock` + trap)**, append **one `log.jsonl` line per skipped slug** using the canonical schema (NC2 review note — `wiki-lint` Step 1 reads `.ts` for "Last activity", Step 6 LOG-INVARIANT reads `.pages_created[]`; any new action MUST preserve `{ts, action, source, pages_created, pages_updated}` shape):
 
 ```jsonc
 {"ts":"<iso>","action":"ingest-skip","source":"<slug>","pages_created":[],"pages_updated":[],"skip_reason":"content_hash unchanged"}
@@ -91,7 +162,14 @@ Use the same UTC ISO 8601 `Z` timestamp for every line in the batch (matches mul
 - `.pending-scan` does not become permanently stale (which would cause the next hook to redetect the same N files and skip-log them again indefinitely),
 - the auto-ingest contract "every detected window is either ingested or recorded as such" is preserved.
 
-If at least one source remains, proceed to Step 2 with the reduced `SOURCES` list. The skipped slugs go into the final report (Step 14) as a separate "Unchanged (skipped)" section so the user knows the call was not entirely wasted.
+If at least one source remains, proceed to Step 2 with the reduced `SOURCES` list (skipped slugs in `SKIPPED`, repair slugs in `REPAIR`). At the end of Step 10 (Append to Log), **emit one extra log line per slug in `SKIPPED` and `REPAIR`** using the same `ts` as the rest of the batch (IW3 review fix — mixed-batch audit completeness):
+
+```jsonc
+{"ts":"<iso>","action":"ingest-skip","source":"<slug>","pages_created":[],"pages_updated":[],"skip_reason":"content_hash unchanged"}
+{"ts":"<iso>","action":"ingest-repair","source":"<slug>","pages_created":[...],"pages_updated":[...],"repair_reason":"<from REPAIR array>"}
+```
+
+`ingest-repair` lines use the same `pages_created`/`pages_updated` filter rule as regular `ingest` lines (Step 10) — i.e. the reason this slug got fall-through is recorded but the `pages_*` fields reflect what the *current* ingest cycle actually produced for that slug, not a historical state. The skipped slugs go into the final report (Step 14) as a separate "Unchanged (skipped)" section, and repaired slugs as "Repaired (state drift detected)".
 
 > **Why URL/text types are exempt:** URL bytes can drift between the SessionStart fetch (none — main doesn't fetch in Step 1) and the agent's WebFetch, and pasted text is by definition new content. Only file/deep-work-report sources have stable byte semantics that justify the skip.
 
@@ -125,6 +203,8 @@ Identify existing pages that *might* overlap with the incoming sources. This is 
 Main MUST NOT read page bodies at this step — only metadata from `index.json` and the Obsidian index. Page bodies are for the agent.
 
 ### 5. Generate Source Slug
+
+> **(v1.2.0+) This step is now a no-op for SOURCES already carrying a `slug` field** (slug derivation moved to end of Step 1 per IW4). Kept here for v1.1.x backward-readability. If for any reason `$SOURCES[i].slug` is missing at this point, derive it now using the algorithm below.
 
 Create a kebab-case slug from the source title or URL:
 - URL: `karpathy-llm-wiki-gist`
@@ -183,7 +263,7 @@ If `failed` is non-empty, continue with metadata updates for whatever succeeded 
 
 If the agent's self-classification disagrees (e.g. agent claimed `created` for a pre-existing file), trust the snapshot and note the discrepancy in the final report.
 
-> **Classification rule:** A page filename belongs in `pages_created` ONLY if the page did not exist in `pages/` at the start of this ingest. If the page already existed (even if this is the first time *this source* contributed to it), classify it under `pages_updated`. Rationale: `log.jsonl` is used to reconstruct per-page creation history; a page must have exactly one `pages_created` entry across the entire log.
+> **Classification rule (IW5 review fix, v1.2.0+):** A page filename belongs in `pages_created` ONLY if **(a)** the page did not exist in `pages/` at the start of this ingest, AND **(b)** it has not already been classified as `created` earlier in this same batch (intra-batch dedup — see Step 8c.1). If the page already existed (even if this is the first time *this source* contributed to it), or if a prior source in this same batch already produced it as `created`, classify under `pages_updated`. Rationale: `log.jsonl` is used to reconstruct per-page creation history; a page must have exactly one `pages_created` entry across the entire log AND within any single multi-source batch.
 
 **c.1. Within-batch deduplication of `CREATED_ENTRIES` (v1.2.0+).**
 

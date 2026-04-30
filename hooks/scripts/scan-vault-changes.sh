@@ -235,15 +235,20 @@ auto_ingest_passes() {
   fi
 
   # require_tag check (read first ~50 lines of frontmatter)
+  # IW2 review fix (v1.2.1+): hard line-count guard. Files without frontmatter
+  # (or with missing closing `---`) would otherwise scan to EOF, which can
+  # exceed the 15s SessionStart hook timeout on cloud-backed vaults with large
+  # untagged notes. 50 lines is well beyond any realistic frontmatter window.
   if [ -n "$REQUIRE_TAG" ] && [ -f "$full" ]; then
     if ! awk -v want="$REQUIRE_TAG" '
-      BEGIN{infm=0; intags=0; found=0}
+      BEGIN{infm=0; intags=0; found=0; line=0}
+      { line++; if(line > 50) exit }
       /^---[[:space:]]*$/ { fm++; if(fm==1) infm=1; else if(fm==2){exit} }
       infm && /^tags:[[:space:]]*$/ { intags=1; next }
       infm && /^tags:[[:space:]]*\[/ {
         # inline list form: tags: [a, b, c]
-        line=$0; sub(/^tags:[[:space:]]*\[/,"",line); sub(/\][[:space:]]*$/,"",line)
-        n=split(line,arr,",")
+        body=$0; sub(/^tags:[[:space:]]*\[/,"",body); sub(/\][[:space:]]*$/,"",body)
+        n=split(body,arr,",")
         for(i=1;i<=n;i++){ gsub(/^[[:space:]"\x27]+|[[:space:]"\x27]+$/,"",arr[i]); if(arr[i]==want){found=1; exit} }
         next
       }

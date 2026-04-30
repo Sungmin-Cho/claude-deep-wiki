@@ -147,9 +147,34 @@ obsidian orphans 2>/dev/null
 
 ### 4. Broken Link Detection
 
-For each markdown link `[text](target.md)` found in pages:
-- Check if `target.md` exists in `pages/`
-- Report any broken links with the source page and target
+For each markdown link `[text](target.md)` found in pages **outside fenced code blocks**, check if `target.md` exists in `pages/`. Report any broken links with the source page and target.
+
+**Code block exclusion (v1.2.0+):** Strip **fenced** code blocks (```...```) before grep'ing for links. **4-space-indented blocks are NOT stripped** (NW3 review note — CommonMark treats 4-space inside lists as item-continuation, and unconditional stripping would silently swallow valid links inside list items). Inline backticks (\`code\`) are also not stripped because broken-link false-positives from inline code are rare and inline backticks can span partial lines.
+
+```bash
+# Reference implementation
+strip_code_blocks() {
+  # W7 review finding: do NOT strip 4-space-indented blocks. CommonMark
+  # only treats 4-space at *block start* as code, but this awk has no
+  # block-context sense and would also eat list-item continuations like
+  # "- top\n    - nested with [link](other.md)", causing false negatives
+  # in broken-link detection. Fenced (```) is the dominant style in this
+  # repo's pages anyway — fence stripping alone is sufficient.
+  awk '
+    BEGIN{infence=0}
+    /^```/ { infence = !infence; next }
+    !infence { print }
+  ' "$1"
+}
+
+for f in "$WIKI_ROOT/pages"/*.md; do
+  bn=$(basename "$f")
+  strip_code_blocks "$f" | grep -oE '\[([^]]+)\]\(([^)]+\.md)\)' | while read match; do
+    tgt=$(echo "$match" | sed -E 's/.*\(([^)]+\.md)\)/\1/')
+    [ ! -f "$WIKI_ROOT/pages/$tgt" ] && echo "[BROKEN] $bn → $tgt"
+  done
+done
+```
 
 **If `OBS_LIVE`**, supplement with Obsidian's unresolved link tracking:
 

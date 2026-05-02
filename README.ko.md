@@ -176,6 +176,8 @@ Obsidian 볼트 — 따라서 `wiki_root` — 가 iCloud Drive, Google Drive, Dr
 **클라우드 백엔드 볼트를 위한 권장 워크플로우:**
 
 1. **위키를 로컬 디스크에서 실행하세요.** 동기화되지 않는 경로(예: `~/deep-wiki-local/`)를 선택하고, `~/.claude/deep-wiki-config.yaml`의 `wiki_root`를 해당 경로로 지정합니다.
+
+   > **참고 (R3W3, v1.2.1+):** `wiki_root`가 `~/deep-wiki-local/`처럼 볼트 외부 로컬 경로로 지정되면, SessionStart hook은 `VAULT_ROOT=$(dirname "$WIKI_ROOT")`을 계산하여 *그 경로*(즉, `$HOME`)를 감시합니다 — Obsidian 볼트가 아닙니다. 그 결과 무관한 auto-ingest 후보가 다수 발생합니다. 로컬 미러 구성에서는 auto-ingest hook을 비활성화하거나(`~/.claude/settings.json`에서) `auto_ingest.ignore_globs: ['**']`로 단락시켜야 합니다. 이 모드에서는 볼트→로컬 역방향 rsync가 hook 기반 감지를 대체합니다. 미래 v1.3.0+에 `vault_root:` 설정 키가 추가되면 `wiki_root`는 로컬에 두면서 hook은 볼트 경로를 명시적으로 감시할 수 있습니다.
 2. **스케줄에 따라 볼트로 미러링하세요.** launchd (macOS) 또는 cron을 통해 `rsync`를 사용하여 10-30분마다 로컬 위키를 볼트로 푸시합니다. **추가 sync만 사용하세요 — `--delete`는 의도적으로 제외됩니다**:
    ```bash
    # Additive only. The plugin currently has no external-edit conflict
@@ -191,7 +193,9 @@ Obsidian 볼트 — 따라서 `wiki_root` — 가 iCloud Drive, Google Drive, Dr
    ```bash
    rsync -a "$HOME/Library/CloudStorage/.../deep-wiki/" ~/deep-wiki-local/
    ```
-   또는 `~/.claude/deep-wiki-config.yaml`에서 `auto_ingest:` 블록을 제거하여 자동 ingest를 일시적으로 중지할 수 있습니다.
+   auto-ingest를 일시 중지하고 싶다면 주의: `~/.claude/deep-wiki-config.yaml`에서 `auto_ingest:` 블록을 제거하는 것은 일시 중지가 **아닙니다** (v1.1.x 기본 동작인 전체 볼트 감지로 회귀하므로 오히려 *더* 공격적입니다). 올바른 방법은 다음 중 하나입니다:
+   - `auto_ingest.ignore_globs: ['**']`을 설정해 모든 감지를 단락시키거나, OR
+   - `~/.claude/settings.json`에서 deep-wiki SessionStart hook을 비활성화하세요.
 
 **왜 플러그인에서 자동화하지 않나요?** 이를 투명하게 처리하는 `cache_local` 설정 옵션은 v1.3.0+에서 계획되어 있습니다. 로컬 편집과 rsync 푸시 사이의 경쟁 창(race window) 트레이드오프는 암묵적 동작보다 명시적 설정 옵션이 적합합니다. v1.2.0은 수동 워크플로우를 문서화하고 지연 관련 관찰 사항만 제공합니다.
 

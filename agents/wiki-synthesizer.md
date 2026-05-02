@@ -43,7 +43,16 @@ Read sources, decide create-vs-update for each topic, write pages under `<wiki_r
 
 7. **Version before overwrite** — Before overwriting an existing page in `pages/`, copy its current content to `.wiki-meta/.versions/<page-name>.v<N>.md`, where `<N>` is the **maximum** existing `v<N>` for that page plus one. To find the current max, use `Glob "<wiki_root>/.wiki-meta/.versions/<page-name>.v*.md"` and parse the numeric suffix; do NOT rely on lexicographic order (Glob returns `v10` before `v2`). If no prior version exists, start at `v1`. Do NOT prune — the calling command handles retention. On partial failure (backup succeeded but page write failed), the orphan backup is harmless: `pages/<name>.md` is still its pre-backup state, so the next successful overwrite simply produces another identical snapshot, and auto-lint's last-3 retention prunes duplicates. Include the backup path in `versioned` only for entries that end up in `updated`; if the page write ends up in `failed`, move the corresponding backup path into the `failed` entry's `orphan_version` field (see Output contract).
 
+   **(Worker-mode exception, v1.3.0+):** when `mode: "worker"`, do NOT version
+   or backup any page. Main session performs all version backups under the
+   global lock during Phase 3 of the A4 fanout flow. Set `merge_against` in the
+   draft so main knows which page to back up.
+
 8. **Write scope** — Write only under `<wiki_root>/pages/` and `<wiki_root>/.wiki-meta/.versions/`. Do NOT modify `index.json`, `log.jsonl`, `log.md`, `index.md`, `sources/*.yaml`, or any lock file. The calling command handles all of those.
+
+   **(Worker-mode exception, v1.3.0+):** when `mode: "worker"`, write NOTHING
+   under `<wiki_root>/` — not pages, not backups, not anything. Return drafts
+   to main via the worker output contract; main performs all writes under lock.
 
 ## Performance guidance — parallel tool dispatch
 
@@ -73,6 +82,7 @@ The calling command passes:
   - `origin` — URL (for `type: url`), absolute file path (for `type: file`, `type: deep-work-report`, or `type: text`), never inline content. For pasted text, the caller writes the text to `<wiki_root>/.wiki-meta/.inbox/<slug>.txt` and passes that path as `origin` — the agent reads it with `Read` just like any other file. The caller deletes the inbox file after the agent returns (success or failure).
   - `type` — `url` | `file` | `text` | `deep-work-report`
 - `candidates` — list of candidate descriptors. Each descriptor: `{file, title, tags, aliases}`. The caller pre-filters from `index.json` title/alias/tag matching and (when available) Obsidian search; descriptors include enough metadata for Phase 1a skim without re-reading `index.json`. A hint only — see Rule 5.
+- `mode` — `"inline"` (default) or `"worker"`. In `"inline"` mode (current behavior, single-source / single-agent fast path), the agent reads sources, decides actions, AND writes pages + version backups directly. In `"worker"` mode (multi-source A4 fanout, v1.3.0+), the agent reads sources and decides actions but DOES NOT write any files; instead it returns drafts as structured output for the main session to aggregate + write under the global lock. The caller specifies `mode` per invocation. Default is `"inline"` for backward compatibility.
 
 The agent is responsible for:
 1. Reading source content (use `WebFetch` for `type: url`, `Read` for all other types).
@@ -131,6 +141,145 @@ Return a single JSON object as your final message (no prose around it):
 - `failed` — pages the agent intended to write but could not. If the agent versioned a backup for a page whose write then failed, include the backup path in `orphan_version` so the caller can surface it in the report (auto-lint's retention prune will remove it). If non-empty, the caller treats the ingest as partial.
 
 A filename appears in `created` XOR `updated`, never both (and never also in `failed`). The caller cross-references against its own pre-batch snapshot of `pages/` — if the agent claims `created` for a file that existed, the caller reclassifies it as `updated` and logs a warning. The caller also verifies each `file` in `created ∪ updated` actually exists on disk after the agent returns; missing files are moved to `failed` with reason `"agent reported written but file not present"`.
+
+## Worker mode (v1.3.0+, A4 fanout Approach B)
+
+**Plan #2.1 extension (Cycle-2 C2V-1):** worker mode now also accepts an
+optional `colliding_drafts` input field for the second-pass synthesis
+case. When `colliding_drafts` is non-empty, the worker's responsibility
+shifts: it merges the conflicting page bodies (plus any existing wiki
+candidate) into ONE merged draft. See "Worker mode — second-pass merge
+input (Plan #2.1)" subsection below for the full contract.
+
+When `mode: "worker"`, the agent's responsibility narrows:
+
+1. Read source content (Phase 0 in parallel-tool-dispatch guidance, unchanged).
+2. Read candidate pages, widening via Glob/Grep when Rule 5 applies (Phases 1a/1b/1c, unchanged).
+3. Decide per topic: create / update / skip — same logic as inline mode.
+4. **DO NOT** version any page (Rule 7 deferred to main).
+5. **DO NOT** write any page or backup (Rule 8 strengthened: in worker mode the
+   agent writes NOTHING under `<wiki_root>/` — main session owns ALL file I/O).
+6. Return a `worker_drafts` JSON object instead of the inline-mode shape (see
+   Worker output contract below).
+
+### Why worker mode (rationale)
+
+Multi-source ingest's dominant cost is LLM analysis (minutes per source).
+Splitting that cost across N parallel workers gives ~N× wall-clock speedup
+in the analysis phase. File I/O (sub-second per page) and B5
+dual-classification ledger management are kept on the main session, where
+the existing single mkdir-based lock guarantees atomicity and v1.2.1's B5
+invariants are trivially preserved (no cross-worker race window).
+
+### Worker output contract
+
+In worker mode, return a JSON object with this shape (NO inline-mode fields
+like `versioned`, `failed.orphan_version` — main handles them post-aggregation):
+
+```json
+{
+  "mode": "worker",
+  "drafts": [
+    {
+      "source_slug": "slug-a",
+      "proposed_action": "create" | "update" | "skip",
+      "proposed_file": "kebab-case.md",
+      "proposed_title": "Page Title",
+      "proposed_tags": ["tag1", "tag2"],
+      "proposed_aliases": ["alt"],
+      "page_content": "<full markdown body if action=create|update, else null>",
+      "skip_reason": "<short string; only set when proposed_action == \"skip\", else null>",
+      "merge_against": "existing-page.md or null (only set when action=update)",
+      "rule_5_widened": true | false
+    }
+  ],
+  "source_hashes": {
+    "slug-a": "<sha256 hex or sentinel>"
+  }
+}
+```
+
+- `mode` — literal string `"worker"`, lets the caller defensively assert.
+- `drafts` — array of per-(source, decided-page) entries. A single source
+  producing multiple pages emits multiple drafts with the same `source_slug`.
+- `proposed_action` — `create` for genuinely new, `update` for merge against
+  existing wiki page, `skip` if no new info justifies a write.
+- `proposed_file` — agent's slug proposal (kebab-case + `.md`). Main may
+  override at aggregation if a cross-worker B5 collision is detected.
+- `page_content` — full markdown body the agent would have written, INCLUDING
+  the standard frontmatter (Rule 2). Main writes this verbatim during Phase 3.
+  Set to `null` when `proposed_action == "skip"`.
+- `merge_against` — when `proposed_action == "update"`, the existing page
+  basename the agent merged against (so main can perform the version backup
+  from main session under lock). `null` for `create` and `skip`.
+- `skip_reason` — short human-readable string explaining why the worker chose
+  `proposed_action == "skip"` (e.g., `"source bytes hash matches existing
+  yaml content_hash"`, `"URL returned 404"`, `"no new information beyond
+  existing wiki coverage"`). Main surfaces this in the per-source summary for
+  user visibility. Set ONLY when `proposed_action == "skip"`; null/missing
+  for `create` and `update`. (Cycle-1 W4 fix: was referenced in prose but
+  missing from JSON contract.)
+- `rule_5_widened` — true if the agent ran Rule 5 widening (Glob/Grep beyond
+  candidates). Useful for telemetry; main may log this for cycle-3 diagnostics.
+
+### Worker mode constraints (must)
+
+- **No writes**: zero filesystem mutations under `<wiki_root>/`. Worker must
+  not Write, not even to `.wiki-meta/.versions/`.
+- **No log appends**: zero touches to `log.jsonl`, `log.md`, `index.md`,
+  `index.json`, or `sources/*.yaml`.
+- **No lock acquisition**: worker never tries to mkdir
+  `.wiki-meta/.wiki-lock`. Main owns the lock.
+- **Idempotent on re-invocation**: worker must produce identical output on
+  identical inputs (no internal state outside the LLM context).
+
+If a worker detects an unrecoverable error (e.g., a source URL 404), it
+returns the corresponding draft with `proposed_action: "skip"` and includes
+a `skip_reason` field in that draft for main's summary.
+
+### Worker mode — second-pass merge input (Plan #2.1, Cycle-2 C2V-1)
+
+When invoked for a cross-worker collision second-pass merge, the input
+descriptor includes an additional optional field:
+
+```json
+{
+  "mode": "worker",
+  "wiki_root": "<absolute path>",
+  "sources": [<union of contributing source descriptors>],
+  "candidates": [<existing wiki page if action=update, else []>],
+  "colliding_drafts": [
+    {"source_slug": "a", "page_content": "<body from worker A>"},
+    {"source_slug": "b", "page_content": "<body from worker B>"}
+  ]
+}
+```
+
+When `colliding_drafts` is present (non-empty), the worker:
+
+1. Reads `sources` (the union of all sources whose drafts collided).
+2. Reads `candidates` (the existing wiki page, if any — for update case).
+3. Reads `colliding_drafts` (the conflicting page bodies produced
+   independently by the parallel workers in Phase 1).
+4. Synthesizes ONE merged `page_content` that:
+   - Honors v1.2.1 multi-source merge semantics (Rule 6 conflict
+     notation when sources disagree on a fact).
+   - Cross-references all contributing sources in the body (one
+     coherent narrative, not a concatenation of N drafts).
+   - Includes the standard frontmatter (Rule 2) with `sources:` array
+     listing all contributing source_slugs (sorted lexicographically
+     per W12).
+5. Returns ONE draft via the standard worker output contract — same
+   shape as the regular worker output, just with `drafts` array of
+   length 1.
+
+**Worker mode constraints still apply:** NO writes, NO log appends,
+NO lock acquisition. Main writes the merged content during Phase 3
+under the already-held lock.
+
+**When `colliding_drafts` is absent or empty** (the normal case), worker
+behavior is unchanged from earlier Plan #2 spec — Phase 0 source read +
+Phase 1 candidate analysis + per-source create/update/skip drafts.
 
 ## Examples
 
@@ -201,5 +350,49 @@ Output:
   "created": [], "updated": [], "versioned": [],
   "source_hashes": {"doc-v2":"main-computes"},
   "failed": [{"file":"flaky-topic.md","reason":"write permission denied","orphan_version":".wiki-meta/.versions/flaky-topic.v5.md"}]
+}
+</example>
+
+<example>
+Context: Worker mode invocation as part of A4 fanout (v1.3.0+). Two sources
+assigned to this worker; one creates a new page, one updates an existing.
+Input: mode="worker", sources=[
+  {slug:"vault-note-a", origin:"/vault/note-a.md", type:"file"},
+  {slug:"vault-note-b", origin:"/vault/note-b.md", type:"file"}
+], candidates=[{file:"existing-topic.md", title:"Existing Topic", tags:[], aliases:[]}]
+Agent: Read both sources in parallel. Read candidate. note-b matches existing-topic
+(update). note-a is a new topic with no overlap (create). NO file writes performed
+— only returns drafts. NO version backup performed (main does it under lock).
+Output:
+{
+  "mode": "worker",
+  "drafts": [
+    {
+      "source_slug": "vault-note-a",
+      "proposed_action": "create",
+      "proposed_file": "new-topic-from-a.md",
+      "proposed_title": "New Topic From A",
+      "proposed_tags": ["vault"],
+      "proposed_aliases": [],
+      "page_content": "---\ntitle: New Topic From A\nsources: [vault-note-a]\ntags: [vault]\naliases: []\n---\n\n# New Topic From A\n\n... grounded body ...",
+      "merge_against": null,
+      "rule_5_widened": false
+    },
+    {
+      "source_slug": "vault-note-b",
+      "proposed_action": "update",
+      "proposed_file": "existing-topic.md",
+      "proposed_title": "Existing Topic",
+      "proposed_tags": [],
+      "proposed_aliases": [],
+      "page_content": "---\ntitle: Existing Topic\nsources: [old-source, vault-note-b]\ntags: []\naliases: []\n---\n\n# Existing Topic\n\n... merged body ...",
+      "merge_against": "existing-topic.md",
+      "rule_5_widened": false
+    }
+  ],
+  "source_hashes": {
+    "vault-note-a": "main-computes",
+    "vault-note-b": "main-computes"
+  }
 }
 </example>

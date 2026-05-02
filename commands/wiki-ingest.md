@@ -40,6 +40,99 @@ Determine the source type from the argument **without reading file bodies or fet
 
 **(v1.2.0+) Derive `slug` for every source at end of Step 1** (IW4 review fix — formerly Step 5's responsibility, moved here so Step 1.5's hash-skip can locate `<wiki>/.wiki-meta/sources/<slug>.yaml`). Apply Step 5's algorithm now: URL → `karpathy-llm-wiki-gist`-style kebab from the URL slug; file path → kebab from `basename` minus `.md`; deep-work session → `deep-work-session-<YYYY-MM-DD>`. Each tuple in `$SOURCES` MUST carry `{slug, origin, type}` (or your equivalent encoding) by the time Step 1.5 runs. Step 5 is now a no-op for sources already carrying a `slug` (kept in the spec only for backward-readability with v1.1.x docs).
 
+> **Slug collision (R3W1 review fix, v1.2.1+):** the kebab algorithm above derives the slug from `basename` for files. Two distinct sources whose paths share a basename (`/A/foo.md` and `/B/foo.md`) produce the same slug. Without disambiguation, Step 1.5's hash-skip lookup would consult the **other** source's yaml (a coincidental bytes-hash match would silently cross-attribute provenance), AND — critically — a fresh batch where neither source has been ingested before would write the same `sources/<slug>.yaml` twice and emit collapsed log lines. Resolve at slug-derivation time with an allocator that tracks BOTH the in-batch claim ledger AND the on-disk yamls.
+
+```bash
+# Slug allocator (CR-A v1.2.1+ — closes the same-batch fresh-collision gap that
+# the on-disk-only check missed). For each source:
+#   1. If another in-batch source already claimed this exact (slug, origin) pair,
+#      re-use it (same source appearing twice in one batch — degenerate, no-op).
+#   2. If another in-batch source already claimed this slug for a DIFFERENT origin,
+#      bump to <slug>-2, <slug>-3, ... until both the in-batch claim ledger AND
+#      the on-disk yaml (if any) are clear or origin-match.
+#   3. If on-disk yaml exists for the candidate slug with a different origin
+#      (rotation across sessions), bump similarly.
+#   4. Record the final (slug, origin) in CLAIMED_SLUGS so subsequent sources
+#      in this batch see the claim.
+# Bash 3.2-safe: newline-delimited string ledger (no associative arrays).
+CLAIMED_SLUGS=""        # newline-delimited "slug|origin" entries claimed in this batch
+NEW_SOURCES=()
+for src in "${SOURCES[@]}"; do
+  slug="${src%%|*}"; origin_and_rest="${src#*|}"
+  origin="${origin_and_rest%|*}"; type="${origin_and_rest##*|}"
+
+  while true; do
+    # 1. In-batch ledger check
+    in_batch_match=false
+    in_batch_collision=false
+    if [ -n "$CLAIMED_SLUGS" ]; then
+      while IFS='|' read -r claimed_slug claimed_origin; do
+        [ -z "$claimed_slug" ] && continue
+        if [ "$claimed_slug" = "$slug" ]; then
+          if [ "$claimed_origin" = "$origin" ]; then
+            in_batch_match=true       # same source repeated — keep slug
+          else
+            in_batch_collision=true   # different origin claimed it — bump
+          fi
+          break
+        fi
+      done <<EOF_LEDGER
+$CLAIMED_SLUGS
+EOF_LEDGER
+    fi
+    $in_batch_match && break  # done — same source already claimed
+
+    # 2. On-disk yaml check (single-quote-aware strip mirrors RW4 below)
+    on_disk_collision=false
+    yaml="$WIKI_ROOT/.wiki-meta/sources/${slug}.yaml"
+    if [ -f "$yaml" ]; then
+      prev_origin=$(grep '^origin:' "$yaml" \
+        | sed -E 's/^origin:[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/' \
+        | sed -E "s/^'([^']*)'\$/\\1/")
+      if [ -n "$prev_origin" ] && [ "$prev_origin" != "$origin" ]; then
+        on_disk_collision=true
+      fi
+    fi
+
+    if ! $in_batch_collision && ! $on_disk_collision; then
+      break  # slug is clear (no claim conflict, no yaml conflict)
+    fi
+
+    # 3. Bump: increment trailing -N suffix or append -2.
+    if [[ "$slug" =~ ^(.+)-([0-9]+)$ ]]; then
+      base="${BASH_REMATCH[1]}"; n="${BASH_REMATCH[2]}"
+      slug="${base}-$((n + 1))"
+    else
+      slug="${slug}-2"
+    fi
+    [ ${#slug} -gt 200 ] && {
+      echo "ERROR: slug allocator exceeded 200 chars (pathological collision); aborting." >&2
+      exit 1
+    }
+  done
+
+  CLAIMED_SLUGS="$CLAIMED_SLUGS"$'\n'"${slug}|${origin}"
+  # W2-δ v1.2.1+: skip NEW_SOURCES append when the same (slug, origin) pair
+  # was already claimed in this batch (degenerate same-source-twice case —
+  # e.g., `/wiki-ingest fileA.md fileA.md`). Without this skip, Step 1.5 would
+  # process the same source twice, producing one `ingest` and one `ingest-skip`
+  # log line for the same (slug, ts) — operational noise. The `$in_batch_match`
+  # flag is true only when the ledger had a pre-existing entry with matching
+  # origin; the non-matching-origin case (true collision) sets `in_batch_collision`
+  # and bumps the slug, so this `continue` does not affect that path.
+  $in_batch_match && continue
+  NEW_SOURCES+=("${slug}|${origin}|${type}")
+done
+SOURCES=("${NEW_SOURCES[@]}")
+```
+
+Once the allocator runs, every source descriptor's `slug` is unique against (a) every other source claimed earlier in this same batch with a different origin, and (b) every existing on-disk per-source yaml whose origin differs. Step 1.5 then reads the correct yaml (or no yaml, if the disambiguator-slot is fresh) and performs hash-skip without cross-attribution risk. Re-ingest of a previously-disambiguated source (same origin → same yaml on disk) returns the same slug — idempotent.
+
+> **Allocator semantics notes (W2-γ + I1 v1.2.1+):**
+>
+> - **`exit 1` on 200-char overflow:** the safety cap aborts the entire `/wiki-ingest` invocation (bash `exit 1` from a sub-loop propagates to the calling spec context). The 200-char threshold is well above any realistic basename length; exceeding it implies adversarial input or a corrupt `.wiki-meta/sources/` directory. The user-facing error message is intentionally terse — `inspect <wiki>/.wiki-meta/sources/ for corruption and re-run` is the expected next step. If the spec ever needs softer fallback (e.g., truncate to `<base>-overflow`), revisit at v1.3.0+.
+> - **Order-dependence within first batch:** when two sources have natural slug-N collision (e.g., `/A/chapter-1.md` + `/B/chapter-1.md` both → `chapter-1`), the final slug assignment depends on iteration order — the second source bumps to `chapter-2`. Subsequent re-ingests in any order produce the same yaml layout because the on-disk yamls anchor each origin to its assigned slug. Idempotence is *across sessions*, not *across in-batch ordering*. Same trade-off as v1.1.x. No action required.
+
 Main does NOT fetch URL bodies or read source file contents at this step. It only classifies sources, derives slugs, and defers pasted-text materialization until after the lock is held.
 
 ### 1.5. Re-Ingest Hash Skip (v1.2.0+)
@@ -52,6 +145,8 @@ For each source identified in Step 1 with `type ∈ {file, deep-work-report}`, c
 # Pre-condition: each source descriptor already has a slug, computed at end of
 # Step 1 using Step 5's algorithm (NC1 fix). The encoding shown below is one
 # possible tuple serialization — adjust to your /wiki-ingest implementation.
+SKIPPED=()
+REPAIR=()
 for src in "${SOURCES[@]}"; do
   slug="${src%%|*}"             # 'slug|origin|type' tuple — set in Step 1
   origin="${src#*|}"; origin="${origin%|*}"
@@ -87,11 +182,29 @@ for src in "${SOURCES[@]}"; do
     # Check 1: every page this source has contributed to (pages_created ∪
     # pages_updated in the YAML) still exists in <wiki>/pages/.
     pages_in_yaml=$(awk '
+      /^pages_created:[[:space:]]*\[/ {
+        body=$0; sub(/^pages_created:[[:space:]]*\[/, "", body); sub(/\][[:space:]]*$/, "", body)
+        n = split(body, arr, ",")
+        for (i = 1; i <= n; i++) {
+          gsub(/^[[:space:]"\x27]+|[[:space:]"\x27]+$/, "", arr[i])
+          if (arr[i] != "") print arr[i]
+        }
+        next
+      }
+      /^pages_updated:[[:space:]]*\[/ {
+        body=$0; sub(/^pages_updated:[[:space:]]*\[/, "", body); sub(/\][[:space:]]*$/, "", body)
+        n = split(body, arr, ",")
+        for (i = 1; i <= n; i++) {
+          gsub(/^[[:space:]"\x27]+|[[:space:]"\x27]+$/, "", arr[i])
+          if (arr[i] != "") print arr[i]
+        }
+        next
+      }
       /^pages_created:[[:space:]]*$/ { in_list=1; next }
       /^pages_updated:[[:space:]]*$/ { in_list=1; next }
       /^[a-zA-Z]/ { in_list=0 }
       in_list && /^[[:space:]]+-[[:space:]]*/ {
-        v=$0; sub(/^[[:space:]]+-[[:space:]]*/, "", v); sub(/[[:space:]]+$/, "", v); gsub(/["]/, "", v); print v
+        v=$0; sub(/^[[:space:]]+-[[:space:]]*/, "", v); sub(/[[:space:]]+$/, "", v); gsub(/^["\x27]+|["\x27]+$/, "", v); print v
       }
     ' "$yaml" | sort -u)
     for page in $pages_in_yaml; do
@@ -107,7 +220,7 @@ for src in "${SOURCES[@]}"; do
         /^---[[:space:]]*$/ { fm++; if(fm==2) exit }
         fm==1 && /^sources:[[:space:]]*$/ { in_src=1; next }
         fm==1 && in_src && /^[[:space:]]+-[[:space:]]*/ {
-          v=$0; sub(/^[[:space:]]+-[[:space:]]*/, "", v); sub(/[[:space:]]+$/, "", v); gsub(/["]/, "", v)
+          v=$0; sub(/^[[:space:]]+-[[:space:]]*/, "", v); sub(/[[:space:]]+$/, "", v); gsub(/^["\x27]+|["\x27]+$/, "", v)
           if (v == slug) found=1
         }
         fm==1 && in_src && !/^[[:space:]]+-/ { in_src=0 }
@@ -119,22 +232,31 @@ for src in "${SOURCES[@]}"; do
       fi
     done
 
-    # Check 3: most recent log.jsonl entry for this slug must be a clean
-    # terminal action (ingest, ingest-skip, ingest-repair). Anything else
-    # (or absence) suggests a partial failure/interruption — re-ingest to
-    # close the gap rather than skip.
-    if $state_ok && [ -f "$WIKI_ROOT/log.jsonl" ]; then
-      last_action=$(grep -F "\"source\":\"$slug\"" "$WIKI_ROOT/log.jsonl" 2>/dev/null \
-        | tail -1 \
-        | sed -E 's/.*"action":"([^"]+)".*/\1/')
-      case "$last_action" in
-        ingest|ingest-skip|ingest-repair) ;;        # clean terminal
-        '') ;;                                      # no log entry (first ingest); allow skip
-        *)
-          state_ok=false
-          repair_reason="last-action-not-terminal:$last_action"
-          ;;
-      esac
+    # Check 3: log.jsonl must exist AND most recent entry for this slug must be
+    # a clean terminal action (ingest, ingest-skip, ingest-repair). Anything else,
+    # absence of log entry, or absence of log.jsonl entirely all indicate that the
+    # wiki state has drifted from what the per-source yaml claims — re-ingest as
+    # self-repair rather than skip. (R3W2 review fix, v1.2.1+)
+    if $state_ok; then
+      if [ ! -f "$WIKI_ROOT/log.jsonl" ]; then
+        state_ok=false
+        repair_reason="log-jsonl-missing"
+      else
+        last_action=$(grep -F "\"source\":\"$slug\"" "$WIKI_ROOT/log.jsonl" 2>/dev/null \
+          | tail -1 \
+          | sed -E 's/.*"action":"([^"]+)".*/\1/')
+        case "$last_action" in
+          ingest|ingest-skip|ingest-repair) ;;        # clean terminal — skip is safe
+          '')
+            state_ok=false
+            repair_reason="no-prior-terminal-log"
+            ;;
+          *)
+            state_ok=false
+            repair_reason="last-action-not-terminal:$last_action"
+            ;;
+        esac
+      fi
     fi
 
     if $state_ok; then
@@ -149,6 +271,8 @@ for src in "${SOURCES[@]}"; do
   fi
 done
 ```
+
+> **Note (W-α v1.2.1+, no-creation-traceability after R3W2 self-repair):** when R3W2 fires due to `log-jsonl-missing` or `no-prior-terminal-log`, the resulting `ingest-repair` line emits `pages_created:[]` per Step 10 R3C1 spec — the historical `ingest` line that originally classified those pages as `pages_created` is gone (log was truncated/lost), and the repair cycle does NOT synthesize a replacement. Going forward, those page filenames will not appear under any log line's `pages_created`. **This is acceptable** because (a) wiki-lint Step 6 LOG-INVARIANT only flags duplicates, not absences — the wiki stays clean; (b) per-source yaml is the authoritative provenance record, not the log — and yaml is verified intact by Checks 1+2 before reaching here; (c) the alternative (synthesize a new `ingest` line for vanished history) would lie about timing and is out of patch scope. If creation-traceability through the log matters for your workflow, restore log.jsonl from a backup before re-ingesting affected sources, or accept the gap.
 
 After filtering: if `SOURCES` is now empty (entirely skip-eligible — note: a `REPAIR` slug forces fall-through and means SOURCES is NOT empty), **briefly acquire the wiki lock (Step 3 protocol — `mkdir <wiki>/.wiki-meta/.wiki-lock` + trap)**, append **one `log.jsonl` line per skipped slug** using the canonical schema (NC2 review note — `wiki-lint` Step 1 reads `.ts` for "Last activity", Step 6 LOG-INVARIANT reads `.pages_created[]`; any new action MUST preserve `{ts, action, source, pages_created, pages_updated}` shape):
 

@@ -179,7 +179,7 @@ obsidian orphans 2>/dev/null
 
 For each markdown link `[text](target.md)` found in pages **outside fenced code blocks**, check if `target.md` exists in `pages/`. Report any broken links with the source page and target.
 
-**Code block exclusion (v1.2.1+):** Strip **fenced** code blocks (```...```) unconditionally, and strip **4-space- or tab-indented blocks** with block-context awareness (track blank/list/paragraph/indented-code state) so real multi-line indented code blocks are stripped while list-item continuations and paragraph lazy continuations are preserved. Inline backticks (\`code\`) are still not stripped because broken-link false-positives from inline code are rare and inline backticks can span partial lines. Post-2-blank-line code remains a documented limitation (DEFER to v1.3.0+). Tab-indent recognition added in v1.3.0.
+**Code block exclusion (v1.2.1+):** Strip **fenced** code blocks (```...```) unconditionally, and strip **4-space- or tab-indented blocks** with block-context awareness (track blank/list/paragraph/indented-code state) so real multi-line indented code blocks are stripped while list-item continuations and paragraph lazy continuations are preserved. Inline backticks (\`code\`) are still not stripped because broken-link false-positives from inline code are rare and inline backticks can span partial lines. Tab-indent recognition added in v1.3.0 (1.2). Post-list 2-blank-line list termination (CommonMark) added in v1.3.0 (1.3).
 
 ```bash
 # Reference implementation
@@ -190,30 +190,33 @@ strip_code_blocks() {
   # multi-line indented code blocks are stripped while list continuations and
   # paragraph lazy continuations are preserved. Fenced (```) is stripped
   # unconditionally. v1.3.0 (1.2) extended the indent rule to recognize
-  # tab-indent (\t) in addition to 4 spaces. Post-2-blank-line code remains
-  # a documented limitation — see in-function comment for v1.3.0+ candidates.
+  # tab-indent (\t) in addition to 4 spaces. v1.3.0 (1.3) added a blank_run
+  # counter so prev_was_list resets after 2 consecutive blank lines, matching
+  # the CommonMark rule that 2 blank lines terminate a list — closes the
+  # remaining post-list code-block false-negative.
   #
   # CR-C v1.2.1+: explicit in_indented_code state so 2nd+ lines of a multi-line
   # indented block are also stripped. Without this state, prev_blank=0 after
   # the first stripped line caused subsequent 4-space lines to fall into the
   # paragraph-lazy-continuation branch and leak into broken-link detection.
   #
-  # Known limitations (DEFER to v1.3.0+ — W-δ from cycle-1 review):
-  #   - prev_was_list does not reset after 2 consecutive blank lines.
-  #     CommonMark says 2 blank lines after a list ends the list, after which
-  #     a 4-space line becomes a code block. Current awk treats it as
-  #     list-continuation. False-negative; same direction as v1.2.0 baseline
-  #     so not a regression.
+  # All earlier deferred limitations (W-γ tab-indent, W-δ post-list 2-blank
+  # reset) are now closed in v1.3.0.
   awk '
-    BEGIN { infence=0; prev_was_list=0; prev_blank=1; in_indented_code=0 }
+    BEGIN { infence=0; prev_was_list=0; prev_blank=1; in_indented_code=0; blank_run=0 }
     /^```/ { infence = !infence; in_indented_code=0; next }
     infence { next }
     /^[[:space:]]*$/ {
+      # v1.3.0 (1.3): 2 consecutive blank lines terminate list context
+      # (CommonMark spec). After reset, a 4-space-indented line becomes a
+      # real code block, not a list continuation. Closes W-δ false-negative.
+      blank_run += 1
+      if (blank_run >= 2) prev_was_list = 0
       prev_blank=1; in_indented_code=0
       print; next
     }
     /^[[:space:]]*([-*+]|[0-9]+\.)[[:space:]]/ {
-      prev_was_list=1; prev_blank=0; in_indented_code=0
+      prev_was_list=1; prev_blank=0; in_indented_code=0; blank_run=0
       print; next
     }
     /^(    |\t)/ {
@@ -222,19 +225,19 @@ strip_code_blocks() {
       # broken-link detection inside tab-indented code blocks.
       if (in_indented_code) {
         # continuation of an already-open indented code block — strip
-        prev_blank=0; next
+        prev_blank=0; blank_run=0; next
       }
       if (prev_was_list || !prev_blank) {
         # list continuation OR paragraph lazy continuation — keep
-        prev_blank=0; print; next
+        prev_blank=0; blank_run=0; print; next
       }
       # start of an indented code block (after blank, no list context) — strip
-      in_indented_code=1; prev_blank=0; next
+      in_indented_code=1; prev_blank=0; blank_run=0; next
     }
     {
       # any other line — paragraph; if non-indented it breaks list/code context
       if ($0 !~ /^[[:space:]]/) { prev_was_list=0; in_indented_code=0 }
-      prev_blank=0; print
+      prev_blank=0; blank_run=0; print
     }
   ' "$1"
 }

@@ -149,21 +149,64 @@ obsidian orphans 2>/dev/null
 
 For each markdown link `[text](target.md)` found in pages **outside fenced code blocks**, check if `target.md` exists in `pages/`. Report any broken links with the source page and target.
 
-**Code block exclusion (v1.2.0+):** Strip **fenced** code blocks (```...```) before grep'ing for links. **4-space-indented blocks are NOT stripped** (NW3 review note — CommonMark treats 4-space inside lists as item-continuation, and unconditional stripping would silently swallow valid links inside list items). Inline backticks (\`code\`) are also not stripped because broken-link false-positives from inline code are rare and inline backticks can span partial lines.
+**Code block exclusion (v1.2.1+):** Strip **fenced** code blocks (```...```) unconditionally, and strip **4-space-indented blocks** with block-context awareness (track blank/list/paragraph/indented-code state) so real multi-line indented code blocks are stripped while list-item continuations and paragraph lazy continuations are preserved. Inline backticks (\`code\`) are still not stripped because broken-link false-positives from inline code are rare and inline backticks can span partial lines. Tab-indented code and post-2-blank-line code remain documented limitations (DEFER to v1.3.0+).
 
 ```bash
 # Reference implementation
 strip_code_blocks() {
-  # W7 review finding: do NOT strip 4-space-indented blocks. CommonMark
-  # only treats 4-space at *block start* as code, but this awk has no
-  # block-context sense and would also eat list-item continuations like
-  # "- top\n    - nested with [link](other.md)", causing false negatives
-  # in broken-link detection. Fenced (```) is the dominant style in this
-  # repo's pages anyway — fence stripping alone is sufficient.
+  # W7 review fix (v1.2.1+): the v1.2.0 NW3 deferral kept 4-space blocks
+  # entirely intact to avoid false-negatives on list continuations. v1.2.1
+  # tracks block context (blank / list / paragraph / indented-code) so real
+  # multi-line indented code blocks are stripped while list continuations and
+  # paragraph lazy continuations are preserved. Fenced (```) is stripped
+  # unconditionally. Tab-indented code and post-2-blank-line code are
+  # documented limitations — see in-function comment for v1.3.0+ candidates.
+  #
+  # CR-C v1.2.1+: explicit in_indented_code state so 2nd+ lines of a multi-line
+  # indented block are also stripped. Without this state, prev_blank=0 after
+  # the first stripped line caused subsequent 4-space lines to fall into the
+  # paragraph-lazy-continuation branch and leak into broken-link detection.
+  #
+  # Known limitations (DEFER to v1.3.0+ — W-γ, W-δ from cycle-1 review):
+  #   - Tab-indented code blocks (`\t` at line start) are NOT stripped.
+  #     Only 4-space indents trigger code-block detection. CommonMark also
+  #     accepts tabs; tab support requires regex extension and an additional
+  #     sandbox case. Real-world wiki pages don't use tabs (Markdown style
+  #     guides discourage them); the tab false-negative is rare.
+  #   - prev_was_list does not reset after 2 consecutive blank lines.
+  #     CommonMark says 2 blank lines after a list ends the list, after which
+  #     a 4-space line becomes a code block. Current awk treats it as
+  #     list-continuation. False-negative; same direction as v1.2.0 baseline
+  #     so not a regression.
   awk '
-    BEGIN{infence=0}
-    /^```/ { infence = !infence; next }
-    !infence { print }
+    BEGIN { infence=0; prev_was_list=0; prev_blank=1; in_indented_code=0 }
+    /^```/ { infence = !infence; in_indented_code=0; next }
+    infence { next }
+    /^[[:space:]]*$/ {
+      prev_blank=1; in_indented_code=0
+      print; next
+    }
+    /^[[:space:]]*([-*+]|[0-9]+\.)[[:space:]]/ {
+      prev_was_list=1; prev_blank=0; in_indented_code=0
+      print; next
+    }
+    /^    / {
+      if (in_indented_code) {
+        # continuation of an already-open indented code block — strip
+        prev_blank=0; next
+      }
+      if (prev_was_list || !prev_blank) {
+        # list continuation OR paragraph lazy continuation — keep
+        prev_blank=0; print; next
+      }
+      # start of an indented code block (after blank, no list context) — strip
+      in_indented_code=1; prev_blank=0; next
+    }
+    {
+      # any other line — paragraph; if non-indented it breaks list/code context
+      if ($0 !~ /^[[:space:]]/) { prev_was_list=0; in_indented_code=0 }
+      prev_blank=0; print
+    }
   ' "$1"
 }
 
@@ -171,6 +214,11 @@ for f in "$WIKI_ROOT/pages"/*.md; do
   bn=$(basename "$f")
   strip_code_blocks "$f" | grep -oE '\[([^]]+)\]\(([^)]+\.md)\)' | while read match; do
     tgt=$(echo "$match" | sed -E 's/.*\(([^)]+\.md)\)/\1/')
+    # T10 review fix (v1.2.1+): external URLs ending in .md (e.g. GitHub gist
+    # raw URL) are not local wiki links — skip the existence check.
+    case "$tgt" in
+      http://*|https://*) continue ;;
+    esac
     [ ! -f "$WIKI_ROOT/pages/$tgt" ] && echo "[BROKEN] $bn → $tgt"
   done
 done

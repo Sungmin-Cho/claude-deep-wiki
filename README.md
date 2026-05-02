@@ -176,6 +176,8 @@ If your Obsidian vault — and therefore `wiki_root` — lives on iCloud Drive, 
 **Recommended workflow for cloud-backed vaults:**
 
 1. **Run the wiki on local disk.** Choose a non-synced path, e.g. `~/deep-wiki-local/`, and point `wiki_root` there in `~/.claude/deep-wiki-config.yaml`.
+
+   > **Note (R3W3, v1.2.1+):** when `wiki_root` is set to a non-vault local path like `~/deep-wiki-local/`, the SessionStart hook computes `VAULT_ROOT=$(dirname "$WIKI_ROOT")` and watches *that* directory — i.e. `$HOME` — rather than your Obsidian vault. This produces noisy, irrelevant auto-ingest candidates. In the local-mirror configuration the auto-ingest hook should be either disabled (in `~/.claude/settings.json`) or short-circuited via `auto_ingest.ignore_globs: ['**']`. The reverse-rsync from the vault into local replaces hook-driven detection in this mode. A future v1.3.0+ `vault_root:` config knob will let the hook target the vault path explicitly while `wiki_root` stays local.
 2. **Mirror to the vault on a schedule.** Use `rsync` from launchd (macOS) or cron to push the local wiki into the vault every 10-30 minutes. **Use additive sync only — `--delete` is INTENTIONALLY OMITTED**:
    ```bash
    # Additive only. The plugin currently has no external-edit conflict
@@ -191,7 +193,14 @@ If your Obsidian vault — and therefore `wiki_root` — lives on iCloud Drive, 
    ```bash
    rsync -a "$HOME/Library/CloudStorage/.../deep-wiki/" ~/deep-wiki-local/
    ```
-   Or pause auto-ingest temporarily by removing the `auto_ingest:` block from `~/.claude/deep-wiki-config.yaml`.
+   Or pause auto-ingest temporarily — removing the `auto_ingest:` block in `~/.claude/deep-wiki-config.yaml` does **not** pause it (that returns to v1.1.x whole-vault detection, which is *more* aggressive). Instead, either:
+   - Add the following block to `~/.claude/deep-wiki-config.yaml` (the SessionStart hook only parses the **block-form YAML** below — `auto_ingest.ignore_globs: ['**']` inline syntax is **silently ignored** by the hook parser):
+     ```yaml
+     auto_ingest:
+       ignore_globs:
+         - "**"
+     ```
+   - OR disable the deep-wiki SessionStart hook in `~/.claude/settings.json`.
 
 **Why not automate this in the plugin?** The `cache_local` config option that does this transparently is planned for v1.3.0+. The trade-off (race window between local edit and rsync push) deserves a deliberate config knob rather than implicit behavior. v1.2.0 documents the manual workflow and ships only the latency-related observations.
 

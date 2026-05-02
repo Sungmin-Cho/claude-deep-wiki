@@ -2,13 +2,59 @@
 
 deep-wiki의 주요 변경사항을 기록합니다.
 
+## [1.2.1] — 2026-05-02
+
+v1.2.0 review-cycle 백로그를 마무리하는 패치 릴리스. 네 축에 걸친 14개 이슈: Step 1.5 hash-skip 무결성 강화, wiki-lint false positive 제거, per-source provenance 보존, README cloud-mirror 문서 정확성. happy path 동작 변경 없음 — 모든 수정은 더 엄격한 invariant 검사 또는 문서/파서 정정.
+
+### 해시 스킵 무결성 (Step 1.5 hardening)
+
+- **R3W1 — 슬러그 충돌 disambiguation**: 두 file 소스가 basename을 공유할 때 (`/A/foo.md`와 `/B/foo.md`가 둘 다 → 슬러그 `foo`), Step 1 끝의 새 disambiguation 단계가 origin이 일치하는 다음 사용 가능한 `foo-N`을 선택 (또는 새 `foo-N` 슬롯). 우연한 bytes-hash 일치 시 발생하는 silent cross-attribution 위험을 차단.
+- **R3W2 — 로그 신호 부재 시 강제 repair**: Step 1.5는 이제 (a) `log.jsonl`이 완전히 없거나, (b) yaml은 있지만 슬러그의 terminal 로그 항목이 없는 경우 (`last_action=''`) `ingest-repair`를 트리거합니다. 두 경우 모두 skip이 아닌 재-ingest를 요구하는 state drift를 의미합니다. **주의 (W-α v1.2.1+):** 로그 부재/truncation으로 인해 R3W2가 발동되면 결과 `ingest-repair` 라인은 spec에 따라 `pages_created:[]`을 emit합니다 — 그 페이지들의 historical 생성 기록은 사라지고 합성되지 않습니다. wiki-lint Step 6 LOG-INVARIANT은 중복만 검사하므로 위키는 clean하게 유지되지만, log 기반 audit 재구성은 log-truncated repair 케이스에서 불완전합니다. Per-source yaml(Checks 1+2로 검증됨)이 authoritative provenance record로 남습니다. 완전한 log 기반 traceability를 보존하려면 영향받은 source를 다시 ingest하기 전에 log.jsonl을 백업에서 복원하세요.
+- **RW3 — 인라인 리스트 yaml 파서**: Check 1 awk가 이제 block-list 형태에 더해 `pages_created: [a.md, b.md]`도 수용합니다. 미래 Step 8e 변형에 대한 defense-in-depth.
+- **RW4 — Single-quote yaml strip**: Check 1과 Check 2가 모두 이제 v1.2.0 IW1의 wiki-lint fix와 동일한 `gsub(/^["\x27]+|["\x27]+$/, "", v)` 패턴을 사용합니다.
+- **RW7 — 명시적 배열 초기화**: Step 1.5 scan loop 상단에서 `SKIPPED=()`와 `REPAIR=()`을 `set -u` 청결성을 위해 명시적으로 초기화합니다.
+
+### 위키-린트 거짓 양성 제거
+
+- **T10 — http(s):// 타겟을 broken-link 검사에서 제외**: `.md`로 끝나는 외부 URL (예: GitHub gist raw URL)이 더 이상 `[BROKEN]`을 발생시키지 않습니다. v1.2.0 dogfood에서 관찰된 5개의 false positive를 차단.
+- **W7 — Block-context-aware 4-space code-block strip**: `strip_code_blocks()`가 이제 진짜 CommonMark indented code block (blank line 뒤의 4-space, list item 하위가 아닌)을 list continuation 및 paragraph lazy continuation과 구분합니다. 진짜 코드는 strip되고 (multi-line은 `in_indented_code` state로, CR-C v1.2.1+); continuation은 보존되어 list item 내부의 링크가 broken-link 감지의 대상이 됩니다. Tab-indented code와 post-2-blank-line code는 문서화된 한계로 남습니다 (v1.3.0+ 후보).
+
+### Per-source provenance
+
+- **B5 — 동일 배치 co-create attribution 보존**: 한 배치에서 두 소스가 독립적으로 같은 페이지를 생성하면, 두 contributing 슬러그의 yaml 모두 그 페이지를 `pages_created`에 기록합니다 (per-source truth). Step 10의 로그 emission은 여전히 intra-batch dedup을 적용하므로 log invariant (각 파일명이 로그 라인 전체에서 `pages_created`에 최대 한 번)은 유지됩니다. Length-guarded snapshot init (CR-B v1.2.1+)이 bash 3.2.57에서 1-element-empty-string을 생성하던 깨진 `("${ARR[@]:-}")` 패턴을 대체합니다. Step 10 prose가 post-dedup 배열을 명시적으로 참조하도록 갱신됨 (CR-D v1.2.1+). v1.2.0 W6의 trade-off를 차단.
+
+### 문서 정확성
+
+- **R3W3 — Cloud-mirror VAULT_ROOT 안내**: README A5가 이제 `wiki_root`를 vault 외부 로컬 경로로 옮기면 SessionStart hook이 `$HOME`을 watch하게 됨을 (since `VAULT_ROOT=$(dirname "$WIKI_ROOT")`) 경고합니다. 이 모드에서는 hook 비활성화 또는 `ignore_globs: ['**']`을 권장합니다. `vault_root:` config knob은 v1.3.0+ 추적.
+- **R3W4 — auto_ingest pause 안내 정정**: `auto_ingest:` 블록 제거는 auto-ingest를 중지하지 **않습니다** (v1.1.x whole-vault default로 회귀하여 *더* 공격적). 정정: `ignore_globs: ['**']` 설정 또는 SessionStart hook 비활성화.
+
+### 스펙 다듬기
+
+- **RW2 — Step 10 SKIPPED/REPAIR drain 안내**: Step 10 prose에 명시적 forward-pointer를 추가하여 암묵적인 Step 1.5 → Step 10 drain이 blockquote을 추적하지 않고도 보이도록 합니다.
+- **RW5 — Hook 50-line frontmatter guard 재배치 + line-1 opening guard**: `^---$` 규칙이 이제 line counter보다 앞서므로 50 라인 이후의 closing `---` (Templater plugin)이 honor됩니다. Line-counter early-exit이 frontmatter가 아직 시작되지 않은 경우에만 발동되도록 좁혀졌고, hard 200-line 절대 cap이 추가됨. Opening `---`이 line 1로 제한되어 50 라인 이후의 body horizontal rule이 frontmatter mode로 leak되지 않습니다 (CR-E v1.2.1+).
+- **RW6 — Synthesizer message-boundary count가 Phase 1c를 포함**: "four message boundaries" → "four to six"로, Phase 1c가 발동하고 escalate되는지에 따른 분기 설명 포함.
+
+### 백필
+
+- v1.2.0 CHANGELOG A3 bullet이 이제 2026-04-30 dogfood에서 관찰된 페이지당 ~20% 감소 실측값을 담습니다.
+
+### 파일 변경
+
+- `commands/wiki-ingest.md` — Step 1 disambiguation, Step 1.5 hardening (R3W1+R3W2+RW3+RW4+RW7), Step 8c.1 + 8e (B5), Step 10 (RW2+CR-D)
+- `commands/wiki-lint.md` — Step 4 (T10, W7+CR-C)
+- `hooks/scripts/scan-vault-changes.sh` — `auto_ingest_passes()` (RW5+CR-E)
+- `agents/wiki-synthesizer.md` — message-boundary count (RW6)
+- `README.md`, `README.ko.md` — A5 (R3W3+R3W4)
+- `.claude-plugin/plugin.json` — version bump
+- `CLAUDE.md` — "Recent releases" 아래 v1.2.1 entry + ingest-repair lifecycle action 안내 (C2-Y v1.2.1+)
+
 ## [1.2.0] — 2026-04-30
 
 ### 성능
 
 - **SessionStart 자동 ingest 범위 필터** — `~/.claude/deep-wiki-config.yaml`에 선택적 `auto_ingest:` 블록이 추가됩니다. `ignore_globs` (경로 glob 제외)와 `require_tag` (프론트매터 태그 opt-in)를 지원합니다. SessionStart hook이 /wiki-ingest 호출 전에 이 필터를 적용해, Daily notes나 아카이브 폴더 같은 고빈도·저가치 경로의 호출 빈도를 줄입니다. 하위 호환 — 블록은 선택 사항이며, 없으면 기존 동작을 유지합니다. (A1)
 - **재-ingest hash skip** — `/wiki-ingest` Step 1.5에서 각 `file`/`deep-work-report` 소스의 sha256을 기존 `.wiki-meta/sources/<slug>.yaml:content_hash`와 비교합니다. 일치하는 소스는 lock 획득 전에 배치에서 제외됩니다. 배치 전체가 skip된 경우에도 lock을 잠깐 획득해 per-slug `ingest-skip` 로그 항목을 추가하고 `.pending-scan → .last-scan` promotion을 실행한 뒤 종료합니다. 새 `ingest-skip` 로그 액션이 감사용 skip 슬러그를 기록합니다 (canonical 스키마 유지: `{ts, action, source, pages_created:[], pages_updated:[], skip_reason}`). Step 1.5가 기존 yaml을 찾을 수 있도록 슬러그 파생을 Step 5에서 Step 1 끝으로 이동했습니다. **Hash 일치만으로는 skip 불충분 (IC1 review fix):** Step 1.5는 wiki 측 상태 무결성도 검증합니다 (`pages_created`∪`pages_updated`의 모든 페이지가 존재, 각 페이지 frontmatter `sources:`에 슬러그 포함, 슬러그의 가장 최근 로그 항목이 clean terminal action). 어느 하나 실패 시 정상 ingest로 fall-through하여 자가 복구하며, 새 `ingest-repair` 로그 액션으로 기록됩니다. `ingest-repair` 라인은 `pages_created:[]`를 emit하고 모든 touched 페이지를 `pages_updated`로 분류하여 wiki-lint Step 6 LOG-INVARIANT (각 파일명이 `pages_created`에 한 번만 등장) 무결성을 보존합니다 (R3C1 review fix); wiki-lint Step 6도 defense-in-depth로 `select(.action != "ingest-repair")` 필터를 추가합니다. (A2)
-- **`wiki-synthesizer` 내 skim-first 후보 필터링** — Phase 1 후보 탐색이 이제 2단계입니다: (1a) I/O 없이 후보 descriptor(`{file, title, tags, aliases}`)를 표면 겹침으로 skim, (1b) 상위 K≤5개 후보 본문만 `Read` (일반 K=3). Rule 5 광범위 검색은 정확성 보강망으로 유지됩니다. 5개 이상 후보 배치에서 **per-call 벽시계 시간 ~15-25% 감소 예상** (v1.1.4 follow-up 예측; 실측값은 dogfood 후 확정 예정). 호출자 변경: Step 4가 이제 단순 파일명 대신 enriched 후보 descriptor를 생성합니다. (A3)
+- **A3 — Skim-first 후보 필터링**: synthesizer Phase 1이 이제 frontmatter만으로 후보를 점수화하고, 상위 K개(일반 3개, 점수 분포가 평탄하면 최대 5개)를 deep-read 한 뒤, skim에서 제외된 후보를 parallel Grep batch (Phase 1c, IW1 fix)로 검증합니다. Per-call 벽시계 시간 ~15-25% 감소 예상 (v1.1.4 follow-up 예측; **v1.2.0 첫 dogfood (2026-04-30)에서 페이지당 ~20% 감소 실측** — v1.2.0의 8-page cloud-vault dogfood에서 페이지당 1.7분, v1.1.3 베이스라인 페이지당 ~2.14분 (2-page update, 더 작은 샘플), source vault는 Google Drive offline mode. 샘플 크기가 다르므로 — 방향성만 유효하며 엄밀한 like-for-like 비교는 아님).
 - **클라우드 스토리지 미러-동기화 워크플로우 가이드** — README(EN/KO)에 iCloud/Google Drive/Dropbox vault 사용자를 위한 3단계 수동 워크플로우를 문서화합니다: `wiki_root`를 로컬 디스크에 두기, 예약된 additive rsync(`--delete` 없음)로 vault에 미러링, 다른 기기에서 편집 시 먼저 수동 역-rsync 실행 (자동 충돌 감지 없음). 자동 `cache_local` 설정 옵션은 v1.3.0+로 보류됩니다. (A5)
 
 ### Lint 강화

@@ -194,8 +194,13 @@ Obsidian 볼트 — 따라서 `wiki_root` — 가 iCloud Drive, Google Drive, Dr
    rsync -a "$HOME/Library/CloudStorage/.../deep-wiki/" ~/deep-wiki-local/
    ```
    auto-ingest를 일시 중지하고 싶다면 주의: `~/.claude/deep-wiki-config.yaml`에서 `auto_ingest:` 블록을 제거하는 것은 일시 중지가 **아닙니다** (v1.1.x 기본 동작인 전체 볼트 감지로 회귀하므로 오히려 *더* 공격적입니다). 올바른 방법은 다음 중 하나입니다:
-   - `auto_ingest.ignore_globs: ['**']`을 설정해 모든 감지를 단락시키거나, OR
-   - `~/.claude/settings.json`에서 deep-wiki SessionStart hook을 비활성화하세요.
+   - `~/.claude/deep-wiki-config.yaml`에 다음 블록을 추가하세요 (SessionStart hook은 아래 **block-form YAML**만 파싱합니다 — `auto_ingest.ignore_globs: ['**']` 같은 inline syntax는 hook parser가 **무시**합니다):
+     ```yaml
+     auto_ingest:
+       ignore_globs:
+         - "**"
+     ```
+   - 또는 `~/.claude/settings.json`에서 deep-wiki SessionStart hook을 비활성화하세요.
 
 **왜 플러그인에서 자동화하지 않나요?** 이를 투명하게 처리하는 `cache_local` 설정 옵션은 v1.3.0+에서 계획되어 있습니다. 로컬 편집과 rsync 푸시 사이의 경쟁 창(race window) 트레이드오프는 암묵적 동작보다 명시적 설정 옵션이 적합합니다. v1.2.0은 수동 워크플로우를 문서화하고 지연 관련 관찰 사항만 제공합니다.
 

@@ -194,8 +194,13 @@ If your Obsidian vault — and therefore `wiki_root` — lives on iCloud Drive, 
    rsync -a "$HOME/Library/CloudStorage/.../deep-wiki/" ~/deep-wiki-local/
    ```
    Or pause auto-ingest temporarily — removing the `auto_ingest:` block in `~/.claude/deep-wiki-config.yaml` does **not** pause it (that returns to v1.1.x whole-vault detection, which is *more* aggressive). Instead, either:
-   - Set `auto_ingest.ignore_globs: ['**']` to short-circuit all detection, OR
-   - Disable the deep-wiki SessionStart hook in `~/.claude/settings.json`.
+   - Add the following block to `~/.claude/deep-wiki-config.yaml` (the SessionStart hook only parses the **block-form YAML** below — `auto_ingest.ignore_globs: ['**']` inline syntax is **silently ignored** by the hook parser):
+     ```yaml
+     auto_ingest:
+       ignore_globs:
+         - "**"
+     ```
+   - OR disable the deep-wiki SessionStart hook in `~/.claude/settings.json`.
 
 **Why not automate this in the plugin?** The `cache_local` config option that does this transparently is planned for v1.3.0+. The trade-off (race window between local edit and rsync push) deserves a deliberate config knob rather than implicit behavior. v1.2.0 documents the manual workflow and ships only the latency-related observations.
 

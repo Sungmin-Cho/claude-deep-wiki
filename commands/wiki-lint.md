@@ -171,6 +171,11 @@ for f in "$WIKI_ROOT/pages"/*.md; do
   bn=$(basename "$f")
   strip_code_blocks "$f" | grep -oE '\[([^]]+)\]\(([^)]+\.md)\)' | while read match; do
     tgt=$(echo "$match" | sed -E 's/.*\(([^)]+\.md)\)/\1/')
+    # T10 review fix (v1.2.1+): external URLs ending in .md (e.g. GitHub gist
+    # raw URL) are not local wiki links — skip the existence check.
+    case "$tgt" in
+      http://*|https://*) continue ;;
+    esac
     [ ! -f "$WIKI_ROOT/pages/$tgt" ] && echo "[BROKEN] $bn → $tgt"
   done
 done

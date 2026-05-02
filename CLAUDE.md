@@ -180,6 +180,22 @@ else ...date -d... ; fi
 3. 정확한 file 명시 git add
 4. HEREDOC commit message (Co-Authored-By trailer 포함)
 
+### Spec/Plan ordering instructions (v1.3.0+)
+
+When a spec/plan directs a code or doc change involving relative position
+("above X", "below Y", "before Z"), name the surrounding pattern so the
+implementer can verify intent against context. v1.2.1 cycle-3 lesson —
+ambiguous "above" instruction conflicted with surrounding
+chronological-oldest-first pattern; the implementer caught it via atomic
+fixup commit, but the spec writer could have been more precise.
+
+- Bad: "Insert v1.2.1 above v1.2.0"
+- Good: "Insert v1.2.1 above v1.2.0 (chronological-newest-first ordering — newest version at top)"
+- Good: "Insert v1.2.1 below v1.2.0 (chronological-oldest-first ordering — keep historical order)"
+
+Apply this whenever editing CHANGELOG, Recent releases, version-tagged
+bullet lists, or any list whose insertion order matters.
+
 ### Review cycle (deep-review)
 
 큰 변경은 다음 사이클 따름:

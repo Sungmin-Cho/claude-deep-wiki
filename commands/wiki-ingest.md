@@ -594,13 +594,40 @@ the v1.2.1 rules extended for fanout:
 
 The lock state depends on the branch (per Step 7.5 preamble): held from
 Phase 0 (multi-source) OR acquired here (single-source — exactly as
-v1.2.1). For each finalized draft in deterministic order (sort by `origin`
-lexicographic — fixes SS-7), apply the **existing v1.2.1 Step 8a-8h
-sequence per draft** (avoids drift if v1.2.1 sequence evolves; W6 fix). The
-8a-8h sequence covers: version snapshot for updates, page write,
-sources/*.yaml update, log.jsonl append, index.json update, log.md update,
-index.md update, retention prune. Plan implementer: re-read v1.2.1 Step 8
-for the exact sub-step list.
+v1.2.1).
+
+**Manifest conversion before Step 8 (Cycle-3 CV3-B fix):** Step 8's
+existing parser expects the inline-mode response shape with top-level
+`created`, `updated`, `versioned`, `failed`, `source_hashes` arrays.
+Worker-mode responses use a different shape (`mode`, `drafts`,
+`source_hashes`). Before invoking Step 8 logic, **main converts the
+aggregated `ALL_DRAFTS` (post-Phase-2 collision resolution) into the
+inline-mode manifest shape**:
+
+- For each draft with `proposed_action == "create"`: append entry to
+  `created` array with `{file: proposed_file, title: proposed_title,
+  tags: proposed_tags, aliases: proposed_aliases, sources: [contributing
+  source_slugs sorted lex per W12]}`. The draft's `page_content` is
+  written by Step 8a per-draft.
+- For each draft with `proposed_action == "update"`: append entry to
+  `updated` array with the same shape. The draft's `merge_against` field
+  identifies the page for Step 8's version-backup phase.
+- `versioned` array starts empty; Step 8a's per-draft version backup
+  populates it as backups land.
+- `failed` array carries any drafts that the second-pass synthesis
+  (Case B2) reported as "merge impossible" — surfaced to user but
+  not retried automatically.
+- `source_hashes` is the union of per-worker `source_hashes` maps
+  (workers compute on read; main may recompute via `shasum` for
+  sentinels per the existing v1.2.1 Step 8d normalization).
+
+After this conversion, Step 8a-8h runs **per draft** as if it were the
+v1.2.1 inline-mode response — no Step 8 spec changes needed. Step 8a-8h
+covers: version snapshot for updates, page write, sources/*.yaml update,
+log.jsonl append, index.json update, log.md update, index.md update,
+retention prune. Plan implementer: re-read v1.2.1 Step 8 for the exact
+sub-step list. Sort the per-draft execution order by `origin`
+lexicographic (fixes SS-7) so reruns are deterministic.
 
 After all drafts are written successfully, apply CONDITIONAL `.pending-scan`
 promotion (fixes Cycle-1 CV-1 + W13 + Plan #2.1 Cycle-2 C2S-1 — separate
@@ -705,9 +732,32 @@ Plan #2.1 C2S-1 manifest + C2-W5 counter edge cases.)
     1. Promote `.pending-scan → .last-scan` ANYWAY (releases the stuck
        window so the user can move forward; the alternative is an infinite
        hook-time retry loop on the same files).
-    2. Append a new `ingest-fail` lifecycle event to `log.jsonl` with
-       source paths + 3 prior failure timestamps + reason (worker error /
-       timeout / lock-contention).
+    2. Append a new `ingest-fail` lifecycle event to `log.jsonl`. Per
+       NC2 canonical-shape rule (Step 1.5), every action MUST preserve
+       `{ts, action, source, pages_created, pages_updated}`. Concrete
+       schema (Cycle-3 W-N2 + P3 fix — note: counter file format
+       `<window_epoch>:<count>` does NOT store prior timestamps; use
+       only the current trigger ts + window_epoch + retry_count to
+       characterize the failure):
+
+       ```jsonc
+       {
+         "ts": "<iso-8601 utc, current trigger time>",
+         "action": "ingest-fail",
+         "source": "<comma-separated source paths from .failed-sources.tsv>",
+         "pages_created": [],
+         "pages_updated": [],
+         "failure_reason": "<worker error / timeout / lock-contention summary>",
+         "window_epoch": <int — the .pending-scan epoch that hit 3 strikes>,
+         "retry_count": 3
+       }
+       ```
+
+       `pages_created` / `pages_updated` are empty (no pages produced by
+       a failure event). The window_epoch + retry_count fields are
+       v1.3.0+ extensions on top of the canonical NC2 shape, capturing
+       enough context to correlate against `.pending-scan` history
+       without storing prior timestamps.
     3. Emit a user-visible error message naming the affected files and
        suggesting `/wiki-ingest <file>` for manual retry with verbose
        output.

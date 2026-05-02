@@ -99,14 +99,43 @@ TAGGED_LEAVES=$(for f in "$WIKI_ROOT/pages"/*.md; do
 done | xargs -I{} basename {} | sort -u)
 
 # Orphan ignore globs from ~/.claude/deep-wiki-config.yaml — block-aware awk
-# (mirror of Task 2.2's auto_ingest.ignore_globs parser) (I3 review note).
+# (mirror of v1.3.0+ broadened auto_ingest.ignore_globs parser; both accept block + inline + dotted forms).
 ORPHAN_IGNORE_GLOBS=()
 while IFS= read -r line; do
   [ -z "$line" ] && continue
   ORPHAN_IGNORE_GLOBS+=("$line")
 done < <(awk '
+  # Inline list parser used by both block-inline and dotted-form branches.
+  function parse_inline_list(line,    s, items, n, i, item) {
+    s = line
+    sub(/^[^\[]*\[/, "", s)         # strip everything up to and including [
+    sub(/\][[:space:]]*(#.*)?$/, "", s)   # strip trailing ] and any comment
+    n = split(s, items, /,/)
+    for (i = 1; i <= n; i++) {
+      item = items[i]
+      gsub(/^[[:space:]]*["'"'"']?/, "", item)
+      gsub(/["'"'"']?[[:space:]]*$/, "", item)
+      if (item != "") print item
+    }
+  }
+  # Form 3: dotted top-level (matched anywhere, no in_block dependency)
+  /^lint\.orphan_ignore:[[:space:]]*\[/ {
+    parse_inline_list($0)
+    next
+  }
   /^lint:[[:space:]]*(#.*)?$/ { in_block=1; next }
   /^[^[:space:]#]/             { in_block=0 }
+  # Form 2: inline form inside lint block
+  in_block && /^[[:space:]]+orphan_ignore:[[:space:]]*\[/ {
+    parse_inline_list($0)
+    in_list=0
+    next
+  }
+  # Form 1: block form (existing). `next` is required: the sub() above
+  # mutates $0 (strips the leading "  - "), so without `next` the terminator
+  # rule below would fire on the very same line and prematurely set in_list=0,
+  # silently dropping every list item after the first. (Pre-existing bug
+  # surfaced by v1.3.0 sandbox; fixed here as part of the broaden.)
   in_block && /^[[:space:]]+orphan_ignore:[[:space:]]*(#.*)?$/ { in_list=1; next }
   in_block && in_list && /^[[:space:]]+-[[:space:]]*/ {
     sub(/^[[:space:]]+-[[:space:]]*/, "")
@@ -114,6 +143,7 @@ done < <(awk '
     sub(/[[:space:]]+$/, "")
     gsub(/^["'"'"']|["'"'"']$/, "")
     print
+    next
   }
   in_block && in_list && !/^[[:space:]]+-/ { in_list=0 }
 ' "$CONFIG" 2>/dev/null)

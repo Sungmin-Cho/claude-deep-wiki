@@ -210,6 +210,15 @@ bullet lists, or any list whose insertion order matters.
 
 각 cycle의 review/response artifact는 `.deep-review/{reports,responses}/`에 timestamp별 저장 (gitignored).
 
+**Implementation review (Step 6) lesson (v1.2.1 cycle-3):** for config /
+hook / parser-driven changes, verify spec text execution against the actual
+parser, not just self-consistent spec text. v1.2.1 cycle-3 found a config
+syntax mismatch that cycles 1+2 missed because they verified the spec was
+internally coherent without testing parser execution. (A companion change
+in the deep-review repo's `commands/deep-review.md` reinforces this in the
+final code-reviewer prompt — see deep-review v1.3.x release notes; merge
+status is optional for deep-wiki releases.)
+
 ### docs/ folder policy
 
 `.gitignore`에 `docs/`가 통째로 ignored되어 있음. plan, followup, ultrareview 등은 **author-local artifact**으로 commit되지 않음. v1.1.1 plan 선례 — `git log -- docs/` 빈 결과. PR review 자료는 PR description에 inline.

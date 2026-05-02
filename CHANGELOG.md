@@ -2,13 +2,59 @@
 
 All notable changes to deep-wiki are documented here.
 
+## [1.2.1] — 2026-05-02
+
+Patch release closing v1.2.0 review-cycle backlog. Fourteen issues across four axes: Step 1.5 hash-skip integrity hardening, wiki-lint false-positive elimination, per-source provenance preservation, and README cloud-mirror documentation accuracy. No behavior change on the happy path; every fix is either a stricter invariant check or a doc/parser correction.
+
+### Hash-skip integrity (Step 1.5 hardening)
+
+- **R3W1 — Slug collision disambiguation**: when two file sources share a basename (`/A/foo.md` and `/B/foo.md` both → slug `foo`), the new disambiguation step at end of Step 1 picks the next available `foo-N` whose origin matches (or fresh `foo-N` slot). Closes the silent cross-attribution risk on coincidental bytes-hash match.
+- **R3W2 — Forced repair on missing log signal**: Step 1.5 now triggers `ingest-repair` when (a) `log.jsonl` is absent entirely, or (b) the slug has no terminal log entry (`last_action=''`) despite a present yaml. Both indicate state drift that demands re-ingest, not skip. **Caveat (W-α v1.2.1+):** when triggered by log absence/truncation, the resulting `ingest-repair` line emits `pages_created:[]` per spec — the historical creation record for those pages is gone and is not synthesized. wiki-lint Step 6 LOG-INVARIANT only flags duplicates so the wiki stays clean, but log-based audit reconstruction will be incomplete for log-truncated repairs. Per-source yaml (intact, verified by Checks 1+2) remains the authoritative provenance record. To preserve full log-based traceability, restore log.jsonl from a backup before re-ingesting affected sources.
+- **RW3 — Inline-list yaml parser**: Check 1 awk now accepts `pages_created: [a.md, b.md]` in addition to the block-list form. Defense-in-depth against future Step 8e variants.
+- **RW4 — Single-quote yaml strip**: both Check 1 and Check 2 now use the same `gsub(/^["\x27]+|["\x27]+$/, "", v)` pattern as v1.2.0 IW1's wiki-lint fix.
+- **RW7 — Explicit array init**: `SKIPPED=()` and `REPAIR=()` are explicitly initialized at the top of the Step 1.5 scan loop for `set -u` cleanliness.
+
+### Wiki-lint false-positive elimination
+
+- **T10 — http(s):// targets excluded from broken-link check**: external URLs ending in `.md` (e.g., GitHub gist raw URL) no longer emit `[BROKEN]`. Closes 5 false positives observed in v1.2.0 dogfood.
+- **W7 — Block-context-aware 4-space code-block strip**: `strip_code_blocks()` now distinguishes real CommonMark indented code blocks (4-space after a blank line, not under a list item) from list continuations and paragraph lazy continuations. Real code is stripped (multi-line via `in_indented_code` state, CR-C v1.2.1+); continuations are preserved so links inside list items stay subject to broken-link detection. Tab-indented code and post-2-blank-line code remain documented limitations (v1.3.0+ candidates).
+
+### Per-source provenance
+
+- **B5 — Same-batch co-create attribution preserved**: when two sources independently produce the same page in one batch, both contributing slugs' yamls now record the page under `pages_created` (per-source truth). Step 10's log emission still applies the intra-batch dedup so the log invariant (each filename in `pages_created` at most once across log lines) holds. Length-guarded snapshot init (CR-B v1.2.1+) replaces the broken `("${ARR[@]:-}")` pattern that produces 1-element-empty-string under bash 3.2.57. Step 10 prose updated to reference post-dedup arrays explicitly (CR-D v1.2.1+). Closes the v1.2.0 W6 trade-off.
+
+### Documentation accuracy
+
+- **R3W3 — Cloud-mirror VAULT_ROOT note**: README A5 now warns that moving `wiki_root` to a non-vault local path makes the SessionStart hook watch `$HOME` (since `VAULT_ROOT=$(dirname "$WIKI_ROOT")`). Recommends hook disable or `ignore_globs: ['**']` in this mode. A `vault_root:` config knob is tracked for v1.3.0+.
+- **R3W4 — auto_ingest pause guidance corrected**: removing the `auto_ingest:` block does NOT pause auto-ingest (it returns to v1.1.x whole-vault default — *more* aggressive). Corrected to: set `ignore_globs: ['**']` or disable the SessionStart hook.
+
+### Spec polish
+
+- **RW2 — Step 10 SKIPPED/REPAIR drain note**: explicit forward-pointer in Step 10 prose so the implicit Step 1.5 → Step 10 drain is visible without chasing the blockquote.
+- **RW5 — Hook 50-line frontmatter guard reorder + line-1 opening guard**: the `^---$` rule now precedes the line counter so a closing `---` past line 50 (Templater plugin) is honored. Line-counter early-exit narrowed to fire only when frontmatter has not started; hard 200-line absolute cap added. Opening `---` restricted to line 1 so a body horizontal rule past line 50 cannot leak into frontmatter mode (CR-E v1.2.1+).
+- **RW6 — Synthesizer message-boundary count covers Phase 1c**: "four message boundaries" → "four to six" with breakdown for whether Phase 1c fires and escalates.
+
+### Backfill
+
+- v1.2.0 CHANGELOG A3 bullet now carries the measured ~20% per-page reduction observed in 2026-04-30 dogfood.
+
+### Files changed
+
+- `commands/wiki-ingest.md` — Step 1 disambiguation, Step 1.5 hardening (R3W1+R3W2+RW3+RW4+RW7), Step 8c.1 + 8e (B5), Step 10 (RW2+CR-D)
+- `commands/wiki-lint.md` — Step 4 (T10, W7+CR-C)
+- `hooks/scripts/scan-vault-changes.sh` — `auto_ingest_passes()` (RW5+CR-E)
+- `agents/wiki-synthesizer.md` — message-boundary count (RW6)
+- `README.md`, `README.ko.md` — A5 (R3W3+R3W4)
+- `.claude-plugin/plugin.json` — version bump
+- `CLAUDE.md` — v1.2.1 entry under "Recent releases" + ingest-repair lifecycle action note (C2-Y v1.2.1+)
+
 ## [1.2.0] — 2026-04-30
 
 ### Performance
 
 - **SessionStart auto-ingest scope filter** — `~/.claude/deep-wiki-config.yaml` now accepts an optional `auto_ingest:` block with `ignore_globs` (path glob exclusions) and `require_tag` (frontmatter-tag opt-in). The SessionStart hook applies these filters before /wiki-ingest is invoked, reducing call frequency for high-volume low-value paths (Daily notes, archive folders). Backwards compatible — block is optional, default behavior unchanged. (A1)
 - **Re-ingest hash skip** — `/wiki-ingest` Step 1.5 now compares each `file`/`deep-work-report` source's sha256 against the existing `.wiki-meta/sources/<slug>.yaml:content_hash`. Matching sources are dropped from the batch before lock acquisition; an entirely-skipped batch still acquires the lock briefly to append a per-slug `ingest-skip` log entry and run the `.pending-scan → .last-scan` promotion before exit. New `ingest-skip` log action records skipped slugs for audit (canonical schema preserved: `{ts, action, source, pages_created:[], pages_updated:[], skip_reason}`). Slug derivation moved from Step 5 to end of Step 1 so Step 1.5 can locate the existing yaml. **Hash match alone is insufficient (IC1 review fix):** Step 1.5 also verifies wiki-side state integrity (every page in `pages_created`∪`pages_updated` exists; each page's frontmatter `sources:` lists the slug; the most-recent log entry for the slug is a clean terminal action). Any failure forces fall-through to normal ingest as self-repair, recorded as new `ingest-repair` log action. The `ingest-repair` line emits `pages_created:[]` and routes all touched pages to `pages_updated` so the wiki-lint Step 6 LOG-INVARIANT (each filename appears in `pages_created` exactly once across history) is preserved (R3C1 review fix); `wiki-lint` Step 6 also adds `select(.action != "ingest-repair")` defense-in-depth. (A2)
-- **Skim-first candidate filtering in `wiki-synthesizer`** — Phase 1 candidate survey is now two-stage: (1a) skim candidate descriptors (`{file, title, tags, aliases}`) by surface overlap with no I/O, (1b) `Read` only top-K ≤ 5 candidate bodies (typical K=3). Rule 5 wide-search remains the correctness net; per-call wall-clock is **expected to drop ~15-25% for batches with 5+ candidates** (projection from the v1.1.4 follow-up; measured number TBD pending dogfood). Caller-side change: Step 4 now produces enriched candidate descriptors instead of bare filenames. (A3)
+- **A3 — Skim-first candidate filtering**: synthesizer Phase 1 now scores candidates against frontmatter only, deep-reads the top K (typically 3, up to 5 when score distribution is flat), and verifies skim-skipped candidates with a parallel Grep batch (Phase 1c, IW1 fix). Per-call wall-clock projected to drop ~15-25% (projection from v1.1.4 follow-up; **measured ~20% per-page reduction in v1.2.0 first dogfood (2026-04-30)** — 1.7 min/page in v1.2.0 8-page cloud-vault dogfood vs v1.1.3 ~2.14 min/page baseline (2-page update, smaller sample), source vault on Google Drive offline mode. Sample sizes differ — directional only, not strictly like-for-like).
 - **Cloud-storage mirror-and-sync workflow guide** — README (EN/KO) now documents a 3-step manual workflow for users on iCloud/Google Drive/Dropbox vaults: keep `wiki_root` on local disk, additive rsync (NO `--delete`) to vault on a schedule, manual reverse-rsync first when editing on other devices (no automated conflict detection). Automated `cache_local` config option deferred to v1.3.0+. (A5)
 
 ### Lint Hardening

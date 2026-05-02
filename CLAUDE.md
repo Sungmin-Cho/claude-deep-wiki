@@ -124,7 +124,7 @@ deep-wiki/
 
 - `ingest` — 정상 처리, 새/갱신 페이지 emit
 - `ingest-skip` (v1.2.0+) — bytes hash unchanged AND wiki state intact → skip
-- `ingest-repair` (v1.2.0+) — bytes unchanged BUT wiki state drift → 자가복구 (`pages_created:[]` 제약)
+- `ingest-repair` (v1.2.0+) — bytes unchanged BUT wiki state drift → 자가복구 (`pages_created:[]` 제약). **(v1.2.1+)** Triggers expanded: now also fires on `log.jsonl` absence and `no-prior-terminal-log` (R3W2). Slug allocator (R3W1, in-batch ledger + on-disk yaml) prevents same-batch basename cross-attribution before this check fires. Caveat (W-α): when triggered by log absence, historical creation records are not synthesized — log-based audit reconstruction will be incomplete; per-source yaml is the authoritative provenance record.
 - `update` — 직접 페이지 수정
 - `lint` — health check 실행 + auto-fix
 - `rebuild` — index 재생성
@@ -213,7 +213,8 @@ Claude Code hook 실행 중에 만들어지는 transcript artifact. session ID +
 - **v1.1.2** (2026-04-21) — wiki-synthesizer subagent delegation (always-on)
 - **v1.1.3** (2026-04-24) — parallel tool dispatch
 - **v1.1.4** (2026-04-24) — hash normalization + promotion regression guard
-- **v1.2.0** (2026-04-30) — **(현재)** throughput + lint hardening + ingest-repair self-healing
+- **v1.2.1** (2026-05-02) — patch: Step 1.5 hash-skip integrity hardening (R3W1 slug-collision allocator with in-batch ledger, R3W2 forced-repair on missing log signal, parser fixes for inline-list/single-quote yaml + explicit array init), wiki-lint false-positive elimination (T10 http(s) URL exclusion, W7 multi-line indented code block strip with `in_indented_code` state), per-source provenance preservation (B5 dual-classification scheme), README cloud-mirror corrections, RW5+CR-E hook frontmatter line-1 opening guard, RW6 synthesizer message-boundary count covers Phase 1c, B5 Step 10 prose update.
+- **v1.2.0** (2026-04-30) — throughput + lint hardening + ingest-repair self-healing
 
 전체 history는 `CHANGELOG.md` 참조.
 

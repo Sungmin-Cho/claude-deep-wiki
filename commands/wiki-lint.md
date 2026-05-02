@@ -179,7 +179,7 @@ obsidian orphans 2>/dev/null
 
 For each markdown link `[text](target.md)` found in pages **outside fenced code blocks**, check if `target.md` exists in `pages/`. Report any broken links with the source page and target.
 
-**Code block exclusion (v1.2.1+):** Strip **fenced** code blocks (```...```) unconditionally, and strip **4-space-indented blocks** with block-context awareness (track blank/list/paragraph/indented-code state) so real multi-line indented code blocks are stripped while list-item continuations and paragraph lazy continuations are preserved. Inline backticks (\`code\`) are still not stripped because broken-link false-positives from inline code are rare and inline backticks can span partial lines. Tab-indented code and post-2-blank-line code remain documented limitations (DEFER to v1.3.0+).
+**Code block exclusion (v1.2.1+):** Strip **fenced** code blocks (```...```) unconditionally, and strip **4-space- or tab-indented blocks** with block-context awareness (track blank/list/paragraph/indented-code state) so real multi-line indented code blocks are stripped while list-item continuations and paragraph lazy continuations are preserved. Inline backticks (\`code\`) are still not stripped because broken-link false-positives from inline code are rare and inline backticks can span partial lines. Post-2-blank-line code remains a documented limitation (DEFER to v1.3.0+). Tab-indent recognition added in v1.3.0.
 
 ```bash
 # Reference implementation
@@ -189,20 +189,16 @@ strip_code_blocks() {
   # tracks block context (blank / list / paragraph / indented-code) so real
   # multi-line indented code blocks are stripped while list continuations and
   # paragraph lazy continuations are preserved. Fenced (```) is stripped
-  # unconditionally. Tab-indented code and post-2-blank-line code are
-  # documented limitations — see in-function comment for v1.3.0+ candidates.
+  # unconditionally. v1.3.0 (1.2) extended the indent rule to recognize
+  # tab-indent (\t) in addition to 4 spaces. Post-2-blank-line code remains
+  # a documented limitation — see in-function comment for v1.3.0+ candidates.
   #
   # CR-C v1.2.1+: explicit in_indented_code state so 2nd+ lines of a multi-line
   # indented block are also stripped. Without this state, prev_blank=0 after
   # the first stripped line caused subsequent 4-space lines to fall into the
   # paragraph-lazy-continuation branch and leak into broken-link detection.
   #
-  # Known limitations (DEFER to v1.3.0+ — W-γ, W-δ from cycle-1 review):
-  #   - Tab-indented code blocks (`\t` at line start) are NOT stripped.
-  #     Only 4-space indents trigger code-block detection. CommonMark also
-  #     accepts tabs; tab support requires regex extension and an additional
-  #     sandbox case. Real-world wiki pages don't use tabs (Markdown style
-  #     guides discourage them); the tab false-negative is rare.
+  # Known limitations (DEFER to v1.3.0+ — W-δ from cycle-1 review):
   #   - prev_was_list does not reset after 2 consecutive blank lines.
   #     CommonMark says 2 blank lines after a list ends the list, after which
   #     a 4-space line becomes a code block. Current awk treats it as
@@ -220,7 +216,10 @@ strip_code_blocks() {
       prev_was_list=1; prev_blank=0; in_indented_code=0
       print; next
     }
-    /^    / {
+    /^(    |\t)/ {
+      # v1.3.0 (1.2): tab-indent now recognized as CommonMark indented code
+      # marker, in addition to 4 spaces. Closes the W-γ false-positive on
+      # broken-link detection inside tab-indented code blocks.
       if (in_indented_code) {
         # continuation of an already-open indented code block — strip
         prev_blank=0; next

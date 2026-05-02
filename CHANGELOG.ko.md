@@ -98,7 +98,10 @@ fanout되어, LLM 분석이 지배적인 비용을 병렬로 처리하면서 모
   드뭄; dogfood가 contention을 드러내면 재고려.
 - **Second-pass synthesis (cross-worker 충돌):** ≥2 workers가 같은
   proposed_file을 non-byte-identical `page_content`로 타겟팅할 때, main이 1개의
-  추가 inline-mode synthesizer를 디스패치하여 충돌 draft들을 merge합니다.
+  추가 **worker-mode** synthesizer (새 `colliding_drafts` input field 포함)를
+  디스패치하여 충돌 draft들을 merge합니다. Worker가 merged draft를 return하고
+  main이 Phase 3에서 write — single-writer invariant 보존 (`inline`-mode
+  dispatch는 Phase 2에서 write를 발생시켜 invariant를 깰 것임).
   비용: 같은-페이지 충돌당 1 추가 subagent 호출. 이것이 없으면 multi-source merge
   invariant (v1.2.1 의미)가 silently fact를 drop. 대부분의 다중 소스 batch는
   충돌이 없음.

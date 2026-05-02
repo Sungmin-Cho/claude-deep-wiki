@@ -117,11 +117,14 @@ form. Single-source ingest is byte-identical to v1.2.1 (fast path).
   surface in dogfood if it matters.
 - **Second-pass synthesis (cross-worker collision):** when ≥2 workers
   target the same proposed_file with non-byte-identical `page_content`,
-  main dispatches one extra inline-mode synthesizer to merge the
-  colliding drafts. Cost: 1 extra subagent invocation per same-page
-  collision. Without this, multi-source merge invariant (v1.2.1
-  semantics) would silently drop facts. Most multi-source batches have
-  no collision.
+  main dispatches one extra **worker-mode** synthesizer (with new
+  `colliding_drafts` input field) to merge the colliding drafts. Worker
+  returns the merged draft; main writes during Phase 3 — preserves the
+  single-writer invariant (an `inline`-mode dispatch here would write
+  during Phase 2 and break that invariant). Cost: 1 extra subagent
+  invocation per same-page collision. Without this, multi-source merge
+  invariant (v1.2.1 semantics) would silently drop facts. Most
+  multi-source batches have no collision.
 
 ### New lifecycle action
 

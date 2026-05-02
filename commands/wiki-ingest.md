@@ -398,23 +398,52 @@ If two or more entries in `CREATED_ENTRIES` share the same `file` value, this me
 ```bash
 # Pseudo-logic — bash 3.2 호환 (macOS 기본 /bin/bash). 연관 배열(declare -A)은 bash 4+ 전용이며
 # v1.1.4 D1 fix가 이미 같은 이유로 TSV 패턴을 도입했음 — 같은 원칙을 따른다.
+#
+# B5 review fix (v1.2.1+): snapshot CREATED_ENTRIES and UPDATED_ENTRIES before
+# applying dedup. Per-source yaml writes (Step 8e) consult the snapshot — every
+# slug records the page under pages_created if the slug actually contributed to
+# its creation, even when the log-emission path will dedup it down. Step 10's
+# log lines still use the deduped CREATED_ENTRIES / UPDATED_ENTRIES, preserving
+# the "each filename appears in pages_created at most once across log lines"
+# invariant.
+#
+# CR-B fix (v1.2.1+): use length-guarded array literal init — bash 3.2.57's
+# `B=("${A[@]:-}")` produces a 1-element-empty-string array when A is empty,
+# NOT an empty array. Verified live:
+#   $ /bin/bash -c 'set -u; A=(); B=("${A[@]:-}"); echo "len=${#B[@]}"'
+#   len=1
+# Same fix pattern is already used in `scan-vault-changes.sh` (lines 303, 310)
+# for the auto_ingest globs / require_tag arrays.
+
+ORIGINAL_CREATED_ENTRIES=()
+[ ${#CREATED_ENTRIES[@]} -gt 0 ] && ORIGINAL_CREATED_ENTRIES=("${CREATED_ENTRIES[@]}")
+ORIGINAL_UPDATED_ENTRIES=()
+[ ${#UPDATED_ENTRIES[@]} -gt 0 ] && ORIGINAL_UPDATED_ENTRIES=("${UPDATED_ENTRIES[@]}")
+
 SEEN_CREATED=""    # newline-delimited "이미 created로 분류된 파일명" 집합
 NEW_CREATED=()
 EXTRA_UPDATED=()
-for entry in "${CREATED_ENTRIES[@]}"; do
-  file="$(jq -r '.file' <<<"$entry")"
-  if printf '%s\n' "$SEEN_CREATED" | grep -Fxq "$file"; then
-    EXTRA_UPDATED+=("$entry")
-  else
-    SEEN_CREATED="$SEEN_CREATED"$'\n'"$file"
-    NEW_CREATED+=("$entry")
-  fi
-done
-CREATED_ENTRIES=("${NEW_CREATED[@]}")
-UPDATED_ENTRIES+=("${EXTRA_UPDATED[@]}")
+if [ ${#CREATED_ENTRIES[@]} -gt 0 ]; then
+  for entry in "${CREATED_ENTRIES[@]}"; do
+    file="$(jq -r '.file' <<<"$entry")"
+    if printf '%s\n' "$SEEN_CREATED" | grep -Fxq "$file"; then
+      EXTRA_UPDATED+=("$entry")
+    else
+      SEEN_CREATED="$SEEN_CREATED"$'\n'"$file"
+      NEW_CREATED+=("$entry")
+    fi
+  done
+fi
+
+# Re-assign post-dedup arrays — same length-guarded pattern (CR-B).
+CREATED_ENTRIES=()
+[ ${#NEW_CREATED[@]} -gt 0 ] && CREATED_ENTRIES=("${NEW_CREATED[@]}")
+[ ${#EXTRA_UPDATED[@]} -gt 0 ] && UPDATED_ENTRIES+=("${EXTRA_UPDATED[@]}")
 ```
 
-The classification change emits a one-line note in the Step 14 report ("N entries reclassified from created to updated due to same-batch dedup") so the user can spot legitimate "two sources created the same NEW page" cases that this guard masks. **Per-source provenance trade-off (W6):** the per-source `sources/<slug>.yaml` is generated from each entry's `sources` list (Step 8e) — `slug2`'s yaml will record `pages_updated:[X.md]` even though `slug2` co-created the page. Operators who care about co-creation attribution should keep `pages_created` in BOTH per-source yamls (drive dedup at log-emission time only). v1.2.0 takes the simpler path (dedup at classification) for log-invariant strictness; full per-source-preserving variant is tracked as a v1.3.0 candidate.
+The classification change emits a one-line note in the Step 14 report ("N entries reclassified from created to updated due to same-batch dedup at log-emission level — per-source yamls preserve full attribution"). **Per-source provenance (B5 review fix, v1.2.1+):** Step 8e per-source yamls are written from `ORIGINAL_CREATED_ENTRIES` / `ORIGINAL_UPDATED_ENTRIES` (pre-dedup), so a co-created page X is recorded in *both* contributing slugs' yamls under `pages_created`. Step 10 log emission uses the post-dedup `CREATED_ENTRIES` / `UPDATED_ENTRIES`, so only the first contributing slug's log line carries X under `pages_created` — the log invariant continues to hold.
+
+**Note on bash 3.2 portability (CR-B v1.2.1+):** the prior `("${ARR[@]:-}")` snapshot pattern is **broken** for empty arrays in bash 3.2.57. The Self-Review checklist that initially claimed it as "set-u-safe array deref" conflated *iteration* (where `${ARR[@]:-}` is correctly empty) with *array literal initialization* (where the `:-}` substitutes a single empty string). All four sites in this task use the length-guarded `[ ${#ARR[@]} -gt 0 ] && ...` pattern instead.
 
 **d. Normalize `source_hashes`.** The agent returns `source_hashes` with one entry per source slug (the caller rejected the manifest in Step 7 / Error Handling if any passed-in slug was missing). The *values*, however, may not all be valid sha256 digests: the default `wiki-synthesizer` agent has no shell/hashing capability (its tool scope is `Read, Write, Glob, Grep, WebFetch`), so it returns a sentinel placeholder value for each slug. The caller is responsible for normalizing these to real digests before Step 8e.
 
@@ -442,12 +471,12 @@ type: <url|file|text|deep-work-report>
 origin: "<url_or_path>"
 content_hash: "sha256:<normalized_hashes[slug] from Step 8d>"
 pages_created:
-  - <files in CREATED_ENTRIES whose entry.sources contains this slug>
+  - <files in ORIGINAL_CREATED_ENTRIES whose entry.sources contains this slug — pre-dedup; B5 v1.2.1+>
 pages_updated:
-  - <files in UPDATED_ENTRIES whose entry.sources contains this slug>
+  - <files in ORIGINAL_UPDATED_ENTRIES whose entry.sources contains this slug — pre-dedup; B5 v1.2.1+>
 ```
 
-Per-slug `pages_created`/`pages_updated` filtering uses each entry's `sources` list — a page only lists a slug if that slug actually contributed to it. This preserves per-source provenance in multi-source batches (`wiki-lint`'s source-provenance invariant continues to hold: every page's frontmatter `sources:` slug has a matching `.wiki-meta/sources/<slug>.yaml` whose `pages_*` includes that page).
+Per-slug `pages_created`/`pages_updated` filtering uses each entry's `sources` list against the **pre-dedup** snapshot taken in Step 8c.1 (`ORIGINAL_CREATED_ENTRIES` / `ORIGINAL_UPDATED_ENTRIES`). A page only lists a slug if that slug actually contributed to it. **B5 review fix (v1.2.1+):** in same-batch co-create cases (`slug1` and `slug2` independently produce `X.md`), Step 8c.1's intra-batch dedup demotes `slug2`'s log-emission classification to `pages_updated`, but per-source yamls preserve the truth — both `slug1.yaml` and `slug2.yaml` record `X.md` under `pages_created`. The wiki-lint source-provenance invariant continues to hold (every page's frontmatter `sources:` slug has a matching `.wiki-meta/sources/<slug>.yaml` whose `pages_*` includes that page). The log-line invariant (each filename appears in `pages_created` at most once across log lines) is enforced exclusively at Step 10's log emission — see Step 10's R3C1+IW3+RW2 blockquote for the per-source log line classification.
 
 `content_hash` comes from the Step 8d normalized map. When the agent could compute its own sha256, this exactly matches the bytes it ingested. When the agent could not, main's post-hoc hash reflects the bytes *available on disk / at the URL* at reconciliation time — for `type: file` and `type: text` this is effectively identical (the file does not change between the agent's read and main's hash in a single ingest), and for `type: url` it is best-effort.
 
@@ -461,7 +490,7 @@ Read the current `.wiki-meta/index.json`. For each entry in `CREATED_ENTRIES` �
 
 > **Timestamp format:** All `ts` and `generated_at` values MUST be UTC ISO 8601 with a `Z` suffix. Generate with `date -u +"%Y-%m-%dT%H:%M:%SZ"`. Never use local timezone offsets (e.g. `+09:00`) — the wiki's log is consumed by tooling that assumes a single canonical timezone.
 
-Append one log line **per source in the batch**, using the per-slug filtered lists from Step 8e:
+Append one log line **per source in the batch**, using the per-slug filter applied to the **post-dedup** `CREATED_ENTRIES` / `UPDATED_ENTRIES` arrays — *not* the per-source yaml lists, which after the B5 fix (v1.2.1+) are intentionally pre-dedup. The yamls record full per-source attribution (both contributing slugs in a co-create get `pages_created:[X.md]`); the log lines apply the intra-batch dedup so the log invariant (each filename appears in `pages_created` at most once across log lines) is preserved at the log-emission layer:
 
 ```json
 {"ts":"<iso_timestamp>","action":"ingest","source":"<slug>","pages_created":[...filtered_for_slug],"pages_updated":[...filtered_for_slug]}

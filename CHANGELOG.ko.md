@@ -2,6 +2,127 @@
 
 deep-wiki의 주요 변경사항을 기록합니다.
 
+## [1.3.0] — 2026-05-02
+
+아키텍처 마이너 릴리스. 두 개의 병렬 축 변경과 v1.2.1 사이클 리뷰에서 이월된 6개 폴리시 항목.
+다중 소스 `/wiki-ingest`가 이제 worker 모드의 `wiki-synthesizer` 서브에이전트 최대 3개로
+fanout되어, LLM 분석이 지배적인 비용을 병렬로 처리하면서 모든 쓰기는 기존 단일 mkdir-기반
+잠금 아래 main에서 직렬화 유지. 훅 YAML 파서가 이제 block form 외에 inline + dotted form도
+수용. 단일 소스 ingest는 v1.2.1과 byte-identical (fast path).
+
+### 아키텍처
+
+- **A4 — wiki-synthesizer fanout (Approach B)**: 다중 소스 `/wiki-ingest`가
+  소스를 `min(3, N)` worker 서브에이전트로 분할 (정렬된 소스 경로 round-robin),
+  병렬 디스패치. Worker는 전체 LLM 분석을 수행하지만 파일 쓰기는 NONE. Main이
+  cross-worker B5 dual-classification ledger를 통해 draft를 집계하고 기존
+  글로벌 lock 아래 모든 쓰기를 순차 수행 (v1.3.0+: lock은 fanout branch에 한해
+  Phase 0에 획득; single-source는 v1.2.1과 동일하게 Phase 3에 획득).
+  Cross-worker page 충돌 시 second-pass `wiki-synthesizer` invocation을
+  worker mode (새 `colliding_drafts` input field 포함)로 dispatch하여
+  충돌하는 page body들을 하나의 일관된 page로 merge — v1.2.1 multi-source
+  merge invariant 보존. v1.2.1 invariant (log-line uniqueness, per-source
+  provenance, ingest-repair semantics) 유지 — main이 유일한 writer로 남기
+  때문. Worker 모드는 synthesizer agent의 `mode: "worker"` 파라미터로
+  opt-in; 기본값은 single-source fast path를 위한 `"inline"`. v1.3.0은 cap 3
+  하드코딩; configurable knob은 v1.4.0+로 보류. 3+ 소스 batch의 예상
+  wall-clock 감소: 30–50% (LLM 분석이 지배적 비용; 이상적 3× speedup, 실제로는
+  가장 빠른 소스 지배 + Phase 2/3 sequential로 인해 ~2×).
+- **C — Hook YAML 파서 확장**: `scan-vault-changes.sh` awk가 이제
+  `auto_ingest.ignore_globs`의 세 가지 form을 인식: block (기존), inline
+  (`["a", "b"]`), dotted (`auto_ingest.ignore_globs: [...]`). 같은 broaden이
+  `wiki-lint.md` `lint.orphan_ignore` 파서 (in-repo 주석에 명시된 mirror parser)
+  에도 적용. v1.2.1 cycle-3의 README/파서 mismatch를 파서 쪽에서 닫음. 또한
+  block-form path의 pre-existing 잠재 버그도 수정 (`sub()`가 `$0`을 변형시켜
+  terminator rule이 fall-through로 같은 라인에 발동, multi-item block list가
+  첫 항목 이후 silently drop되던 문제).
+
+### 폴리시
+
+- **1.1 — Delimiter-aware awk slug allocator extractor**: v1.2.0의 two-pass
+  sed를 `wiki-ingest.md` slug allocator의 `prev_origin` 추출에서 교체. 3개의
+  anchored awk rule (double-quoted / single-quoted / unquoted) + `\47` literal-
+  single-quote (POSIX awk portable)이 embedded opposite-kind quotes 포함 3가지
+  form을 모두 올바르게 처리 (예: `"/path/with'quote.md"`). Plan #1에서 처음
+  제안된 single-pass char-class sed는 Cycle-1 cross-validation에서 reject —
+  `[^"']*` capture가 첫 inner quote에서 멈추므로 embedded-opposite-kind 케이스
+  를 실제로 fix하지 못함.
+- **1.2 — Tab-indent를 코드 블록 마커로 인식**: `wiki-lint.md`
+  `strip_code_blocks` awk가 이제 `/^    /` 대신 `/^(    |\t)/` 매칭.
+  Tab-indented 코드 블록 내부의 broken-link 감지 false-positive (W-γ) 차단.
+- **1.3 — Post-list 2-blank-line reset**: 같은 awk가 `blank_run` 카운터 추가;
+  CommonMark 스펙대로 2 연속 blank line 후 `prev_was_list` 리셋. 4-space line이
+  실제 코드 블록인데 list continuation으로 처리되던 false-negative (W-δ) 차단.
+- **1.4 — Spec/plan ordering convention**: `CLAUDE.md` Workflows & Conventions
+  섹션이 spec writer가 위치 표현 ("above X", "below Y") 사용 시 surrounding
+  pattern을 명시하도록 요구하는 sub-section 추가. v1.2.1 cycle-3 lesson 적용.
+- **1.5 — Implementation review prompt tweak**: `CLAUDE.md` Review cycle
+  sub-section이 Step 6 (implementation review)에서 config/parser 실행 체크
+  메모 추가. deep-review repo (`commands/deep-review.md`)의 final
+  code-reviewer prompt에도 같은 가이드라인 추가 (optional companion change).
+- **1.6 — README config syntax sweep**: `README.md`와 `README.ko.md`가 이제
+  `auto_ingest`의 세 가지 수용 YAML form을 모두 문서화. v1.2.1 cycle-3의
+  "block-form only / silently ignored" 경고 괄호 제거 (Task 1 후 factually
+  false).
+
+### Tier 3 결정 (close)
+
+- **D — R3W2 missing-log design**: status quo 유지. Prose-only
+  `ingest-repair` (`pages_created:[]`) for log-truncation cases. Spec 변경
+  없음. v1.3.0+ dogfood가 빈번한 발생을 드러내면 재고려.
+- **E — `cache_local` 자동화**: 사용자-base 데이터 누적까지 v1.4.0+로 defer.
+  본인 vault는 Google Drive offline 모드; 그 모드의 cache_local benefit은
+  ~0. 1인-사용자 플러그인의 다른-사용자 분포는 가시성 없음.
+
+### Backwards compatibility
+
+- 단일 소스 `/wiki-ingest`는 v1.2.1과 byte-identical (fast path가 fanout 전체
+  스킵; lock도 Phase 3에서만 획득 — v1.2.1과 동일).
+- 다중 소스 `/wiki-ingest`는 cross-worker page collision이 없을 때 (보편적
+  케이스) 동일한 최종 wiki state 생성; collision 발생 시 second-pass synthesis가
+  v1.2.1 multi-source merge 의미를 보존. wall-clock만 변화.
+- 기존 `auto_ingest:` block-form config는 변경 없이 계속 작동.
+
+### Trade-offs
+
+- **토큰 비용 증가 (다중 소스 batch):** A4 fanout이 `min(3, sources)`개의
+  `wiki-synthesizer` 서브에이전트를 병렬 디스패치합니다. 각 worker는 synthesizer
+  spec + wiki-schema (~3-5K 토큰 컨텍스트)을 독립적으로 로드합니다. 3-소스
+  batch의 경우, v1.2.1 단일-synthesizer 기준 대비 ~2-3× synthesizer-spec
+  컨텍스트 비용 증가. wall-clock 절감 (~30-50%, LLM-dominant 분석)이 토큰 증가를
+  대부분의 사용자에게 상쇄. configurable `max_workers` knob은 v1.4.0+로 보류.
+- **Lock 보유 기간 (다중 소스 only):** 글로벌 mkdir-기반 lock이 fanout branch
+  (≥2 sources)에 한해 Phase 0에 획득되어 Phase 3까지 유지됩니다. v1.2.1은
+  Step 8에서 획득. 결과: 다중 소스의 LLM 분석 전체 시간(~분 단위) lock 보유.
+  단일 소스 path는 변경 없음. 동시 `/wiki-ingest` 세션은 1인 사용자 vault에서
+  드뭄; dogfood가 contention을 드러내면 재고려.
+- **Second-pass synthesis (cross-worker 충돌):** ≥2 workers가 같은
+  proposed_file을 non-byte-identical `page_content`로 타겟팅할 때, main이 1개의
+  추가 inline-mode synthesizer를 디스패치하여 충돌 draft들을 merge합니다.
+  비용: 같은-페이지 충돌당 1 추가 subagent 호출. 이것이 없으면 multi-source merge
+  invariant (v1.2.1 의미)가 silently fact를 drop. 대부분의 다중 소스 batch는
+  충돌이 없음.
+
+### 새 lifecycle action
+
+- **`ingest-fail`**: 같은 `.pending-scan` window에서 all-workers-fail이
+  3회 연속 (counter `<wiki>/.wiki-meta/.pending-scan-retry-count`,
+  format `<window_epoch>:<count>`) 발생하면 `log.jsonl`에 emit됩니다. 실패에도
+  불구하고 `.pending-scan → .last-scan` promote (stuck window 해제) + 영향받은
+  파일 명시한 user-visible error 표시. counter는 성공한 (full/partial) batch에서
+  reset — partial은 `.failed-sources.tsv`에 의존하여 per-source 재시도.
+
+### 새 storage-layout 파일
+
+- **`<wiki>/.wiki-meta/.failed-sources.tsv`**: 다중 소스 ingest에서 partial
+  worker failure 발생 시 작성되는 path-level 재시도 manifest. TSV format
+  `<source_path>\t<failure_reason>\t<ts>`. Hook이 다음 iteration에서
+  `.pending-scan`과 함께 읽음. Full success에서 clear. Plan #2의 (잘못된)
+  `.pending-scan`에 path를 쓰는 아이디어 (timestamp-only 파일) 대체.
+- **`<wiki>/.wiki-meta/.pending-scan-retry-count`**: 3-strike `ingest-fail`
+  트리거를 위한 all-workers-fail 카운터. Format `<window_epoch>:<count>`.
+  Success 또는 3-strike trigger에서 clear.
+
 ## [1.2.1] — 2026-05-02
 
 v1.2.0 review-cycle 백로그를 마무리하는 패치 릴리스. 네 축에 걸친 14개 이슈: Step 1.5 hash-skip 무결성 강화, wiki-lint false positive 제거, per-source provenance 보존, README cloud-mirror 문서 정확성. happy path 동작 변경 없음 — 모든 수정은 더 엄격한 invariant 검사 또는 문서/파서 정정.

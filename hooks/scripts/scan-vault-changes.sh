@@ -235,23 +235,39 @@ auto_ingest_passes() {
   fi
 
   # require_tag check (read first ~50 lines of frontmatter)
-  # IW2 review fix (v1.2.1+): hard line-count guard. Files without frontmatter
+  # IW2 review fix (v1.2.0+): hard line-count guard. Files without frontmatter
   # (or with missing closing `---`) would otherwise scan to EOF, which can
   # exceed the 15s SessionStart hook timeout on cloud-backed vaults with large
   # untagged notes. 50 lines is well beyond any realistic frontmatter window.
+  # RW5+CR-E review fix (v1.2.1+): the `---` rule must precede the line-counter
+  # rule so a closing `---` past line 50 (Templater-plugin frontmatter) is not
+  # missed. The line-counter early-exit only fires when frontmatter has not
+  # started (fm == 0); in-progress frontmatter (fm == 1) keeps reading up to
+  # the 200-line absolute cap. Opening `---` is restricted to line 1 so a
+  # body horizontal rule past line 50 cannot leak into frontmatter mode.
   if [ -n "$REQUIRE_TAG" ] && [ -f "$full" ]; then
     if ! awk -v want="$REQUIRE_TAG" '
       BEGIN{infm=0; intags=0; found=0; line=0}
-      { line++; if(line > 50) exit }
-      /^---[[:space:]]*$/ { fm++; if(fm==1) infm=1; else if(fm==2){exit} }
-      infm && /^tags:[[:space:]]*$/ { intags=1; next }
+      { line++ }
+      /^---[[:space:]]*$/ {
+        # CR-E v1.2.1+: only line-1 `---` opens frontmatter. A body horizontal rule
+        # past line 50 in a no-frontmatter file would otherwise flip fm to 1 and
+        # cause subsequent body lines that look like `tags: [x]` to match the
+        # require_tag check, leaking files past the auto_ingest filter.
+        if (fm == 0 && line != 1) {
+          if (line > 50) exit                     # body `---` past 50 → no FM, exit
+          next                                    # body `---` within first 50 → ignore, keep reading
+        }
+        fm++; if(fm==1) infm=1; else if(fm==2){exit}
+      }
+      { if (fm == 0 && line > 50) exit; if (line > 200) exit }
       infm && /^tags:[[:space:]]*\[/ {
-        # inline list form: tags: [a, b, c]
         body=$0; sub(/^tags:[[:space:]]*\[/,"",body); sub(/\][[:space:]]*$/,"",body)
         n=split(body,arr,",")
         for(i=1;i<=n;i++){ gsub(/^[[:space:]"\x27]+|[[:space:]"\x27]+$/,"",arr[i]); if(arr[i]==want){found=1; exit} }
         next
       }
+      infm && /^tags:[[:space:]]*$/ { intags=1; next }
       infm && intags && /^[[:space:]]+-[[:space:]]*/ {
         v=$0; sub(/^[[:space:]]+-[[:space:]]*/,"",v); sub(/[[:space:]]+$/,"",v); gsub(/^["\x27]+|["\x27]+$/,"",v)
         if(v==want){found=1; exit}

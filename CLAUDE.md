@@ -213,8 +213,8 @@ Claude Code hook 실행 중에 만들어지는 transcript artifact. session ID +
 - **v1.1.2** (2026-04-21) — wiki-synthesizer subagent delegation (always-on)
 - **v1.1.3** (2026-04-24) — parallel tool dispatch
 - **v1.1.4** (2026-04-24) — hash normalization + promotion regression guard
-- **v1.2.1** (2026-05-02) — patch: Step 1.5 hash-skip integrity hardening (R3W1 slug-collision allocator with in-batch ledger, R3W2 forced-repair on missing log signal, parser fixes for inline-list/single-quote yaml + explicit array init), wiki-lint false-positive elimination (T10 http(s) URL exclusion, W7 multi-line indented code block strip with `in_indented_code` state), per-source provenance preservation (B5 dual-classification scheme), README cloud-mirror corrections, RW5+CR-E hook frontmatter line-1 opening guard, RW6 synthesizer message-boundary count covers Phase 1c, B5 Step 10 prose update.
 - **v1.2.0** (2026-04-30) — throughput + lint hardening + ingest-repair self-healing
+- **v1.2.1** (2026-05-02) — **(현재)** patch: Step 1.5 hash-skip integrity hardening (R3W1 slug-collision allocator with in-batch ledger, R3W2 forced-repair on missing log signal, parser fixes for inline-list/single-quote yaml + explicit array init), wiki-lint false-positive elimination (T10 http(s) URL exclusion, W7 multi-line indented code block strip with `in_indented_code` state), per-source provenance preservation (B5 dual-classification scheme), README cloud-mirror corrections, RW5+CR-E hook frontmatter line-1 opening guard, RW6 synthesizer message-boundary count covers Phase 1c, B5 Step 10 prose update.
 
 전체 history는 `CHANGELOG.md` 참조.
 

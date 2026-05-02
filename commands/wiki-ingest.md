@@ -469,6 +469,8 @@ Append one log line **per source in the batch**, using the per-slug filtered lis
 
 For a single-source ingest this is one line; for multi-source batch it is one line per source, identical `ts`. This matches the per-source yaml written in Step 8e — any page whose frontmatter `sources:` field lists a given slug MUST appear under that slug's log line (`pages_created` or `pages_updated`).
 
+> **Drain note (RW2 review fix, v1.2.1+):** the `SKIPPED` and `REPAIR` arrays populated by Step 1.5 are *drained here in Step 10*, not in Step 8 — see the `(v1.2.1+, R3C1 + IW3)` blockquote immediately below for the exact replacement-vs-supplement semantics. Step 8e per-source yamls are still written for SKIPPED slugs (no-op — yaml is already authoritative) and for REPAIR slugs (per current cycle's restoration). The two paths converge here.
+
 > **(v1.2.1+, R3C1 + IW3 review fixes) Slugs in `SKIPPED` and `REPAIR` from Step 1.5 emit different action types and bypass the normal `ingest` line:**
 >
 > - For each slug in `SKIPPED` (bytes unchanged AND wiki state intact): emit `{"ts":"<iso>","action":"ingest-skip","source":"<slug>","pages_created":[],"pages_updated":[],"skip_reason":"content_hash unchanged"}`. Same `ts` as the rest of the batch.

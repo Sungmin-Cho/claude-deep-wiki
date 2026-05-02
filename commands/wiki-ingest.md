@@ -86,9 +86,34 @@ EOF_LEDGER
     on_disk_collision=false
     yaml="$WIKI_ROOT/.wiki-meta/sources/${slug}.yaml"
     if [ -f "$yaml" ]; then
-      prev_origin=$(grep '^origin:' "$yaml" \
-        | sed -E 's/^origin:[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/' \
-        | sed -E "s/^'([^']*)'\$/\\1/")
+      # v1.3.0 (1.1, Cycle-1 CV-3 + Cycle-2 C2V-2): three-form delimiter-aware
+      # awk parser. Each form anchored independently; first match wins.
+      # Embedded opposite-kind quotes preserved (e.g., "/path/with'quote.md" →
+      # /path/with'quote.md). Embedded SAME-kind quotes still truncate at the
+      # inner quote — this is a YAML limitation, not a parser bug. The YAML spec
+      # requires escaping same-kind embedded quotes via the alternate quote form.
+      # v1.3.0 closes only the embedded-opposite-kind case (the common one).
+      # `\47` is literal single-quote in awk (portable across POSIX awks).
+      prev_origin=$(grep '^origin:' "$yaml" | awk '
+        # Form 1: double-quoted — capture between first " and LAST "
+        /^origin:[[:space:]]*"/ {
+          sub(/^origin:[[:space:]]*"/, "")
+          sub(/"[[:space:]]*$/, "")
+          print; exit
+        }
+        # Form 2: single-quoted — capture between first \47 and LAST \47
+        /^origin:[[:space:]]*\47/ {
+          sub(/^origin:[[:space:]]*\47/, "")
+          sub(/\47[[:space:]]*$/, "")
+          print; exit
+        }
+        # Form 3: unquoted — capture remainder, trim whitespace
+        /^origin:[[:space:]]*/ {
+          sub(/^origin:[[:space:]]*/, "")
+          sub(/[[:space:]]*$/, "")
+          print; exit
+        }
+      ')
       if [ -n "$prev_origin" ] && [ "$prev_origin" != "$origin" ]; then
         on_disk_collision=true
       fi

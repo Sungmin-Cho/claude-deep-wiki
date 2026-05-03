@@ -2,6 +2,153 @@
 
 All notable changes to deep-wiki are documented here.
 
+## [1.3.0] — 2026-05-02
+
+Architectural minor release. Two parallel-axis changes plus six polish items
+carried over from v1.2.1 cycle reviews. Multi-source `/wiki-ingest` now
+fans out across up to 3 parallel `wiki-synthesizer` subagents in worker
+mode, capturing the LLM-analysis-dominant cost in parallel while keeping
+all writes serialized on main under the existing single mkdir-based lock.
+Hook YAML parser now accepts inline + dotted forms in addition to block
+form. Single-source ingest is byte-identical to v1.2.1 (fast path).
+
+### Architectural
+
+- **A4 — wiki-synthesizer fanout (Approach B)**: multi-source `/wiki-ingest`
+  splits sources across `min(3, N)` worker subagents (round-robin by
+  sorted source path), dispatched in parallel. Workers do full LLM
+  analysis but NO file writes. Main aggregates drafts via cross-worker
+  B5 dual-classification ledger and performs all writes sequentially
+  under the existing global lock (now acquired in Phase 0 for fanout
+  branch only — single-source path keeps v1.2.1 Phase-3-only timing).
+  Cross-worker page collisions trigger a second-pass `wiki-synthesizer`
+  invocation in worker mode (with new `colliding_drafts` input field) to
+  merge conflicting page bodies into one cohesive page — preserves
+  v1.2.1 multi-source merge invariant. v1.2.1 invariants (log-line
+  uniqueness, per-source provenance, ingest-repair semantics) preserved
+  by keeping main as single writer. Worker mode is opt-in via
+  `mode: "worker"` parameter on the synthesizer agent; default remains
+  `"inline"` for single-source fast path. Hardcoded cap of 3;
+  configurable knob deferred to v1.4.0+. Expected wall-clock reduction
+  for 3+ source batches: 30–50% (LLM analysis is dominant cost; ideal
+  speedup of 3× in practice ~2× due to fastest-source dominance +
+  Phase 2/3 sequential).
+- **C — Hook YAML parser broaden**: `scan-vault-changes.sh` awk now
+  recognizes three forms of `auto_ingest.ignore_globs`: block (current),
+  inline (`["a", "b"]`), and dotted (`auto_ingest.ignore_globs: [...]`).
+  Same broaden applied to `wiki-lint.md` `lint.orphan_ignore` parser
+  (mirror parser per in-repo comment). Closes the v1.2.1 cycle-3
+  README/parser mismatch on the parser side. Also fixes a pre-existing
+  latent bug in the block-form path (`sub()` mutates `$0` causing
+  terminator rule to fire on same line via fall-through, silently
+  dropping multi-item block lists after the first).
+
+### Polish
+
+- **1.1 — Delimiter-aware awk slug allocator extractor**: replaces the
+  v1.2.0 two-pass sed in `wiki-ingest.md` slug allocator's `prev_origin`
+  extraction. Three anchored awk rules (double-quoted / single-quoted /
+  unquoted) with `\47` literal-single-quote (POSIX awk portable) handle
+  all 3 forms correctly, including embedded opposite-kind quotes
+  (e.g., `"/path/with'quote.md"`). The single-pass char-class sed
+  initially proposed in Plan #1 was rejected in Cycle-1 cross-validation
+  — `[^"']*` capture stops at first inner quote, doesn't actually fix
+  the embedded-opposite-kind case.
+- **1.2 — Tab-indent recognized as code-block marker**: `wiki-lint.md`
+  `strip_code_blocks` awk now matches `/^(    |\t)/` instead of `/^    /`.
+  Closes W-γ false-positive on broken-link detection inside tab-indented
+  code blocks.
+- **1.3 — Post-list 2-blank-line reset**: same awk gains a `blank_run`
+  counter; `prev_was_list` resets after 2 consecutive blank lines per
+  CommonMark spec. Closes W-δ false-negative when a 4-space line after
+  2 blanks is a real code block but was treated as list continuation.
+- **1.4 — Spec/plan ordering convention**: `CLAUDE.md` Workflows &
+  Conventions section gains a sub-section requiring spec writers to name
+  the surrounding pattern when using positional language ("above X",
+  "below Y"). v1.2.1 cycle-3 lesson applied.
+- **1.5 — Implementation review prompt tweak**: `CLAUDE.md` Review cycle
+  sub-section gains a memo about config/parser execution checks at Step
+  6 (implementation review). Optional companion change in deep-review
+  repo (`commands/deep-review.md`) appends the same guidance to the
+  final code-reviewer prompt.
+- **1.6 — README config syntax sweep**: `README.md` and `README.ko.md`
+  now document all three accepted YAML forms for `auto_ingest`. Removed
+  the v1.2.1 cycle-3 "block-form only / silently ignored" warning
+  parenthetical (factually false post-Task-1).
+
+### Tier 3 decisions (closed)
+
+- **D — R3W2 missing-log design**: status quo retained. Prose-only
+  `ingest-repair` (`pages_created:[]`) for log-truncation cases. No
+  spec change. Will revisit if v1.3.0+ dogfood reveals frequent
+  occurrence.
+- **E — `cache_local` automation**: deferred to v1.4.0+ pending
+  user-base data. Personal vault is Google Drive offline mode;
+  cache_local benefit for that mode is ~0. Other-user prevalence is
+  unobservable for a 1-user plugin.
+
+### Backwards compatibility
+
+- Single-source `/wiki-ingest` is byte-identical to v1.2.1 (fast path
+  skips fanout entirely; lock still acquired in Phase 3 only — same as
+  v1.2.1).
+- Multi-source `/wiki-ingest` produces identical final wiki state when
+  no cross-worker page collision occurs (the common case); second-pass
+  synthesis preserves the same invariant when collisions DO occur. Only
+  wall-clock changes.
+- Existing `auto_ingest:` block-form configs continue to work unchanged.
+
+### Trade-offs
+
+- **Token cost increase (multi-source batches):** A4 fanout dispatches
+  `min(3, sources)` `wiki-synthesizer` subagents in parallel. Each worker
+  independently loads the synthesizer spec + wiki-schema (~3-5K tokens of
+  context per worker). For 3-source batches, expect ~2-3× synthesizer-spec
+  context cost vs the v1.2.1 single-synthesizer baseline. Wall-clock
+  savings (~30-50% on LLM-dominant analysis) outweigh the token increase
+  for most users; configurable `max_workers` knob deferred to v1.4.0+
+  pending dogfood data.
+- **Lock-held duration (multi-source only):** the global mkdir-based
+  lock is now acquired in Phase 0 for the fanout branch (≥2 sources)
+  and held through Phase 3 (atomic writes), versus v1.2.1 which acquired
+  in Step 8. Lock held for the full LLM-analysis duration (~minutes for
+  multi-source). Single-source path unchanged. Concurrent
+  `/wiki-ingest` sessions are rare (single-user vault); contention will
+  surface in dogfood if it matters.
+- **Second-pass synthesis (cross-worker collision):** when ≥2 workers
+  target the same proposed_file with non-byte-identical `page_content`,
+  main dispatches one extra **worker-mode** synthesizer (with new
+  `colliding_drafts` input field) to merge the colliding drafts. Worker
+  returns the merged draft; main writes during Phase 3 — preserves the
+  single-writer invariant (an `inline`-mode dispatch here would write
+  during Phase 2 and break that invariant). Cost: 1 extra subagent
+  invocation per same-page collision. Without this, multi-source merge
+  invariant (v1.2.1 semantics) would silently drop facts. Most
+  multi-source batches have no collision.
+
+### New lifecycle action
+
+- **`ingest-fail`**: emitted to `log.jsonl` when the all-workers-fail
+  retry counter (`<wiki>/.wiki-meta/.pending-scan-retry-count`,
+  format `<window_epoch>:<count>`) reaches 3 consecutive batches on
+  the same `.pending-scan` window. Promotes `.pending-scan → .last-scan`
+  despite the failure (releases the stuck window) and records affected
+  source paths + 3 prior failure timestamps. Counter resets on any
+  successful (full or partial) batch — partial relies on
+  `.failed-sources.tsv` for per-source retry.
+
+### New storage-layout files
+
+- **`<wiki>/.wiki-meta/.failed-sources.tsv`**: path-level retry manifest
+  written when a partial worker failure occurs in multi-source ingest.
+  TSV format `<source_path>\t<failure_reason>\t<ts>`. Hook reads this
+  alongside `.pending-scan` on next iteration. Cleared on full success.
+  Replaces the (incorrect) Plan #2 idea of writing paths into
+  `.pending-scan` (which is timestamp-only).
+- **`<wiki>/.wiki-meta/.pending-scan-retry-count`**: all-workers-fail
+  counter for the 3-strike `ingest-fail` trigger. Format
+  `<window_epoch>:<count>`. Cleared on success or 3-strike trigger.
+
 ## [1.2.1] — 2026-05-02
 
 Patch release closing v1.2.0 review-cycle backlog. Fourteen issues across four axes: Step 1.5 hash-skip integrity hardening, wiki-lint false-positive elimination, per-source provenance preservation, and README cloud-mirror documentation accuracy. No behavior change on the happy path; every fix is either a stricter invariant check or a doc/parser correction.

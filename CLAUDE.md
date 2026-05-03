@@ -117,7 +117,16 @@ deep-wiki/
     ├── .versions/               # 페이지 backup (write 전 snapshot, last 3)
     ├── .wiki-lock/              # mkdir-based concurrency lock
     ├── .last-scan               # SessionStart hook의 마지막 committed scan window
-    └── .pending-scan            # 진행 중인 scan window (promote 안 됨 = ingest 미완료)
+    ├── .pending-scan            # 진행 중인 scan window (promote 안 됨 = ingest 미완료)
+    ├── .failed-sources.tsv      # (v1.3.0+) Path-level retry manifest for
+    │                            # partial-fail multi-source ingest. TSV:
+    │                            # <source_path>\t<reason>\t<ts>. Hook reads
+    │                            # alongside .pending-scan; cleared on full
+    │                            # success.
+    └── .pending-scan-retry-count  # (v1.3.0+) All-workers-fail counter for
+                                 # 3-strike ingest-fail trigger. Format:
+                                 # <window_epoch>:<count>. Cleared on
+                                 # success or 3-strike trigger.
 ```
 
 ### Lifecycle actions (log.jsonl `action` field)
@@ -131,6 +140,14 @@ deep-wiki/
 - `delete` — 페이지 삭제
 - `query-filed` — `/wiki-query`가 cross-page synthesis를 자동 페이지화
 - `setup` — `/wiki-setup` 초기화 시 seed (welcome.md)
+- `ingest-fail` (v1.3.0+) — emitted when the all-workers-fail retry counter
+  reaches 3 consecutive batches on the same `.pending-scan` window.
+  Promotes the window despite failure (releases stuck state) and records
+  affected source paths + 3 prior failure timestamps. Counter
+  (`<wiki>/.wiki-meta/.pending-scan-retry-count`, format
+  `<window_epoch>:<count>`) resets on any successful batch (full or
+  partial — partial relies on `.failed-sources.tsv` for per-source
+  retry).
 
 ### Critical invariants
 
@@ -180,6 +197,22 @@ else ...date -d... ; fi
 3. 정확한 file 명시 git add
 4. HEREDOC commit message (Co-Authored-By trailer 포함)
 
+### Spec/Plan ordering instructions (v1.3.0+)
+
+When a spec/plan directs a code or doc change involving relative position
+("above X", "below Y", "before Z"), name the surrounding pattern so the
+implementer can verify intent against context. v1.2.1 cycle-3 lesson —
+ambiguous "above" instruction conflicted with surrounding
+chronological-oldest-first pattern; the implementer caught it via atomic
+fixup commit, but the spec writer could have been more precise.
+
+- Bad: "Insert v1.2.1 above v1.2.0"
+- Good: "Insert v1.2.1 above v1.2.0 (chronological-newest-first ordering — newest version at top)"
+- Good: "Insert v1.2.1 below v1.2.0 (chronological-oldest-first ordering — keep historical order)"
+
+Apply this whenever editing CHANGELOG, Recent releases, version-tagged
+bullet lists, or any list whose insertion order matters.
+
 ### Review cycle (deep-review)
 
 큰 변경은 다음 사이클 따름:
@@ -193,6 +226,15 @@ else ...date -d... ; fi
 8. **이 CLAUDE.md + deep-suite 동기화** (위 "CRITICAL" 섹션)
 
 각 cycle의 review/response artifact는 `.deep-review/{reports,responses}/`에 timestamp별 저장 (gitignored).
+
+**Implementation review (Step 6) lesson (v1.2.1 cycle-3):** for config /
+hook / parser-driven changes, verify spec text execution against the actual
+parser, not just self-consistent spec text. v1.2.1 cycle-3 found a config
+syntax mismatch that cycles 1+2 missed because they verified the spec was
+internally coherent without testing parser execution. (A companion change
+in the deep-review repo's `commands/deep-review.md` reinforces this in the
+final code-reviewer prompt — see deep-review v1.3.x release notes; merge
+status is optional for deep-wiki releases.)
 
 ### docs/ folder policy
 
@@ -214,7 +256,8 @@ Claude Code hook 실행 중에 만들어지는 transcript artifact. session ID +
 - **v1.1.3** (2026-04-24) — parallel tool dispatch
 - **v1.1.4** (2026-04-24) — hash normalization + promotion regression guard
 - **v1.2.0** (2026-04-30) — throughput + lint hardening + ingest-repair self-healing
-- **v1.2.1** (2026-05-02) — **(현재)** patch: Step 1.5 hash-skip integrity hardening (R3W1 slug-collision allocator with in-batch ledger, R3W2 forced-repair on missing log signal, parser fixes for inline-list/single-quote yaml + explicit array init), wiki-lint false-positive elimination (T10 http(s) URL exclusion, W7 multi-line indented code block strip with `in_indented_code` state), per-source provenance preservation (B5 dual-classification scheme), README cloud-mirror corrections, RW5+CR-E hook frontmatter line-1 opening guard, RW6 synthesizer message-boundary count covers Phase 1c, B5 Step 10 prose update.
+- **v1.2.1** (2026-05-02) — patch: Step 1.5 hash-skip integrity hardening (R3W1 slug-collision allocator with in-batch ledger, R3W2 forced-repair on missing log signal, parser fixes for inline-list/single-quote yaml + explicit array init), wiki-lint false-positive elimination (T10 http(s) URL exclusion, W7 multi-line indented code block strip with `in_indented_code` state), per-source provenance preservation (B5 dual-classification scheme), README cloud-mirror corrections, RW5+CR-E hook frontmatter line-1 opening guard, RW6 synthesizer message-boundary count covers Phase 1c, B5 Step 10 prose update.
+- **v1.3.0** (2026-05-02) — **(현재)** minor: A4 synthesizer fanout (Approach B — workers parallel-analyze, main aggregates + writes under single lock; lock branch-scoped: multi-source Phase 0, single-source Phase 3) for multi-source `/wiki-ingest` (~30-50% wall-clock reduction on 3+ source batches); cross-worker page collisions trigger second-pass synthesis in worker mode with new `colliding_drafts` input. Hook YAML parser broaden (inline + dotted forms accepted in addition to block; same broaden applied to `wiki-lint.md` `lint.orphan_ignore` mirror parser; pre-existing latent multi-item block-list drop bug also fixed). 6 polish items (1.1 awk-based delimiter-aware slug-allocator extractor [v1.3.0 plan reframe of Cycle-1 CV-3 sed bug], 1.2 tab-indent code block strip, 1.3 post-list 2-blank reset, 1.4 spec/plan ordering convention, 1.5 implementation review prompt tweak [+ optional companion deep-review repo PR], 1.6 README config syntax sweep). New `ingest-fail` lifecycle action for stuck-window recovery after 3 consecutive all-workers-fail batches. New `.failed-sources.tsv` manifest for partial-fail per-source retry. Tier 3 D=status-quo, E=defer-v1.4.0+. Single-source ingest byte-identical to v1.2.1.
 
 전체 history는 `CHANGELOG.md` 참조.
 

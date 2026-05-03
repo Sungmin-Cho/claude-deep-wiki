@@ -86,9 +86,34 @@ EOF_LEDGER
     on_disk_collision=false
     yaml="$WIKI_ROOT/.wiki-meta/sources/${slug}.yaml"
     if [ -f "$yaml" ]; then
-      prev_origin=$(grep '^origin:' "$yaml" \
-        | sed -E 's/^origin:[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/' \
-        | sed -E "s/^'([^']*)'\$/\\1/")
+      # v1.3.0 (1.1, Cycle-1 CV-3 + Cycle-2 C2V-2): three-form delimiter-aware
+      # awk parser. Each form anchored independently; first match wins.
+      # Embedded opposite-kind quotes preserved (e.g., "/path/with'quote.md" →
+      # /path/with'quote.md). Embedded SAME-kind quotes still truncate at the
+      # inner quote — this is a YAML limitation, not a parser bug. The YAML spec
+      # requires escaping same-kind embedded quotes via the alternate quote form.
+      # v1.3.0 closes only the embedded-opposite-kind case (the common one).
+      # `\47` is literal single-quote in awk (portable across POSIX awks).
+      prev_origin=$(grep '^origin:' "$yaml" | awk '
+        # Form 1: double-quoted — capture between first " and LAST "
+        /^origin:[[:space:]]*"/ {
+          sub(/^origin:[[:space:]]*"/, "")
+          sub(/"[[:space:]]*$/, "")
+          print; exit
+        }
+        # Form 2: single-quoted — capture between first \47 and LAST \47
+        /^origin:[[:space:]]*\47/ {
+          sub(/^origin:[[:space:]]*\47/, "")
+          sub(/\47[[:space:]]*$/, "")
+          print; exit
+        }
+        # Form 3: unquoted — capture remainder, trim whitespace
+        /^origin:[[:space:]]*/ {
+          sub(/^origin:[[:space:]]*/, "")
+          sub(/[[:space:]]*$/, "")
+          print; exit
+        }
+      ')
       if [ -n "$prev_origin" ] && [ "$prev_origin" != "$origin" ]; then
         on_disk_collision=true
       fi
@@ -361,6 +386,11 @@ Sources of other types (`url`, `file`, `deep-work-report`) are unchanged and hav
 
 ### 7. Dispatch to wiki-synthesizer (always)
 
+> **v1.3.0+ change:** synthesizer invocation now branches on source count.
+> See "Step 7.5 — Synthesizer dispatch (v1.3.0+: A4 fanout, Approach B)" below
+> for the full flow. The text below remains valid for the single-source fast
+> path (Step 7.5 decision branch 2).
+
 Spawn the `wiki-synthesizer` agent via the Agent tool. This happens for **every** ingest — single-source, multi-source, URL, file, pasted text, or deep-work report alike. The main session does not read source content or page bodies; it only passes paths and the candidate list.
 
 **Input and output contracts are defined in `agents/wiki-synthesizer.md` (Input contract / Output contract sections). That file is the single source of truth. This step summarizes what the caller does with the returned manifest; for field semantics, see the agent file.**
@@ -373,6 +403,402 @@ Input (summary):
 Output (summary): structured entries for `created` / `updated` carrying `{file, title, tags, aliases, sources}`, plus `versioned`, `source_hashes` (per-slug sha256), and `failed` (may include `orphan_version`).
 
 If `failed` is non-empty, continue with metadata updates for whatever succeeded and include the failures in the final report (Step 14). Always release the lock. **In auto-ingest mode, do NOT promote `.pending-scan → .last-scan` on any partial or full failure** — the next session's hook will re-detect the window. See Error Handling below.
+
+### 7.5. Synthesizer dispatch (v1.3.0+: A4 fanout, Approach B)
+
+**Lock scope (v1.3.0+, fixes Cycle-1 SS-1 + Plan #2.1 Cycle-2 C2-W2 —
+branch-scoped):** the existing global lock
+(`mkdir <wiki>/.wiki-meta/.wiki-lock`) acquisition timing now depends
+on the branch:
+
+- **Multi-source path (≥2 sources):** lock acquired **BEFORE worker
+  dispatch** (Phase 0/Step 7.5.A entry) and held through Phase 3 (atomic
+  writes). Approach B's correctness depends on workers seeing a stable
+  wiki state snapshot during their analysis. Lock held for the full LLM
+  analysis duration (~minutes), blocking concurrent `/wiki-ingest`
+  sessions. Rare in practice (single-user vault).
+- **Single-source path (1 source):** lock acquired in Phase 3 only —
+  exactly as v1.2.1. Preserves byte-identical single-source behavior
+  (no extra blocking, no contention drift, no timing change). The
+  single-source fast path does not have the cross-worker-snapshot
+  consistency need.
+- **0-source path:** no lock at all (immediate exit).
+
+The Cycle-2 review (C2-W2) flagged that an unconditional Phase-0 lock
+contradicted the "byte-identical to v1.2.1 single-source" claim.
+Branch-scoping resolves the contradiction: single-source remains
+byte-identical (lock timing AND state); multi-source gets the new lock
+scope it needs for B5 invariant on fanout. See spec §2.5 for full
+trade-offs.
+
+After Step 1.5 (re-ingest hash skip) finalizes the source set, the agent
+decides between empty-batch exit, single-worker fast path, and multi-worker
+fanout based on source count.
+
+**Three-branch decision (fixes Cycle-1 SS-9):**
+
+1. **0 sources** (`${#SOURCES[@]} == 0`): emit `"No sources to ingest."` and
+   exit cleanly. **No lock acquired.** (v1.2.1 behavior preserved — does
+   NOT invoke synthesizer at all.)
+
+2. **1 source** (`${#SOURCES[@]} == 1`): single-source fast path. Invoke
+   `wiki-synthesizer` agent with `mode: "inline"` (default). The synthesizer
+   reads the source, decides action, writes pages + backups directly. Main
+   records log + sources/*.yaml + index.json updates per the existing
+   v1.2.1 Step 8a-8h sequence. **Lock acquired in Phase 3 only — same as
+   v1.2.1. Byte-identical to v1.2.1** for this branch in BOTH state AND
+   lock timing.
+
+3. **≥2 sources**: multi-source fanout — **acquire lock NOW** (Phase 0
+   for fanout branch only), then proceed to Step 7.5.A below.
+
+#### Step 7.5.A — Parallel worker dispatch (Phase 1)
+
+Split sources across **`min(3, ${#SOURCES[@]})`** wiki-synthesizer worker
+subagents. Sources are sorted lexicographically by `origin` (source path)
+for deterministic worker assignment across reruns. Round-robin distribution:
+`source[i] → worker (i % WORKER_COUNT)`. **Dispatch all N workers in a
+single Agent-tool-message-turn** (the LLM emits N parallel Agent tool
+invocations in one assistant turn — that is the actual parallel mechanism
+in Claude Code; there is no shell-side orchestrator).
+
+Each worker invocation specifies `subagent_type: "wiki-synthesizer"` with
+input descriptor:
+
+```json
+{
+  "mode": "worker",
+  "wiki_root": "<absolute path>",
+  "sources": [<source descriptors assigned to this worker, sorted>],
+  "candidates": [<candidate descriptors — same snapshot for all workers>]
+}
+```
+
+The candidates list is a snapshot taken AFTER Phase 0 lock acquisition, so
+all workers see the same wiki state.
+
+**Reference (non-executable) example** of the round-robin split:
+
+```bash
+# Reference only — actual mechanism is parallel Agent tool invocations
+WORKER_COUNT=3
+[ ${#SOURCES[@]} -lt $WORKER_COUNT ] && WORKER_COUNT=${#SOURCES[@]}
+SORTED_SOURCES=$(printf '%s\n' "${SOURCES[@]}" | sort)
+i=0
+WORKER_BUCKETS=""
+while IFS= read -r src; do
+  worker_idx=$((i % WORKER_COUNT))
+  WORKER_BUCKETS="${WORKER_BUCKETS}${worker_idx}|${src}"$'\n'
+  i=$((i + 1))
+done <<< "$SORTED_SOURCES"
+# Then group by worker_idx and dispatch each subset to a parallel Agent call.
+```
+
+#### Step 7.5.B — Aggregate drafts (Phase 2, sequential, in-memory)
+
+Once all workers return, the agent collects their `drafts[]` arrays into a
+single `ALL_DRAFTS` list. The aggregation runs B5 dual-classification with
+the v1.2.1 rules extended for fanout:
+
+1. **Build in-batch ledger** (in-memory; main is the single writer, no
+   file-lock needed for this in-memory structure):
+
+   ```
+   ledger = {}  # proposed_file → list of (worker_idx, draft_idx, draft)
+   for worker_idx, worker in enumerate(ALL_WORKER_RESULTS):
+     for draft_idx, draft in enumerate(worker.drafts):
+       ledger.setdefault(draft.proposed_file, []).append((worker_idx, draft_idx, draft))
+   ```
+
+2. **Resolve cross-worker collisions** (fixes Cycle-1 CV-2 + SS-7 + W12):
+   For each `proposed_file` with >1 proposers:
+
+   - **Determine canonical ordering** by `origin` (source path) lexicographic
+     order, NOT `source_slug`. Slug allocator may suffix-bump based on batch
+     order; using slug for tie-breaking would make the final wiki state
+     non-deterministic across reruns. **`origin` (or `source_path`) is the
+     only stable source-key.**
+
+   - **Case A — All drafts have `proposed_action == "skip"`:** collapse to
+     one ingest-skip log entry per source slug; no page write.
+
+   - **Case B — All drafts have `proposed_action == "create"` or `"update"`:**
+
+     - **B1 — Byte-identical `page_content`:** write the canonical draft
+       once; append all contributing source_slugs to the page's frontmatter
+       `sources:` field AND record each contributing slug's `pages_created`
+       per v1.2.1 B5 (per-source provenance). **Sort the resulting `sources:`
+       array lexicographically by slug** before writing the page (W12 fix —
+       ensures byte-identical output across reruns regardless of worker
+       return order).
+
+     - **B2 — `page_content` differs across drafts (CV-2 second-pass + Plan
+       #2.1 Cycle-2 C2V-1 mode fix):** the workers analyzed the same
+       target page from different sources but produced non-identical
+       bodies. Run a SECOND PASS — but use **`mode: "worker"`** (NOT
+       `"inline"`, which would write files during Phase 2 and break the
+       single-writer invariant):
+         1. Main dispatches a **single** wiki-synthesizer subagent in
+            `mode: "worker"` with the new `colliding_drafts` input field
+            (defined in Task 8 Plan #2.1 extension). Input shape:
+            ```json
+            {
+              "mode": "worker",
+              "wiki_root": "...",
+              "sources": [<union of contributing source descriptors>],
+              "candidates": [<existing wiki page if action=update, else []>],
+              "colliding_drafts": [
+                {"source_slug": "a", "page_content": "<body from worker A>"},
+                {"source_slug": "b", "page_content": "<body from worker B>"}
+              ]
+            }
+            ```
+         2. The second-pass worker reads sources + colliding_drafts +
+            existing page (if any), synthesizes ONE merged
+            `page_content` honoring v1.2.1 multi-source merge semantics
+            (Rule 6 conflict notation when sources disagree). Returns
+            ONE draft via the standard worker output contract — NO
+            file writes (worker mode contract enforced).
+         3. Main writes the merged content during Phase 3 (under the
+            already-held lock); all contributing slugs go into
+            `sources` (sorted lexicographically per W12).
+       Cost: extra subagent invocation only on collision (rare — most
+       multi-source batches don't have same-page overlap). Preserves the
+       v1.2.1 invariant of "one merged page per topic across all
+       contributing sources" AND the v1.3.0 single-writer invariant
+       (all writes happen in Phase 3 via main).
+
+   - **B3 — Genuinely-different topics under same slug:** when the
+     second-pass synthesizer reports the topics are distinct (heuristic:
+     no semantic overlap between drafts), main suffixes the later draft's
+     slug to `<slug>-2`, `<slug>-3`, etc. Order by `origin` (source path)
+     lexicographic — first proposer keeps the bare slug.
+
+   - **If proposed actions differ across workers** (e.g., one says
+     `create`, another says `update` for the same proposed_file): `update`
+     wins (more conservative — assume the existing-wiki match is real).
+     Reclassify the `create` draft to contribute its source to the merged
+     page; second-pass synthesis (B2) handles content merge.
+
+3. **Apply Step 1.5-equivalent finalization on aggregated drafts (fixes
+   Cycle-1 SS-2):** for each draft whose source `type ∈ {file,
+   deep-work-report}`, compare the source bytes sha256 (use the worker's
+   `source_hashes[source_slug]` if it returned a 64-char hex; otherwise
+   recompute from `origin` via `shasum -a 256` / `sha256sum`) against the
+   existing `sources/<source_slug>.yaml:content_hash`. If match AND wiki
+   state intact (R3W2 v1.2.1 forced-repair check passes), reclassify to
+   ingest-skip (no write, just log entry). Forced-repair check runs
+   identically to v1.2.1.
+
+#### Step 7.5.C — Atomic write (Phase 3, lock per Phase 0 decision)
+
+The lock state depends on the branch (per Step 7.5 preamble): held from
+Phase 0 (multi-source) OR acquired here (single-source — exactly as
+v1.2.1).
+
+**Manifest conversion before Step 8 (Cycle-3 CV3-B fix):** Step 8's
+existing parser expects the inline-mode response shape with top-level
+`created`, `updated`, `versioned`, `failed`, `source_hashes` arrays.
+Worker-mode responses use a different shape (`mode`, `drafts`,
+`source_hashes`). Before invoking Step 8 logic, **main converts the
+aggregated `ALL_DRAFTS` (post-Phase-2 collision resolution) into the
+inline-mode manifest shape**:
+
+- For each draft with `proposed_action == "create"`: append entry to
+  `created` array with `{file: proposed_file, title: proposed_title,
+  tags: proposed_tags, aliases: proposed_aliases, sources: [contributing
+  source_slugs sorted lex per W12]}`. The draft's `page_content` is
+  written by Step 8a per-draft.
+- For each draft with `proposed_action == "update"`: append entry to
+  `updated` array with the same shape. The draft's `merge_against` field
+  identifies the page for Step 8's version-backup phase.
+- `versioned` array starts empty; Step 8a's per-draft version backup
+  populates it as backups land.
+- `failed` array carries any drafts that the second-pass synthesis
+  (Case B2) reported as "merge impossible" — surfaced to user but
+  not retried automatically.
+- `source_hashes` is the union of per-worker `source_hashes` maps
+  (workers compute on read; main may recompute via `shasum` for
+  sentinels per the existing v1.2.1 Step 8d normalization).
+
+After this conversion, Step 8a-8h runs **per draft** as if it were the
+v1.2.1 inline-mode response — no Step 8 spec changes needed. Step 8a-8h
+covers: version snapshot for updates, page write, sources/*.yaml update,
+log.jsonl append, index.json update, log.md update, index.md update,
+retention prune. Plan implementer: re-read v1.2.1 Step 8 for the exact
+sub-step list. Sort the per-draft execution order by `origin`
+lexicographic (fixes SS-7) so reruns are deterministic.
+
+After all drafts are written successfully, apply CONDITIONAL `.pending-scan`
+promotion (fixes Cycle-1 CV-1 + W13 + Plan #2.1 Cycle-2 C2S-1 — separate
+manifest for path retry state):
+
+**Important format constraint (Cycle-2 C2S-1):** `.pending-scan` is a
+**timestamp-only** file (matches `TS_RE` in v1.2.1 hook + lint scan-window
+parser). Writing source paths INTO it makes the file malformed → next hook
+iteration discards it → failed sources lost from retry. Plan #2 incorrectly
+proposed this. Plan #2.1 fix: keep `.pending-scan` timestamp-only and use a
+**separate** manifest file for path-level retry state.
+
+- **`.pending-scan` exists AND all drafts succeeded:** promote
+  `.pending-scan → .last-scan` normally. Delete any stale
+  `.wiki-meta/.failed-sources.tsv` (clean state).
+- **`.pending-scan` exists AND partial worker failure (N-1 succeeded):**
+  do NOT promote `.pending-scan` (timestamp file unchanged). Instead, write
+  the failed worker's source paths to **`<wiki>/.wiki-meta/.failed-sources.tsv`**
+  (one path per line, TSV format `<source_path>\t<failure_reason>\t<ts>`).
+  `.last-scan` unchanged. **Hook reads BOTH on next iteration:**
+  `.pending-scan` for the unchanged window epoch, `.failed-sources.tsv` for
+  the must-retry source paths (union with newly-detected files in window).
+  Existing v1.2.1 partial-failure contract preserved (same effect — failed
+  files retried — different mechanism).
+- **`.pending-scan` exists AND all workers failed:** abort earlier in
+  Phase 1 — Phase 3 not reached. `.failed-sources.tsv` not written
+  (handled by the 3-strike retry counter logic in Step 7.5.D).
+- **No `.pending-scan` (manual `/wiki-ingest fileA.md fileB.md`):** do NOT
+  touch `.pending-scan` (it doesn't exist) AND do NOT write
+  `.failed-sources.tsv` (manual invocation does not use scan window
+  mechanism). Failed sources surfaced as "unprocessed" in stdout summary
+  for user to re-invoke manually.
+
+**Schema-coupled change (CLAUDE.md update required):** the new
+`.wiki-meta/.failed-sources.tsv` file must be added to CLAUDE.md "Storage
+layout (`<wiki_root>/`)" section as part of Task 10 release commit.
+
+Release lock (multi-source) or release lock acquired in this Step (single-
+source). Emit per-source action summary.
+
+#### Step 7.5.D — Failure handling
+
+(Updated to address Cycle-1 W3 + reflect CV-1 partial-fail handling +
+Plan #2.1 C2S-1 manifest + C2-W5 counter edge cases.)
+
+- **Worker subagent failure** (any worker returns error): main commits the
+  N-1 successful workers' drafts (Phase 3 runs normally for those). Failed
+  worker's sources are written to **`.wiki-meta/.failed-sources.tsv`**
+  per Step 7.5.C (auto-ingest mode) — NOT into `.pending-scan` (Plan #2.1
+  C2S-1 fix; `.pending-scan` is timestamp-only, see Step 7.5.C). For
+  manual-mode invocation: omitted from the structured retry mechanism;
+  surfaced in stdout summary as "unprocessed". Idempotent — Step 1.5
+  hash-skip on next invocation handles the no-op case for sources that
+  succeed-then-resucceed.
+
+- **Worker timeout** (>5 min wall-clock, Agent tool default): treated as
+  failure (same path as above).
+
+- **All workers fail (single batch):** abort batch, NO Phase 3 execution,
+  `.pending-scan` not promoted, `.last-scan` unchanged.
+
+- **All workers fail repeatedly (3 consecutive batches on same `.pending-scan`
+  window — W3 fix + Plan #2.1 Cycle-2 C2-W5 edge-case semantics):**
+  maintain a counter at `<wiki>/.wiki-meta/.pending-scan-retry-count`.
+
+  **Counter file format** (Plan #2.1, single line):
+  ```
+  <window_epoch>:<count>
+  ```
+  Example: `1735738200:2` (window epoch 1735738200, fail count 2).
+
+  **Read semantics** (start of every all-workers-fail handling):
+  - File missing or unreadable → treat as `<current_window_epoch>:0`
+    (initialize on first failure).
+  - Stored window_epoch ≠ current `.pending-scan` epoch → **reset count
+    to 0** (different window; previous failures don't carry over to a
+    new scan window). Write `<current>:0` (now becomes :1 after this
+    increment).
+  - Corrupt content (no colon, non-integer) → log warning, treat as
+    `<current_window_epoch>:0`, overwrite cleanly on next write.
+
+  **Write semantics** (after each all-workers-fail event):
+  - Increment count by 1.
+  - Write `<current_window_epoch>:<count>` (overwrites stored).
+  - Atomic write (write to temp file, mv to final — same pattern as
+    v1.2.1 lock + atomic ops).
+
+  **Counter clear** (on successful — partial or full — batch):
+  - Delete the file (next read sees missing → init to 0).
+  - Note: a partial-success batch (N-1 succeed) DOES clear the counter
+    even though some sources failed. Rationale: the failed-source-set
+    is now in `.failed-sources.tsv` for targeted retry; the
+    .pending-scan window is making progress; deterministic
+    single-source failure won't loop infinitely because next iteration
+    retries only that one source via the manifest, not the full window.
+    If the same lone source persists in `.failed-sources.tsv` for
+    repeated batches, the user-visible failure surface is via that
+    manifest (TSV file with reason + timestamp), not via the
+    .pending-scan-retry-count.
+
+  When count reaches 3:
+    1. Promote `.pending-scan → .last-scan` ANYWAY (releases the stuck
+       window so the user can move forward; the alternative is an infinite
+       hook-time retry loop on the same files).
+    2. Append a new `ingest-fail` lifecycle event to `log.jsonl`. Per
+       NC2 canonical-shape rule (Step 1.5), every action MUST preserve
+       `{ts, action, source, pages_created, pages_updated}`. Concrete
+       schema (Cycle-3 W-N2 + P3 fix — note: counter file format
+       `<window_epoch>:<count>` does NOT store prior timestamps; use
+       only the current trigger ts + window_epoch + retry_count to
+       characterize the failure):
+
+       ```jsonc
+       {
+         "ts": "<iso-8601 utc, current trigger time>",
+         "action": "ingest-fail",
+         "source": "<comma-separated source paths from .failed-sources.tsv>",
+         "pages_created": [],
+         "pages_updated": [],
+         "failure_reason": "<worker error / timeout / lock-contention summary>",
+         "window_epoch": <int — the .pending-scan epoch that hit 3 strikes>,
+         "retry_count": 3
+       }
+       ```
+
+       `pages_created` / `pages_updated` are empty (no pages produced by
+       a failure event). The window_epoch + retry_count fields are
+       v1.3.0+ extensions on top of the canonical NC2 shape, capturing
+       enough context to correlate against `.pending-scan` history
+       without storing prior timestamps.
+    3. Emit a user-visible error message naming the affected files and
+       suggesting `/wiki-ingest <file>` for manual retry with verbose
+       output.
+    4. Delete the counter file (cleared by side effect; next iteration
+       starts fresh).
+
+   The new `ingest-fail` lifecycle action is added to CLAUDE.md "Lifecycle
+   actions" list as part of Task 10 (release commit). It is a terminal
+   event — not retried further.
+
+- **Phase 3 lock acquisition fails** (cannot happen if lock is held from
+  Phase 0; this case is now N/A under the new lock scope for multi-source.
+  For single-source, same semantics as v1.2.1).
+
+- **Phase 3 mid-loop write failure**: roll back partial writes for the
+  failing draft using its `.versions/` snapshot; abort remaining drafts in
+  the batch; log error event; release lock; do NOT promote `.pending-scan`
+  (per Step 7.5.C partial-fail rule). Drafts written successfully BEFORE the
+  failure remain on disk (already committed atomically). Their log.jsonl
+  entries also remain. The `.failed-sources.tsv` reduction includes any
+  sources whose drafts were skipped due to mid-loop abort.
+
+- **log.jsonl append failure**: fatal — Phase 3 atomicity is broken. Main
+  attempts to roll back the just-written page using its `.versions/`
+  snapshot, releases lock, surfaces a user-visible critical error. Do NOT
+  promote `.pending-scan`.
+
+#### Backwards compatibility note
+
+For 1-source `/wiki-ingest`, the fast path (Step 7.5 decision branch 2)
+invokes the synthesizer in `mode: "inline"` exactly as v1.2.1 did —
+**byte-identical behavior**, no Worker mode bleed-through.
+
+For multi-source batches in v1.2.1, v1.3.0 produces identical final wiki
+state when no cross-worker page collision occurs (the common case): same
+pages, same log events, same provenance YAMLs. Only wall-clock differs
+(parallel analysis phase). When cross-worker collision DOES occur
+(uncommon — most multi-source batches surface independent topics), v1.3.0's
+second-pass synthesis (Step 7.5.B Case B2) preserves v1.2.1's
+single-synthesizer multi-source merge invariant — content from all
+contributing sources flows into one merged page, no facts dropped.
 
 ### 8. Reconcile, Classify, and Write Source Provenance
 

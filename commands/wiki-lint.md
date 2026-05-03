@@ -99,14 +99,43 @@ TAGGED_LEAVES=$(for f in "$WIKI_ROOT/pages"/*.md; do
 done | xargs -I{} basename {} | sort -u)
 
 # Orphan ignore globs from ~/.claude/deep-wiki-config.yaml — block-aware awk
-# (mirror of Task 2.2's auto_ingest.ignore_globs parser) (I3 review note).
+# (mirror of v1.3.0+ broadened auto_ingest.ignore_globs parser; both accept block + inline + dotted forms).
 ORPHAN_IGNORE_GLOBS=()
 while IFS= read -r line; do
   [ -z "$line" ] && continue
   ORPHAN_IGNORE_GLOBS+=("$line")
 done < <(awk '
+  # Inline list parser used by both block-inline and dotted-form branches.
+  function parse_inline_list(line,    s, items, n, i, item) {
+    s = line
+    sub(/^[^\[]*\[/, "", s)         # strip everything up to and including [
+    sub(/\][[:space:]]*(#.*)?$/, "", s)   # strip trailing ] and any comment
+    n = split(s, items, /,/)
+    for (i = 1; i <= n; i++) {
+      item = items[i]
+      gsub(/^[[:space:]]*["'"'"']?/, "", item)
+      gsub(/["'"'"']?[[:space:]]*$/, "", item)
+      if (item != "") print item
+    }
+  }
+  # Form 3: dotted top-level (matched anywhere, no in_block dependency)
+  /^lint\.orphan_ignore:[[:space:]]*\[/ {
+    parse_inline_list($0)
+    next
+  }
   /^lint:[[:space:]]*(#.*)?$/ { in_block=1; next }
   /^[^[:space:]#]/             { in_block=0 }
+  # Form 2: inline form inside lint block
+  in_block && /^[[:space:]]+orphan_ignore:[[:space:]]*\[/ {
+    parse_inline_list($0)
+    in_list=0
+    next
+  }
+  # Form 1: block form (existing). `next` is required: the sub() above
+  # mutates $0 (strips the leading "  - "), so without `next` the terminator
+  # rule below would fire on the very same line and prematurely set in_list=0,
+  # silently dropping every list item after the first. (Pre-existing bug
+  # surfaced by v1.3.0 sandbox; fixed here as part of the broaden.)
   in_block && /^[[:space:]]+orphan_ignore:[[:space:]]*(#.*)?$/ { in_list=1; next }
   in_block && in_list && /^[[:space:]]+-[[:space:]]*/ {
     sub(/^[[:space:]]+-[[:space:]]*/, "")
@@ -114,6 +143,7 @@ done < <(awk '
     sub(/[[:space:]]+$/, "")
     gsub(/^["'"'"']|["'"'"']$/, "")
     print
+    next
   }
   in_block && in_list && !/^[[:space:]]+-/ { in_list=0 }
 ' "$CONFIG" 2>/dev/null)
@@ -149,7 +179,7 @@ obsidian orphans 2>/dev/null
 
 For each markdown link `[text](target.md)` found in pages **outside fenced code blocks**, check if `target.md` exists in `pages/`. Report any broken links with the source page and target.
 
-**Code block exclusion (v1.2.1+):** Strip **fenced** code blocks (```...```) unconditionally, and strip **4-space-indented blocks** with block-context awareness (track blank/list/paragraph/indented-code state) so real multi-line indented code blocks are stripped while list-item continuations and paragraph lazy continuations are preserved. Inline backticks (\`code\`) are still not stripped because broken-link false-positives from inline code are rare and inline backticks can span partial lines. Tab-indented code and post-2-blank-line code remain documented limitations (DEFER to v1.3.0+).
+**Code block exclusion (v1.2.1+):** Strip **fenced** code blocks (```...```) unconditionally, and strip **4-space- or tab-indented blocks** with block-context awareness (track blank/list/paragraph/indented-code state) so real multi-line indented code blocks are stripped while list-item continuations and paragraph lazy continuations are preserved. Inline backticks (\`code\`) are still not stripped because broken-link false-positives from inline code are rare and inline backticks can span partial lines. Tab-indent recognition added in v1.3.0 (1.2). Post-list 2-blank-line list termination (CommonMark) added in v1.3.0 (1.3).
 
 ```bash
 # Reference implementation
@@ -159,53 +189,55 @@ strip_code_blocks() {
   # tracks block context (blank / list / paragraph / indented-code) so real
   # multi-line indented code blocks are stripped while list continuations and
   # paragraph lazy continuations are preserved. Fenced (```) is stripped
-  # unconditionally. Tab-indented code and post-2-blank-line code are
-  # documented limitations — see in-function comment for v1.3.0+ candidates.
+  # unconditionally. v1.3.0 (1.2) extended the indent rule to recognize
+  # tab-indent (\t) in addition to 4 spaces. v1.3.0 (1.3) added a blank_run
+  # counter so prev_was_list resets after 2 consecutive blank lines, matching
+  # the CommonMark rule that 2 blank lines terminate a list — closes the
+  # remaining post-list code-block false-negative.
   #
   # CR-C v1.2.1+: explicit in_indented_code state so 2nd+ lines of a multi-line
   # indented block are also stripped. Without this state, prev_blank=0 after
   # the first stripped line caused subsequent 4-space lines to fall into the
   # paragraph-lazy-continuation branch and leak into broken-link detection.
   #
-  # Known limitations (DEFER to v1.3.0+ — W-γ, W-δ from cycle-1 review):
-  #   - Tab-indented code blocks (`\t` at line start) are NOT stripped.
-  #     Only 4-space indents trigger code-block detection. CommonMark also
-  #     accepts tabs; tab support requires regex extension and an additional
-  #     sandbox case. Real-world wiki pages don't use tabs (Markdown style
-  #     guides discourage them); the tab false-negative is rare.
-  #   - prev_was_list does not reset after 2 consecutive blank lines.
-  #     CommonMark says 2 blank lines after a list ends the list, after which
-  #     a 4-space line becomes a code block. Current awk treats it as
-  #     list-continuation. False-negative; same direction as v1.2.0 baseline
-  #     so not a regression.
+  # All earlier deferred limitations (W-γ tab-indent, W-δ post-list 2-blank
+  # reset) are now closed in v1.3.0.
   awk '
-    BEGIN { infence=0; prev_was_list=0; prev_blank=1; in_indented_code=0 }
+    BEGIN { infence=0; prev_was_list=0; prev_blank=1; in_indented_code=0; blank_run=0 }
     /^```/ { infence = !infence; in_indented_code=0; next }
     infence { next }
     /^[[:space:]]*$/ {
+      # v1.3.0 (1.3): 2 consecutive blank lines terminate list context
+      # (CommonMark spec). After reset, a 4-space-indented line becomes a
+      # real code block, not a list continuation. Closes W-δ false-negative.
+      blank_run += 1
+      if (blank_run >= 2) prev_was_list = 0
       prev_blank=1; in_indented_code=0
       print; next
     }
     /^[[:space:]]*([-*+]|[0-9]+\.)[[:space:]]/ {
-      prev_was_list=1; prev_blank=0; in_indented_code=0
+      prev_was_list=1; prev_blank=0; in_indented_code=0; blank_run=0
       print; next
     }
-    /^    / {
+    /^(    |\t)/ {
+      # v1.3.0 (1.2): tab-indent now recognized as CommonMark indented code
+      # marker, in addition to 4 spaces. Closes the W-γ false-positive on
+      # broken-link detection inside tab-indented code blocks.
       if (in_indented_code) {
         # continuation of an already-open indented code block — strip
-        prev_blank=0; next
+        prev_blank=0; blank_run=0; next
       }
       if (prev_was_list || !prev_blank) {
         # list continuation OR paragraph lazy continuation — keep
-        prev_blank=0; print; next
+        prev_blank=0; blank_run=0; print; next
       }
       # start of an indented code block (after blank, no list context) — strip
-      in_indented_code=1; prev_blank=0; next
+      in_indented_code=1; prev_blank=0; blank_run=0; next
     }
     {
       # any other line — paragraph; if non-indented it breaks list/code context
       if ($0 !~ /^[[:space:]]/) { prev_was_list=0; in_indented_code=0 }
-      prev_blank=0; print
+      prev_blank=0; blank_run=0; print
     }
   ' "$1"
 }

@@ -185,6 +185,18 @@ for src in "${SOURCES[@]}"; do
   yaml="$WIKI_ROOT/.wiki-meta/sources/$slug.yaml"
   [ ! -f "$yaml" ] && continue   # First-time ingest — proceed normally
 
+  # v1.4.0 A1 — partial_fail sentinel takes precedence over bytes-hash.
+  # If a prior ingest left a partial_fail block (Stage 2 worker fail, Stage 3
+  # write fail, or C3 concurrency abort), force REPAIR with the
+  # `partial-fail-recovery` reason regardless of bytes match. The bytes-hash
+  # check below would falsely emit `ingest-skip` and the failed pages would
+  # never be retried. The state-machine awk in Step 7.6.F (Case ii) is what
+  # removes this sentinel on the first fully-successful retry.
+  if grep -q '^partial_fail:' "$yaml"; then
+    REPAIR+=("$slug:partial-fail-recovery")
+    continue
+  fi
+
   prev_hash=$(grep '^content_hash:' "$yaml" | sed -E 's/^content_hash:[[:space:]]*"?(sha256:)?([0-9a-f]{64})"?.*$/\2/')
   # bash 3.2: =~ requires [[ ]]; single [ ] does not support it (runtime error).
   [[ "$prev_hash" =~ ^[0-9a-f]{64}$ ]] || continue   # Pre-v1.1.4 sentinel → fall through to recompute path

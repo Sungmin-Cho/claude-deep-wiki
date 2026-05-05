@@ -2,6 +2,180 @@
 
 All notable changes to deep-wiki are documented here.
 
+## [1.4.0] — 2026-05-05
+
+A5 page-level fanout. Single-source `/wiki-ingest` wall-clock target
+~15 min → ~4 min via parallel page-body generation. Stage 1
+(`wiki-synthesizer mode="analysis"`) emits a `page_plan` describing
+which pages to create/update plus (when sub-threshold) `inline_bodies`
+ready for atomic write. Stage 2 dispatches one `wiki-page-writer`
+worker per affected page (parallel; `len(page_plan) ≥ a5_fanout_threshold`
+default 3). Stage 3 main aggregates drafts and atomic-writes under
+lock with mandatory C3 concurrency checks (update via hash compare,
+create via existence check). Karpathy's "10–15 page touches per source"
+property preserved — A5 changes WHO writes pages, not how many.
+Multi-source path (≥2 sources) is unchanged from v1.3.0 A4 fanout;
+A4×A5 combination deferred to v1.4.1+.
+
+### Architectural
+
+- **A5 — single-source page-level fanout (Stages 1/2/3)**: new
+  three-stage pipeline for 1-source ingests. Stage 1 invokes the
+  synthesizer in `mode: "analysis"` (new contract) — synthesizer reads
+  the source + cross-page candidates, emits a `page_plan` array of
+  `{file, action, frontmatter_meta, source_excerpts, intent_summary,
+  novel_facts, preserve_sections, existing_page_body, existing_body_hash}`
+  entries describing each affected page. For sub-threshold runs
+  (`len(page_plan) < a5_fanout_threshold`), Stage 1 also emits
+  `inline_bodies` carrying the full `page_content` for each entry, and
+  the flow skips Stage 2 entirely. Stage 2 (when active) dispatches one
+  `wiki-page-writer` worker per `page_plan` entry in a single
+  Agent-tool-message-turn — workers receive only the entry payload
+  (NO Read/Glob/Grep tools), generate `page_content` for that one page,
+  return `{file, page_content, frontmatter_meta, worker_status,
+  fail_reason}`. Stage 3 (main, under lock) runs mandatory C3 optimistic
+  concurrency check for every draft (update: re-read body + sha256
+  compare against `existing_body_hash`; create: existence check), backs
+  up under Rule 7, atomic-writes (tmp + rename), runs v1.3.0 Steps 8-13
+  metadata pipeline UNCHANGED, then writes or removes the
+  `partial_fail` sentinel based on `PARTIAL_FAIL` state.
+- **`wiki-page-writer` agent (new)**: minimal LLM page-body generator.
+  Tools: `[]` (no file I/O — main owns Stage 3 writes under lock).
+  Inputs: `wiki_root` + one `page_plan_entry`. Output: a single JSON
+  object `{file, page_content, frontmatter_meta, worker_status,
+  fail_reason}` — main aggregates outputs and writes pages atomically
+  in Step 7.6.C. No cross-page synthesis (Stage 1 owns it via
+  `intent_summary` / `novel_facts` / `preserve_sections`); no source
+  I/O (all relevant excerpts already in `source_excerpts`).
+- **`wiki-synthesizer` extension**: new `mode: "analysis"` (additive
+  to v1.3.0 `mode: "inline" | "worker"`). Analysis mode reads source +
+  candidates, emits page_plan + (for sub-threshold) inline_bodies.
+  Inline + worker modes preserved byte-identical from v1.3.0.
+
+### Step 1.5 partial_fail cascading (A1)
+
+- **`partial_fail` sentinel**: new optional field in
+  `<wiki>/.wiki-meta/sources/<slug>.yaml` written when any page in a
+  fanout run fails (Stage 2 worker fail OR Stage 3 write/concurrency
+  abort). Schema:
+  ```yaml
+  partial_fail:
+    ts: 2026-05-05T12:34:56Z
+    failed_pages: ["page-a.md", "page-b.md"]
+    reason: "stage 2 worker fail" | "stage 3 write fail" | "concurrency abort" | "all workers failed" | "metadata pipeline failure"
+  ```
+  Step 1.5 hash-skip cascades through partial_fail BEFORE the bytes-hash
+  check: when present, force REPAIR override (new
+  `partial-fail-recovery` repair_reason value) on next session even if
+  source bytes are unchanged. Sentinel removal-on-success (Step 7.6.F
+  Case ii) breaks the retry loop after a clean re-ingest.
+- **`pages_failed` log field (additive)**: `log.jsonl` `ingest` action
+  now includes `pages_failed: [<file>...]` whenever FAILED_PAGES OR
+  FAILED_WORKERS is non-empty. wiki-lint Step 6 LOG-INVARIANT scan
+  unaffected (additive field).
+- **`partial-fail-recovery` repair_reason**: joins v1.2.1 R3W2's existing
+  five values (informational note added in `commands/wiki-lint.md` —
+  no strict whitelist exists; the value is emit-only).
+- **`ingest-fail` lifecycle action**: emitted when the all-workers-fail
+  retry counter reaches 3 consecutive batches on the same source
+  (Step 7.7.B). Promotes `.pending-scan` despite failure to release
+  stuck-window state.
+
+### Hidden configuration
+
+- **`<wiki>/.wiki-meta/.config.json` (optional, additive)**: new file
+  with two A5 knobs:
+  - `a5_fanout_threshold` (default 3) — `page_plan` size at which A5
+    fanout activates. Below threshold, Stage 1's `inline_bodies` write
+    via Step 7.5.A sub-threshold path (no Stage 2 dispatch). Set to a
+    very large number to effectively disable fanout.
+  - `a5_worker_timeout_sec` (default 90, aspirational per W9
+    disclaimer) — soft per-worker timeout target. Agent tool exposes no
+    per-call timeout knob; `a5_worker_timeout_sec` is a documentation
+    target, not enforced. Actual hard limit is the runtime's ~5 min
+    default per Agent call.
+  - Loaded via python3 (preferred) or jq (fallback). When neither is
+    available, defaults apply and a stderr warning is emitted (W10).
+  - Absence of `.config.json` means defaults — no migration needed.
+
+### Concurrency
+
+- **Mandatory C3 concurrency check at Step 7.6.C**: every Stage 3
+  draft runs the check (update: re-read + hash compare; create:
+  existence check). On detection, the page is added to FAILED_PAGES
+  with reason `"concurrent ingest detected at Stage 3 — page bytes
+  drifted since Stage 1 read"` and the draft is skipped (loop
+  CONTINUES — other pages may still write). PARTIAL_FAIL is toggled.
+- **Existing global lock unchanged**: `mkdir
+  <wiki>/.wiki-meta/.wiki-lock` for single-writer guarantee. A5
+  acquires the lock at Stage 3 entry only (mirrors v1.3.0 single-source
+  fast path; multi-source A4 still acquires at Phase 0).
+- **R-P1 dual fallback**: every shasum invocation across A5 paths
+  (Step 7.5 P6 hash compute, Step 7.6.C update C3 check, Step 7.7.B
+  baseline yaml hash, Step 7.8 file-source hash) uses `shasum -a 256
+  || sha256sum` for Linux portability.
+
+### Failure handling
+
+- **Step 7.7.A (per-worker fail)**: routed to FAILED_WORKERS;
+  PARTIAL_FAIL toggled before SUCCESS_DRAFTS loop (P5 fix).
+- **Step 7.7.B (all-workers fail)**: A7 lock acquisition before any
+  log/meta write. R4-Adv-Adv-2 baseline yaml materialization for
+  first-ingest case (sentinel writer otherwise corrupts non-existent
+  yaml). 3-strike retry counter with `ingest-fail` force-promote on
+  3rd consecutive failure.
+- **Step 7.7.C (mid-loop write fail)**: A6 abort — remaining drafts
+  go to FAILED_PAGES with reason `"skipped due to mid-loop abort"`
+  on tmp-write fail OR rename fail (R4-R4-2 symmetry fix).
+- **Step 7.7.D (C3 concurrency abort)**: continue (other pages may
+  still write); PARTIAL_FAIL toggled, sentinel fires.
+- **Step 7.7.E (worker timeout)**: treated identically to per-worker
+  failure.
+- **Step 7.7.F (R4-Adv-Adv-1 metadata pipeline failure recovery)**:
+  Steps 8-13 fail AFTER Step 7.6.C wrote pages — mark all WRITTEN
+  entries as failed, write `partial_fail` sentinel under held lock,
+  best-effort log emit, do NOT promote `.pending-scan` (next session
+  retries via partial_fail cascading + R3W2 wiki state drift detection).
+
+### Backward compatibility
+
+- **Single-source semantics preserved** but **NOT byte-identical**.
+  v1.4.0 routes 1-source `/wiki-ingest` through analysis mode (page_plan
+  emit) instead of v1.3.0's inline mode (direct synthesis). Same pages
+  produced, same provenance, same log events; ~10–25% wall-clock
+  variance from analysis-mode invocation.
+- **Multi-source path unchanged from v1.3.0 A4** (worker mode + B5
+  dual-classification + Phase 0 lock + second-pass collision merge).
+  A4×A5 combination deferred to v1.4.1+.
+- **All v1.2.0+ invariants preserved**: `pages_created` exactly-once
+  across log, `.last-scan` monotonic, lock atomicity, source provenance,
+  Step 1.5 hash-skip (now with `partial_fail` cascade prepended).
+- **All v1.3.0 contracts preserved**: worker mode `proposed_action: "skip"`,
+  `colliding_drafts` second-pass input, multi-source B5 ledger
+  invariants, hook YAML parser broaden.
+
+### Sandbox tests (Phase 6, deferred per W2)
+
+12 sandbox scenarios specified in spec §10.1. Tests 1, 2, 3, 4, 8, 9,
+11, 12 cover success/main paths and run on plain `/wiki-ingest`
+invocations. Tests 5, 6, 7, 10 require fault-injection (`WIKI_TEST_*`
+env vars) which is deferred to v1.4.1 per round-1 W2 fix. Phase 6
+sandbox runs themselves are deferred to user discretion / v1.4.1 release
+prep.
+
+### Review trajectory
+
+Plan went through 4 deep-review cycles before implementation:
+- Round 1: 18 items. Plan: 1267 → 1810.
+- Round 2: 7 items. Plan: 1810 → 1953.
+- Round 3: 9 items. Plan: 1953 → 2080.
+- Round 4: 7 items. Plan: 2080 → 2213.
+- Round 5: not performed (fix-and-go cap after 4 cycles).
+
+Implementation phase added one Phase 4 cleanup commit (stale v1.3.0
+prose drift identified by impl-vs-spec drift check between Phase 4 and
+Phase 5).
+
 ## [1.3.0] — 2026-05-02
 
 Architectural minor release. Two parallel-axis changes plus six polish items

@@ -285,6 +285,17 @@ jq -r 'select(.action != "ingest-repair") | .pages_created[]? | select(type=="st
 
 Report findings as `[LOG-INVARIANT]` — no auto-fix (historical log is append-only). Fix forward in future ingests by respecting the pages_created classification rule.
 
+> **v1.4.0 compatibility note:** A5 fanout ingests may emit an additional
+> top-level `pages_failed` field in `log.jsonl` (per `commands/wiki-ingest.md`
+> Step 7.6.E Step 10 + Step 7.6.F sentinel payload). The `jq -r '.pages_created[]?'`
+> operator + `select(type=="string")` filter above ignores the new field
+> correctly — no schema update needed. v1.4.0 also introduces
+> `partial-fail-recovery` as a new `repair_reason` value (alongside v1.2.1 R3W2's
+> `missing-page:<file>`, `page-missing-slug:<file>`, `log-jsonl-missing`,
+> `no-prior-terminal-log`, `last-action-not-terminal:<action>`). This value
+> is informational (Step 10 R3C1 emit only) — wiki-lint does NOT strict-validate
+> it, so no whitelist update needed.
+
 ### 7. Source Provenance Check
 
 For each page, check that every slug in `sources:` frontmatter has a corresponding `.wiki-meta/sources/<slug>.yaml` file. Report missing source provenance.

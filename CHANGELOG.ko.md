@@ -2,6 +2,167 @@
 
 deep-wiki의 주요 변경사항을 기록합니다.
 
+## [1.4.0] — 2026-05-05
+
+A5 페이지 단위 fanout. 단일 소스 `/wiki-ingest` wall-clock 목표
+~15분 → ~4분, 페이지 본문 생성 병렬화로 달성. Stage 1
+(`wiki-synthesizer mode="analysis"`)이 어떤 페이지를 생성/갱신할지
+기술하는 `page_plan`을 emit하고, sub-threshold 시 atomic write 가능한
+`inline_bodies`도 함께 emit. Stage 2는 영향 받는 페이지마다 하나씩
+`wiki-page-writer` worker를 병렬 dispatch (`len(page_plan) ≥
+a5_fanout_threshold`, default 3). Stage 3는 main이 lock 아래 draft를
+집계 + atomic-write하면서 모든 draft에 mandatory C3 concurrency check
+적용 (update는 hash 비교, create는 existence check). Karpathy의 "한
+소스가 10–15개 페이지에 영향" 속성 보존 — A5는 누가 페이지를 쓰는지를
+바꾸지, 페이지 수를 바꾸지 않음. 다중 소스 (≥2) 경로는 v1.3.0 A4 fanout
+그대로 보존; A4×A5 결합은 v1.4.1+로 보류.
+
+### 아키텍처
+
+- **A5 — 단일 소스 페이지 단위 fanout (Stages 1/2/3)**: 1-source ingest
+  3-stage 파이프라인 신설. Stage 1은 synthesizer를 `mode: "analysis"`
+  (신규 contract)로 invoke — synthesizer가 source + cross-page
+  candidates를 읽고, 각 영향 페이지를 기술하는 `page_plan` 배열을 emit
+  (`{file, action, frontmatter_meta, source_excerpts, intent_summary,
+  novel_facts, preserve_sections, existing_page_body,
+  existing_body_hash}`). Sub-threshold (`len(page_plan) <
+  a5_fanout_threshold`) 실행 시 Stage 1이 각 entry의 전체 `page_content`를
+  담은 `inline_bodies`도 함께 emit하여 Stage 2를 완전히 skip. Stage 2
+  (활성 시) 단일 Agent-tool-message-turn에서 `page_plan` entry마다 하나씩
+  `wiki-page-writer` worker를 dispatch — worker는 entry payload만
+  받음 (Read/Glob/Grep tool 없음), 그 한 페이지의 `page_content`만
+  생성, `{file, page_content, frontmatter_meta, worker_status,
+  fail_reason}` 반환. Stage 3 (main, lock 아래)는 모든 draft에
+  mandatory C3 optimistic concurrency check 실행 (update: body 재
+  read + sha256을 `existing_body_hash`와 비교; create: existence
+  check), Rule 7 backup, atomic-write (tmp + rename), v1.3.0 Step
+  8-13 metadata 파이프라인 UNCHANGED 실행, 마지막에 PARTIAL_FAIL state에
+  따라 `partial_fail` sentinel write 또는 removal.
+- **`wiki-page-writer` agent (신규)**: 최소형 LLM 페이지 본문 생성기.
+  Tool: `[]` (파일 I/O 없음 — main이 Stage 3 lock 아래 모든 write 소유).
+  Input: `wiki_root` + `page_plan_entry` 1개. Output: 단일 JSON 객체
+  `{file, page_content, frontmatter_meta, worker_status, fail_reason}`
+  — main이 output을 집계하고 Step 7.6.C에서 페이지를 atomic write.
+  Cross-page synthesis 없음 (Stage 1이 `intent_summary` /
+  `novel_facts` / `preserve_sections`로 소유); source I/O 없음
+  (관련 발췌는 이미 `source_excerpts`에 들어있음).
+- **`wiki-synthesizer` 확장**: `mode: "analysis"` 신규 추가
+  (v1.3.0 `mode: "inline" | "worker"`에 additive). Analysis mode가
+  source + candidates 읽고 page_plan + (sub-threshold일 때) inline_bodies
+  emit. Inline + worker mode는 v1.3.0과 byte-identical 유지.
+
+### Step 1.5 partial_fail cascading (A1)
+
+- **`partial_fail` sentinel**: `<wiki>/.wiki-meta/sources/<slug>.yaml`의
+  새 optional 필드. Fanout 실행에서 어떤 페이지든 실패하면 (Stage 2
+  worker fail OR Stage 3 write/concurrency abort) write됨. Schema:
+  ```yaml
+  partial_fail:
+    ts: 2026-05-05T12:34:56Z
+    failed_pages: ["page-a.md", "page-b.md"]
+    reason: "stage 2 worker fail" | "stage 3 write fail" | "concurrency abort" | "all workers failed" | "metadata pipeline failure"
+  ```
+  Step 1.5 hash-skip이 bytes-hash 검사 BEFORE에 partial_fail을 cascade —
+  존재 시 다음 세션에서 source bytes가 변하지 않았어도 REPAIR override
+  강제 (신규 `partial-fail-recovery` repair_reason 값). Sentinel
+  removal-on-success (Step 7.6.F Case ii)가 깨끗한 재 ingest 후 retry
+  loop를 끊음.
+- **`pages_failed` 로그 필드 (additive)**: `log.jsonl`의 `ingest`
+  action에 FAILED_PAGES OR FAILED_WORKERS가 non-empty일 때 `pages_failed:
+  [<file>...]` 포함. wiki-lint Step 6 LOG-INVARIANT scan 영향 없음.
+- **`partial-fail-recovery` repair_reason**: v1.2.1 R3W2의 기존 5개
+  값에 합류 (`commands/wiki-lint.md`에 informational note 추가 —
+  엄격한 whitelist는 없음; 값은 emit-only).
+- **`ingest-fail` lifecycle action**: 같은 source에 all-workers-fail
+  retry counter가 3 연속 batch 도달 시 emit (Step 7.7.B). 실패에도
+  `.pending-scan` promote하여 stuck-window state 해제.
+
+### 숨김 설정
+
+- **`<wiki>/.wiki-meta/.config.json` (optional, additive)**: 두 A5
+  knob을 가진 신규 파일:
+  - `a5_fanout_threshold` (default 3) — `page_plan` size에 따라 A5
+    fanout 활성화. Threshold 미만 시 Stage 1의 `inline_bodies`가
+    Step 7.5.A sub-threshold 경로로 write (Stage 2 dispatch 없음).
+    매우 큰 값으로 설정하면 fanout 사실상 비활성화.
+  - `a5_worker_timeout_sec` (default 90, W9 disclaimer에 따라 aspirational)
+    — soft per-worker timeout 목표. Agent tool은 per-call timeout knob을
+    노출하지 않음; 강제되지 않는 문서화 목표. 실제 hard limit은 runtime의
+    Agent call당 ~5분 default.
+  - python3 (선호) 또는 jq (fallback)로 로드. 둘 다 없을 시 default
+    적용 + stderr warning emit (W10).
+  - `.config.json` 부재 시 default — migration 불필요.
+
+### 동시성
+
+- **Step 7.6.C의 mandatory C3 concurrency check**: 모든 Stage 3 draft가
+  check 실행 (update: body 재 read + hash 비교; create: existence
+  check). 검출 시 페이지를 FAILED_PAGES에 추가, draft skip (loop
+  CONTINUES — 다른 페이지는 여전히 write 가능). PARTIAL_FAIL toggle.
+- **기존 global lock 변경 없음**: `mkdir <wiki>/.wiki-meta/.wiki-lock`
+  으로 single-writer 보장. A5는 lock을 Stage 3 entry에서만 획득
+  (v1.3.0 single-source fast path mirror; 다중 소스 A4는 여전히 Phase 0
+  획득).
+- **R-P1 dual fallback**: A5 경로 전반의 모든 shasum invocation이
+  Linux portability를 위해 `shasum -a 256 || sha256sum` 사용.
+
+### 실패 처리
+
+- **Step 7.7.A (per-worker fail)**: FAILED_WORKERS로 routing;
+  SUCCESS_DRAFTS loop BEFORE에 PARTIAL_FAIL toggle (P5 fix).
+- **Step 7.7.B (all-workers fail)**: A7 — log/meta write 전에 lock
+  획득 mandatory. R4-Adv-Adv-2 — first-ingest case의 baseline yaml
+  materialization (sentinel writer가 부재 yaml을 corrupt시키는 문제 방지).
+  3-strike retry counter, 3번째 연속 실패 시 `ingest-fail` force-promote.
+- **Step 7.7.C (mid-loop write fail)**: A6 abort — tmp-write fail OR
+  rename fail 시 나머지 draft를 FAILED_PAGES에 `"skipped due to
+  mid-loop abort"` reason으로 (R4-R4-2 symmetry fix).
+- **Step 7.7.D (C3 concurrency abort)**: continue; PARTIAL_FAIL toggle,
+  sentinel fire.
+- **Step 7.7.E (worker timeout)**: per-worker failure와 동일 처리.
+- **Step 7.7.F (R4-Adv-Adv-1 metadata pipeline failure recovery)**:
+  Step 7.6.C가 페이지를 쓴 AFTER Step 8-13이 실패 — 모든 WRITTEN entry를
+  failed로 mark, held lock 아래 `partial_fail` sentinel write,
+  best-effort log emit, `.pending-scan` promote NOT (다음 세션이
+  partial_fail cascading + R3W2 wiki state drift 검출로 재시도).
+
+### 하위 호환성
+
+- **단일 소스 semantics 보존** but **byte-identical NOT**. v1.4.0은
+  1-source `/wiki-ingest`를 v1.3.0의 inline mode 대신 analysis mode를
+  통해 routing. 같은 페이지 생성, 같은 provenance, 같은 log event;
+  analysis-mode invocation으로 인한 ~10–25% wall-clock variance.
+- **다중 소스 경로는 v1.3.0 A4 그대로** (worker mode + B5
+  dual-classification + Phase 0 lock + second-pass collision merge).
+  A4×A5 결합은 v1.4.1+로 보류.
+- **모든 v1.2.0+ invariant 보존**: log 전체에서 `pages_created`
+  exactly-once, `.last-scan` monotonic, lock atomicity, source
+  provenance, Step 1.5 hash-skip (이제 `partial_fail` cascade가 앞에
+  추가됨).
+- **모든 v1.3.0 contract 보존**: worker mode `proposed_action: "skip"`,
+  `colliding_drafts` second-pass input, 다중 소스 B5 ledger invariant,
+  hook YAML 파서 broaden.
+
+### Sandbox 테스트 (Phase 6, W2에 따라 보류)
+
+spec §10.1에 12개 sandbox scenario 명세. Test 1, 2, 3, 4, 8, 9, 11, 12는
+success/main path를 plain `/wiki-ingest` invocation으로 실행. Test 5,
+6, 7, 10은 fault-injection (`WIKI_TEST_*` env var)이 필요한데 round-1
+W2 fix에 따라 v1.4.1로 보류. Phase 6 sandbox 실행 자체도 사용자 재량 /
+v1.4.1 release 준비로 보류.
+
+### 리뷰 trajectory
+
+Plan은 구현 전 4번의 deep-review cycle을 거침:
+- Round 1: 18 items. Plan: 1267 → 1810.
+- Round 2: 7 items. Plan: 1810 → 1953.
+- Round 3: 9 items. Plan: 1953 → 2080.
+- Round 4: 7 items. Plan: 2080 → 2213.
+- Round 5: 미수행 (4 cycle 후 fix-and-go cap).
+
+구현 단계에서 Phase 4와 Phase 5 사이의 impl-vs-spec drift check이 식별한
+stale v1.3.0 prose drift에 대해 1개의 Phase 4 cleanup commit 추가.
+
 ## [1.3.0] — 2026-05-02
 
 아키텍처 마이너 릴리스. 두 개의 병렬 축 변경과 v1.2.1 사이클 리뷰에서 이월된 6개 폴리시 항목.

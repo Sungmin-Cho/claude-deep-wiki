@@ -48,11 +48,22 @@ Read sources, decide create-vs-update for each topic, write pages under `<wiki_r
    global lock during Phase 3 of the A4 fanout flow. Set `merge_against` in the
    draft so main knows which page to back up.
 
+   **(Analysis-mode exception, v1.4.0+):** when `mode: "analysis"`, do NOT
+   version or backup any page. Main session performs all version backups
+   under the lock during Stage 3 of the A5 fanout flow (or Step 7.6.C of the
+   sub-threshold path). Set `merge_against` and `existing_page_body` in each
+   page_plan_entry; main owns the version snapshot.
+
 8. **Write scope** — Write only under `<wiki_root>/pages/` and `<wiki_root>/.wiki-meta/.versions/`. Do NOT modify `index.json`, `log.jsonl`, `log.md`, `index.md`, `sources/*.yaml`, or any lock file. The calling command handles all of those.
 
    **(Worker-mode exception, v1.3.0+):** when `mode: "worker"`, write NOTHING
    under `<wiki_root>/` — not pages, not backups, not anything. Return drafts
    to main via the worker output contract; main performs all writes under lock.
+
+   **(Analysis-mode exception, v1.4.0+):** when `mode: "analysis"`, write
+   NOTHING under `<wiki_root>/` — not pages, not backups, not anything. Return
+   `page_plan` + `inline_bodies` (sub-threshold) via the analysis output
+   contract; main + Stage 2 workers perform all writes under lock.
 
 ## Performance guidance — parallel tool dispatch
 
@@ -68,6 +79,8 @@ The phases below have hard data dependencies between them (you need the source r
 - **Phase 2 — Backup batch** (parallel across pages you will overwrite): For every page you decided to update, resolve its next `v<N>` (Rule 7) and issue the `Read` of the current page body + `Write` of the backup file together, batched across all pages in a single message. Per-page: the Read must complete before the Write so the backup copies the pre-update content — if you must serialize per page, still parallelize across pages.
 - **Phase 3 — Page write** (parallel across new/updated pages): After you have composed all page bodies in your head (LLM inference is naturally sequential here — that is fine and is the dominant cost), issue `Write` for every `created` and `updated` page in one batched message.
 
+  **Note:** Worker mode (v1.3.0+) and Analysis mode (v1.4.0+) skip Phase 2 (backup) and Phase 3 (page write) — main session owns those under the global lock.
+
 The LLM inference between phases is the floor on total wall-clock time — tool dispatch concurrency cannot speed that up. But the tool-dispatch portion must not stack linearly on top of it. A correct run for N pages should see four to six message boundaries with tool calls fanned out inside each, not ~3N. The exact count depends on Phase 1c: when no skim-skipped candidates need verification, four boundaries (Phase 0 source read, Phase 1b deep candidate read, Phase 2 backup batch, Phase 3 page write); when Phase 1c fires with no escalation, five (1c Grep batch added between 1b and 2); when Phase 1c finds matches and escalates to deep Read, six (extra Read batch). Phase 1a is in-context scoring with no tool calls.
 
 Do NOT use this guidance as a reason to skip Rule 5 widening, to batch independent sources into a single synthesis pass before the per-source decisions are made, or to write pages before their backups complete. Correctness rules always dominate performance guidance.
@@ -82,7 +95,7 @@ The calling command passes:
   - `origin` — URL (for `type: url`), absolute file path (for `type: file`, `type: deep-work-report`, or `type: text`), never inline content. For pasted text, the caller writes the text to `<wiki_root>/.wiki-meta/.inbox/<slug>.txt` and passes that path as `origin` — the agent reads it with `Read` just like any other file. The caller deletes the inbox file after the agent returns (success or failure).
   - `type` — `url` | `file` | `text` | `deep-work-report`
 - `candidates` — list of candidate descriptors. Each descriptor: `{file, title, tags, aliases}`. The caller pre-filters from `index.json` title/alias/tag matching and (when available) Obsidian search; descriptors include enough metadata for Phase 1a skim without re-reading `index.json`. A hint only — see Rule 5.
-- `mode` — `"inline"` (default) or `"worker"`. In `"inline"` mode (current behavior, single-source / single-agent fast path), the agent reads sources, decides actions, AND writes pages + version backups directly. In `"worker"` mode (multi-source A4 fanout, v1.3.0+), the agent reads sources and decides actions but DOES NOT write any files; instead it returns drafts as structured output for the main session to aggregate + write under the global lock. The caller specifies `mode` per invocation. Default is `"inline"` for backward compatibility.
+- `mode` — `"inline"` (default), `"worker"`, or `"analysis"` (v1.4.0+, A5 single-source path). In `"inline"` mode (current behavior, single-source / single-agent fast path), the agent reads sources, decides actions, AND writes pages + version backups directly. In `"worker"` mode (multi-source A4 fanout, v1.3.0+), the agent reads sources and decides actions but DOES NOT write any files; instead it returns drafts as structured output for the main session to aggregate + write under the global lock. In `"analysis"` mode (v1.4.0+, A5 single-source page-fanout), the agent reads sources + candidates, decides actions, computes excerpts/intent/preserve_sections, and emits a `page_plan` (with `inline_bodies` for sub-threshold) — but DOES NOT write or version pages; main owns Stage 3 I/O under lock. The caller specifies `mode` per invocation. Default is `"inline"` for backward compatibility.
 
 The agent is responsible for:
 1. Reading source content (use `WebFetch` for `type: url`, `Read` for all other types).
@@ -280,6 +293,150 @@ under the already-held lock.
 **When `colliding_drafts` is absent or empty** (the normal case), worker
 behavior is unchanged from earlier Plan #2 spec — Phase 0 source read +
 Phase 1 candidate analysis + per-source create/update/skip drafts.
+
+## Analysis mode (v1.4.0+, A5 single-source path)
+
+When `mode: "analysis"`, the agent's responsibility narrows to *decision* + *body generation when sub-threshold*:
+
+1. Read source content (Phase 0, parallel-tool-dispatch unchanged from inline mode).
+2. Read candidate pages, widening via Glob/Grep when Rule 5 applies (Phases 1a/1b/1c, unchanged).
+3. Decide per topic: create / update — same logic as inline mode (NOTE: `skip` action removed from `page_plan` in v1.4.0; do not emit plan entries for unaffected candidates).
+4. **For each create/update decision, capture `existing_page_body` for the worker** — Read the candidate's body bytes (already done as part of Phase 1b/1c). Emit `existing_body_hash` as the sentinel string `"main-computes"` — synthesizer's tool whitelist is `[Read, Write, Glob, Grep, WebFetch]` (no shasum / Bash), so it cannot compute sha256. Main computes the hash from `existing_page_body` bytes AFTER parsing the analysis output, BEFORE entering Stage 3 — see commands/wiki-ingest.md Step 7.5 post-analysis mapping.
+5. **Emit `page_plan`** — array of plan entries (no body content yet for above-threshold; full body for sub-threshold).
+6. **If `len(page_plan) < a5_fanout_threshold`**, ALSO generate the page_content for each entry inside the same LLM context (no extra invocation), and emit `inline_bodies` array. Otherwise `inline_bodies = []`.
+7. **DO NOT** version any page (Phase 2 deferred to main).
+8. **DO NOT** write any page or backup (Phase 3 deferred to main).
+9. **DO NOT** acquire any lock (lock at Stage 3 only — main owns it).
+10. Return an `analysis_drafts` JSON object instead of the inline-mode shape (see Analysis output contract below).
+
+### Why analysis mode (rationale)
+
+Single-source ingest's dominant cost is sequential body generation across ~13 pages (Karpathy's 10-15 page synthesis property). v1.3.0 inline mode generates all bodies in one LLM context (sequential decoding). Analysis mode separates *decision* (Stage 1) from *body generation* (Stage 2 fanout for above-threshold, inline_bodies for sub-threshold). Plan: above-threshold dispatches one `wiki-page-writer` worker per affected page, parallel.
+
+### Analysis output contract
+
+In analysis mode, return a JSON object with this shape:
+
+```json
+{
+  "mode": "analysis",
+  "page_plan": [
+    {
+      "file": "react-server-components.md",
+      "action": "create" | "update",
+      "merge_against": "<existing-file.md or null>",
+      "existing_page_body": "<full markdown including frontmatter, or null for create>",
+      "existing_body_hash": "main-computes (sentinel string — synthesizer cannot shasum; main computes from existing_page_body bytes post-parse) or null for create",
+      "source_excerpts": ["...", "..."],
+      "intent_summary": "1-2 sentences",
+      "novel_facts": ["...", "..."],
+      "preserve_sections": ["## Architecture"],
+      "frontmatter_meta": {
+        "title": "...",
+        "tags": [...],
+        "aliases": [...],
+        "sources_final": ["...", "..."]
+      }
+    }
+  ],
+  "inline_bodies": [
+    {"file": "small-page.md", "page_content": "<full markdown body INCLUDING frontmatter>"}
+  ],
+  "source_hashes": {"slug-a": "<sha256 hex or sentinel>"}
+}
+```
+
+- `mode` — literal `"analysis"`, lets caller defensively assert.
+- `page_plan` — array of per-page entries, ALWAYS populated regardless of threshold (workers consume above-threshold; main applies sub-threshold from inline_bodies). When all sub-threshold, `page_plan` still describes them.
+- `inline_bodies` — populated ONLY when `len(page_plan) < a5_fanout_threshold`. Maps `file` to full `page_content`. Caller MUST verify `inline_bodies[].file` equals `page_plan[].file` lex-set (no orphans).
+- `source_hashes` — same as worker mode contract: per-slug sha256 of fetched/read bytes; sentinel allowed.
+
+### Analysis mode constraints (must)
+
+- **No writes:** zero filesystem mutations under `<wiki_root>/`.
+- **No log appends:** zero touches to log/index/yaml files.
+- **No lock acquisition:** main owns lock at Stage 3.
+- **`sources_final` is lex-sorted:** Stage 1 reads existing page's `sources:` (from `existing_page_body` for update) and merges with new contributing source slugs to produce the final lex-sorted list. Worker writes literally — no merge logic in worker.
+- **`existing_body_hash` for update entries:** Stage 1 emits the sentinel string `"main-computes"` (synthesizer tool whitelist excludes shasum/Bash). Main computes sha256 from `existing_page_body` bytes IMMEDIATELY after parsing analysis output, BEFORE entering Stage 3 (per commands/wiki-ingest.md Step 7.5 — single-source decision tree). Stage 3 main re-reads page body under lock and compares against the main-computed hash to detect concurrent ingest commits (mandatory check; see commands/wiki-ingest.md Step 7.6 C3 concurrency guard).
+
+### `action: "skip"` REMOVED in v1.4.0 (was in worker mode)
+
+Worker mode's `proposed_action: "skip"` is preserved (multi-source A4 path). Analysis mode has NO skip — Stage 1 simply does not emit a `page_plan` entry for unaffected candidates. This matches v1.3.0 inline-mode behavior of just-not-producing-a-draft.
+
+### Source bytes hash semantic drift
+
+`source_hashes[<slug>]` records the sha256 of bytes Stage 1 read at fetch/Read
+time, NOT the bytes that contributed to written pages. Stage 2 workers see only
+`source_excerpts` — pre-extracted slices of the source — not the raw bytes. Three
+implications worth being explicit about:
+
+1. **Fidelity assumption.** The bytes-hash → ingest-skip optimization (Step 1.5,
+   v1.2.0+) assumes Stage 1's excerpt extraction is faithful in normal cases.
+   I.e., when source bytes are unchanged, the LLM extracts the same key facts,
+   so re-running analysis would produce the same page_plan. The v1.2.0+
+   bytes-skip is therefore safe for the SAME source content.
+2. **False-positive re-ingest.** A trivial source rewrite (typo fix, paragraph
+   reflow) that doesn't change extracted excerpts WILL trigger re-ingest because
+   bytes-hash mismatches. The resulting pages will be functionally identical to
+   the prior ingest (same excerpts → same intent_summaries → similar page bodies).
+   Cost is bounded by Step 1.5: full re-analysis only when bytes match AND wiki
+   state is clean (R3W2 v1.2.1 invariants).
+3. **No bytes-of-truth drift on success.** Successful ingest still records the
+   current source bytes-hash as truth (because that's what was just LLM-analyzed),
+   so the next ingest's bytes-skip is correct. The "drift" is conceptual (what
+   bytes ARE the page derived from?), not corruption.
+
+This drift is documented for operator clarity. No mitigation needed for v1.4.0;
+v1.5.0's community-based candidate selector may revisit this when introducing
+graph-based source-page edges.
+
+### Examples
+
+<example>
+Context: Single-source analysis on a deep-work session report producing 13 affected pages (above default threshold = 3). 5 pages create, 8 update.
+Input: mode="analysis", sources=[{slug:"deep-work-2026-05", origin:"/path/report.md", type:"deep-work-report"}], candidates=[8 candidate descriptors]
+Agent: Read source. Read 8 candidates fully (Phase 1b). Decide create+update for each. For each update entry, capture existing_page_body + sentinel "main-computes" for hash. Emit page_plan with 13 entries, inline_bodies = [] (above threshold).
+Output (truncated):
+{
+  "mode": "analysis",
+  "page_plan": [
+    {"file": "topic-a.md", "action": "create", "merge_against": null, "existing_page_body": null, "existing_body_hash": null, "source_excerpts": [...], ..., "frontmatter_meta": {..., "sources_final": ["deep-work-2026-05"]}},
+    {"file": "topic-b.md", "action": "update", "merge_against": "topic-b.md", "existing_page_body": "---\ntitle: ...\n---\n\n# ...", "existing_body_hash": "main-computes", ...}
+  ],
+  "inline_bodies": [],
+  "source_hashes": {"deep-work-2026-05": "main-computes"}
+}
+</example>
+
+<example>
+Context: Single-source analysis on a small URL source affecting 1 page (sub-threshold).
+Input: mode="analysis", sources=[{slug:"react-blog", ...}], candidates=[]
+Agent: Fetch URL. No candidates overlap. Decide create. page_plan has 1 entry. Since 1 < threshold (3), generate page_content inline within same LLM context, emit inline_bodies.
+Output:
+{
+  "mode": "analysis",
+  "page_plan": [
+    {"file": "react-server-components.md", "action": "create", "merge_against": null, "existing_page_body": null, "existing_body_hash": null, "source_excerpts": [...], "intent_summary": "...", "novel_facts": [...], "preserve_sections": [], "frontmatter_meta": {..., "sources_final": ["react-blog"]}}
+  ],
+  "inline_bodies": [
+    {"file": "react-server-components.md", "page_content": "---\ntitle: React Server Components\n...\n---\n\n# ...full body..."}
+  ],
+  "source_hashes": {"react-blog": "main-computes"}
+}
+</example>
+
+<example>
+Context: Analysis judges no pages need update (source is duplicate / no new info).
+Output:
+{
+  "mode": "analysis",
+  "page_plan": [],
+  "inline_bodies": [],
+  "source_hashes": {"slug-a": "main-computes"}
+}
+
+Caller treats this as `ingest-skip` terminal event (Step 7.8 in commands/wiki-ingest.md).
+</example>
 
 ## Examples
 

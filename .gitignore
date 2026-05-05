@@ -10,7 +10,8 @@
 docs/
 .deep-review/
 
-# V-0 probe results (per scripts/v0-probe/v0-procedure.md §5 + §8) — outcomes
-# are session-specific and authored by the main session at run time, not
-# artifacts of the v1.4.1 commit history.
+# V-0 / V-1 probe results (per scripts/v0-probe/{v0,v1}-procedure.md §5)
+# — outcomes are session-specific and authored by the main session at run
+# time, not artifacts of the v1.4.1 commit history.
 scripts/v0-probe/results.tsv
+scripts/v0-probe/v1-results.tsv

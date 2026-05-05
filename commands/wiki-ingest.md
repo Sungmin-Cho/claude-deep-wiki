@@ -398,10 +398,13 @@ Sources of other types (`url`, `file`, `deep-work-report`) are unchanged and hav
 
 ### 7. Dispatch to wiki-synthesizer (always)
 
-> **v1.3.0+ change:** synthesizer invocation now branches on source count.
-> See "Step 7.5 — Synthesizer dispatch (v1.3.0+: A4 fanout, Approach B)" below
-> for the full flow. The text below remains valid for the single-source fast
-> path (Step 7.5 decision branch 2).
+> **v1.4.0+ change:** synthesizer invocation branches on source count AND
+> on `len(page_plan)` for single-source. See "Step 7.5 — Synthesizer
+> dispatch (v1.4.0+: single-source A5 / multi-source A4)" below for the
+> full flow. The text below remains valid as a high-level summary; the
+> single-source path now invokes the synthesizer in `mode: "analysis"`
+> (page_plan emit) rather than `mode: "inline"` (v1.3.0 single-source).
+> Multi-source path is unchanged from v1.3.0 (A4 fanout, Approach B).
 
 Spawn the `wiki-synthesizer` agent via the Agent tool. This happens for **every** ingest — single-source, multi-source, URL, file, pasted text, or deep-work report alike. The main session does not read source content or page bodies; it only passes paths and the candidate list.
 
@@ -1596,9 +1599,14 @@ Without this terminal flow, the SessionStart hook would re-detect the source's f
 
 #### Backwards compatibility note
 
-For 1-source `/wiki-ingest`, the fast path (Step 7.5 decision branch 2)
-invokes the synthesizer in `mode: "inline"` exactly as v1.2.1 did —
-**byte-identical behavior**, no Worker mode bleed-through.
+For 1-source `/wiki-ingest`, v1.4.0 changes the dispatch from `mode: "inline"`
+to `mode: "analysis"` (Step 7.5 decision branch 2) so cross-page synthesis
+is exposed before page bodies are written. Behavior is **semantically
+preserved** from v1.3.0 (same pages produced, same provenance, same log
+events) but **not byte-identical** — analysis-mode invocation introduces a
+~10-25% wall-clock variance and the page_plan/inline_bodies/A5-fanout sub-
+branches replace inline-mode's single-stage synthesis. v1.2.1's byte-
+identical 1-source guarantee no longer holds.
 
 For multi-source batches in v1.2.1, v1.3.0 produces identical final wiki
 state when no cross-worker page collision occurs (the common case): same
@@ -1607,7 +1615,8 @@ pages, same log events, same provenance YAMLs. Only wall-clock differs
 (uncommon — most multi-source batches surface independent topics), v1.3.0's
 second-pass synthesis (Step 7.5.M-B Case B2) preserves v1.2.1's
 single-synthesizer multi-source merge invariant — content from all
-contributing sources flows into one merged page, no facts dropped.
+contributing sources flows into one merged page, no facts dropped. v1.4.0
+multi-source path is unchanged from v1.3.0.
 
 ### 8. Reconcile, Classify, and Write Source Provenance
 

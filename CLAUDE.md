@@ -114,6 +114,20 @@ deep-wiki/
 └── .wiki-meta/
     ├── index.json               # machine-readable page catalog (rebuildable)
     ├── sources/                 # per-source provenance YAML
+    │                            # (v1.4.0+) optional `partial_fail:
+    │                            # {ts, failed_pages, reason}` field —
+    │                            # written by Step 7.6.F when any page
+    │                            # in a fanout run fails; removed on
+    │                            # repair-on-success (Case ii); causes
+    │                            # Step 1.5 to force REPAIR override
+    │                            # via `partial-fail-recovery`
+    │                            # repair_reason on next session.
+    ├── .config.json             # (v1.4.0+) optional A5 knobs:
+    │                            # {a5_fanout_threshold (default 3),
+    │                            #  a5_worker_timeout_sec (default 90,
+    │                            #  aspirational per W9)}. Loaded via
+    │                            # python3 (preferred) or jq (fallback).
+    │                            # Absence = defaults; no migration.
     ├── .versions/               # 페이지 backup (write 전 snapshot, last 3)
     ├── .wiki-lock/              # mkdir-based concurrency lock
     ├── .last-scan               # SessionStart hook의 마지막 committed scan window
@@ -131,7 +145,11 @@ deep-wiki/
 
 ### Lifecycle actions (log.jsonl `action` field)
 
-- `ingest` — 정상 처리, 새/갱신 페이지 emit
+- `ingest` — 정상 처리, 새/갱신 페이지 emit. **(v1.4.0+)** additive
+  `pages_failed: [<file>...]` field on `ingest` lines whenever
+  FAILED_PAGES OR FAILED_WORKERS is non-empty (A5 fanout partial-fail
+  audit; wiki-lint Step 6 LOG-INVARIANT scan unaffected — additive
+  field).
 - `ingest-skip` (v1.2.0+) — bytes hash unchanged AND wiki state intact → skip
 - `ingest-repair` (v1.2.0+) — bytes unchanged BUT wiki state drift → 자가복구 (`pages_created:[]` 제약). **(v1.2.1+)** Triggers expanded: now also fires on `log.jsonl` absence and `no-prior-terminal-log` (R3W2). Slug allocator (R3W1, in-batch ledger + on-disk yaml) prevents same-batch basename cross-attribution before this check fires. Caveat (W-α): when triggered by log absence, historical creation records are not synthesized — log-based audit reconstruction will be incomplete; per-source yaml is the authoritative provenance record.
 - `update` — 직접 페이지 수정
@@ -257,7 +275,8 @@ Claude Code hook 실행 중에 만들어지는 transcript artifact. session ID +
 - **v1.1.4** (2026-04-24) — hash normalization + promotion regression guard
 - **v1.2.0** (2026-04-30) — throughput + lint hardening + ingest-repair self-healing
 - **v1.2.1** (2026-05-02) — patch: Step 1.5 hash-skip integrity hardening (R3W1 slug-collision allocator with in-batch ledger, R3W2 forced-repair on missing log signal, parser fixes for inline-list/single-quote yaml + explicit array init), wiki-lint false-positive elimination (T10 http(s) URL exclusion, W7 multi-line indented code block strip with `in_indented_code` state), per-source provenance preservation (B5 dual-classification scheme), README cloud-mirror corrections, RW5+CR-E hook frontmatter line-1 opening guard, RW6 synthesizer message-boundary count covers Phase 1c, B5 Step 10 prose update.
-- **v1.3.0** (2026-05-02) — **(현재)** minor: A4 synthesizer fanout (Approach B — workers parallel-analyze, main aggregates + writes under single lock; lock branch-scoped: multi-source Phase 0, single-source Phase 3) for multi-source `/wiki-ingest` (~30-50% wall-clock reduction on 3+ source batches); cross-worker page collisions trigger second-pass synthesis in worker mode with new `colliding_drafts` input. Hook YAML parser broaden (inline + dotted forms accepted in addition to block; same broaden applied to `wiki-lint.md` `lint.orphan_ignore` mirror parser; pre-existing latent multi-item block-list drop bug also fixed). 6 polish items (1.1 awk-based delimiter-aware slug-allocator extractor [v1.3.0 plan reframe of Cycle-1 CV-3 sed bug], 1.2 tab-indent code block strip, 1.3 post-list 2-blank reset, 1.4 spec/plan ordering convention, 1.5 implementation review prompt tweak [+ optional companion deep-review repo PR], 1.6 README config syntax sweep). New `ingest-fail` lifecycle action for stuck-window recovery after 3 consecutive all-workers-fail batches. New `.failed-sources.tsv` manifest for partial-fail per-source retry. Tier 3 D=status-quo, E=defer-v1.4.0+. Single-source ingest byte-identical to v1.2.1.
+- **v1.3.0** (2026-05-02) — minor: A4 synthesizer fanout (Approach B — workers parallel-analyze, main aggregates + writes under single lock; lock branch-scoped: multi-source Phase 0, single-source Phase 3) for multi-source `/wiki-ingest` (~30-50% wall-clock reduction on 3+ source batches); cross-worker page collisions trigger second-pass synthesis in worker mode with new `colliding_drafts` input. Hook YAML parser broaden (inline + dotted forms accepted in addition to block; same broaden applied to `wiki-lint.md` `lint.orphan_ignore` mirror parser; pre-existing latent multi-item block-list drop bug also fixed). 6 polish items (1.1 awk-based delimiter-aware slug-allocator extractor [v1.3.0 plan reframe of Cycle-1 CV-3 sed bug], 1.2 tab-indent code block strip, 1.3 post-list 2-blank reset, 1.4 spec/plan ordering convention, 1.5 implementation review prompt tweak [+ optional companion deep-review repo PR], 1.6 README config syntax sweep). New `ingest-fail` lifecycle action for stuck-window recovery after 3 consecutive all-workers-fail batches. New `.failed-sources.tsv` manifest for partial-fail per-source retry. Tier 3 D=status-quo, E=defer-v1.4.0+. Single-source ingest byte-identical to v1.2.1.
+- **v1.4.0** (2026-05-05) — **(현재)** minor: A5 page-level fanout. Single-source `/wiki-ingest` wall-clock 목표 ~15분 → ~4분, 페이지 본문 생성 병렬화로 달성. Stage 1 (`wiki-synthesizer mode="analysis"`)이 page_plan + (sub-threshold 시) inline_bodies emit; Stage 2가 영향 받는 페이지마다 하나씩 `wiki-page-writer` worker 병렬 dispatch (`len(page_plan) ≥ a5_fanout_threshold`, default 3); Stage 3 main이 lock 아래 aggregate + atomic-write, mandatory C3 concurrency check (update: hash 비교, create: existence check). Karpathy "10–15 page touches per source" 속성 보존 — A5는 누가 쓰는지 바꾸지 페이지 수 안 바꿈. **Single-source semantics 보존하나 byte-identical NOT** (v1.3.0의 inline-mode 대신 analysis-mode routing으로 ~10–25% wall-clock variance). 다중 소스 (≥2) 경로 v1.3.0 A4 그대로; A4×A5 결합은 v1.4.1+로 보류. 새 schema: `partial_fail` sentinel in `sources/<slug>.yaml` (A1 hash-skip override + Step 1.5 cascading), `pages_failed` log 필드 (additive), 신규 optional `<wiki>/.wiki-meta/.config.json` (`a5_fanout_threshold`, `a5_worker_timeout_sec`). 신규 `partial-fail-recovery` repair_reason 값. 신규 agent: `wiki-page-writer` (Read+Write only, 자기 page만). `wiki-synthesizer`에 `mode: "analysis"` 추가 (additive; inline+worker mode v1.3.0 byte-identical). Failure handling: Step 7.7.A-F (per-worker / all-fail / mid-loop / C3 abort / timeout / R4 metadata pipeline recovery). R-P1 dual fallback (`shasum -a 256 || sha256sum`) Linux portability. Plan 4 review cycles (18→7→9→7 items, fix-and-go cap; 38 substantive fixes 적용). Phase 6 sandbox tests 사용자 재량으로 보류, W2 fault-injection v1.4.1.
 
 전체 history는 `CHANGELOG.md` 참조.
 

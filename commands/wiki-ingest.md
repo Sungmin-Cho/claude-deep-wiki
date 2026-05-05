@@ -1510,6 +1510,90 @@ when fault-injection lands, add Test 14 — "metadata pipeline failure after
 page writes": inject `WIKI_TEST_METADATA_FAIL_AT=Step9` env var; verify
 partial_fail sentinel written + pages_failed log + .pending-scan NOT promoted.
 
+### Step 7.8 — `page_plan == 0` terminal handling (A8)
+
+When Stage 1 returns empty `page_plan` (analysis judged the source brings no new info worthy of a page write), main treats this as `ingest-skip` lifecycle event — same shape as v1.3.0 multi-source Case A (all skip):
+
+**P2 fix (round-1 review, Codex review P2 + Codex adv D3, 2/3 agreement):** Step 7.8
+must NOT recompute hash via `shasum -a 256 < "<source.origin>"`. For URL and text
+sources, `<source.origin>` is a URL string or pasted-text marker, NOT a readable
+file path — `shasum < <url>` either fails or records empty/garbage hash. Use the
+analysis output's `source_hashes[<slug>]` (already computed by Stage 1, valid for
+all source types). For file/deep-work-report sources, fall back to local shasum
+ONLY when synthesizer emitted the sentinel "main-computes" (per P6 fix below).
+
+```bash
+# Caller passes source descriptor + the analysis output's source_hashes map.
+# Markdown-spec pseudocode; implementer maps to actual bash arrays per Step 7.6
+# disclaimer (see Task 4.2).
+do_ingest_skip_terminal_under_lock() {
+  # Args: $1=source descriptor (slug, origin, type fields), $2=source_hashes map
+  mkdir "<wiki>/.wiki-meta/.wiki-lock" || { echo "Wiki locked"; exit 1; }
+  trap 'rmdir "<wiki>/.wiki-meta/.wiki-lock" 2>/dev/null || true' EXIT
+
+  # 1. Determine content_hash for sources/<slug>.yaml.
+  # P2 fix (round-1) — use Stage 1 source_hashes when available.
+  # C2 fix (round-2 review, 2/3 agreement — Codex review R-P2 + Codex adv A-P1):
+  # the previous round-1 form treated url|text + sentinel "main-computes" as a
+  # fatal contract violation. But the analysis contract explicitly ALLOWS the
+  # sentinel (synthesizer has no shasum tool), so every duplicate URL/text
+  # ingest with no new info (page_plan==0) was hitting fatal exit, never writing
+  # the ingest-skip log line, never promoting .pending-scan. Result: user-visible
+  # repeated failure on re-ingest of unchanged URL/text sources.
+  #
+  # New behavior — graceful degradation by source type:
+  #   - file/deep-work-report: re-shasum locally (synthesizer's sentinel signals
+  #     "main, please compute").
+  #   - url/text: reuse Step 8d's existing normalization helper (curl-fetch +
+  #     shasum for url; text-inbox + shasum for text), already implemented in
+  #     v1.3.0. If normalization fails (network down for url, etc.), keep the
+  #     sentinel — Step 1.5's sed regex matches only 64-char hex, so sentinel
+  #     naturally falls through to safe re-ingest on next attempt (no data loss,
+  #     just one extra ingest cycle).
+  current_hash="${source_hashes[<slug>]:-main-computes}"
+  if [ "$current_hash" = "main-computes" ] || [ -z "$current_hash" ]; then
+    case "<source.type>" in
+      file|deep-work-report)
+        # Local file — safe to re-shasum.
+        # R4-R4-3 fix (round-4 review, Codex review P2) — dual fallback for Linux.
+        # Without sha256sum fallback: empty hash on Linux without `shasum`,
+        # which gets written to sources/<slug>.yaml; Step 1.5 sed regex
+        # `^[0-9a-f]{64}$` rejects empty → re-ingest forced indefinitely.
+        # Mirror Step 1.5 L193 + Step 7.5/7.6.C R-P1 fix pattern.
+        current_hash=$({ shasum -a 256 "<source.origin>" 2>/dev/null \
+                         || sha256sum "<source.origin>" 2>/dev/null; } | awk '{print $1}')
+        ;;
+      url|text)
+        # C2 fix — reuse Step 8d normalization (single source of truth for
+        # url/text hashing). Implementer note: `step_8d_normalize_url_or_text_hash`
+        # is markdown-spec shorthand — read commands/wiki-ingest.md Step 8d
+        # block (curl/text-inbox + shasum logic) and inline the equivalent here.
+        current_hash=$(step_8d_normalize_url_or_text_hash "<source.origin>" "<source.type>" 2>/dev/null)
+        # If normalization fails (e.g., network down for url) keep sentinel.
+        # Step 1.5 sed regex `^content_hash:.*([0-9a-f]{64})` rejects sentinel
+        # values, naturally forcing re-ingest on next attempt — safe fallback.
+        if [ -z "$current_hash" ]; then
+          current_hash="main-computes"
+          echo "WARNING: Step 8d normalization unavailable for $type:$origin; recording sentinel — next ingest will retry." >&2
+        fi
+        ;;
+    esac
+  fi
+  write_or_update_yaml slug=<slug> content_hash=$current_hash ingested_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+  # 2. Append ingest-skip log line.
+  emit_log_line action=ingest-skip source=<slug> pages_created=[] pages_updated=[]
+
+  # 3. Promote .pending-scan → .last-scan (terminal event, source is fully accounted for).
+  promote_pending_scan_to_last_scan
+
+  rmdir "<wiki>/.wiki-meta/.wiki-lock"
+  trap - EXIT
+}
+```
+
+Without this terminal flow, the SessionStart hook would re-detect the source's file every session (its mtime is in pending-scan window but no terminal log exists for it).
+
 #### Backwards compatibility note
 
 For 1-source `/wiki-ingest`, the fast path (Step 7.5 decision branch 2)

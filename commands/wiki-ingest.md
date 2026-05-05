@@ -1369,6 +1369,147 @@ trap - EXIT
 
 Surface result to user (Step 14 final report unchanged from v1.3.0).
 
+### Step 7.7 — A5 failure handling
+
+#### Step 7.7.A — Per-worker failure (one or more, but not all)
+
+Documented in Step 7.6.B (workers with `worker_status: "failed"` go to `FAILED_WORKERS`). Step 7.6.C iterates only over SUCCESS_DRAFTS — failed-worker entries are added to manifest's `failed[]` and contribute to PARTIAL_FAIL flag.
+
+#### Step 7.7.B — All-workers fail (zero successes from page-writers)
+
+```bash
+if [[ ${#SUCCESS_DRAFTS[@]} -eq 0 ]]; then
+  # No Stage 3 page write. But still need to write log + retry counter under lock.
+  mkdir "<wiki>/.wiki-meta/.wiki-lock" || { echo "Wiki locked"; exit 1; }
+  trap 'rmdir "<wiki>/.wiki-meta/.wiki-lock" 2>/dev/null || true' EXIT
+
+  # R4-Adv-Adv-2 fix (round-4 review, Codex adv finding):
+  # All-workers-fail can leave a FIRST-time source's yaml in a corrupt state.
+  # Step 7.6.F's sentinel writer assumes sources/<slug>.yaml ALREADY EXISTS
+  # (cat | awk transform + append partial_fail). For first-ingest all-fail case,
+  # the yaml file doesn't exist yet → write fails OR creates a sentinel-only
+  # yaml missing required fields (id/type/origin/content_hash/pages_*).
+  # Fix: ensure baseline yaml exists before sentinel write.
+  yaml="<wiki>/.wiki-meta/sources/<slug>.yaml"
+  if [ ! -f "$yaml" ]; then
+    # Materialize a baseline yaml using Step 8e's schema with empty page arrays
+    # and a normalized content_hash (file/deep-work-report → shasum dual fallback;
+    # url/text → "main-computes" sentinel which Step 1.5 rejects, forcing
+    # safe re-ingest on next attempt).
+    case "<source.type>" in
+      file|deep-work-report)
+        baseline_hash=$({ shasum -a 256 "<source.origin>" 2>/dev/null \
+                          || sha256sum "<source.origin>" 2>/dev/null; } | awk '{print $1}')
+        ;;
+      url|text)
+        baseline_hash="main-computes"  # Sentinel — Step 1.5 sed regex rejects, forces re-ingest.
+        ;;
+    esac
+    write_or_update_yaml slug=<slug> origin=<source.origin> type=<source.type> \
+                        content_hash="$baseline_hash" \
+                        ingested_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") \
+                        pages_created=[] pages_updated=[]
+  fi
+
+  # 1. Append pages_failed log line.
+  emit_log_line action=ingest pages_created=[] pages_updated=[] \
+                pages_failed="${FAILED_WORKER_FILES[@]}"  # parallel-array form per disclaimer
+
+  # 2. Write partial_fail sentinel to sources/<slug>.yaml (Step 7.6.F path Case (i)).
+  write_partial_fail_sentinel reason="all workers failed"
+
+  # 3. Increment retry counter (.pending-scan-retry-count).
+  increment_retry_counter
+
+  # 4. If counter == 3:
+  if [[ retry_counter == 3 ]]; then
+    emit_log_line action=ingest-fail
+    promote_pending_scan_to_last_scan  # break stuck-window loop
+    reset_retry_counter
+  fi
+  # else: .pending-scan NOT promoted (next session retries the source).
+
+  rmdir "<wiki>/.wiki-meta/.wiki-lock"
+  trap - EXIT
+  exit 1
+fi
+```
+
+**A7 — lock acquisition before any log/meta write is mandatory.** Even though no page is written, log.jsonl + sources yaml + retry counter are all concurrency-sensitive.
+
+#### Step 7.7.C — Stage 3 mid-loop write failure
+
+Documented in Step 7.6.C — `break` halts the loop on first write failure. A6 — remaining drafts after the failing one go to FAILED_PAGES with reason `"skipped due to mid-loop abort after <file> write failure"`. Pages already written stay (atomic per page).
+
+#### Step 7.7.D — Stage 3 concurrency check abort (C3)
+
+Per Step 7.6.C: hash mismatch (update) or file-exists (create) under lock → page added to FAILED_PAGES, loop CONTINUES (concurrency abort doesn't halt other pages — that's why this is `continue`, not `break`). Other pages may still write.
+
+PARTIAL_FAIL flag is set, so Step 7.6.F sentinel write fires.
+
+#### Step 7.7.E — Worker timeout
+
+Each worker has timeout `a5_worker_timeout_sec` (default 90s). Timeout = `worker_status: "failed"` with `fail_reason: "timeout"`. Treated identically to per-worker failure (Step 7.7.A).
+
+#### Step 7.7.F — Metadata pipeline failure after Step 7.6.C wrote pages (R4-Adv-Adv-1 fix)
+
+**R4-Adv-Adv-1 fix (round-4 review, Codex adv critical):** the round-3 plan
+covers Step 2 (worker fail) + Stage 3 page write fail (mid-loop break) + C3
+concurrency abort, but does NOT define recovery for FAILURES IN STEPS 8-13 AFTER
+PAGES WERE COMMITTED. If 7.6.C wrote N pages successfully, then Step 9 (index.json)
+or Step 10 (log.jsonl append) fails (disk full, permission, sigkill mid-write),
+the plan would silently exit with: pages mutated on disk + no provenance/log/index
+update + no `partial_fail` sentinel + no retry record. Result: wiki state divergence
+that no automated recovery path detects.
+
+**Recovery contract:** any error from Step 8a (reconcile) through Step 11 (human
+artifacts) AFTER 7.6.C wrote pages MUST trigger:
+
+```bash
+# Pseudocode — implementer maps to error trap or per-step rc check
+on_metadata_failure() {
+  # 1. Mark all WRITTEN entries as FAILED for retry purposes.
+  for entry in WRITTEN; do
+    FAILED_PAGES+=({file: entry.file, reason: "metadata pipeline failure after page write — yaml/log/index out of sync"})
+    FAILED_PAGE_FILES+=("${entry.file}")
+  done
+  PARTIAL_FAIL=true
+
+  # 2. Write partial_fail sentinel via Step 7.6.F Case (i) path.
+  # Same lock semantics: lock is still held from 7.6.C; do not release.
+  write_partial_fail_sentinel reason="metadata pipeline failure"
+
+  # 3. Append minimal log line (defensive — Step 10 itself may have failed,
+  # so retry log emission with shorter payload to maximize chance of landing).
+  if ! emit_log_line action=ingest pages_created="${WRITTEN_CREATE_FILES[@]}" \
+                     pages_updated="${WRITTEN_UPDATE_FILES[@]}" \
+                     pages_failed="${FAILED_PAGE_FILES[@]}"; then
+    # Even minimal log line failed. Last-resort: write a marker file so
+    # next-session R3W2 detection can flag wiki state drift.
+    echo "metadata pipeline failure at $(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      >> "<wiki>/.wiki-meta/.metadata-failure-marker"
+  fi
+
+  # 4. Do NOT promote .pending-scan (next session retries).
+  # 5. Release lock.
+  rmdir "<wiki>/.wiki-meta/.wiki-lock"
+  exit 1
+}
+```
+
+**Rationale:** the alternative — rolling back all WRITTEN pages from `.versions/`
+backups — is more correct but invasive (requires N file copies under lock,
+extending lock duration unpredictably; if rollback itself partially fails, state
+is even worse). The chosen contract (mark all as failed + write sentinel + best-effort
+log + next-session retry) trades "perfect rollback" for "predictable recovery
+signal". Step 1.5's `partial_fail` cascading + R3W2 wiki state drift detection
+will force a clean re-ingest on next session, which restores consistency.
+
+Phase 6 sandbox test (W2 fault-injection deferred to v1.4.1 per round-1 W2 fix):
+when fault-injection lands, add Test 14 — "metadata pipeline failure after
+page writes": inject `WIKI_TEST_METADATA_FAIL_AT=Step9` env var; verify
+partial_fail sentinel written + pages_failed log + .pending-scan NOT promoted.
+
 #### Backwards compatibility note
 
 For 1-source `/wiki-ingest`, the fast path (Step 7.5 decision branch 2)

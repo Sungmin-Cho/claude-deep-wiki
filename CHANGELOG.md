@@ -4,8 +4,8 @@ All notable changes to deep-wiki are documented here.
 
 ## [1.4.0] — 2026-05-05
 
-A5 page-level fanout. Single-source `/wiki-ingest` wall-clock target
-~15 min → ~4 min via parallel page-body generation. Stage 1
+A5 page-level fanout. Single-source `/wiki-ingest` parallelizes
+page-body generation across N `wiki-page-writer` workers. Stage 1
 (`wiki-synthesizer mode="analysis"`) emits a `page_plan` describing
 which pages to create/update plus (when sub-threshold) `inline_bodies`
 ready for atomic write. Stage 2 dispatches one `wiki-page-writer`
@@ -16,6 +16,20 @@ create via existence check). Karpathy's "10–15 page touches per source"
 property preserved — A5 changes WHO writes pages, not how many.
 Multi-source path (≥2 sources) is unchanged from v1.3.0 A4 fanout;
 A4×A5 combination deferred to v1.4.1+.
+
+**Performance note (added 2026-05-05 post-release):** The original ≤5 min
+wall-clock target (vs v1.3.0 ~15 min single-source baseline) assumed
+unbounded subagent parallelism. Initial real-vault dogfood (14-page plan,
+295-page wiki, this CHANGELOG's session) measured ~17 min total wall-clock
+under Claude Code runtime's observed concurrent-subagent cap of ~3
+(Stage 1 ~7 min analysis + Stage 2 ~10 min worker dispatch; effective
+parallelism ~2.7×, not 14×). The architectural mechanism (parallel
+page-body generation, lock-protected Stage 3, mandatory C3 concurrency
+check) functions as designed; empirical per-stage characterization and
+parallelism-cap quantification are deferred to v1.4.1 B1 fault-injection
++ B3 phase_timing_ms telemetry. Track C (synthesizer agent split for
+trust-boundary closure) priority elevated after dogfood realized the
+M1 limitation (2/14 workers violated `tools: []` contract).
 
 ### Architectural
 

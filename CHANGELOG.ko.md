@@ -4,8 +4,8 @@ deep-wiki의 주요 변경사항을 기록합니다.
 
 ## [1.4.0] — 2026-05-05
 
-A5 페이지 단위 fanout. 단일 소스 `/wiki-ingest` wall-clock 목표
-~15분 → ~4분, 페이지 본문 생성 병렬화로 달성. Stage 1
+A5 페이지 단위 fanout. 단일 소스 `/wiki-ingest`가 페이지 본문 생성을
+N개의 `wiki-page-writer` worker에 분산 병렬화. Stage 1
 (`wiki-synthesizer mode="analysis"`)이 어떤 페이지를 생성/갱신할지
 기술하는 `page_plan`을 emit하고, sub-threshold 시 atomic write 가능한
 `inline_bodies`도 함께 emit. Stage 2는 영향 받는 페이지마다 하나씩
@@ -16,6 +16,19 @@ a5_fanout_threshold`, default 3). Stage 3는 main이 lock 아래 draft를
 소스가 10–15개 페이지에 영향" 속성 보존 — A5는 누가 페이지를 쓰는지를
 바꾸지, 페이지 수를 바꾸지 않음. 다중 소스 (≥2) 경로는 v1.3.0 A4 fanout
 그대로 보존; A4×A5 결합은 v1.4.1+로 보류.
+
+**성능 주석 (2026-05-05 release 직후 추가):** 원래 ≤5분 wall-clock 목표
+(vs v1.3.0 ~15분 단일 소스 baseline)는 무제한 subagent 병렬성을 전제했음.
+초기 real-vault dogfood (14-page plan, 295-page wiki, 본 CHANGELOG 작성
+세션)는 Claude Code 런타임의 동시 subagent cap ~3 환경에서 총 ~17분
+wall-clock을 측정 (Stage 1 ~7분 analysis + Stage 2 ~10분 worker dispatch;
+effective parallelism ~2.7×, 기대치 14× 아님). 아키텍처 메커니즘
+(페이지 본문 병렬 생성, lock 아래 Stage 3, mandatory C3 concurrency
+check)은 설계대로 동작; 정량적 per-stage 측정 + 병렬성 cap 정량화는
+v1.4.1 B1 fault-injection + B3 phase_timing_ms telemetry로 보류. 또한
+dogfood에서 14 워커 중 2개가 `tools: []` 계약을 위반함이 실증되어,
+synthesizer agent split을 통한 trust-boundary closure (Track C)
+우선순위가 격상.
 
 ### 아키텍처
 

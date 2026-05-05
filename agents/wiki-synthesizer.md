@@ -310,6 +310,25 @@ When `mode: "analysis"`, the agent's responsibility narrows to *decision* + *bod
 9. **DO NOT** acquire any lock (lock at Stage 3 only — main owns it).
 10. Return an `analysis_drafts` JSON object instead of the inline-mode shape (see Analysis output contract below).
 
+> **Trust boundary acknowledgement (M1 — Codex adversarial post-fix):**
+> The agent's frontmatter `tools:` list includes `Write` because inline-mode
+> (the default for v1.3.0 single-source) requires it. Analysis-mode contract's
+> "do not write any page" rule (Steps 7-9 above) is enforced by **prompt
+> obedience only** — the runtime tool whitelist does not change between
+> modes. A non-compliant agent slip during analysis-mode could in principle
+> mutate `pages/` files outside Stage 3's lock-protected transaction. This
+> is a known design limitation acknowledged here for v1.4.0; full
+> tool-level enforcement would require either splitting `wiki-synthesizer`
+> into mode-scoped agents (large refactor) OR acquiring the global lock
+> BEFORE analysis-mode dispatch (extends lock duration unpredictably for
+> single-source path, contradicting v1.4.0's "lock at Stage 3 only"
+> trade-off). Interim mitigation: main can perform a post-analysis
+> `git diff <wiki>/pages/` (or equivalent inotify check) before entering
+> Stage 3 and abort if the agent slip wrote anything. v1.4.x candidate
+> for full mitigation. **For v1.4.0, the contract is enforced by prompt
+> trust + reviewer audit + spec/CHANGELOG documentation of the
+> limitation.**
+
 ### Why analysis mode (rationale)
 
 Single-source ingest's dominant cost is sequential body generation across ~13 pages (Karpathy's 10-15 page synthesis property). v1.3.0 inline mode generates all bodies in one LLM context (sequential decoding). Analysis mode separates *decision* (Stage 1) from *body generation* (Stage 2 fanout for above-threshold, inline_bodies for sub-threshold). Plan: above-threshold dispatches one `wiki-page-writer` worker per affected page, parallel.

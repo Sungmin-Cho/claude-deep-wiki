@@ -1110,21 +1110,49 @@ for raw in "${RAW_WORKER_OUTPUTS[@]}"; do
       frontmatter_meta="${parsed.frontmatter_meta}"
       if [[ -z "$page_content" ]]; then
         FAILED_WORKERS+=({file: "$file", fail_reason: "worker_status=ok but page_content empty (truncated output?)"})
-      elif [[ -z "$frontmatter_meta" ]]; then
+      elif [[ -z "$frontmatter_meta" || "$frontmatter_meta" == "null" ]]; then
         # Post-review fix — fixes round-4 missed: W2 (Codex review P2). Worker
         # contract requires frontmatter_meta with title/tags/aliases/sources_final;
         # without this gate, a truncated/prose-only response with valid
         # page_content but missing frontmatter_meta would be promoted to
         # SUCCESS_DRAFTS and Step 7.6.D's P7 lift would yield null/missing
         # top-level fields, corrupting index.json + sources/<slug>.yaml.
-        FAILED_WORKERS+=({file: "$file", fail_reason: "worker_status=ok but frontmatter_meta missing or incomplete (truncated output?)"})
+        # JSON null guard added — bash `[[ -z ]]` would treat the 4-char string
+        # "null" as non-empty.
+        FAILED_WORKERS+=({file: "$file", fail_reason: "worker_status=ok but frontmatter_meta missing or null (truncated output?)"})
       else
-        # Implementer note: when feasible, also verify the frontmatter_meta object
-        # contains all four required subfields (title, tags, aliases, sources_final).
-        # Bash 3.2 cannot introspect JSON natively; rely on Step 7.6.D's P7 lift
-        # to detect missing subfields and fall back to pe.frontmatter_meta from
-        # page_plan when available.
-        SUCCESS_DRAFTS+=("$parsed")
+        # H1 fix (Codex adversarial post-fix) — verify required frontmatter_meta
+        # subfields BEFORE promoting to SUCCESS_DRAFTS. Worker contract requires
+        # title (string, non-empty), tags (array), aliases (array), sources_final
+        # (array, lex-sorted slugs). Without this gate, a partial frontmatter_meta
+        # like `{"title":"X"}` (missing sources_final) would lift null/missing
+        # values into manifest, corrupting per-source provenance + index.
+        # Implementer note: bash 3.2 cannot introspect JSON natively. Use jq when
+        # available (preferred) or python3 fallback; treat any extraction error
+        # as missing field. Cross-reference with `pe.frontmatter_meta` from
+        # `page_plan` when feasible — if the worker's subfields are missing but
+        # page_plan has them, fall back to plan values rather than failing the
+        # draft (synthesizer's analysis-mode emit is the canonical source).
+        # On any unrecoverable subfield gap → FAILED_WORKERS.
+        for required_sub in title tags aliases sources_final; do
+          val=$(printf '%s' "$frontmatter_meta" | jq -r ".$required_sub // empty" 2>/dev/null \
+                || printf '%s' "$frontmatter_meta" | python3 -c "import json,sys;d=json.load(sys.stdin);v=d.get('$required_sub');print('' if v in (None,[],'') else v)" 2>/dev/null \
+                || echo "")
+          if [[ -z "$val" ]]; then
+            # Try fallback to pe.frontmatter_meta first.
+            pe_val=$(printf '%s' "${pe.frontmatter_meta}" | jq -r ".$required_sub // empty" 2>/dev/null || echo "")
+            if [[ -n "$pe_val" ]]; then
+              # Implementer note: splice the missing subfield from page_plan back
+              # into the worker's frontmatter_meta payload before SUCCESS_DRAFTS.
+              # Markdown-spec pseudocode — actual implementation uses jq merge.
+              continue
+            fi
+            FAILED_WORKERS+=({file: "$file", fail_reason: "worker_status=ok but frontmatter_meta.$required_sub missing or empty (cannot fall back to page_plan)"})
+            ok_validated=false
+            break
+          fi
+        done
+        [[ "${ok_validated:-true}" == "true" ]] && SUCCESS_DRAFTS+=("$parsed")
       fi
       ;;
     failed)
@@ -1728,7 +1756,17 @@ do_ingest_skip_terminal_under_lock() {
         ;;
     esac
   fi
-  write_or_update_yaml slug=<slug> content_hash=$current_hash ingested_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  # Post-review fix — fixes round-4 missed: H2 (Codex adversarial post-fix).
+  # First-time source with empty page_plan must materialize the FULL Step 8e
+  # yaml schema, not just slug/content_hash/ingested_at. Missing type/origin
+  # weakens slug-collision detection (allocator can't distinguish two sources
+  # with the same natural slug) and breaks downstream consumers expecting
+  # the canonical yaml shape. Mirror the Step 7.7.B baseline-yaml logic
+  # (R4-Adv-Adv-2) for consistency — same write_or_update_yaml field set.
+  write_or_update_yaml slug=<slug> origin=<source.origin> type=<source.type> \
+                      content_hash=$current_hash \
+                      ingested_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ") \
+                      pages_created=[] pages_updated=[]
 
   # 2. Append ingest-skip log line.
   emit_log_line action=ingest-skip source=<slug> pages_created=[] pages_updated=[]

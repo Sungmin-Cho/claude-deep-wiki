@@ -27,6 +27,73 @@ obsidian version 2>/dev/null
 
 If the config does not contain `obsidian_cli`, set `OBS_LIVE=false` (filesystem-only mode).
 
+#### Optional A5 fanout config (v1.4.0+)
+
+Optional file `<wiki>/.wiki-meta/.config.json` overrides A5 page-fanout
+defaults. Schema:
+
+```json
+{
+  "a5_fanout_threshold": 3,
+  "a5_worker_timeout_sec": 90
+}
+```
+
+- `a5_fanout_threshold` (default 3) — single-source page_plan size at
+  which A5 fanout activates. `< threshold` uses Step 7.5.A inline_bodies
+  sub-threshold path; `>= threshold` dispatches Step 7.6 parallel
+  page-writers. Set to a very large number (e.g. 9999) to effectively
+  disable A5 fanout (always sub-threshold path).
+- `a5_worker_timeout_sec` (default 90) — aspirational per-worker timeout
+  (see W9 disclaimer at Step 7.6.E).
+
+Absence of `.config.json` means defaults — no migration needed.
+
+```bash
+# v1.4.0 — load optional .config.json
+CONFIG="<wiki>/.wiki-meta/.config.json"
+A5_FANOUT_THRESHOLD=3
+A5_WORKER_TIMEOUT_SEC=90
+
+if [ -f "$CONFIG" ]; then
+  # Bash 3.2 portable JSON read — use python3 if available, else jq.
+  if command -v python3 >/dev/null 2>&1; then
+    val=$(python3 -c "import json,sys;d=json.load(open('$CONFIG'));print(d.get('a5_fanout_threshold',3))" 2>/dev/null)
+    [ -n "$val" ] && A5_FANOUT_THRESHOLD="$val"
+    val=$(python3 -c "import json,sys;d=json.load(open('$CONFIG'));print(d.get('a5_worker_timeout_sec',90))" 2>/dev/null)
+    [ -n "$val" ] && A5_WORKER_TIMEOUT_SEC="$val"
+  elif command -v jq >/dev/null 2>&1; then
+    val=$(jq -r '.a5_fanout_threshold // 3' "$CONFIG" 2>/dev/null)
+    [ -n "$val" ] && [ "$val" != "null" ] && A5_FANOUT_THRESHOLD="$val"
+    val=$(jq -r '.a5_worker_timeout_sec // 90' "$CONFIG" 2>/dev/null)
+    [ -n "$val" ] && [ "$val" != "null" ] && A5_WORKER_TIMEOUT_SEC="$val"
+  else
+    # W10 fix (round-1 review, Opus W10) — neither python3 nor jq found in PATH.
+    # Bash 3.2 cannot portably parse JSON; emit stderr warning so the user knows
+    # their .config.json overrides were silently ignored. Defaults still apply
+    # (no fail-stop — A5 still runs with safe defaults).
+    echo "WARNING: $CONFIG exists but no python3 or jq found in PATH;" >&2
+    echo "         a5_fanout_threshold + a5_worker_timeout_sec overrides ignored." >&2
+    echo "         Using defaults: threshold=$A5_FANOUT_THRESHOLD, timeout=${A5_WORKER_TIMEOUT_SEC}s." >&2
+    echo "         Install jq (brew install jq / apt install jq) or ensure python3 is available to apply overrides." >&2
+  fi
+fi
+```
+
+> **W9 fix (round-1 review, Opus W9) — `a5_worker_timeout_sec` is aspirational:**
+> The Claude Code Agent tool API does NOT expose a per-call timeout knob. The
+> 90s value is a SOFT TARGET used for: (1) documentation of the worker design
+> intent (Stage 1's `intent_summary` complexity budget — workers shouldn't need
+> more than ~90s of LLM thinking for one page), (2) future-compat in case the
+> runtime exposes timeouts later. The runtime's actual default (~5 minutes per
+> Agent call) is the hard limit until the user kills the parent session.
+> Implementer notes: do NOT write code that depends on 90s being enforced
+> (e.g., do not `kill -SIGTERM` workers at 90s — there is no PID exposed). The
+> "all workers fail" path (Step 7.7.B) covers runaway-worker scenarios after
+> the runtime kills hung agents at its own ~5min limit. Spec §10.2 telemetry
+> (deferred to v1.4.x) will record actual per-worker durations to inform
+> whether to lobby for a runtime timeout knob.
+
 ## Steps
 
 ### 1. Identify Source Type

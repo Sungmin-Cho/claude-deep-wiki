@@ -416,7 +416,7 @@ Output (summary): structured entries for `created` / `updated` carrying `{file, 
 
 If `failed` is non-empty, continue with metadata updates for whatever succeeded and include the failures in the final report (Step 14). Always release the lock. **In auto-ingest mode, do NOT promote `.pending-scan → .last-scan` on any partial or full failure** — the next session's hook will re-detect the window. See Error Handling below.
 
-### 7.5. Synthesizer dispatch (v1.3.0+: A4 fanout, Approach B)
+### 7.5. Synthesizer dispatch (v1.4.0+: single-source A5 / multi-source A4)
 
 **Lock scope (v1.3.0+, fixes Cycle-1 SS-1 + Plan #2.1 Cycle-2 C2-W2 —
 branch-scoped):** the existing global lock
@@ -424,7 +424,7 @@ branch-scoped):** the existing global lock
 on the branch:
 
 - **Multi-source path (≥2 sources):** lock acquired **BEFORE worker
-  dispatch** (Phase 0/Step 7.5.A entry) and held through Phase 3 (atomic
+  dispatch** (Phase 0/Step 7.5.M-A entry) and held through Phase 3 (atomic
   writes). Approach B's correctness depends on workers seeing a stable
   wiki state snapshot during their analysis. Lock held for the full LLM
   analysis duration (~minutes), blocking concurrent `/wiki-ingest`
@@ -444,27 +444,128 @@ scope it needs for B5 invariant on fanout. See spec §2.5 for full
 trade-offs.
 
 After Step 1.5 (re-ingest hash skip) finalizes the source set, the agent
-decides between empty-batch exit, single-worker fast path, and multi-worker
+decides between empty-batch exit, single-source A5 path (with sub-branches
+for empty page_plan / sub-threshold inline / fanout), and multi-worker A4
 fanout based on source count.
 
-**Three-branch decision (fixes Cycle-1 SS-9):**
+**Four-branch decision (v1.4.0+ — extends v1.3.0 three-branch with
+single-source A5 sub-branches):**
 
-1. **0 sources** (`${#SOURCES[@]} == 0`): emit `"No sources to ingest."` and
-   exit cleanly. **No lock acquired.** (v1.2.1 behavior preserved — does
-   NOT invoke synthesizer at all.)
+> **W11 fix (round-1 review, Opus W11) — pseudocode style:**
+> The block below uses Python-style `if/elif/else` and `for entry in ...`
+> syntax for readability. The LLM interpreter maps these to bash 3.2
+> equivalents during `/wiki-ingest` execution — e.g.,
+> `if sources_count == 0:` becomes `if [ "$sources_count" -eq 0 ]; then`,
+> `for entry in page_plan:` becomes
+> `for i in "${!page_plan[@]}"; do entry="${page_plan[$i]}"; ... done`
+> (with the usual JSON parsing per the Step 7.6 P3 disclaimer).
+> Implementer must respect CLAUDE.md "Bash 3.2 portability" rules
+> (no `declare -A`, no `mapfile`, etc.). Dotted field access
+> (`entry.action`, `entry.existing_body_hash`, `entry.existing_page_body`)
+> follows the same convention as Step 7.6.
 
-2. **1 source** (`${#SOURCES[@]} == 1`): single-source fast path. Invoke
-   `wiki-synthesizer` agent with `mode: "inline"` (default). The synthesizer
-   reads the source, decides action, writes pages + backups directly. Main
-   records log + sources/*.yaml + index.json updates per the existing
-   v1.2.1 Step 8a-8h sequence. **Lock acquired in Phase 3 only — same as
-   v1.2.1. Byte-identical to v1.2.1** for this branch in BOTH state AND
-   lock timing.
+```
+sources_count = len(SOURCES)
 
-3. **≥2 sources**: multi-source fanout — **acquire lock NOW** (Phase 0
-   for fanout branch only), then proceed to Step 7.5.A below.
+if sources_count == 0:
+    exit "No sources to ingest." [v1.3.0 unchanged — no lock]
 
-#### Step 7.5.A — Parallel worker dispatch (Phase 1)
+if sources_count == 1:
+    # v1.4.0 single-source A5 path: always invoke analysis mode first.
+    invoke wiki-synthesizer mode="analysis"
+    page_plan = synthesizer.page_plan
+    inline_bodies = synthesizer.inline_bodies
+    source_hashes = synthesizer.source_hashes
+
+    # P6 fix (round-1, Codex review D4) — synthesizer's tool whitelist is
+    # [Read, Write, Glob, Grep, WebFetch] (no shasum/Bash). Synthesizer emits
+    # sentinel "main-computes" for existing_body_hash on update entries. Main now
+    # computes the actual hash from existing_page_body bytes BEFORE Stage 3, so
+    # the C3 concurrency check at Step 7.6.C has a real value to compare against.
+    for entry in page_plan:
+        if entry.action == "update" and entry.existing_body_hash == "main-computes":
+            # R-P1 fix (round-3, Codex review P2) — Linux portability.
+            # macOS BSD ships `shasum`; most Linux distros ship `sha256sum`.
+            # Mirror Step 8d's portable form.
+            entry.existing_body_hash = $({ printf '%s' "$entry.existing_page_body" | shasum -a 256 2>/dev/null \
+                                          || printf '%s' "$entry.existing_page_body" | sha256sum 2>/dev/null; } \
+                                         | awk '{print $1}')
+        # action == "create" entries keep existing_body_hash = null (no prior body to hash).
+
+    if len(page_plan) == 0:
+        # A8 — empty plan terminal-skip flow (Step 7.8 below).
+        do_ingest_skip_terminal_under_lock(source, source_hashes)
+        exit "1 source skipped — analysis judged no pages need update."
+
+    elif len(page_plan) < a5_fanout_threshold:
+        # A5 sub-threshold — Stage 1 already emitted bodies in inline_bodies.
+        # No Stage 2 worker dispatch. Skip to Stage 3 atomic write.
+        do_atomic_write_from_inline_bodies(page_plan, inline_bodies, source_hashes)
+
+    else:
+        # A5 fanout active — Step 7.6 below.
+        do_a5_fanout(page_plan, source_hashes)
+
+if sources_count >= 2:
+    do_v1_3_0_a4_fanout()  # unchanged (existing Step 7.5.M-A through 7.5.M-D)
+```
+
+The single-source A5 path branches further on `len(page_plan)` after the
+analysis-mode synthesizer returns; see Step 7.5.A (sub-threshold), Step 7.6
+(A5 fanout) and Step 7.8 (empty-plan terminal-skip) for the per-branch
+flow. The multi-source path is unchanged from v1.3.0 — Step 7.5.M-A through
+Step 7.5.M-D below contain the A4 fanout logic verbatim. The `≥2 sources`
+branch acquires the global lock NOW (Phase 0 for fanout) before entering
+Step 7.5.M-A.
+
+#### Step 7.5.A — Sub-threshold atomic write from `inline_bodies` (W6 fix)
+
+When `page_plan` is non-empty AND `len(page_plan) < a5_fanout_threshold`,
+Stage 1 already emitted full bodies inside `inline_bodies` (no Stage 2
+worker dispatch). Main consumes those bodies directly through the same
+Stage 3 path A5 fanout uses, with the C3 concurrency check still mandatory.
+Same lock semantics, same backup/write/sentinel flow as Step 7.6.C-G.
+
+```bash
+do_atomic_write_from_inline_bodies(page_plan, inline_bodies, source_hashes) {
+  # Inline_bodies acts as SUCCESS_DRAFTS — no FAILED_WORKERS possible (no fanout).
+  # Convert inline_bodies to the same draft shape Step 7.6.C consumes.
+  SUCCESS_DRAFTS=()
+  FAILED_WORKERS=()  # Always empty in sub-threshold path.
+  for body in "${inline_bodies[@]}"; do
+    pe="<corresponding page_plan entry where pe.file == body.file>"
+    SUCCESS_DRAFTS+=({
+      file: body.file,
+      page_content: body.page_content,
+      frontmatter_meta: pe.frontmatter_meta
+    })
+  done
+
+  # Verify lex-set match (caller MUST emit inline_bodies with same files as page_plan).
+  if [ "$(echo "${page_plan[@]/.file}" | sort)" != "$(echo "${inline_bodies[@]/.file}" | sort)" ]; then
+    echo "ERROR: page_plan / inline_bodies file lex-set mismatch — Stage 1 contract violated"
+    exit 1
+  fi
+
+  # Reuse the Step 7.6.C-G atomic-write block VERBATIM:
+  #  - Step 7.6.C: lock acquire + mandatory C3 concurrency check + backup + atomic write
+  #  - Step 7.6.D: manifest conversion (with P7 sources lift)
+  #  - Step 7.6.E: Step 8a-8h execution
+  #  - Step 7.6.F: partial_fail sentinel write OR removal-on-success
+  #  - Step 7.6.G: lock release
+  #
+  # PARTIAL_FAIL semantics identical: any Stage 3 error (C3 abort, backup, write, rename)
+  # toggles PARTIAL_FAIL=true. FAILED_WORKERS is always empty so no pre-loop toggle needed.
+  call_step_7_6_C_through_G "${SUCCESS_DRAFTS[@]}"
+}
+```
+
+Implementer note: in markdown-spec pseudocode, `call_step_7_6_C_through_G`
+is shorthand for the LLM to inline the same logic — both paths share the
+same atomic-write algorithm, parameterized only by the source of drafts
+(workers vs `inline_bodies`).
+
+#### Step 7.5.M-A — Parallel worker dispatch (multi-source A4 — Phase 1)
 
 Split sources across **`min(3, ${#SOURCES[@]})`** wiki-synthesizer worker
 subagents. Sources are sorted lexicographically by `origin` (source path)
@@ -506,7 +607,7 @@ done <<< "$SORTED_SOURCES"
 # Then group by worker_idx and dispatch each subset to a parallel Agent call.
 ```
 
-#### Step 7.5.B — Aggregate drafts (Phase 2, sequential, in-memory)
+#### Step 7.5.M-B — Aggregate drafts (multi-source A4 — Phase 2, sequential, in-memory)
 
 Once all workers return, the agent collects their `drafts[]` arrays into a
 single `ALL_DRAFTS` list. The aggregation runs B5 dual-classification with
@@ -602,7 +703,7 @@ the v1.2.1 rules extended for fanout:
    ingest-skip (no write, just log entry). Forced-repair check runs
    identically to v1.2.1.
 
-#### Step 7.5.C — Atomic write (Phase 3, lock per Phase 0 decision)
+#### Step 7.5.M-C — Atomic write (multi-source A4 — Phase 3, lock per Phase 0 decision)
 
 The lock state depends on the branch (per Step 7.5 preamble): held from
 Phase 0 (multi-source) OR acquired here (single-source — exactly as
@@ -666,7 +767,7 @@ proposed this. Plan #2.1 fix: keep `.pending-scan` timestamp-only and use a
   files retried — different mechanism).
 - **`.pending-scan` exists AND all workers failed:** abort earlier in
   Phase 1 — Phase 3 not reached. `.failed-sources.tsv` not written
-  (handled by the 3-strike retry counter logic in Step 7.5.D).
+  (handled by the 3-strike retry counter logic in Step 7.5.M-D).
 - **No `.pending-scan` (manual `/wiki-ingest fileA.md fileB.md`):** do NOT
   touch `.pending-scan` (it doesn't exist) AND do NOT write
   `.failed-sources.tsv` (manual invocation does not use scan window
@@ -680,7 +781,7 @@ layout (`<wiki_root>/`)" section as part of Task 10 release commit.
 Release lock (multi-source) or release lock acquired in this Step (single-
 source). Emit per-source action summary.
 
-#### Step 7.5.D — Failure handling
+#### Step 7.5.M-D — Failure handling (multi-source A4)
 
 (Updated to address Cycle-1 W3 + reflect CV-1 partial-fail handling +
 Plan #2.1 C2S-1 manifest + C2-W5 counter edge cases.)
@@ -688,8 +789,8 @@ Plan #2.1 C2S-1 manifest + C2-W5 counter edge cases.)
 - **Worker subagent failure** (any worker returns error): main commits the
   N-1 successful workers' drafts (Phase 3 runs normally for those). Failed
   worker's sources are written to **`.wiki-meta/.failed-sources.tsv`**
-  per Step 7.5.C (auto-ingest mode) — NOT into `.pending-scan` (Plan #2.1
-  C2S-1 fix; `.pending-scan` is timestamp-only, see Step 7.5.C). For
+  per Step 7.5.M-C (auto-ingest mode) — NOT into `.pending-scan` (Plan #2.1
+  C2S-1 fix; `.pending-scan` is timestamp-only, see Step 7.5.M-C). For
   manual-mode invocation: omitted from the structured retry mechanism;
   surfaced in stdout summary as "unprocessed". Idempotent — Step 1.5
   hash-skip on next invocation handles the no-op case for sources that
@@ -787,7 +888,7 @@ Plan #2.1 C2S-1 manifest + C2-W5 counter edge cases.)
 - **Phase 3 mid-loop write failure**: roll back partial writes for the
   failing draft using its `.versions/` snapshot; abort remaining drafts in
   the batch; log error event; release lock; do NOT promote `.pending-scan`
-  (per Step 7.5.C partial-fail rule). Drafts written successfully BEFORE the
+  (per Step 7.5.M-C partial-fail rule). Drafts written successfully BEFORE the
   failure remain on disk (already committed atomically). Their log.jsonl
   entries also remain. The `.failed-sources.tsv` reduction includes any
   sources whose drafts were skipped due to mid-loop abort.
@@ -808,7 +909,7 @@ state when no cross-worker page collision occurs (the common case): same
 pages, same log events, same provenance YAMLs. Only wall-clock differs
 (parallel analysis phase). When cross-worker collision DOES occur
 (uncommon — most multi-source batches surface independent topics), v1.3.0's
-second-pass synthesis (Step 7.5.B Case B2) preserves v1.2.1's
+second-pass synthesis (Step 7.5.M-B Case B2) preserves v1.2.1's
 single-synthesizer multi-source merge invariant — content from all
 contributing sources flows into one merged page, no facts dropped.
 

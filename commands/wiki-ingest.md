@@ -494,7 +494,7 @@ if sources_count == 1:
 
     if len(page_plan) == 0:
         # A8 — empty plan terminal-skip flow (Step 7.8 below).
-        do_ingest_skip_terminal_under_lock(source, source_hashes)
+        do_ingest_skip_terminal_under_lock(SOURCES[0], source_hashes)
         exit "1 source skipped — analysis judged no pages need update."
 
     elif len(page_plan) < a5_fanout_threshold:
@@ -529,9 +529,18 @@ Same lock semantics, same backup/write/sentinel flow as Step 7.6.C-G.
 ```bash
 do_atomic_write_from_inline_bodies(page_plan, inline_bodies, source_hashes) {
   # Inline_bodies acts as SUCCESS_DRAFTS — no FAILED_WORKERS possible (no fanout).
-  # Convert inline_bodies to the same draft shape Step 7.6.C consumes.
   SUCCESS_DRAFTS=()
   FAILED_WORKERS=()  # Always empty in sub-threshold path.
+
+  # Verify lex-set match BEFORE assembling drafts (caller MUST emit inline_bodies
+  # with same files as page_plan). Contract violations caught early — no partial
+  # draft state possible if check fails.
+  if [ "$(echo "${page_plan[@]/.file}" | sort)" != "$(echo "${inline_bodies[@]/.file}" | sort)" ]; then
+    echo "ERROR: page_plan / inline_bodies file lex-set mismatch — Stage 1 contract violated"
+    exit 1
+  fi
+
+  # Convert inline_bodies to the same draft shape Step 7.6.C consumes.
   for body in "${inline_bodies[@]}"; do
     pe="<corresponding page_plan entry where pe.file == body.file>"
     SUCCESS_DRAFTS+=({
@@ -540,12 +549,6 @@ do_atomic_write_from_inline_bodies(page_plan, inline_bodies, source_hashes) {
       frontmatter_meta: pe.frontmatter_meta
     })
   done
-
-  # Verify lex-set match (caller MUST emit inline_bodies with same files as page_plan).
-  if [ "$(echo "${page_plan[@]/.file}" | sort)" != "$(echo "${inline_bodies[@]/.file}" | sort)" ]; then
-    echo "ERROR: page_plan / inline_bodies file lex-set mismatch — Stage 1 contract violated"
-    exit 1
-  fi
 
   # Reuse the Step 7.6.C-G atomic-write block VERBATIM:
   #  - Step 7.6.C: lock acquire + mandatory C3 concurrency check + backup + atomic write

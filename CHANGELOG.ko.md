@@ -39,9 +39,10 @@ a5_fanout_threshold`, default 3). Stage 3는 main이 lock 아래 draft를
   8-13 metadata 파이프라인 UNCHANGED 실행, 마지막에 PARTIAL_FAIL state에
   따라 `partial_fail` sentinel write 또는 removal.
 - **`wiki-page-writer` agent (신규)**: 최소형 LLM 페이지 본문 생성기.
-  Tool: `Read, Write` (write는 자기 `page_plan_entry.file` 경로로 제한).
-  Input: `wiki_root` + `page_plan_entry` 1개. Output: `{file,
-  page_content, frontmatter_meta, worker_status, fail_reason}`.
+  Tool: `[]` (파일 I/O 없음 — main이 Stage 3 lock 아래 모든 write 소유).
+  Input: `wiki_root` + `page_plan_entry` 1개. Output: 단일 JSON 객체
+  `{file, page_content, frontmatter_meta, worker_status, fail_reason}`
+  — main이 output을 집계하고 Step 7.6.C에서 페이지를 atomic write.
   Cross-page synthesis 없음 (Stage 1이 `intent_summary` /
   `novel_facts` / `preserve_sections`로 소유); source I/O 없음
   (관련 발췌는 이미 `source_excerpts`에 들어있음).
@@ -70,7 +71,8 @@ a5_fanout_threshold`, default 3). Stage 3는 main이 lock 아래 draft를
   action에 FAILED_PAGES OR FAILED_WORKERS가 non-empty일 때 `pages_failed:
   [<file>...]` 포함. wiki-lint Step 6 LOG-INVARIANT scan 영향 없음.
 - **`partial-fail-recovery` repair_reason**: v1.2.1 R3W2의 기존 5개
-  값에 합류 (`commands/wiki-lint.md`의 whitelist 갱신).
+  값에 합류 (`commands/wiki-lint.md`에 informational note 추가 —
+  엄격한 whitelist는 없음; 값은 emit-only).
 - **`ingest-fail` lifecycle action**: 같은 source에 all-workers-fail
   retry counter가 3 연속 batch 도달 시 emit (Step 7.7.B). 실패에도
   `.pending-scan` promote하여 stuck-window state 해제.

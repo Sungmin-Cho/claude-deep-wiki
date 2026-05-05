@@ -542,7 +542,14 @@ if sources_count == 0:
 
 if sources_count == 1:
     # v1.4.0 single-source A5 path: always invoke analysis mode first.
-    invoke wiki-synthesizer mode="analysis"
+    # Post-review fix — fixes round-4 missed: W1 — pass A5_FANOUT_THRESHOLD
+    # so the synthesizer's analysis mode knows which page_plan size triggers
+    # inline_bodies emit. Without this, the synthesizer falls back to its
+    # internal default (3) and ignores user-set .config.json overrides; with
+    # threshold=9999 + 5-page plan, Stage 1 would NOT emit inline_bodies
+    # (5 ≥ 3 → fanout under default), main then chooses sub-threshold
+    # branch (5 < 9999) and aborts on lex-set mismatch.
+    invoke wiki-synthesizer mode="analysis" a5_fanout_threshold=$A5_FANOUT_THRESHOLD
     page_plan = synthesizer.page_plan
     inline_bodies = synthesizer.inline_bodies
     source_hashes = synthesizer.source_hashes
@@ -1077,6 +1084,19 @@ for raw in "${RAW_WORKER_OUTPUTS[@]}"; do
     FAILED_WORKERS+=({file: "$file", fail_reason: "worker output for unplanned file (not in page_plan, possibly hallucinated or duplicate)"})
     continue
   fi
+
+  # Gate 3.5: basename safety (post-review fix — fixes round-4 missed: C1
+  # path traversal). page_plan files reach Step 7.6.C as the page_path
+  # construction key; without basename validation here, Step 7.6.C's
+  # `mktemp`/`cp`/`mv` runs against whatever the file string contains
+  # (including `../foo`). Step 8b's basename regex is the canonical
+  # validator but runs AFTER 7.6.C wrote pages — irreversible. Apply the
+  # same `^[a-z0-9][a-z0-9-]*\.md$` regex here, BEFORE the file claims
+  # the UNCLAIMED slot or enters SUCCESS_DRAFTS.
+  if ! printf '%s' "$file" | grep -qE '^[a-z0-9][a-z0-9-]*\.md$'; then
+    FAILED_WORKERS+=({file: "$file", fail_reason: "worker output file is not a valid kebab-case basename (rejected by Step 8b regex; would write outside pages/)"})
+    continue
+  fi
   # Mark this file claimed.
   UNCLAIMED=("${UNCLAIMED[@]/$file/}")  # markdown pseudocode — implementer uses
                                          # explicit array filter loop or new
@@ -1087,9 +1107,23 @@ for raw in "${RAW_WORKER_OUTPUTS[@]}"; do
   case "$status" in
     ok)
       page_content="${parsed.page_content}"
+      frontmatter_meta="${parsed.frontmatter_meta}"
       if [[ -z "$page_content" ]]; then
         FAILED_WORKERS+=({file: "$file", fail_reason: "worker_status=ok but page_content empty (truncated output?)"})
+      elif [[ -z "$frontmatter_meta" ]]; then
+        # Post-review fix — fixes round-4 missed: W2 (Codex review P2). Worker
+        # contract requires frontmatter_meta with title/tags/aliases/sources_final;
+        # without this gate, a truncated/prose-only response with valid
+        # page_content but missing frontmatter_meta would be promoted to
+        # SUCCESS_DRAFTS and Step 7.6.D's P7 lift would yield null/missing
+        # top-level fields, corrupting index.json + sources/<slug>.yaml.
+        FAILED_WORKERS+=({file: "$file", fail_reason: "worker_status=ok but frontmatter_meta missing or incomplete (truncated output?)"})
       else
+        # Implementer note: when feasible, also verify the frontmatter_meta object
+        # contains all four required subfields (title, tags, aliases, sources_final).
+        # Bash 3.2 cannot introspect JSON natively; rely on Step 7.6.D's P7 lift
+        # to detect missing subfields and fall back to pe.frontmatter_meta from
+        # page_plan when available.
         SUCCESS_DRAFTS+=("$parsed")
       fi
       ;;
@@ -1133,6 +1167,20 @@ fi
 
 for draft in "${SUCCESS_DRAFTS[@]}"; do
   file="${draft.file}"
+
+  # Defense-in-depth basename guard (post-review fix — fixes round-4
+  # missed: C1 path traversal). Step 7.6.B Gate 3.5 should already have
+  # caught any non-basename file, but this loop is the canonical
+  # filesystem-touching code path and SUCCESS_DRAFTS may also be populated
+  # from sub-threshold inline_bodies (Step 7.5.A) or from page_plan
+  # synthesizer output that bypassed Step 7.6.B. Re-validate here so
+  # Step 8b's regex is never the only safety gate.
+  if ! printf '%s' "$file" | grep -qE '^[a-z0-9][a-z0-9-]*\.md$'; then
+    FAILED_PAGES+=({file, reason: "page_plan/draft file rejected by basename regex (invalid kebab-case .md or contains path separator)"})
+    PARTIAL_FAIL=true
+    continue
+  fi
+
   page_path="<wiki>/pages/${file}"
   pe="<corresponding page_plan entry>"
 
@@ -1258,13 +1306,17 @@ For entries in `created` and `updated`, also embed `page_content` (per round-2 C
 > structures Steps 8+ as metadata-only by virtue of the synthesizer-vs-command
 > split — A5 inherits this property automatically.
 
-After Step 7.6.D's manifest conversion, run `commands/wiki-ingest.md` Steps 8 through 13 UNCHANGED:
+After Step 7.6.D's manifest conversion, run `commands/wiki-ingest.md` Steps 8 through 11 UNDER THE LOCK acquired in Step 7.6.C:
 
 - **Step 8** (reconcile + classify + sources/*.yaml). Specifically:
   - **8a** (Reconcile against disk) — `test -f` check that 7.6.C's writes landed.
     A5 path STILL needs this defensive check (verifies the agent-claimed `created`/`updated`
     entries are actually on disk after 7.6.C).
   - **8b** (Validate filenames) — regex check `^[a-z0-9][a-z0-9-]*\.md$`.
+    A5 path's basename guards in Step 7.6.B (Gate 3.5) and Step 7.6.C (defense-in-depth)
+    SHOULD have caught violations before any write; Step 8b is the canonical post-write
+    audit and should treat any rejection as a state-divergence error (escalate to
+    Step 7.7.F metadata pipeline failure recovery).
   - **8c** (Classify authoritatively) — split into CREATED_ENTRIES vs UPDATED_ENTRIES
     using PRE_BATCH_PAGES.
   - **8d** (Normalize source_hashes) — recompute sha256 for "main-computes" sentinel slugs.
@@ -1278,12 +1330,23 @@ After Step 7.6.D's manifest conversion, run `commands/wiki-ingest.md` Steps 8 th
   Payload value = union of `FAILED_PAGE_FILES` + `FAILED_WORKER_FILES`, matching
   the Step 7.6.F sentinel payload.
 - **Step 11** (Update Human-Readable Wiki Artifacts — `log.md` + `index.md`).
-- **Step 12** (Release Lock).
-- **Step 13** (Auto-Lint, includes retention prune `last-3 .versions per page`).
-  Retention prune retains the newest .versions/v<N+1>.md created by 7.6.C and
-  prunes from the oldest end — no risk of pruning the just-created backup.
 
-No sub-step skipping required. v1.3.0 metadata pipeline runs end-to-end.
+> **Post-review fix — fixes round-4 missed: C2 (lock ordering / partial_fail
+> race):** Step 12 (Release Lock) and Step 13 (Auto-Lint) DEFERRED to Step
+> 7.6.G. Reason: the partial_fail sentinel WRITE/REMOVAL in Step 7.6.F is the
+> retry-correctness signal for the same yaml file Step 8e mutates — it MUST
+> run inside the same lock transaction. The original "Steps 8-13 unchanged"
+> wording inadvertently included Step 12, putting Step 7.6.F outside the
+> lock and exposing a window where a concurrent ingest can observe stale
+> yaml between Step 12 release and Step 7.6.F's rewrite. v1.3.0 multi-source
+> A4 path's Step 7.5.M-C (atomic write) acquires the lock and runs Steps
+> 8-13 inline because v1.3.0 has no partial_fail sentinel; A5 introduces
+> the sentinel and therefore needs Step 12 to fire AFTER Step 7.6.F, not
+> before. Step 13 (auto-lint) is read-mostly and idempotent — safe to run
+> post-lock.
+
+No sub-step skipping required. Steps 8-11 run end-to-end under the lock; Step 12
++ Step 13 fire from Step 7.6.G AFTER Step 7.6.F's sentinel rewrite is durable.
 
 #### Step 7.6.F — partial_fail sentinel WRITE or REMOVAL-on-success (A1 + C5 + P4)
 
@@ -1430,11 +1493,27 @@ EOF
 fi  # End if/elif (Case ii / Case i). Case (iii) PARTIAL_FAIL=false AND no yaml partial_fail → falls past (no-op clean ingest).
 ```
 
-#### Step 7.6.G — Release lock + report
+#### Step 7.6.G — Release lock + post-lock auto-lint + report
+
+> **Post-review fix — fixes round-4 missed: C2 (lock ordering):** Step 12
+> (Release Lock) + Step 13 (Auto-Lint) deferred from Step 7.6.E land here,
+> AFTER Step 7.6.F's partial_fail sentinel WRITE/REMOVAL has flushed.
+> This guarantees the sentinel update is part of the same lock-protected
+> transaction that wrote pages and updated yaml/log/index, closing the
+> race window where a concurrent ingest could observe stale state
+> between an early Step 12 release and Step 7.6.F's rewrite.
 
 ```bash
+# Step 12 (Release Lock) — runs AFTER Step 7.6.F's sentinel write.
 rmdir "<wiki>/.wiki-meta/.wiki-lock"
 trap - EXIT
+
+# Step 13 (Auto-Lint, includes retention prune `last-3 .versions per page`)
+# — runs POST-LOCK. Read-mostly + idempotent; safe outside the transaction.
+# Retention prune retains the newest .versions/v<N+1>.md created by 7.6.C
+# and prunes from the oldest end — no risk of pruning the just-created
+# backup.
+run_step_13_auto_lint
 ```
 
 Surface result to user (Step 14 final report unchanged from v1.3.0).

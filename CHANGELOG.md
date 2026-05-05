@@ -40,12 +40,13 @@ A4×A5 combination deferred to v1.4.1+.
   metadata pipeline UNCHANGED, then writes or removes the
   `partial_fail` sentinel based on `PARTIAL_FAIL` state.
 - **`wiki-page-writer` agent (new)**: minimal LLM page-body generator.
-  Tools: `Read, Write` (write restricted to its single
-  `page_plan_entry.file` path). Inputs: `wiki_root` + one
-  `page_plan_entry`. Output: `{file, page_content, frontmatter_meta,
-  worker_status, fail_reason}`. No cross-page synthesis (Stage 1 owns
-  it via `intent_summary` / `novel_facts` / `preserve_sections`); no
-  source I/O (all relevant excerpts already in `source_excerpts`).
+  Tools: `[]` (no file I/O — main owns Stage 3 writes under lock).
+  Inputs: `wiki_root` + one `page_plan_entry`. Output: a single JSON
+  object `{file, page_content, frontmatter_meta, worker_status,
+  fail_reason}` — main aggregates outputs and writes pages atomically
+  in Step 7.6.C. No cross-page synthesis (Stage 1 owns it via
+  `intent_summary` / `novel_facts` / `preserve_sections`); no source
+  I/O (all relevant excerpts already in `source_excerpts`).
 - **`wiki-synthesizer` extension**: new `mode: "analysis"` (additive
   to v1.3.0 `mode: "inline" | "worker"`). Analysis mode reads source +
   candidates, emits page_plan + (for sub-threshold) inline_bodies.
@@ -73,7 +74,8 @@ A4×A5 combination deferred to v1.4.1+.
   FAILED_WORKERS is non-empty. wiki-lint Step 6 LOG-INVARIANT scan
   unaffected (additive field).
 - **`partial-fail-recovery` repair_reason**: joins v1.2.1 R3W2's existing
-  five values (whitelist updated in `commands/wiki-lint.md`).
+  five values (informational note added in `commands/wiki-lint.md` —
+  no strict whitelist exists; the value is emit-only).
 - **`ingest-fail` lifecycle action**: emitted when the all-workers-fail
   retry counter reaches 3 consecutive batches on the same source
   (Step 7.7.B). Promotes `.pending-scan` despite failure to release

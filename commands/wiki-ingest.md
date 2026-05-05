@@ -901,6 +901,474 @@ Plan #2.1 C2S-1 manifest + C2-W5 counter edge cases.)
   snapshot, releases lock, surfaces a user-visible critical error. Do NOT
   promote `.pending-scan`.
 
+### Step 7.6 — A5 fanout flow (single-source, page_plan ≥ a5_fanout_threshold)
+
+After Step 7.5's analysis-mode invocation, when `len(page_plan) >= a5_fanout_threshold` (default 3), main dispatches one `wiki-page-writer` worker per `page_plan` entry, parallel.
+
+> **Pseudocode disclaimer (P3+P5 fix, round-1 review — Opus C3+C5 + Codex adv D1):**
+> The bash blocks in Step 7.6 below use markdown-spec pseudocode that the LLM running
+> `/wiki-ingest` interprets at execution time. Specifically the following constructs are
+> NOT runnable bash 3.2 and MUST be mapped to real shell during interpretation:
+>
+> - **Dotted field access** (`${draft.file}`, `${pe.action}`, `${pe.existing_body_hash}`,
+>   `${draft.page_content}`) — represent positional fields of a JSON-encoded worker draft
+>   (Stage 2 output) or a page_plan entry (Stage 1 output). Implementer parses each draft
+>   into bash variables (e.g. `file=$(jq -r '.file' <<< "$draft")`) before the loop body, OR
+>   the LLM directly substitutes the value when emitting the action. Both paths are
+>   acceptable — the contract is what data flows where, not the exact extraction syntax.
+> - **JSON-style array literals** (`FAILED_PAGES+=({file, reason: "..."})`) — represent
+>   appending a tuple to an accumulator. Implementer maintains parallel `FAILED_PAGE_FILES`
+>   + `FAILED_PAGE_REASONS` bash arrays (TSV-separated would also work) and consumes them
+>   together when emitting the manifest in Step 7.6.D. The `failed[]` shape in the manifest
+>   IS canonical JSON — only the bash-internal representation is implementation-flex.
+>
+>   **Q3 fix (round-3 review, Opus Q3) — same pattern applies to FAILED_WORKERS:** the W3
+>   fix introduces `FAILED_WORKERS+=({file, fail_reason: "..."})` (note `fail_reason`,
+>   not `reason`, matching the worker-output contract). Map to parallel arrays
+>   `FAILED_WORKER_FILES` + `FAILED_WORKER_REASONS`. The W1 fix loop at Step 7.6.F
+>   uses `FAILED_WORKER_FILES` to project the `file` field. Combined union for the
+>   sentinel `failed_pages` payload + log emit (R-P2) is `FAILED_PAGE_FILES` ∪
+>   `FAILED_WORKER_FILES`.
+> - **Array field-strip** (`${arr[@]/.field}`) — represents iterating a struct-array and
+>   projecting one field. Implementer iterates the parallel arrays directly.
+>
+> These pseudocode constructs are PRESENT for clarity (the data shape is the spec, the
+> exact bash extraction is incidental). Bash 3.2 portable patterns to use during
+> implementation: TSV temp files, parallel arrays, `jq -r` extraction, or the LLM
+> directly emitting Edit calls with literal string values. Verify against bash 3.2
+> macOS portability rules (no `declare -A`, no `mapfile`, no `${var,,}`, no `&>`)
+> per CLAUDE.md "Bash 3.2 portability" section.
+
+#### Step 7.6.A — Parallel page-writer dispatch
+
+For each entry in `page_plan`, dispatch one `wiki-page-writer` agent in a single message (concurrent execution):
+
+```
+Agent({
+  subagent_type: "wiki-page-writer",
+  run_in_background: true,
+  prompt: <JSON-encoded {wiki_root, page_plan_entry: <entry>}>
+})
+```
+
+All `len(page_plan)` agents are dispatched in ONE message (Claude Code subagent concurrency). Worker timeout: `a5_worker_timeout_sec` (default 90s).
+
+#### Step 7.6.B — Aggregate worker drafts
+
+Wait for all worker completion notifications (Claude Code runtime delivers automatically — no polling). Collect each worker's output JSON:
+
+```bash
+# W3 fix (round-2 review, Codex adv A-P3) — defensive parse + validation gate
+# for worker output aggregation. Agent tool JSON output is best-effort; LLM
+# workers may return prose-only response, JSON with missing required fields,
+# truncated output (LLM hit max_tokens mid-emission), or no output at all
+# (Agent spawn failure / timeout). Without this gate, malformed responses
+# silently drop the page from FAILED_WORKERS, skip partial_fail sentinel,
+# never retry — exactly the silent-state-divergence Codex adv flagged.
+#
+# INVARIANT: every page_plan entry MUST produce exactly one outcome (ok or
+# failed). The "claimed-files" tracker enforces this.
+
+WORKER_DRAFTS=()    # raw outputs (for diagnostics)
+SUCCESS_DRAFTS=()   # validated: worker_status=="ok" + non-empty page_content
+FAILED_WORKERS=()   # ANY of: status != "ok", missing fields, unparseable JSON,
+                    # empty page_content, no output received (spawn fail/timeout)
+
+# Track which planned files have NOT yet been claimed by a worker output.
+UNCLAIMED=()
+for pe in "${page_plan[@]}"; do UNCLAIMED+=("${pe.file}"); done
+
+for raw in "${RAW_WORKER_OUTPUTS[@]}"; do
+  # Gate 1: strict JSON parse.
+  if ! parsed=$(parse_json_strict "$raw" 2>/dev/null); then
+    # Cannot identify which file this is for — attribute to first unclaimed.
+    if [[ ${#UNCLAIMED[@]} -gt 0 ]]; then
+      FAILED_WORKERS+=({file: "${UNCLAIMED[0]}", fail_reason: "worker output not parseable as JSON"})
+      UNCLAIMED=("${UNCLAIMED[@]:1}")
+    fi
+    continue
+  fi
+
+  file="${parsed.file}"
+  status="${parsed.worker_status}"
+
+  # Gate 2: required fields present.
+  if [[ -z "$file" || -z "$status" ]]; then
+    if [[ ${#UNCLAIMED[@]} -gt 0 ]]; then
+      FAILED_WORKERS+=({file: "${UNCLAIMED[0]}", fail_reason: "worker output missing required field (file or worker_status)"})
+      UNCLAIMED=("${UNCLAIMED[@]:1}")
+    fi
+    continue
+  fi
+
+  # Gate 3: file is one of the planned files (defensive — synthesizer
+  # hallucination or duplicate output would otherwise corrupt manifest).
+  if ! printf '%s\n' "${UNCLAIMED[@]}" | grep -Fxq "$file"; then
+    FAILED_WORKERS+=({file: "$file", fail_reason: "worker output for unplanned file (not in page_plan, possibly hallucinated or duplicate)"})
+    continue
+  fi
+  # Mark this file claimed.
+  UNCLAIMED=("${UNCLAIMED[@]/$file/}")  # markdown pseudocode — implementer uses
+                                         # explicit array filter loop or new
+                                         # parallel-array shift per Step 7.6
+                                         # disclaimer mapping rule.
+
+  # Gate 4: status branch.
+  case "$status" in
+    ok)
+      page_content="${parsed.page_content}"
+      if [[ -z "$page_content" ]]; then
+        FAILED_WORKERS+=({file: "$file", fail_reason: "worker_status=ok but page_content empty (truncated output?)"})
+      else
+        SUCCESS_DRAFTS+=("$parsed")
+      fi
+      ;;
+    failed)
+      reason="${parsed.fail_reason:-no reason given}"
+      FAILED_WORKERS+=({file: "$file", fail_reason: "$reason"})
+      ;;
+    *)
+      FAILED_WORKERS+=({file: "$file", fail_reason: "unknown worker_status: $status"})
+      ;;
+  esac
+done
+
+# Any unclaimed planned files → no output received at all (Agent spawn
+# failure, runtime timeout, network drop, etc.). Each becomes a FAILED_WORKERS
+# entry so PARTIAL_FAIL toggles correctly per P5 fix.
+for f in "${UNCLAIMED[@]}"; do
+  [[ -n "$f" ]] && FAILED_WORKERS+=({file: "$f", fail_reason: "no worker output received (Agent spawn failure or runtime timeout)"})
+done
+```
+
+If `len(SUCCESS_DRAFTS) == 0`, ALL workers failed → see Step 7.7.B (all-fail path).
+
+#### Step 7.6.C — Atomic write under lock (mandatory C3 concurrency check + manifest conversion)
+
+```bash
+mkdir "<wiki>/.wiki-meta/.wiki-lock" || { echo "Wiki locked"; exit 1; }
+trap 'rmdir "<wiki>/.wiki-meta/.wiki-lock" 2>/dev/null || true' EXIT
+
+PARTIAL_FAIL=false
+
+# P5 fix (round-1 review, Codex adversarial D1) — toggle PARTIAL_FAIL=true when ANY
+# worker returned worker_status: "failed" BEFORE the SUCCESS_DRAFTS loop runs.
+# Without this, a partial-success run (e.g., 3/5 SUCCESS_DRAFTS, 2 FAILED_WORKERS)
+# never triggers Step 7.6.F's sentinel write because the loop only toggles on
+# Stage 3 errors. Result: 2 failed pages would silently never retry on next
+# session — round-1 A1 bug regression in plan form. Sentinel must include FAILED_WORKERS' file basenames in failed_pages payload alongside FAILED_PAGES (see Step 7.6.F).
+if [[ ${#FAILED_WORKERS[@]} -gt 0 ]]; then
+  PARTIAL_FAIL=true
+fi
+
+for draft in "${SUCCESS_DRAFTS[@]}"; do
+  file="${draft.file}"
+  page_path="<wiki>/pages/${file}"
+  pe="<corresponding page_plan entry>"
+
+  # C3 — mandatory optimistic concurrency check.
+  if [[ "${pe.action}" == "update" ]]; then
+    # Update path: re-Read existing body, hash compare against pe.existing_body_hash.
+    # R-P1 fix (round-3 review, Codex review P2) — dual fallback for Linux portability.
+    current_body=$(cat "$page_path" 2>/dev/null || echo "")
+    current_hash=$({ printf '%s' "$current_body" | shasum -a 256 2>/dev/null \
+                     || printf '%s' "$current_body" | sha256sum 2>/dev/null; } \
+                   | awk '{print $1}')
+    if [[ "$current_hash" != "${pe.existing_body_hash}" ]]; then
+      FAILED_PAGES+=({file, reason: "concurrent ingest detected at Stage 3 — page bytes drifted since Stage 1 read"})
+      PARTIAL_FAIL=true
+      continue
+    fi
+  else  # action == "create"
+    # Create path: existence check.
+    if [[ -f "$page_path" ]]; then
+      FAILED_PAGES+=({file, reason: "concurrent ingest claimed same filename at Stage 3"})
+      PARTIAL_FAIL=true
+      continue
+    fi
+  fi
+
+  # Backup (Rule 7) for update only.
+  if [[ "${pe.action}" == "update" ]]; then
+    versioned_path=$(compute_next_version_path "$file")
+    cp "$page_path" "$versioned_path" || {
+      FAILED_PAGES+=({file, reason: "backup failed"})
+      PARTIAL_FAIL=true
+      continue
+    }
+    VERSIONED+=("$versioned_path")
+  fi
+
+  # Atomic write (write to tmp, rename).
+  tmp=$(mktemp "${page_path}.XXXXXX")
+  printf '%s' "${draft.page_content}" > "$tmp" || {
+    rm -f "$tmp"
+    FAILED_PAGES+=({file, reason: "tmp write failed"})
+    # A6 — abort remaining drafts in the loop (matches v1.3.0 Phase 3 mid-loop fail).
+    for remaining in "${remaining drafts after this one}"; do
+      FAILED_PAGES+=({file: remaining.file, reason: "skipped due to mid-loop abort after $file write failure"})
+    done
+    PARTIAL_FAIL=true
+    break  # halt loop
+  }
+  mv "$tmp" "$page_path" || {
+    rm -f "$tmp"
+    FAILED_PAGES+=({file, reason: "rename to final path failed"})
+    # R4-R4-2 fix (round-4 review, Codex review P2) — symmetric with tmp-write
+    # fail path above. Without this, A6 promise ("Step 7.7.C: remaining drafts
+    # captured in FAILED_PAGES") is broken on rename failure: `break` halts
+    # loop without recording the remaining drafts → audit + retry payload
+    # under-reports the pages skipped by the abort.
+    for remaining in "${remaining drafts after this one}"; do
+      FAILED_PAGES+=({file: remaining.file, reason: "skipped due to mid-loop abort after $file rename failure"})
+    done
+    PARTIAL_FAIL=true
+    break  # same A6 abort
+  }
+  WRITTEN+=({file, action: pe.action, frontmatter_meta: draft.frontmatter_meta})
+done
+```
+
+#### Step 7.6.D — Manifest conversion (to v1.3.0 Step 8 input shape)
+
+Build the manifest for Step 8a-8h consumption:
+
+```bash
+manifest = {
+  created: [],      # entries from WRITTEN where pe.action == "create" AND PRE_BATCH_PAGES does not contain file
+  updated: [],      # entries from WRITTEN where pe.action == "update"
+  versioned: VERSIONED,
+  source_hashes: <from analysis output>,
+  failed: FAILED_PAGES + FAILED_WORKERS  # union with reason strings
+}
+
+# P7 fix (round-1 review, Codex review D5/P1) — Step 8a-8h (v1.3.0 unchanged) reads
+# top-level `title`, `tags`, `aliases`, `sources` from each entry in `created`/`updated`.
+# Worker output carries these fields nested under `frontmatter_meta`. Without explicit
+# lifting, Step 8 sees them as `null`/missing → broken per-source provenance + index.
+for entry in manifest.created + manifest.updated:
+  entry.title    = entry.frontmatter_meta.title
+  entry.tags     = entry.frontmatter_meta.tags
+  entry.aliases  = entry.frontmatter_meta.aliases
+  entry.sources  = entry.frontmatter_meta.sources_final  # already lex-sorted by Stage 1
+  # frontmatter_meta itself stays for diagnostics; consumers read top-level only.
+```
+
+For entries in `created` and `updated`, also embed `page_content` (per round-2 C4 fix — main needs to ensure Stage 8 emit includes the body that was written; while Step 8 metadata path reads only frontmatter_meta fields, downstream consumers may need page_content for diagnostics).
+
+#### Step 7.6.E — Run v1.3.0 Steps 8-13 unchanged (R4-Q1 corrected — page-write/metadata split is structural, not sub-step skip)
+
+> **R4-Q1 fix (round-4 review, Opus Q1) — REPLACES the round-3 Adv-A2 fictional
+> sub-step taxonomy:**
+> Round-3's Adv-A2 fix introduced a "Step 8 sub-step taxonomy" table asserting
+> Step 8a=version snapshot, 8b=page write, 8c=sources/*.yaml, 8d=log.jsonl,
+> 8e=index.json, 8f=log.md, 8g=index.md, 8h=retention prune. **Round 4 verified
+> this taxonomy is fictional** — `commands/wiki-ingest.md` Step 8 actually has
+> sub-steps 8a-8e covering reconciliation, validation, classification, source_hashes
+> normalization, and per-source provenance. log.jsonl/index.json/human-artifacts/
+> retention are SEPARATE top-level steps (Step 9 / Step 10 / Step 11 / Step 13).
+>
+> **The actual page-write-vs-metadata split is structural, not a Step 8 internal
+> skip.** In v1.3.0:
+> - Synthesizer agent's **Phase 2 (backup)** + **Phase 3 (page write)** own the
+>   page-write side effects.
+> - `commands/wiki-ingest.md` Steps 8-13 are PURELY metadata pipelines (run AFTER
+>   the agent has already written pages).
+>
+> A5 path mirrors this exactly:
+> - **Step 7.6.C** owns backup + page write (under lock — equivalent to v1.3.0
+>   synthesizer Phase 2 + Phase 3).
+> - **Steps 8-13** run UNCHANGED — no sub-step skipping needed because Steps 8+
+>   never write pages in any code path.
+>
+> The round-3 Adv-A2 concern ("double version snapshot") was based on misreading
+> `commands/wiki-ingest.md:625-628` — that paragraph is a v1.3.0 A4 multi-source
+> narrative summary describing what happens AFTER Phase 3 ends (i.e., Steps 8
+> through 13 in narrative form), NOT a sub-step listing of Step 8. v1.3.0 already
+> structures Steps 8+ as metadata-only by virtue of the synthesizer-vs-command
+> split — A5 inherits this property automatically.
+
+After Step 7.6.D's manifest conversion, run `commands/wiki-ingest.md` Steps 8 through 13 UNCHANGED:
+
+- **Step 8** (reconcile + classify + sources/*.yaml). Specifically:
+  - **8a** (Reconcile against disk) — `test -f` check that 7.6.C's writes landed.
+    A5 path STILL needs this defensive check (verifies the agent-claimed `created`/`updated`
+    entries are actually on disk after 7.6.C).
+  - **8b** (Validate filenames) — regex check `^[a-z0-9][a-z0-9-]*\.md$`.
+  - **8c** (Classify authoritatively) — split into CREATED_ENTRIES vs UPDATED_ENTRIES
+    using PRE_BATCH_PAGES.
+  - **8d** (Normalize source_hashes) — recompute sha256 for "main-computes" sentinel slugs.
+  - **8e** (Write per-source provenance to `sources/<slug>.yaml`).
+- **Step 9** (Update Index — `index.json`). Only WRITTEN entries; `frontmatter_meta.title/tags/aliases/sources`
+  already lifted to top-level entry fields by Step 7.6.D P7 fix.
+- **Step 10** (Append to Log — `log.jsonl`). **R-P2 fix (round-3 review, Codex review P2)**:
+  include `pages_failed` field when FAILED_PAGES OR FAILED_WORKERS is non-empty
+  (NOT just FAILED_PAGES — partial-fanout where Stage 2 has worker failures AND
+  Stage 3 succeeds cleanly otherwise must still record retry-required pages).
+  Payload value = union of `FAILED_PAGE_FILES` + `FAILED_WORKER_FILES`, matching
+  the Step 7.6.F sentinel payload.
+- **Step 11** (Update Human-Readable Wiki Artifacts — `log.md` + `index.md`).
+- **Step 12** (Release Lock).
+- **Step 13** (Auto-Lint, includes retention prune `last-3 .versions per page`).
+  Retention prune retains the newest .versions/v<N+1>.md created by 7.6.C and
+  prunes from the oldest end — no risk of pruning the just-created backup.
+
+No sub-step skipping required. v1.3.0 metadata pipeline runs end-to-end.
+
+#### Step 7.6.F — partial_fail sentinel WRITE or REMOVAL-on-success (A1 + C5 + P4)
+
+**Two sub-cases depending on `PARTIAL_FAIL` state and existing yaml content:**
+
+- **Case (i) PARTIAL_FAIL = true** — write/update partial_fail sentinel block.
+- **Case (ii) PARTIAL_FAIL = false AND yaml has partial_fail field** — atomic-remove the
+  partial_fail field. **P4 fix (round-1 review, Opus C2 single-reviewer but verified
+  against spec §7.4 "Repair-on-success cleanup")** — without this, every source that
+  ever had a transient failure enters a permanent re-ingest loop because Step 1.5 keeps
+  forcing REPAIR via the partial-fail-recovery cascading check (Phase 3 Task 3.1).
+- **Case (iii) PARTIAL_FAIL = false AND yaml has no partial_fail field** — no-op
+  (the typical clean ingest case).
+
+```bash
+yaml="<wiki>/.wiki-meta/sources/<slug>.yaml"
+yaml_has_partial=false
+if grep -q '^partial_fail:' "$yaml" 2>/dev/null; then
+  yaml_has_partial=true
+fi
+
+# C1 fix (round-2 review, 2/3 agreement — Opus Q1 + Codex review R-P1) — explicit
+# if/elif/else structure replaces the ambiguous `return 0` hedge. The previous form
+# relied on `return 0` at script-top-level to skip Case (i), which fails silently
+# (bash error "return: can only `return' from a function") and falls through to
+# Case (i) — re-running the awk+printf chain with PARTIAL_FAIL=false on an
+# already-stripped yaml, producing an empty `partial_fail: failed_pages: [""]` block.
+# This corruption fired on every successful repair-on-success cycle, retriggering
+# partial-fail-recovery cascade indefinitely (the very loop P4 was meant to break).
+#
+# Three exhaustive cases:
+# (ii) PARTIAL_FAIL=false AND yaml_has_partial=true  → strip partial_fail (repair success)
+# (i)  PARTIAL_FAIL=true                              → write/update partial_fail sentinel
+# (iii) PARTIAL_FAIL=false AND yaml_has_partial=false → no-op (clean ingest, falls past)
+
+if [ "$PARTIAL_FAIL" = "false" ] && [ "$yaml_has_partial" = "true" ]; then
+  # Case (ii) — repair-on-success cleanup (P4 fix). Strip partial_fail block entirely.
+  tmp=$(mktemp "${yaml}.XXXXXX")
+  # State-machine awk: strip partial_fail header (in ANY form) + indented children, do NOT append.
+  #
+  # R-P3 fix (round-3 review, Codex review P2) — pattern broadened from
+  # `/^partial_fail:[[:space:]]*$/` (header-only form: `partial_fail:`) to
+  # `/^partial_fail:.*$/` (any line starting with `partial_fail:`). Step 1.5's
+  # detect uses `grep -q '^partial_fail:'` which matches BOTH:
+  #   (a) header form:   `partial_fail:` followed by indented children
+  #   (b) inline form:   `partial_fail: {ts: bad}` (single-line malformed)
+  # Original strip pattern only matched (a), so (b) would be detected → forces
+  # REPAIR → Stage 3 succeeds → strip awk skips no lines → yaml unchanged →
+  # next session detects again → PERMANENT retry loop.
+  #
+  # Broadened pattern correctly handles both cases:
+  # - Header form: skip=1 → indented children dropped → next non-indent clears skip
+  # - Inline form: skip=1 (line dropped) → next non-indent line clears skip
+  #   (no indented continuation expected for inline form)
+  awk '
+    /^partial_fail:.*$/             { skip=1; next }
+    skip && /^[[:space:]]/           { next }
+    skip && /^[^[:space:]]/          { skip=0 }
+    { print }
+  ' "$yaml" > "$tmp"
+  sync
+  if ! mv "$tmp" "$yaml"; then
+    rm -f "$tmp"
+    echo "ERROR: partial_fail removal failed; source stuck in re-ingest loop"
+    exit 1
+  fi
+
+elif [ "$PARTIAL_FAIL" = "true" ]; then
+  # Case (i) — partial_fail sentinel WRITE (gate explicit per C1 fix).
+  # Read existing yaml content.
+  existing=$(cat "$yaml")
+
+  # Construct partial_fail block.
+  # P5 fix — failed_pages payload includes BOTH FAILED_PAGES (Stage 3 errors) AND
+  # FAILED_WORKERS file basenames (Stage 2 errors), since PARTIAL_FAIL is now toggled
+  # from both sources (see Step 7.6.B addition above).
+  #
+  # W1 fix (round-2 review, Opus Q3) — explicit loop replaces ambiguous printf
+  # payload with field-strip pseudocode. The previous form
+  #   printf '"%s",' "${FAILED_PAGES[@]/.}" "${FAILED_WORKERS[@]/.file}" | sed 's/,$//'
+  # had two bugs: (a) `${FAILED_PAGES[@]/.}` (no field name after the dot) deletes
+  # the FIRST literal `.` from each element at runtime, corrupting filenames
+  # (page1.md → page1md). The disclaimer at Step 7.6 documents `${arr[@]/.field}`
+  # but does NOT cover the bare `/.` form. (b) Empty-array case yields
+  # `failed_pages: [""]` instead of `failed_pages: []`, breaking next-session retry
+  # parsing. The explicit loop below produces a valid empty `[]` for empty input
+  # and uses pre-extracted basename arrays per the pseudocode disclaimer's
+  # parallel-array mapping rule.
+  failed_pages_json="["
+  __sep=""
+  for __f in "${FAILED_PAGE_FILES[@]}" "${FAILED_WORKER_FILES[@]}"; do
+    failed_pages_json="${failed_pages_json}${__sep}\"${__f}\""; __sep=","
+  done
+  failed_pages_json="${failed_pages_json}]"
+
+  partial_fail_block=$(cat <<EOF
+partial_fail:
+  ts: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  failed_pages: ${failed_pages_json}
+  reason: "$(determine_reason)"  # "stage 2 worker fail" | "stage 3 write fail" | "concurrency abort" | "all workers failed"
+EOF
+)
+
+  # Atomic rewrite: write to tmp, fsync, rename.
+  tmp=$(mktemp "${yaml}.XXXXXX")
+  {
+    # P1 fix (round-1 review, 3-way unanimous) — state-machine awk replaces broken
+    # range-pattern variant. The previous form `awk '/^partial_fail:/,/^[a-z_]+:/...'`
+    # had two bugs: (1) `partial_fail:` itself matches `^[a-z_]+:`, range terminates
+    # immediately; (2) indented children (`  ts:`, `  failed_pages:`, `  reason:`)
+    # don't match `^[a-z_]+:`, fall through to output unchanged. Result: orphan child
+    # lines + new partial_fail block appended → malformed yaml after every cycle.
+    #
+    # The state-machine variant below tracks `skip` flag explicitly:
+    # - line entering `partial_fail:` sets skip=1, continues (drop the header).
+    # - while skip=1 AND line begins with whitespace (indented child): drop it.
+    # - while skip=1 AND line begins non-whitespace (next top-level key): clear skip,
+    #   then PRINT this line (it's a sibling key like `pages_updated:`).
+    # - default: print.
+    # Verified bash 3.2 + macOS BSD awk compatible (no GNU extensions).
+    #
+    # If existing yaml already has partial_fail, strip the old block then append fresh.
+    # Otherwise, pass through.
+    if grep -q '^partial_fail:' "$yaml"; then
+      # R-P3 fix: same broadened pattern as Case (ii) — match ANY partial_fail:
+      # line including malformed inline forms like `partial_fail: {ts: bad}`.
+      awk '
+        /^partial_fail:.*$/             { skip=1; next }
+        skip && /^[[:space:]]/           { next }
+        skip && /^[^[:space:]]/          { skip=0 }
+        { print }
+      ' "$yaml"
+    else
+      cat "$yaml"
+    fi
+    echo "$partial_fail_block"
+  } > "$tmp"
+  sync  # fsync hint (best-effort)
+  if ! mv "$tmp" "$yaml"; then
+    rm -f "$tmp"
+    echo "ERROR: partial_fail sentinel write failed; wiki state at risk"
+    exit 1
+  fi
+fi  # End if/elif (Case ii / Case i). Case (iii) PARTIAL_FAIL=false AND no yaml partial_fail → falls past (no-op clean ingest).
+```
+
+#### Step 7.6.G — Release lock + report
+
+```bash
+rmdir "<wiki>/.wiki-meta/.wiki-lock"
+trap - EXIT
+```
+
+Surface result to user (Step 14 final report unchanged from v1.3.0).
+
 #### Backwards compatibility note
 
 For 1-source `/wiki-ingest`, the fast path (Step 7.5 decision branch 2)

@@ -12,7 +12,7 @@ tools: [Read, Glob, Grep, WebFetch]
 
 ## Related agents
 
-This agent shares Rules 1-7 + Performance guidance with `wiki-synthesizer-inline` and `wiki-synthesizer-worker` (see those files for the same rule with the appropriate mode-specific exceptions). When updating Rule N, update all 3 agents simultaneously.
+This agent shares Rules 1-9 + Performance guidance with `wiki-synthesizer-inline` and `wiki-synthesizer-worker` (see those files for the same rule with the appropriate mode-specific exceptions). When updating Rule N, update all 3 agents simultaneously.
 
 Read sources, decide create-vs-update for each topic, capture `existing_page_body` for updates, and emit a structured `page_plan` (with `inline_bodies` when sub-threshold). This agent NEVER writes or versions any wiki file — Stage 2 workers and/or Stage 3 main own all I/O under the global lock.
 

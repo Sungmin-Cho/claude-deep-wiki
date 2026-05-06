@@ -486,6 +486,70 @@ Output (summary): structured entries for `created` / `updated` carrying `{file, 
 
 If `failed` is non-empty, continue with metadata updates for whatever succeeded and include the failures in the final report (Step 14). Always release the lock. **In auto-ingest mode, do NOT promote `.pending-scan → .last-scan` on any partial or full failure** — the next session's hook will re-detect the window. See Error Handling below.
 
+### Step 7 — Shared utility: §3.9 worker mutation detection (`WIKI_TEST_MODE=1` gated)
+
+The following 3 shell functions implement the §3.9 post-dispatch dirty-file scan (per plan §3.9, cycle-3 N1.1/N1.2/N1.3 fixes). They are invoked at 3 dispatch sites (Step 7.5.M-A / Step 7.5.M-B Case B2 / Step 7.6.B-post) to detect worker LLM mutations of `<wiki_root>/` files outside the lock-protected atomic-write windows. Production runs skip (zero cost); re-dogfood + sandbox tests opt in via `WIKI_TEST_MODE=1`.
+
+```bash
+# _post_dispatch_dirty_scan — invoked at 3 sites (Step 7.5.M-A / 7.5.M-B / 7.6.B-post)
+# Args: $1 = phase label ("A4-fanout" | "A4-second-pass" | "A5-fanout")
+# Reads/sets globals: PRE_DISPATCH_HASH (pre-snapshot), PARTIAL_FAIL, FAILED_REASON
+# Side effect: if mismatch, sets PARTIAL_FAIL=1 and triggers abort
+
+_compute_wiki_hash() {
+  # Single-line digest of <WIKI_ROOT>/pages + <WIKI_ROOT>/.wiki-meta tree.
+  # Bash 3.2 portable: no mapfile, no declare -A, no &>/dev/null.
+  # Pre-hash stored in shell variable, NOT in scanned tree (cycle-3 N1.1 fix).
+  if [ -d "$WIKI_ROOT/pages" ] || [ -d "$WIKI_ROOT/.wiki-meta" ]; then
+    find "$WIKI_ROOT/pages" "$WIKI_ROOT/.wiki-meta" -type f 2>/dev/null \
+      | sort \
+      | { while IFS= read -r f; do
+            { shasum -a 256 -- "$f" 2>/dev/null \
+              || sha256sum -- "$f" 2>/dev/null; } \
+            | awk '{print $1, $2}'
+          done; } \
+      | shasum -a 256 \
+      | awk '{print $1}'
+  else
+    # First-ingest case: empty/non-existent paths produce a deterministic empty digest.
+    printf '' | shasum -a 256 | awk '{print $1}'
+  fi
+}
+
+_post_dispatch_pre_snapshot() {
+  if [ "${WIKI_TEST_MODE:-0}" = "1" ]; then
+    PRE_DISPATCH_HASH=$(_compute_wiki_hash)
+  fi
+}
+
+_post_dispatch_dirty_scan() {
+  # $1 = phase label
+  local phase="${1:-unknown}"
+  if [ "${WIKI_TEST_MODE:-0}" != "1" ]; then return 0; fi
+  local post_hash
+  post_hash=$(_compute_wiki_hash)
+  if [ -n "${PRE_DISPATCH_HASH:-}" ] && [ "$PRE_DISPATCH_HASH" != "$post_hash" ]; then
+    echo "FATAL: $phase worker mutated wiki_root (pre=$PRE_DISPATCH_HASH, post=$post_hash)" >&2
+    PARTIAL_FAIL=1
+    FAILED_REASON="worker_mutation_detected ($phase)"
+    # Trigger Step 7.7.A worker-mutation failure handling here:
+    # - Emit partial_fail sentinel for all source slugs in the batch
+    # - Log worker_mutation_detected event with phase label
+    # - Abort the ingest (do NOT promote .pending-scan)
+    return 1
+  fi
+  return 0
+}
+```
+
+**Acceptance gate (cycle-3 N1.1 clean no-op):** `_post_dispatch_pre_snapshot` + `_post_dispatch_dirty_scan` MUST pass when no worker mutation occurs between them — pre-hash and post-hash equal, function returns 0. Any non-clean baseline indicates §3.9 is broken (e.g., scan walking files modified by main's bookkeeping during the window) and MUST not ship.
+
+**Production cost trade-off:** zero by default (env-gated). Sandbox/dogfood adds one filesystem walk per dispatch site per ingest (~300 stat calls + sha256 hashes; sub-second on local SSD). Production trusts V-0/V-1/V-2/V-3 chain alone (per cycle-3 N3.4 reframing).
+
+**Limitations** (refined cycle-3 N1.5 — honest framing): catches Stage-2-direct mutation; does NOT cover post-Stage-3-close race, atomic-rename via /tmp/, or symbolic links. See plan §3.9 limitations subsection for v1.4.1.x follow-up candidates.
+
+**Bash 3.2 portability** (per CLAUDE.md): no `declare -A`, no `mapfile`, no `${var,,}`. The `local` keyword IS Bash 3.2-compatible (built-in to functions). `shasum -a 256 || sha256sum` dual fallback (R-P1 fix per plan).
+
 ### 7.5. Synthesizer dispatch (v1.4.0+: single-source A5 / multi-source A4)
 
 **Lock scope (v1.3.0+, fixes Cycle-1 SS-1 + Plan #2.1 Cycle-2 C2-W2 —
@@ -647,6 +711,16 @@ same atomic-write algorithm, parameterized only by the source of drafts
 
 #### Step 7.5.M-A — Parallel worker dispatch (multi-source A4 — Phase 1)
 
+**§3.9 worker mutation detection — pre-snapshot:**
+
+Before dispatching the parallel workers, capture a baseline hash of the wiki tree (gated by `WIKI_TEST_MODE=1`; production skips):
+
+```bash
+_post_dispatch_pre_snapshot   # Sets PRE_DISPATCH_HASH if WIKI_TEST_MODE=1
+```
+
+The matching `_post_dispatch_dirty_scan "A4-fanout"` invocation fires at the start of Step 7.5.M-B (before the B5 ledger build), bracketing the worker LLM execution window.
+
 Split sources across **`min(3, ${#SOURCES[@]})`** wiki-synthesizer worker
 subagents. Sources are sorted lexicographically by `origin` (source path)
 for deterministic worker assignment across reruns. Round-robin distribution:
@@ -688,6 +762,16 @@ done <<< "$SORTED_SOURCES"
 ```
 
 #### Step 7.5.M-B — Aggregate drafts (multi-source A4 — Phase 2, sequential, in-memory)
+
+**§3.9 worker mutation detection — post-dispatch scan:**
+
+Before building the in-batch ledger, verify no worker mutated the wiki tree during their LLM execution window (gated by `WIKI_TEST_MODE=1`; production skips):
+
+```bash
+_post_dispatch_dirty_scan "A4-fanout" || abort_ingest
+```
+
+On mismatch: function emits `FATAL: ...` to stderr, sets `PARTIAL_FAIL=1` + `FAILED_REASON="worker_mutation_detected (A4-fanout)"`, and triggers Step 7.7.A worker-mutation failure handling. The ingest aborts; `.pending-scan` is NOT promoted.
 
 Once all workers return, the agent collects their `drafts[]` arrays into a
 single `ALL_DRAFTS` list. The aggregation runs B5 dual-classification with
@@ -731,6 +815,23 @@ the v1.2.1 rules extended for fanout:
        bodies. Run a SECOND PASS — but use **`mode: "worker"`** (NOT
        `"inline"`, which would write files during Phase 2 and break the
        single-writer invariant):
+
+       **§3.9 worker mutation detection — pre-snapshot (B2 only, conditional):**
+
+       Before dispatching the second-pass synthesizer worker, re-snapshot (gated by `WIKI_TEST_MODE=1`):
+
+       ```bash
+       _post_dispatch_pre_snapshot   # re-captures PRE_DISPATCH_HASH for the B2 window
+       ```
+
+       After the second-pass worker returns its merged draft (BEFORE main proceeds to write merged content during Phase 3), invoke the scan:
+
+       ```bash
+       _post_dispatch_dirty_scan "A4-second-pass" || abort_ingest
+       ```
+
+       On mismatch: same handling as Site 1 (Step 7.7.A failure path, PARTIAL_FAIL=1, ingest aborts).
+
          1. Main dispatches a **single** wiki-synthesizer subagent in
             `mode: "worker"` with the new `colliding_drafts` input field
             (defined in Task 8 Plan #2.1 extension). Input shape:
@@ -751,7 +852,10 @@ the v1.2.1 rules extended for fanout:
             `page_content` honoring v1.2.1 multi-source merge semantics
             (Rule 6 conflict notation when sources disagree). Returns
             ONE draft via the standard worker output contract — NO
-            file writes (worker mode contract enforced).
+            file writes (worker mode contract enforced). **§3.9 scan:
+            `_post_dispatch_dirty_scan "A4-second-pass"` fires HERE
+            (between worker return and main's Phase 3 write below) per
+            the pre-snapshot/scan pair documented above.**
          3. Main writes the merged content during Phase 3 (under the
             already-held lock); all contributing slugs go into
             `sources` (sorted lexicographically per W12).
@@ -1018,6 +1122,16 @@ After Step 7.5's analysis-mode invocation, when `len(page_plan) >= a5_fanout_thr
 
 #### Step 7.6.A — Parallel page-writer dispatch
 
+**§3.9 worker mutation detection — pre-snapshot:**
+
+Before dispatching the parallel page-writer workers, capture a baseline hash (gated by `WIKI_TEST_MODE=1`):
+
+```bash
+_post_dispatch_pre_snapshot   # Sets PRE_DISPATCH_HASH if WIKI_TEST_MODE=1
+```
+
+The matching `_post_dispatch_dirty_scan "A5-fanout"` fires AFTER worker output validation (Step 7.6.B) but BEFORE Step 7.6.C atomic-write — bracketing the worker LLM execution window. Cycle-3 N1.2 fix: scan MUST run BEFORE main's legitimate writes, not after.
+
 For each entry in `page_plan`, dispatch one `wiki-page-writer` agent in a single message (concurrent execution):
 
 ```
@@ -1174,6 +1288,18 @@ done
 ```
 
 If `len(SUCCESS_DRAFTS) == 0`, ALL workers failed → see Step 7.7.B (all-fail path).
+
+#### Step 7.6.B-post — §3.9 worker mutation detection (pre-Step-7.6.C)
+
+After Step 7.6.B aggregation + validation completes, verify no `wiki-page-writer` worker mutated the wiki tree during their LLM execution window (gated by `WIKI_TEST_MODE=1`; production skips):
+
+```bash
+_post_dispatch_dirty_scan "A5-fanout" || abort_ingest
+```
+
+**CRITICAL ordering** (cycle-3 N1.2 fix): this scan MUST fire BEFORE Step 7.6.C atomic-write, not after — otherwise main's legitimate Phase 3 writes register as worker-mutation false positives and abort every ingest.
+
+On mismatch: function emits `FATAL: A5-fanout worker mutated wiki_root (pre=..., post=...)` to stderr, sets `PARTIAL_FAIL=1` + `FAILED_REASON="worker_mutation_detected (A5-fanout)"`, and triggers Step 7.7.A worker-mutation failure handling. The ingest aborts; lock is released; `.pending-scan` is NOT promoted.
 
 #### Step 7.6.C — Atomic write under lock (mandatory C3 concurrency check + manifest conversion)
 

@@ -102,6 +102,65 @@ invariant를 변경). 위키 스키마는 additive only (`ingest` log 라인의
     sentinel 작성, `pages_failed=[F1-dropped]` 포함된 `ingest` log line
     emit, `.pending-scan` 미승격.
 
+**3rd-round /deep-review fixups (5 critical + 2 warning, 모두 ACCEPT):**
+
+2nd-round fixup commit이 `do_all_failed_under_lock` (신규 ~30줄 함수)을
+도입. 3rd-round /deep-review가 이 신규 코드에서 5 critical + 2 warning을
+발견 — v1.4.2 base 디자인이 아닌 신규 함수 자체의 regression.
+
+  - **R3.P2.1 (2/3 reviewer agreement, Codex review P2 + Codex
+    adversarial high)** — slug vs descriptor mismatch. Caller가
+    `SOURCES[0]` (descriptor encoding `slug|origin|type`)을 함수의 첫
+    인자로 전달했으나 함수는 `slug` 기대. yaml path가 `<wiki>/.wiki-meta/
+    sources/<slug|origin|type>.yaml`로 잘못 구성 → partial_fail sentinel이
+    canonical location에 안 떨어짐 → Step 1.5 partial-fail-recovery
+    detection 미스. Fix: caller가 `slug="${SOURCES[0]%%|*}"` 추출 후 전달.
+  - **R3.P2.2 (2/3 reviewer agreement, Codex review P2 + Codex
+    adversarial medium)** — 3-strike retry counter 누락. Step 7.5.M-D
+    multi-source 경로에는 `<wiki>/.wiki-meta/.pending-scan-retry-count`
+    counter가 stuck-window 복구용으로 존재 (3번째 동일-window 실패 시
+    `ingest-fail` action emit + `.pending-scan` promote). pre-R3 fixup의
+    `do_all_failed_under_lock`은 이 counter를 증가시키지 않아 persistent
+    F1 all-drop (예: synthesizer가 absent page를 반복 hallucinate) 시
+    indefinite loop. Fix: Step 7.5.M-D 패턴 mirror — counter 읽기 +
+    증가, count≥3 시 `ingest-fail` emit + promote, 그 외에는 `ingest`
+    + `pages_failed` emit.
+  - **R3.C-1 (single-reviewer Opus)** — `mkdir … exit 1` 처리 오류.
+    pre-R3 fixup의 `mkdir … || { echo "Wiki locked"; exit 1; }`은 caller의
+    user-facing exit message 이전 + benign concurrent-ingest 케이스의
+    partial_fail signal 작성 이전에 script termination. Fix: soft-fail
+    `if ! mkdir … 2>/dev/null; then echo WARN; return 1; fi`. + 명시적
+    rmdir 후 `trap - EXIT` 추가 (Step 7.7.B + Step 7.6.G 패턴 mirror).
+  - **R3.C-2 (single-reviewer Opus)** — first-ingest baseline yaml
+    materialization 누락. Step 7.7.B의 R4-Adv-Adv-2 fix는 source yaml이
+    아직 없는 경우 (brand-new source의 첫 ingest가 all-fail 명중)
+    baseline yaml을 명시적으로 materialize. `do_all_failed_under_lock`은
+    Step 7.7.B mirror라고 주장했지만 이 block 누락 → first-ingest
+    all-F1-dropped 시 partial_fail block만 있고 `id/type/origin/
+    content_hash/pages_created/pages_updated` 없는 corrupt yaml 생성.
+    Fix: 함수 entry에 동일 baseline materialization block inline.
+  - **R3.C-3 (single-reviewer Opus)** — `FAILED_PAGE_FILES` parallel
+    array 채움 누락. F1 loop가 `FAILED_PAGES`만 push했고 함수 body의
+    `printf '%s\n' "${FAILED_PAGE_FILES[@]}" | jq -R . | jq -s -c .`
+    전개가 `set +u`에서는 `[""]` (W1 round-2 bug shape) 생성, `set -u`
+    에서는 unbound-variable abort. 둘 다 R2.F1.7 의도 무력화. Fix: F1
+    `FAILED_PAGES+=` push 다음에 명시적 `FAILED_PAGE_FILES+=("${entry.file}")`
+    추가 (3 site — basename invalid / page absent / disk read fail) +
+    `if sources_count == 1:` block 상단에 명시적 `FAILED_PAGES=()`
+    `FAILED_PAGE_FILES=()` init.
+  - **R3.W-1 (single-reviewer Opus)** — `phase_timing_ms.stage_3_write`
+    공식 오류. pre-R3 fixup은 `LOG_EMIT_MS - INGEST_T0_MS` 계산 — `total`과
+    동일하여 `total >= sum(stages)` invariant 위반. Fix: caller가 함수
+    호출 직전에 `STAGE_3_START_MS_FAIL` 캡처; 함수 compute는
+    `LOG_EMIT_MS - STAGE_3_START_MS_FAIL`로 stage_3_write를 lock+yaml+log
+    emit으로 한정. B3.1 path-coverage matrix에 "Single-source F1
+    all-dropped" 행 추가.
+  - **R3.W-2 (single-reviewer Opus)** — reason taxonomy 정규화. pre-R3
+    fixup은 `"all_f1_dropped"` (snake_case) 사용했으나 기존 Step 7.6.F
+    vocabulary는 space-separated phrases (`"stage 2 worker fail"`,
+    `"all workers failed"`). Fix: `"all f1 dropped"`로 정규화 + line
+    ~2068의 inline taxonomy에 추가.
+
 - **F2 (MEDIUM) — single-source Stage 1 dispatch §3.9 bracketing gap.**
   v1.4.1의 §3.9 worker-mutation dirty-scan brackets는 3개 dispatch site
   (Step 7.5.M-A multi-source A4 fanout, Step 7.5.M-B Case B2 collision

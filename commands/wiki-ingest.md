@@ -603,11 +603,12 @@ _ts_ms() {
 | Single-source A5 fanout | `ingest` | ✅ yes | LLM dispatch + dirty-scan brackets | parallel `wiki-page-writer` workers | lock + atomic write loop + Step 8-10 |
 | Single-source sub-threshold inline (no F1 drift) | `ingest` | ✅ yes | LLM dispatch + dirty-scan brackets | 0 (inline_bodies, no Stage 2) | lock + atomic write + Step 8-10 |
 | Single-source sub-threshold drift (F1.1 force-fanout) | `ingest` | ✅ yes | as Stage 1 | as Stage 2 (forced fanout) | as Stage 3 |
+| **Single-source F1 all-dropped (Step 7.5.B `do_all_failed_under_lock`, count<3)** | **`ingest`** | **✅ yes (R3.W-1 fix)** | **LLM dispatch + dirty-scan brackets** | **0 (no Stage 2 — F1 dropped before fanout)** | **lock + yaml baseline+sentinel + log emit (no atomic write loop). STAGE_3_START_MS_FAIL captured by caller; PT_STAGE_3_MS scopes to lock+yaml+log only.** |
 | Multi-source A4 fanout | `ingest` (one line per source, identical timing) | ✅ yes | worker-fanout analysis | 0 for clean first-pass; non-zero on Step 7.5.M-B Case B2 second-pass | Step 7.5.M-C atomic write |
 | Single-source empty page_plan terminal-skip (Step 7.8) | `ingest-skip` | ❌ omitted (different log path; Step 7.8 emits its own line) | n/a | n/a | n/a |
 | Re-ingest hash-skip (Step 1.5) | `ingest-skip` | ❌ omitted (Step 1.5 emits its own line) | n/a | n/a | n/a |
 | Ingest-repair self-healing | `ingest-repair` | ❌ omitted (per Step 10 omission rule) | n/a | n/a | n/a |
-| Ingest-fail 3-strike abort (Step 7.5.M-D) | `ingest-fail` | ❌ omitted (Step 7.5.M-D emits its own line) | n/a | n/a | n/a |
+| Ingest-fail 3-strike abort (Step 7.5.M-D OR Step 7.5.B count≥3) | `ingest-fail` | ❌ omitted on Step 7.5.M-D's own emit; ✅ emitted on Step 7.5.B's R3.P2.2 escape (since the emit goes through `emit_log_line` at Step 7.5.B itself, with full PHASE_TIMING_JSON computed). | partial (Stage 1 ran) | 0 | lock+yaml+log emit only |
 
 **Bash 3.2 portability**: `_ts_ms` python3 fallback chain works on macOS BSD + Linux (no `date +%s.%N` non-portability). Numeric arithmetic uses POSIX `$((LOG_EMIT_MS - STAGE_3_START_MS))` (works in Bash 3.2). The phase_timing_ms JSON object can be assembled with simple `printf` interpolation; no `jq` dependency added.
 
@@ -674,6 +675,20 @@ if sources_count == 0:
     exit "No sources to ingest." [v1.3.0 unchanged — no lock]
 
 if sources_count == 1:
+    # R3.C-3 fix (v1.4.2 3rd-round /deep-review) — explicit init of
+    # FAILED_PAGES + FAILED_PAGE_FILES before F1 gate runs. F1 was the
+    # first append site for these arrays at top-level (outside any
+    # function scope). Without explicit init, set -u would abort on
+    # `${FAILED_PAGE_FILES[@]}` expansion in `do_all_failed_under_lock`,
+    # and set +u would yield `pages_failed: [""]` (the W1 round-2 bug
+    # shape). Initialize empty here. Same convention applied to
+    # FAILED_WORKERS (Step 7.6.B's gate population — already initialized
+    # in its own block, line 1383).
+    FAILED_PAGES=()
+    FAILED_PAGE_FILES=()
+    FAILED_PAGE_REASONS=()
+    F1_DRIFT_DETECTED=false   # F1.1 fix moved here for early visibility.
+
     # v1.4.0 single-source A5 path: always invoke analysis mode first.
     # Post-review fix — fixes round-4 missed: W1 — pass A5_FANOUT_THRESHOLD
     # so the synthesizer's analysis mode knows which page_plan size triggers
@@ -724,8 +739,7 @@ if sources_count == 1:
     # post-Stage-1 disk read. Both protect the window between baseline
     # capture and Stage 3 lock — same shape, narrower window. Stage 3
     # success/abort decisions are equivalent for spec-compliant agents.
-    F1_DRIFT_DETECTED=false   # F1.1 fix — track drift to force A5 fanout
-    for entry in page_plan:
+    for entry in page_plan:   # F1_DRIFT_DETECTED initialized at sources_count == 1 entry block (above)
         if entry.action == "update":
             # F1.3 fix (basename traversal guard) — apply the same
             # `^[a-z0-9][a-z0-9-]*\.md$` regex Step 7.6.B Gate 3.5 + Step
@@ -736,6 +750,7 @@ if sources_count == 1:
             # Stage 2 / inline-write context.
             if ! printf '%s' "${entry.file}" | grep -qE '^[a-z0-9][a-z0-9-]*\.md$'; then
                 FAILED_PAGES+=({file: "${entry.file}", reason: "page_plan update entry has invalid kebab-case basename — refused at F1 v1.4.2 disk-read guard (path traversal protection; same regex as Step 7.6.B Gate 3.5 / Step 7.6.C defense-in-depth)"})
+                FAILED_PAGE_FILES+=("${entry.file}")  # R3.C-3 fix — parallel-array per Step 7.6 disclaimer (line 1392-1404). do_all_failed_under_lock + Step 7.6.F sentinel readers project FAILED_PAGE_FILES; the FAILED_PAGES tuple is bash-internal only.
                 PARTIAL_FAIL=true
                 page_plan_drop "${entry.file}"
                 inline_bodies_drop "${entry.file}"
@@ -748,6 +763,7 @@ if sources_count == 1:
                 # Stage 1 hallucination or post-Stage-1 deletion. Treat as
                 # FAILED so the page does not enter Stage 2/3.
                 FAILED_PAGES+=({file: "${entry.file}", reason: "page_plan update entry but page absent on disk (F1 v1.4.2 disk-authoritative gate)"})
+                FAILED_PAGE_FILES+=("${entry.file}")  # R3.C-3 fix — parallel-array.
                 PARTIAL_FAIL=true
                 # Drop entry from page_plan (and from inline_bodies if
                 # sub-threshold). Implementer note: Bash 3.2 portable
@@ -762,6 +778,7 @@ if sources_count == 1:
             # equivalent to Read with no limit and is bash-portable).
             disk_body=$(cat "$page_path") || {
                 FAILED_PAGES+=({file: "${entry.file}", reason: "disk read failed during F1 v1.4.2 disk-authoritative gate"})
+                FAILED_PAGE_FILES+=("${entry.file}")  # R3.C-3 fix — parallel-array.
                 PARTIAL_FAIL=true
                 page_plan_drop "${entry.file}"
                 inline_bodies_drop "${entry.file}"
@@ -840,8 +857,22 @@ if sources_count == 1:
         # phase_timing_ms is emitted (the action is `ingest`, not
         # `ingest-skip`) so the operator audit trail shows wall-clock
         # spent on the failed F1 gate.
-        do_all_failed_under_lock(SOURCES[0], FAILED_PAGES, source_hashes)
-        exit "1 source: all entries failed F1 disk-authoritative gate (basename / missing / disk-fail). partial_fail sentinel written; .pending-scan NOT promoted; next session will retry."
+        #
+        # R3.P2.1 fix (3rd-round 2/3 review) — pass extracted slug
+        # explicitly. SOURCES[0] is the descriptor encoding (slug|origin|type);
+        # do_all_failed_under_lock's first arg is the SLUG used as the
+        # yaml path key. Without extraction, sources/<slug|origin|type>.yaml
+        # would be the wrong path → partial_fail sentinel never lands at
+        # the canonical location → Step 1.5's partial-fail-recovery
+        # cascading detection misses on next session.
+        # R3.W-1 fix — capture STAGE_3_START_MS_FAIL so the function's
+        # phase_timing_ms.stage_3_write value scopes to lock+yaml+log only.
+        STAGE_3_START_MS_FAIL=$(_ts_ms)
+        slug="${SOURCES[0]%%|*}"
+        # R3.C-3 fix — pass FAILED_PAGE_FILES parallel array explicitly
+        # (function reads it for pages_failed_json projection).
+        do_all_failed_under_lock("$slug", FAILED_PAGES, FAILED_PAGE_FILES, source_hashes)
+        exit "1 source: all entries failed F1 disk-authoritative gate (basename / missing / disk-fail). partial_fail sentinel written; .pending-scan NOT promoted; next session will retry (or 3-strike escape via ingest-fail)."
 
     elif len(page_plan) < a5_fanout_threshold and ! F1_DRIFT_DETECTED:
         # A5 sub-threshold — Stage 1 already emitted bodies in inline_bodies.
@@ -882,57 +913,167 @@ Step 7.5.M-D below contain the A4 fanout logic verbatim. The `≥2 sources`
 branch acquires the global lock NOW (Phase 0 for fanout) before entering
 Step 7.5.M-A.
 
-##### Step 7.5.B — `do_all_failed_under_lock` (R2.F1.7 fix v1.4.2)
+##### Step 7.5.B — `do_all_failed_under_lock` (R2.F1.7 fix v1.4.2 + 3rd-round R3 fixups)
 
-`do_all_failed_under_lock(slug, FAILED_PAGES, source_hashes)` mirrors the
+`do_all_failed_under_lock(slug, FAILED_PAGES, FAILED_PAGE_FILES, source_hashes)` mirrors the
 Step 7.7.B "all workers failed" partial-failure finalization, adapted for
 the F1-gate-drops-all-entries case (no Stage 2 dispatch occurred — drops
 happened at Step 7.5 single-source branch). Signature: caller passes the
-single source slug, the populated FAILED_PAGES array, and source_hashes.
+extracted source slug (R3.P2.1 — NOT the descriptor tuple), the populated
+FAILED_PAGES + FAILED_PAGE_FILES parallel arrays (R3.C-3 fix), and
+source_hashes.
 
 ```bash
-do_all_failed_under_lock(slug, FAILED_PAGES, source_hashes) {
-  # Acquire lock (single-source path defers lock to Phase 3 per branch-
-  # scoped lock convention; for partial-fail finalization we acquire here).
-  mkdir "<wiki>/.wiki-meta/.wiki-lock" || { echo "Wiki locked"; exit 1; }
+do_all_failed_under_lock(slug, FAILED_PAGES, FAILED_PAGE_FILES, source_hashes) {
+  # R3.C-1 fix (3rd-round /deep-review Opus) — soft-fail on lock contention.
+  # Pre-fixup `mkdir … || exit 1` would terminate the whole /wiki-ingest
+  # script before the caller's user-facing exit message + before any
+  # diagnostic output. For the F1 all-dropped path specifically, a benign
+  # concurrent /wiki-ingest holding the lock would silently lose the
+  # partial_fail signal — the very failure mode R2.F1.7 was meant to close.
+  # New behavior: WARN, return non-zero. .pending-scan remains unpromoted
+  # (still no promotion since this path never reaches the promotion step),
+  # so retry semantics still hold via SessionStart hook re-detection on
+  # next session. Caller's exit message surfaces normally.
+  if ! mkdir "<wiki>/.wiki-meta/.wiki-lock" 2>/dev/null; then
+    echo "WARN: Wiki locked; F1 all-dropped path could not write partial_fail sentinel for $slug. Source state preserved as-is — .pending-scan NOT promoted, next session re-detects + retries F1 gate." >&2
+    return 1
+  fi
   trap 'rmdir "<wiki>/.wiki-meta/.wiki-lock" 2>/dev/null || true' EXIT
 
-  # 1. Source provenance yaml — write source_hashes (Step 8d normalize)
-  #    + write `partial_fail: {ts, failed_pages, reason}` sentinel
-  #    block so Step 1.5's partial-fail-recovery cascading detects on
-  #    next session and forces REPAIR. Reason: "all_f1_dropped" (R2.F1.7).
   yaml="<wiki>/.wiki-meta/sources/${slug}.yaml"
-  # ... write yaml with current source bytes hash + partial_fail block ...
 
-  # 2. Append one log.jsonl line — action `ingest` (NOT `ingest-skip`,
-  #    since this is a failure case; matches Step 7.7.B's emit shape).
-  #    pages_created=[], pages_updated=[], pages_failed=[F1-dropped basenames].
-  #    phase_timing_ms emitted per Step 10 (action == ingest).
+  # R3.C-2 fix (3rd-round /deep-review Opus) — first-ingest baseline yaml
+  # materialization. Step 7.7.B's R4-Adv-Adv-2 fix (line ~2009-2035)
+  # explicitly handles the case where sources/<slug>.yaml does NOT exist
+  # yet (brand-new source whose first ingest hits all-fail). do_all_failed_
+  # under_lock claims to mirror Step 7.7.B but pre-R3 was missing this
+  # block — first-ingest all-F1-dropped case would produce a yaml that
+  # contains only the partial_fail block but lacks id/type/origin/
+  # content_hash/pages_created/pages_updated, breaking Step 1.5 +
+  # downstream consumers. Fix: cross-reference and inline the same
+  # baseline block.
+  if [ ! -f "$yaml" ]; then
+    # Mirror Step 7.7.B R4-Adv-Adv-2 (line ~2017-2035): materialize a
+    # baseline yaml using Step 8e's schema with empty page arrays before
+    # the partial_fail sentinel write. The source descriptor is rebuilt
+    # from the slug + the SOURCES[0] tuple held in caller scope (the
+    # caller invokes this only for sources_count == 1 paths, so SOURCES[0]
+    # is the canonical descriptor for $slug).
+    src_origin="${SOURCES[0]#*|}"; src_origin="${src_origin%|*}"
+    src_type="${SOURCES[0]##*|}"
+    cat > "$yaml" <<YAML_EOF
+id: $slug
+type: $src_type
+origin: $src_origin
+content_hash: ${source_hashes[$slug]:-main-computes}
+pages_created: []
+pages_updated: []
+ingested_at: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+YAML_EOF
+  fi
+
+  # 1. Source provenance yaml — append `partial_fail: {ts, failed_pages,
+  #    reason}` sentinel block so Step 1.5's partial-fail-recovery
+  #    cascading detects on next session and forces REPAIR.
+  #    Reason value: "all f1 dropped" (R3.W-2 fix — taxonomy-consistent
+  #    space-separated form, per the canonical vocabulary at Step 7.6.F
+  #    line ~1923).
+  partial_fail_block=$(cat <<PFAIL_EOF
+partial_fail:
+  ts: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  reason: "all f1 dropped"
+  failed_pages: [$(printf '"%s",' "${FAILED_PAGE_FILES[@]}" | sed 's/,$//')]
+PFAIL_EOF
+)
+  printf '%s\n' "$partial_fail_block" >> "$yaml"
+
+  # R3.P2.2 fix (3rd-round 2/3 review) — 3-strike retry counter.
+  # Mirrors Step 7.5.M-D's pattern (multi-source all-workers-fail).
+  # Counter format: "<window_epoch>:<count>" stored in
+  # <wiki>/.wiki-meta/.pending-scan-retry-count. Without this counter,
+  # an auto-ingest scan window with a persistent F1-all-dropped source
+  # (e.g., synthesizer keeps hallucinating absent pages) loops
+  # indefinitely. Same 3-strike escape as v1.3.0 ingest-fail action:
+  # on 3rd consecutive same-window failure, emit ingest-fail + promote
+  # .pending-scan to release stuck state.
+  RETRY_FILE="<wiki>/.wiki-meta/.pending-scan-retry-count"
+  current_window=$(cat "<wiki>/.wiki-meta/.pending-scan" 2>/dev/null || echo "")
+  current_count=0
+  if [ -n "$current_window" ] && [ -f "$RETRY_FILE" ]; then
+    saved=$(cat "$RETRY_FILE" 2>/dev/null || echo ":")
+    saved_window="${saved%%:*}"
+    saved_count="${saved##*:}"
+    if [ "$saved_window" = "$current_window" ]; then
+      current_count="$saved_count"
+    fi
+  fi
+  current_count=$((current_count + 1))
+  printf '%s:%d' "$current_window" "$current_count" > "$RETRY_FILE"
+
+  # 2. Append one log.jsonl line. action choice depends on retry count:
+  #    - count < 3: action `ingest` with pages_failed populated (normal
+  #      retry-required emit; .pending-scan NOT promoted)
+  #    - count >= 3: action `ingest-fail` (3-strike escape; .pending-scan
+  #      IS promoted to release stuck state — mirrors v1.3.0 Step 7.5.M-D)
   LOG_EMIT_MS=$(_ts_ms)
+
+  # R3.W-1 fix (3rd-round Opus single-reviewer) — STAGE_3_START_MS scoped
+  # to the lock+yaml+log section, NOT to INGEST_T0_MS. Pre-fixup formula
+  # set stage_3_write == total which violated the "total >= sum(stages)"
+  # invariant documented at line ~593. Capture STAGE_3_START_MS at the
+  # top of this function (before mkdir lock attempt) to scope correctly.
   PT_STAGE_1_MS=$(( ${STAGE_1_END_MS:-0} - ${STAGE_1_START_MS:-0} ))
   PT_STAGE_2_MS=0   # No Stage 2 (F1 dropped before fanout)
-  PT_STAGE_3_MS=$(( LOG_EMIT_MS - ${INGEST_T0_MS:-0} ))   # Approximate; lock+log+yaml only.
+  PT_STAGE_3_MS=$(( LOG_EMIT_MS - ${STAGE_3_START_MS_FAIL:-${LOG_EMIT_MS}} ))
   PT_TOTAL_MS=$((  LOG_EMIT_MS - ${INGEST_T0_MS:-0} ))
   PHASE_TIMING_JSON=$(printf '{"stage_1_analysis":%d,"stage_2_fanout":%d,"stage_3_write":%d,"total":%d}' \
                      "$PT_STAGE_1_MS" "$PT_STAGE_2_MS" "$PT_STAGE_3_MS" "$PT_TOTAL_MS")
-  # Project FAILED_PAGE_FILES from FAILED_PAGES per the markdown-spec
-  # pseudocode mapping (parallel arrays per Step 7.6 disclaimer).
-  pages_failed_json=$(printf '%s\n' "${FAILED_PAGE_FILES[@]}" | jq -R . | jq -s -c .)
-  emit_log_line action=ingest source=$slug pages_created=[] pages_updated=[] \
-                pages_failed=$pages_failed_json phase_timing_ms=$PHASE_TIMING_JSON
 
-  # 3. Do NOT promote .pending-scan (next session re-detects + retries
-  #    via partial-fail-recovery cascading → forced REPAIR).
-  # 4. Release lock.
+  pages_failed_json=$(printf '%s\n' "${FAILED_PAGE_FILES[@]}" | jq -R . | jq -s -c .)
+
+  if [ "$current_count" -ge 3 ]; then
+    # 3-strike escape — emit ingest-fail, promote .pending-scan, clear counter.
+    emit_log_line action=ingest-fail source=$slug pages_created=[] pages_updated=[] \
+                  pages_failed=$pages_failed_json phase_timing_ms=$PHASE_TIMING_JSON \
+                  fail_reason="all_f1_dropped_3_strike"
+    # Promote .pending-scan despite failure (release stuck state) — same
+    # contract as v1.3.0 Step 7.5.M-D ingest-fail.
+    if [ -n "$current_window" ]; then
+      mv "<wiki>/.wiki-meta/.pending-scan" "<wiki>/.wiki-meta/.last-scan"
+    fi
+    # Clear retry counter.
+    rm -f "$RETRY_FILE"
+    echo "ERROR: F1 all-dropped path hit 3-strike escape for $slug. .pending-scan promoted; manual investigation required." >&2
+  else
+    # Normal retry-required emit — action `ingest` with pages_failed.
+    emit_log_line action=ingest source=$slug pages_created=[] pages_updated=[] \
+                  pages_failed=$pages_failed_json phase_timing_ms=$PHASE_TIMING_JSON
+    # 3. Do NOT promote .pending-scan (next session re-detects + retries
+    #    via partial-fail-recovery cascading → forced REPAIR).
+  fi
+
+  # 4. Release lock + clear EXIT trap (R3.C-1 fix mirror — same pattern
+  #    as Step 7.7.B line ~2056 / Step 7.6.G line ~1983).
   rmdir "<wiki>/.wiki-meta/.wiki-lock"
+  trap - EXIT
 }
 ```
 
+Caller-side `STAGE_3_START_MS_FAIL` capture (Step 7.5 single-source branch
+just before the `do_all_failed_under_lock` call):
+
+```bash
+STAGE_3_START_MS_FAIL=$(_ts_ms)
+slug="${SOURCES[0]%%|*}"
+do_all_failed_under_lock "$slug" "${FAILED_PAGES[@]}" "${FAILED_PAGE_FILES[@]}" "${source_hashes[@]}"
+```
+
 Implementation notes:
-- The `phase_timing_ms.stage_3_write` value is approximate for this path
-  (no real lock-protected write loop) — captures lock + yaml + log emit
-  wall-clock only. Documented per B3.1 path-coverage matrix as covered
-  under "F1 all-failed" sub-path.
+- The `phase_timing_ms.stage_3_write` value scopes to the lock+yaml+log
+  section only (R3.W-1 fix). This produces a meaningful delta even for
+  this all-failed path (vs. the pre-R3 form where stage_3_write equaled
+  total). B3.1 path-coverage matrix has a row for this path.
 - `partial_fail.failed_pages` matches the union pattern used by Step
   7.6.F (FAILED_PAGE_FILES ∪ FAILED_WORKER_FILES) — for this case
   FAILED_WORKER_FILES is empty (no fanout), so the union reduces to
@@ -941,6 +1082,11 @@ Implementation notes:
   page-writer dispatch — only one of the two fires per single-source
   ingest. Multi-source A4 path uses Step 7.7.B (the original all-workers-
   fail handler) and is unaffected by R2.F1.7.
+- The 3-strike retry counter is shared with Step 7.5.M-D multi-source
+  ingest-fail logic (same `RETRY_FILE`). Concurrent multi-source +
+  single-source failures at the same `.pending-scan` window aggregate
+  their counts — this matches the `<wiki>/.wiki-meta/.pending-scan-retry-count`
+  schema's intended semantics (per-window, not per-path).
 
 #### Step 7.5.A — Sub-threshold atomic write from `inline_bodies` (W6 fix)
 
@@ -1920,7 +2066,7 @@ elif [ "$PARTIAL_FAIL" = "true" ]; then
 partial_fail:
   ts: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
   failed_pages: ${failed_pages_json}
-  reason: "$(determine_reason)"  # "stage 2 worker fail" | "stage 3 write fail" | "concurrency abort" | "all workers failed"
+  reason: "$(determine_reason)"  # "stage 2 worker fail" | "stage 3 write fail" | "concurrency abort" | "all workers failed" | "all f1 dropped" (R3.W-2 v1.4.2 — F1 gate dropped all update entries; emitted by do_all_failed_under_lock at Step 7.5.B)
 EOF
 )
 

@@ -120,6 +120,71 @@ v1.4.1 §11.5 (re-stated for transparency):**
     partial_fail sentinel for the source slug, emits `ingest` log line
     with `pages_failed=[F1-dropped]`, does NOT promote `.pending-scan`.
 
+**3rd-round /deep-review fixups (5 critical + 2 warning, all ACCEPT):**
+
+The 2nd-round fixup commit introduced `do_all_failed_under_lock` (novel
+~30-line function). 3rd-round /deep-review on this novel code surfaced
+5 criticals + 2 warnings — direct regressions in the new code, not in
+the v1.4.2 base design.
+
+  - **R3.P2.1 (2/3 reviewer agreement, Codex review P2 + Codex
+    adversarial high)** — slug vs. descriptor mismatch. Caller passed
+    `SOURCES[0]` (the descriptor encoding `slug|origin|type`) where
+    function expected `slug`. Result: yaml path constructed as
+    `<wiki>/.wiki-meta/sources/<slug|origin|type>.yaml` → wrong path
+    → partial_fail sentinel never landed at canonical location → Step
+    1.5's partial-fail-recovery cascading detection missed. Fix: caller
+    extracts slug via `slug="${SOURCES[0]%%|*}"` before invocation.
+  - **R3.P2.2 (2/3 reviewer agreement, Codex review P2 + Codex
+    adversarial medium)** — 3-strike retry counter missing. Step 7.5.M-D
+    multi-source path has the `<wiki>/.wiki-meta/.pending-scan-retry-count`
+    counter for stuck-window recovery (`ingest-fail` action emits on 3rd
+    consecutive same-window failure + promotes `.pending-scan`).
+    `do_all_failed_under_lock` did not increment this counter, so a
+    persistent F1 all-drop scenario (e.g., synthesizer hallucinating
+    absent pages repeatedly) loops indefinitely. Fix: mirror Step 7.5.M-D
+    pattern — read counter, increment, emit `ingest-fail` + promote on
+    count≥3, otherwise emit `ingest` with `pages_failed`.
+  - **R3.C-1 (single-reviewer Opus)** — `mkdir … exit 1` mishandling.
+    Pre-R3 fixup `mkdir … || { echo "Wiki locked"; exit 1; }` would
+    terminate the script before the caller's user-facing exit message
+    AND before any partial_fail signal could be written for benign
+    concurrent-ingest cases. Fix: soft-fail with `if ! mkdir … 2>/dev/null;
+    then echo WARN; return 1; fi`. Plus added `trap - EXIT` after explicit
+    rmdir (mirror Step 7.7.B + Step 7.6.G pattern).
+  - **R3.C-2 (single-reviewer Opus)** — first-ingest baseline yaml
+    materialization missing. Step 7.7.B's R4-Adv-Adv-2 fix explicitly
+    materializes a baseline yaml when the source's yaml does not exist
+    yet (brand-new source whose first ingest hits all-fail).
+    `do_all_failed_under_lock` claimed to mirror Step 7.7.B but was
+    missing this block — first-ingest all-F1-dropped would produce a
+    yaml with only the partial_fail block, missing `id/type/origin/
+    content_hash/pages_created/pages_updated`. Fix: inline the same
+    baseline materialization block at function entry.
+  - **R3.C-3 (single-reviewer Opus)** — `FAILED_PAGE_FILES` parallel
+    array population. F1 loop pushed only `FAILED_PAGES`; the function
+    body's `printf '%s\n' "${FAILED_PAGE_FILES[@]}" | jq -R . | jq -s -c .`
+    expansion under `set +u` produces `[""]` (the W1 round-2 bug shape),
+    under `set -u` aborts the script with unbound-variable. Both
+    outcomes defeat R2.F1.7's stated goal. Fix: add explicit
+    `FAILED_PAGE_FILES+=("${entry.file}")` after each F1 `FAILED_PAGES+=`
+    push (3 sites — basename invalid / page absent / disk read fail) +
+    explicit `FAILED_PAGES=()` `FAILED_PAGE_FILES=()` init at top of
+    `if sources_count == 1:` block.
+  - **R3.W-1 (single-reviewer Opus)** — `phase_timing_ms.stage_3_write`
+    formula. Pre-R3 fixup computed `LOG_EMIT_MS - INGEST_T0_MS` — same
+    as `total`, violating the documented `total >= sum(stages)`
+    invariant. Fix: caller captures `STAGE_3_START_MS_FAIL` immediately
+    before invoking the function; function's compute uses
+    `LOG_EMIT_MS - STAGE_3_START_MS_FAIL` for stage_3_write, scoping to
+    lock+yaml+log emit only. B3.1 path-coverage matrix updated with
+    new "Single-source F1 all-dropped" row.
+  - **R3.W-2 (single-reviewer Opus)** — reason taxonomy normalization.
+    Pre-R3 fixup used `"all_f1_dropped"` (snake_case) while existing
+    Step 7.6.F vocabulary used space-separated phrases (`"stage 2
+    worker fail"`, `"all workers failed"`). Fix: normalized to
+    `"all f1 dropped"` and added to inline taxonomy at line ~2068.
+
 - **F2 (MEDIUM) — single-source Stage 1 dispatch §3.9 bracketing gap.**
   v1.4.1 §3.9 worker-mutation dirty-scan brackets fire at 3 dispatch
   sites (Step 7.5.M-A multi-source A4 fanout, Step 7.5.M-B Case B2

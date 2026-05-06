@@ -618,19 +618,67 @@ if sources_count == 1:
     inline_bodies = synthesizer.inline_bodies
     source_hashes = synthesizer.source_hashes
 
-    # P6 fix (round-1, Codex review D4) — synthesizer's tool whitelist is
-    # [Read, Write, Glob, Grep, WebFetch] (no shasum/Bash). Synthesizer emits
-    # sentinel "main-computes" for existing_body_hash on update entries. Main now
-    # computes the actual hash from existing_page_body bytes BEFORE Stage 3, so
-    # the C3 concurrency check at Step 7.6.C has a real value to compare against.
+    # F1 fix (v1.4.2 — handoff §1.F1) — main re-reads existing page bytes
+    # from DISK as the authoritative C3 hash baseline. v1.4.1 dogfood found
+    # the Stage 1 LLM occasionally emits dramatically-truncated
+    # existing_page_body (e.g., 12.3KB disk → 0.7KB emit, 20KB disk →
+    # 0.6KB emit), which previously corrupted main's hash compute → Step
+    # 7.6.C C3 always saw "concurrent ingest detected" against the actual
+    # disk bytes → every update aborted. Disk-read closes the gap: the
+    # synthesizer's existing_page_body still flows to Stage 2 workers /
+    # inline-write as synthesis context, but the C3 hash baseline is
+    # independent. Single-source path has no concurrent-write window
+    # between this read and Stage 3 lock acquire other than another
+    # /wiki-ingest session arriving in the same vault — same window the
+    # pre-v1.4.2 contract protected, so concurrent-detection is preserved.
+    # (Subsumes prior P6 hash-from-emit compute — no separate compute pass.)
     for entry in page_plan:
-        if entry.action == "update" and entry.existing_body_hash == "main-computes":
-            # R-P1 fix (round-3, Codex review P2) — Linux portability.
-            # macOS BSD ships `shasum`; most Linux distros ship `sha256sum`.
-            # Mirror Step 8d's portable form.
-            entry.existing_body_hash = $({ printf '%s' "$entry.existing_page_body" | shasum -a 256 2>/dev/null \
-                                          || printf '%s' "$entry.existing_page_body" | sha256sum 2>/dev/null; } \
-                                         | awk '{print $1}')
+        if entry.action == "update":
+            page_path="$WIKI_ROOT/pages/${entry.file}"
+            if [ ! -f "$page_path" ]; then
+                # Synthesizer claimed update but file is absent on disk —
+                # Stage 1 hallucination or post-Stage-1 deletion. Treat as
+                # FAILED so the page does not enter Stage 2/3.
+                FAILED_PAGES+=({file: "${entry.file}", reason: "page_plan update entry but page absent on disk (F1 v1.4.2 disk-authoritative gate)"})
+                PARTIAL_FAIL=true
+                # Drop entry from page_plan (and from inline_bodies if
+                # sub-threshold). Implementer note: Bash 3.2 portable
+                # array filter — write to temp array then reassign. The
+                # markdown-spec pseudocode below (`page_plan_drop`,
+                # `inline_bodies_drop`) is shorthand for that filter.
+                page_plan_drop "${entry.file}"
+                inline_bodies_drop "${entry.file}"
+                continue
+            fi
+            # Disk read (full bytes, no offset/limit — POSIX cat is
+            # equivalent to Read with no limit and is bash-portable).
+            disk_body=$(cat "$page_path") || {
+                FAILED_PAGES+=({file: "${entry.file}", reason: "disk read failed during F1 v1.4.2 disk-authoritative gate"})
+                PARTIAL_FAIL=true
+                page_plan_drop "${entry.file}"
+                inline_bodies_drop "${entry.file}"
+                continue
+            }
+            # Telemetry: WARN when synthesizer emit substantially differs
+            # from disk (LLM truncation in the wild — not a fatal condition
+            # since main now uses disk, but visible signal for spec drift).
+            emit_size=$(printf '%s' "${entry.existing_page_body}" | wc -c | awk '{print $1}')
+            disk_size=$(printf '%s' "$disk_body" | wc -c | awk '{print $1}')
+            delta=$((disk_size - emit_size))
+            [ "$delta" -lt 0 ] && delta=$((-delta))
+            if [ "$delta" -gt 4 ]; then
+                # >4 bytes EOL-tolerance band crossed → synthesizer drift.
+                echo "WARN: synthesizer existing_page_body drift for ${entry.file} (emit=${emit_size}B, disk=${disk_size}B, delta=${delta}B); main using disk bytes (F1 v1.4.2 fix)" >&2
+            fi
+            # Authoritative replacement — Stage 2 workers / inline-write
+            # path receive disk bytes (matching what main hashes); spec
+            # drift is silently corrected.
+            entry.existing_page_body="$disk_body"
+            # Hash from disk bytes. R-P1 fix preserved (shasum / sha256sum
+            # dual fallback for Linux portability).
+            entry.existing_body_hash=$({ printf '%s' "$disk_body" | shasum -a 256 2>/dev/null \
+                                         || printf '%s' "$disk_body" | sha256sum 2>/dev/null; } \
+                                       | awk '{print $1}')
         # action == "create" entries keep existing_body_hash = null (no prior body to hash).
 
     if len(page_plan) == 0:

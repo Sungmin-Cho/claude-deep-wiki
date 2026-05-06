@@ -24,3 +24,4 @@ scripts/v0-probe/v3-results.tsv
 # artifacts of the v1.4.1 commit history.
 scripts/v0-probe/webfetch-stub.log
 scripts/v0-probe/webfetch-stub-stdout.log
+scripts/v0-probe/__pycache__/

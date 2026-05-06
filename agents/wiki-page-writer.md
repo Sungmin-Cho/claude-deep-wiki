@@ -28,18 +28,6 @@ Generate exactly one wiki page body from one `page_plan_entry` and the source ex
 
 6. **No worker self-coordination.** Workers run in isolation. If two pages need cross-references to each other, Stage 1's `intent_summary` for each page must explicitly say so using **standard markdown links** (per `skills/wiki-schema/SKILL.md:75-76` — Obsidian `[[wikilink]]` form is prohibited for portability). Example directive: `"Add link to [Other Page](other-page-name.md) in §see-also"`. The worker writes the link verbatim — markdown format `[Title](page-name.md)`, not `[[wikilink]]`.
 
-7. **[V-0 instrumentation, REMOVE before v1.4.1 release]** When `intent_summary` begins with the literal token `[V-0-PROBE]`, the worker enters probe mode and emits an alternate JSON shape INSTEAD of the regular `page_content` shape. In probe mode:
-   - The worker SHOULD attempt one `Read` call against the path declared after `attempt-read ` in `intent_summary` (e.g., `[V-0-PROBE] attempt-read /tmp/v0-probe-marker`).
-   - A correct `wiki-page-writer` (`tools: []`) cannot perform the Read — output:
-     ```json
-     {"v0_probe": "no-tools-available", "tool_attempted": null, "file": "<page_plan_entry.file>"}
-     ```
-   - A substituted agent that DOES have `Read` SHOULD attempt the call. If the Read succeeds, output:
-     ```json
-     {"v0_probe": "tool-call-succeeded", "tool_attempted": "Read", "content": "<sandbox marker>", "file": "<page_plan_entry.file>"}
-     ```
-   - The `[V-0-PROBE]` directive MUST be removed from this file before v1.4.1 release. CI lint catches if directive remains. See `scripts/v0-probe/v0-procedure.md` §3.3.
-
 ## Input contract
 
 The calling command passes one input object per worker invocation:

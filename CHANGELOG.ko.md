@@ -78,6 +78,29 @@ invariant를 변경). 위키 스키마는 additive only (`ingest` log 라인의
     Stage 3 결정은 symmetric `$(cat)` byte-stripping으로 equivalent임을
     문서화; Rule 4 + field semantic을 synth bytes → telemetry-only contract
     로 재작성.
+  - **R2.F1.6 (2/3 reviewer agreement, 2nd-round /deep-review)** —
+    concurrent-ingest baseline race. Pre-R2 fixup의 F1 size-delta
+    heuristic (>4 bytes 시 escalate)은 LARGE drift만 감지. Stage 1 LLM
+    실행 중 concurrent `/wiki-ingest` commit이 same-size byte change
+    (또는 EOL tolerance band 안의 truncation pattern)를 만들면 silent
+    baseline → C3 통과 → 우리 세션이 concurrent commit 덮어쓰기. Fix:
+    size-delta를 synth emit hash vs disk read hash HASH-COMPARE로 교체.
+    byte 단위 차이 발생 시 F1_DRIFT_DETECTED → F1.1 escalation 통해 A5
+    fanout 강제. Stage 2 worker가 현재 disk bytes로 re-synthesize —
+    concurrent commit 내용은 worker input으로 보존, 우리 source 기여는
+    그 위에 merge. T0→T1 (Stage 1 read → F1 cat) silent window 갭 차단.
+  - **R2.F1.7 (2/3 reviewer agreement, 2nd-round /deep-review)** —
+    all-dropped → terminal ingest-skip bypass. Pre-R2 fixup `len(page_plan)
+    == 0`은 무조건 `do_ingest_skip_terminal_under_lock` 경로 → ingest-skip
+    log + source promote. F1이 모든 update 항목 drop (basename invalid /
+    page absent / disk read failed) 시 partial_fail sentinel 미작성으로
+    source가 clean skip으로 promote → 다음 세션 retry 안 함 → permanent
+    silent failure. Fix: empty-page_plan terminal skip을 FAILED_PAGES
+    EMPTY일 때만 trigger. non-empty (all-F1-dropped) 시 신규
+    `do_all_failed_under_lock` (Step 7.5.B) 경로로 route — Step 7.7.B
+    "all-fail" finalization mirror: lock 획득, source slug에 partial_fail
+    sentinel 작성, `pages_failed=[F1-dropped]` 포함된 `ingest` log line
+    emit, `.pending-scan` 미승격.
 
 - **F2 (MEDIUM) — single-source Stage 1 dispatch §3.9 bracketing gap.**
   v1.4.1의 §3.9 worker-mutation dirty-scan brackets는 3개 dispatch site

@@ -767,34 +767,81 @@ if sources_count == 1:
                 inline_bodies_drop "${entry.file}"
                 continue
             }
-            # Telemetry: WARN when synthesizer emit substantially differs
-            # from disk (LLM truncation in the wild — not a fatal condition
-            # since main now uses disk, but visible signal for spec drift).
-            emit_size=$(printf '%s' "${entry.existing_page_body}" | wc -c | awk '{print $1}')
-            disk_size=$(printf '%s' "$disk_body" | wc -c | awk '{print $1}')
-            delta=$((disk_size - emit_size))
-            [ "$delta" -lt 0 ] && delta=$((-delta))
-            if [ "$delta" -gt 4 ]; then
-                # >4 bytes EOL-tolerance band crossed → synthesizer drift.
-                echo "WARN: synthesizer existing_page_body drift for ${entry.file} (emit=${emit_size}B, disk=${disk_size}B, delta=${delta}B); main using disk bytes (F1 v1.4.2 fix)" >&2
+            # R2.F1.6 fix (v1.4.2 2nd-round /deep-review — 2/3 reviewer
+            # agreement: Codex review P1 + Codex adversarial high) —
+            # concurrent-ingest baseline race. Pre-fixup F1 size-delta
+            # heuristic only escalated when |disk-emit| > 4 bytes. That
+            # left a window: between Stage 1's read (T0) and main's F1
+            # cat (T1), a concurrent /wiki-ingest could commit a same-
+            # size byte change (or a truncation-pattern matching change)
+            # that F1 silently absorbs as the new C3 baseline. Stage 3
+            # then passes C3 (against post-concurrent-commit disk) and
+            # writes our session's body — silently overwriting the
+            # concurrent commit. Fix: replace size-delta with HASH-COMPARE.
+            # Any byte-level difference between synth's emit and disk
+            # bytes triggers F1_DRIFT_DETECTED → force A5 fanout, which
+            # re-synthesizes from current disk via Stage 2 workers
+            # (concurrent commit's content is preserved in the worker's
+            # input; our session's source contribution merges on top).
+            # Hash both with the same `$(cat …)` byte-stripped form for
+            # symmetric comparison. WARN telemetry retained for
+            # operator visibility.
+            synth_hash=$({ printf '%s' "${entry.existing_page_body}" | shasum -a 256 2>/dev/null \
+                           || printf '%s' "${entry.existing_page_body}" | sha256sum 2>/dev/null; } \
+                         | awk '{print $1}')
+            disk_hash=$({ printf '%s' "$disk_body" | shasum -a 256 2>/dev/null \
+                          || printf '%s' "$disk_body" | sha256sum 2>/dev/null; } \
+                        | awk '{print $1}')
+            if [ "$synth_hash" != "$disk_hash" ]; then
+                # Drift detected (truncation OR concurrent-ingest commit
+                # in T0→T1 window — F1 cannot distinguish, both demand
+                # re-synthesis).
+                emit_size=$(printf '%s' "${entry.existing_page_body}" | wc -c | awk '{print $1}')
+                disk_size=$(printf '%s' "$disk_body" | wc -c | awk '{print $1}')
+                delta=$((disk_size - emit_size))
+                [ "$delta" -lt 0 ] && delta=$((-delta))
+                echo "WARN: synthesizer existing_page_body drift for ${entry.file} (emit=${emit_size}B, disk=${disk_size}B, delta=${delta}B, synth_hash=${synth_hash:0:12}, disk_hash=${disk_hash:0:12}); main using disk bytes + escalating to A5 fanout (F1 v1.4.2 fix; R2.F1.6 hash-compare). Cause: synthesizer truncation OR concurrent /wiki-ingest commit during Stage 1 LLM execution." >&2
                 F1_DRIFT_DETECTED=true   # F1.1 fix — force A5 fanout below
             fi
             # Authoritative replacement — main's hash baseline + Stage 2
             # worker / A5 fanout context (NOT inline-write — see F1.1
             # branch override below). Synthesizer's existing_page_body is
-            # discarded except for the WARN delta above.
+            # discarded; only its hash flowed into the drift detection
+            # above.
             entry.existing_page_body="$disk_body"
-            # Hash from disk bytes. R-P1 fix preserved (shasum / sha256sum
-            # dual fallback for Linux portability).
-            entry.existing_body_hash=$({ printf '%s' "$disk_body" | shasum -a 256 2>/dev/null \
-                                         || printf '%s' "$disk_body" | sha256sum 2>/dev/null; } \
-                                       | awk '{print $1}')
+            entry.existing_body_hash="$disk_hash"   # Reuse disk_hash (same value as old recompute path, no double-shasum).
         # action == "create" entries keep existing_body_hash = null (no prior body to hash).
 
-    if len(page_plan) == 0:
+    if len(page_plan) == 0 and len(FAILED_PAGES) == 0:
         # A8 — empty plan terminal-skip flow (Step 7.8 below).
+        # Synthesizer judged no pages need update AND F1 gate dropped no
+        # entries → genuine no-op. Promotes the source as accounted for
+        # (yaml updated, ingest-skip log line emitted).
         do_ingest_skip_terminal_under_lock(SOURCES[0], source_hashes)
         exit "1 source skipped — analysis judged no pages need update."
+
+    elif len(page_plan) == 0 and len(FAILED_PAGES) > 0:
+        # R2.F1.7 fix (v1.4.2 2nd-round /deep-review — 2/3 reviewer
+        # agreement: Codex review P2 + Codex adversarial high) — F1 gate
+        # dropped ALL update entries (e.g., every entry was basename-
+        # invalid OR every page absent on disk OR every disk read failed).
+        # Pre-fixup len(page_plan)==0 routed through `do_ingest_skip_
+        # terminal_under_lock`, which emits an `ingest-skip` log line and
+        # promotes the source as accounted for via yaml update — but
+        # writes NO `partial_fail` sentinel. The source then never retries
+        # on next session, hiding a real failure as a clean skip. Fix:
+        # gate Step 7.8 terminal-skip on FAILED_PAGES being EMPTY.
+        # When non-empty (this branch), route through partial-failure
+        # finalization: acquire lock, write partial_fail sentinel for
+        # the source slug, emit one `ingest` log line with
+        # `pages_created: []`, `pages_updated: []`,
+        # `pages_failed: [<F1-dropped files>]`, do NOT promote
+        # `.pending-scan`. Mirrors Step 7.7.B "all-fail" path semantics.
+        # phase_timing_ms is emitted (the action is `ingest`, not
+        # `ingest-skip`) so the operator audit trail shows wall-clock
+        # spent on the failed F1 gate.
+        do_all_failed_under_lock(SOURCES[0], FAILED_PAGES, source_hashes)
+        exit "1 source: all entries failed F1 disk-authoritative gate (basename / missing / disk-fail). partial_fail sentinel written; .pending-scan NOT promoted; next session will retry."
 
     elif len(page_plan) < a5_fanout_threshold and ! F1_DRIFT_DETECTED:
         # A5 sub-threshold — Stage 1 already emitted bodies in inline_bodies.
@@ -834,6 +881,66 @@ flow. The multi-source path is unchanged from v1.3.0 — Step 7.5.M-A through
 Step 7.5.M-D below contain the A4 fanout logic verbatim. The `≥2 sources`
 branch acquires the global lock NOW (Phase 0 for fanout) before entering
 Step 7.5.M-A.
+
+##### Step 7.5.B — `do_all_failed_under_lock` (R2.F1.7 fix v1.4.2)
+
+`do_all_failed_under_lock(slug, FAILED_PAGES, source_hashes)` mirrors the
+Step 7.7.B "all workers failed" partial-failure finalization, adapted for
+the F1-gate-drops-all-entries case (no Stage 2 dispatch occurred — drops
+happened at Step 7.5 single-source branch). Signature: caller passes the
+single source slug, the populated FAILED_PAGES array, and source_hashes.
+
+```bash
+do_all_failed_under_lock(slug, FAILED_PAGES, source_hashes) {
+  # Acquire lock (single-source path defers lock to Phase 3 per branch-
+  # scoped lock convention; for partial-fail finalization we acquire here).
+  mkdir "<wiki>/.wiki-meta/.wiki-lock" || { echo "Wiki locked"; exit 1; }
+  trap 'rmdir "<wiki>/.wiki-meta/.wiki-lock" 2>/dev/null || true' EXIT
+
+  # 1. Source provenance yaml — write source_hashes (Step 8d normalize)
+  #    + write `partial_fail: {ts, failed_pages, reason}` sentinel
+  #    block so Step 1.5's partial-fail-recovery cascading detects on
+  #    next session and forces REPAIR. Reason: "all_f1_dropped" (R2.F1.7).
+  yaml="<wiki>/.wiki-meta/sources/${slug}.yaml"
+  # ... write yaml with current source bytes hash + partial_fail block ...
+
+  # 2. Append one log.jsonl line — action `ingest` (NOT `ingest-skip`,
+  #    since this is a failure case; matches Step 7.7.B's emit shape).
+  #    pages_created=[], pages_updated=[], pages_failed=[F1-dropped basenames].
+  #    phase_timing_ms emitted per Step 10 (action == ingest).
+  LOG_EMIT_MS=$(_ts_ms)
+  PT_STAGE_1_MS=$(( ${STAGE_1_END_MS:-0} - ${STAGE_1_START_MS:-0} ))
+  PT_STAGE_2_MS=0   # No Stage 2 (F1 dropped before fanout)
+  PT_STAGE_3_MS=$(( LOG_EMIT_MS - ${INGEST_T0_MS:-0} ))   # Approximate; lock+log+yaml only.
+  PT_TOTAL_MS=$((  LOG_EMIT_MS - ${INGEST_T0_MS:-0} ))
+  PHASE_TIMING_JSON=$(printf '{"stage_1_analysis":%d,"stage_2_fanout":%d,"stage_3_write":%d,"total":%d}' \
+                     "$PT_STAGE_1_MS" "$PT_STAGE_2_MS" "$PT_STAGE_3_MS" "$PT_TOTAL_MS")
+  # Project FAILED_PAGE_FILES from FAILED_PAGES per the markdown-spec
+  # pseudocode mapping (parallel arrays per Step 7.6 disclaimer).
+  pages_failed_json=$(printf '%s\n' "${FAILED_PAGE_FILES[@]}" | jq -R . | jq -s -c .)
+  emit_log_line action=ingest source=$slug pages_created=[] pages_updated=[] \
+                pages_failed=$pages_failed_json phase_timing_ms=$PHASE_TIMING_JSON
+
+  # 3. Do NOT promote .pending-scan (next session re-detects + retries
+  #    via partial-fail-recovery cascading → forced REPAIR).
+  # 4. Release lock.
+  rmdir "<wiki>/.wiki-meta/.wiki-lock"
+}
+```
+
+Implementation notes:
+- The `phase_timing_ms.stage_3_write` value is approximate for this path
+  (no real lock-protected write loop) — captures lock + yaml + log emit
+  wall-clock only. Documented per B3.1 path-coverage matrix as covered
+  under "F1 all-failed" sub-path.
+- `partial_fail.failed_pages` matches the union pattern used by Step
+  7.6.F (FAILED_PAGE_FILES ∪ FAILED_WORKER_FILES) — for this case
+  FAILED_WORKER_FILES is empty (no fanout), so the union reduces to
+  FAILED_PAGE_FILES.
+- This sub-step's invocation is mutually exclusive with Step 7.6.A
+  page-writer dispatch — only one of the two fires per single-source
+  ingest. Multi-source A4 path uses Step 7.7.B (the original all-workers-
+  fail handler) and is unaffected by R2.F1.7.
 
 #### Step 7.5.A — Sub-threshold atomic write from `inline_bodies` (W6 fix)
 

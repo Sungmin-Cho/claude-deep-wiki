@@ -93,6 +93,32 @@ v1.4.1 §11.5 (re-stated for transparency):**
     via symmetric `$(cat)` byte-stripping; rewrite Rule 4 + field
     semantics so spec accurately reflects synth bytes → telemetry-only
     contract.
+  - **R2.F1.6 (2/3 reviewer agreement, 2nd-round /deep-review)** —
+    concurrent-ingest baseline race. Pre-R2 fixup F1 size-delta heuristic
+    (>4 bytes → escalate) only caught LARGE drifts. Concurrent
+    `/wiki-ingest` commits during Stage 1 LLM execution that produce
+    same-size byte changes (or truncation patterns within the EOL
+    tolerance band) silently became the new C3 baseline → Stage 3 passed
+    C3 → our session overwrote the concurrent commit. Fix: replace
+    size-delta with HASH-COMPARE between synth's emit and disk read.
+    Any byte-level difference triggers F1_DRIFT_DETECTED → force A5
+    fanout per F1.1 escalation logic. Stage 2 worker re-synthesizes from
+    current disk bytes — concurrent commit's content is preserved as the
+    worker's input, our session's source contribution merges on top.
+    Closes the T0→T1 (Stage 1 read → F1 cat) silent-window gap.
+  - **R2.F1.7 (2/3 reviewer agreement, 2nd-round /deep-review)** —
+    all-dropped → terminal ingest-skip bypass. Pre-R2 fixup `len(page_plan)
+    == 0` routed unconditionally through `do_ingest_skip_terminal_under_
+    lock` which emits `ingest-skip` log line + promotes source as
+    accounted for. If F1 dropped ALL update entries (basename invalid /
+    page absent / disk read failed), the source got promoted as a clean
+    skip without writing the partial_fail sentinel → next session never
+    retried → permanent silent failure. Fix: gate empty-page_plan terminal
+    skip on FAILED_PAGES being EMPTY. When non-empty (all-F1-dropped),
+    route through new `do_all_failed_under_lock` (Step 7.5.B) which
+    mirrors Step 7.7.B "all-fail" finalization: acquires lock, writes
+    partial_fail sentinel for the source slug, emits `ingest` log line
+    with `pages_failed=[F1-dropped]`, does NOT promote `.pending-scan`.
 
 - **F2 (MEDIUM) — single-source Stage 1 dispatch §3.9 bracketing gap.**
   v1.4.1 §3.9 worker-mutation dirty-scan brackets fire at 3 dispatch

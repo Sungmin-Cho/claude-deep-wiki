@@ -28,7 +28,7 @@
 #   - No `&>/dev/null` (uses `>/dev/null 2>&1`)
 #   - `${arr[@]}` length-guarded under `set -u`
 
-set -u
+set -euo pipefail
 
 VERBOSE=0
 if [ "${1:-}" = "--verbose" ]; then
@@ -47,15 +47,31 @@ FAIL=0
 # Format: <agent_file_path>\t<expected_normalized_tools_array>
 # Normalized form: bracketed, comma+single-space separated, no extra whitespace.
 # ---------------------------------------------------------------------------
-MANIFEST_FILE="$(mktemp -t lint-agent-tools.XXXXXX)"
+MANIFEST_FILE="$(mktemp -t lint-agent-tools.XXXXXX)" || {
+  echo "FATAL: mktemp failed — cannot create manifest temp file (TMPDIR=${TMPDIR:-/tmp})" >&2
+  exit 2
+}
 trap 'rm -f "$MANIFEST_FILE"' EXIT
 
-cat > "$MANIFEST_FILE" <<'EOF'
+# Explicit verify the manifest write succeeded — set -e + pipefail catches most
+# cases, but here-doc redirection failures can still slip through if disk is
+# full mid-write.
+if ! cat > "$MANIFEST_FILE" <<'EOF'
 agents/wiki-synthesizer-inline.md	[Read, Write, Glob, Grep, WebFetch]
 agents/wiki-synthesizer-analysis.md	[Read, Glob, Grep, WebFetch]
 agents/wiki-synthesizer-worker.md	[Read, Glob, Grep, WebFetch]
 agents/wiki-page-writer.md	[]
 EOF
+then
+  echo "FATAL: manifest write failed — cannot populate $MANIFEST_FILE" >&2
+  exit 2
+fi
+
+# Sanity: the manifest must be non-empty after write.
+if [ ! -s "$MANIFEST_FILE" ]; then
+  echo "FATAL: manifest file is empty after write — TMPDIR full or unwritable?" >&2
+  exit 2
+fi
 
 # ---------------------------------------------------------------------------
 # Helper: extract `tools:` value from a file's YAML frontmatter.

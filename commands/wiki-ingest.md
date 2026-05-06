@@ -737,7 +737,9 @@ input descriptor:
 ```json
 {
   "wiki_root": "<absolute path>",
-  "sources": [<source descriptors assigned to this worker, sorted>],
+  "source_shard": {
+    "sources": [<source descriptors assigned to this worker, sorted>]
+  },
   "candidates": [<candidate descriptors — same snapshot for all workers>]
 }
 ```
@@ -840,7 +842,9 @@ the v1.2.1 rules extended for fanout:
             ```json
             {
               "wiki_root": "...",
-              "sources": [<union of contributing source descriptors>],
+              "source_shard": {
+                "sources": [<union of contributing source descriptors>]
+              },
               "candidates": [<existing wiki page if action=update, else []>],
               "colliding_drafts": [
                 {"source_slug": "a", "page_content": "<body from worker A>"},
@@ -2218,7 +2222,16 @@ In this case:
 ## Error Handling
 
 - If the lock cannot be acquired, report the error and stop
-- If any of the split agents (`deep-wiki:wiki-synthesizer-{analysis|worker}`, also `deep-wiki:wiki-page-writer` for A5 fanout) cannot be spawned or returns an unparseable response, release the lock and report the error. Do NOT promote `.pending-scan` — the next session will re-detect the window. "Unparseable" means one of: (a) not valid JSON, (b) missing any of `created`/`updated`/`versioned`/`source_hashes`/`failed` at the top level, (c) entries in `created`/`updated` missing required fields (`file`/`title`/`tags`/`aliases`/`sources`), (d) `source_hashes` missing a slug the caller passed in. Note that invalid-format `source_hashes` *values* (sentinels, empty strings, non-hex) are NOT fatal — Step 8d normalizes them via main-side recompute. Only a missing key for a slug the caller passed in is fatal.
+- If any of the split agents (`deep-wiki:wiki-synthesizer-{analysis|worker}`, also `deep-wiki:wiki-page-writer` for A5 fanout) cannot be spawned or returns an unparseable response, release the lock and report the error. Do NOT promote `.pending-scan` — the next session will re-detect the window.
+
+  "Unparseable" depends on which split agent returned the response (per-agent contracts differ in v1.4.1+):
+  - `deep-wiki:wiki-synthesizer-analysis`: missing `mode: "analysis"` literal, OR missing `page_plan` array (may be empty), OR missing `source_hashes` map. `inline_bodies` array required (may be empty when above-threshold).
+  - `deep-wiki:wiki-synthesizer-worker`: missing `mode: "worker"` literal, OR missing `drafts` array, OR missing `source_hashes` map.
+  - `deep-wiki:wiki-page-writer`: missing `file` field, OR missing `page_content`, OR missing `frontmatter_meta` (object), OR missing `worker_status` field.
+  - For `wiki-synthesizer-analysis` AND `wiki-synthesizer-worker`: `source_hashes` missing a slug the caller passed in is fatal.
+  - For `wiki-page-writer`: any worker-output validation failure is handled per Step 7.6.B Gates 1-4 (file basename, status branch, page_content non-empty, frontmatter_meta subfields) — the per-agent contract above is the BEFORE-Gate-1 baseline.
+  - Note: invalid-format `source_hashes` *values* (sentinels like `"main-computes"`, empty strings, non-hex) are NOT fatal — Step 8d normalizes them via main-side recompute. Only a missing key for a slug the caller passed in is fatal.
+  - Legacy `created`/`updated`/`versioned`/`failed` shape applies ONLY to the Step 8 manifest AFTER main reconciles drafts/page_plans (i.e., post-aggregation, NOT raw split-agent output). Step 8a's manifest construction generates this shape from per-agent outputs; Step 8b+ validation operates on this constructed manifest, not on the raw agent JSON.
 - Always release the lock in case of errors (use trap in bash operations)
 - **Inbox cleanup (type: text)**: The trap that releases the lock also deletes each file in `INBOX_FILES` (populated in Step 6.5). Never use `.inbox/*.txt` wildcards — stale inbox files from a prior crashed session belong to that session and may still be needed for recovery. This cleanup runs on success AND failure so pasted text never lingers on disk
 - **Orphan versions**: If any `failed` entry carries an `orphan_version`, surface it in the Step 14 report so the user knows a backup exists for a page that did NOT get overwritten. Auto-lint's retention prune (Step 13) handles actual cleanup — no special action here

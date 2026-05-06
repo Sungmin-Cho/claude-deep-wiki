@@ -2,6 +2,188 @@
 
 All notable changes to deep-wiki are documented here.
 
+## [1.4.1] — 2026-05-06
+
+Trust-boundary closure (best-effort, layered defense). Splits the unified
+`wiki-synthesizer.md` agent into three role-scoped files
+(`wiki-synthesizer-{analysis,worker,inline}.md`), all without `Write` in
+their `tools:` declaration on the active paths, and routes
+`/wiki-ingest` to them via Claude Code's qualified-namespace
+(`deep-wiki:<agent>`). Together with a frontmatter lint
+(`scripts/lint-agent-tools.sh`) and an in-root post-dispatch dirty-file
+scan (gated by `WIKI_TEST_MODE=1`, zero cost in production), this closes
+the v1.4.0 dogfood failure root cause: **caller-side voluntary downgrade
+to `subagent_type: "general-purpose"`** which silently granted
+Read+Write+Edit to `wiki-page-writer` workers and enabled writes outside
+the Stage 3 lock. Single-source A5 + multi-source A4 paths are
+structurally equivalent to v1.4.0 (NOT byte-identical — split-agent
+dispatch changes WHO writes pages, not page-creation semantics).
+
+**Production-cost note:** §3.9 dirty-file scan is `WIKI_TEST_MODE=1`
+env-gated; production `/wiki-ingest` invocations skip it entirely (zero
+cost). The scan opts in for sandbox + re-dogfood scenarios only — see
+cycle-3 N3.4 / plan §3.9.
+
+### Architectural
+
+- **3-agent split (Track C closure)**: the v1.3.0 / v1.4.0 single
+  `agents/wiki-synthesizer.md` (mode-scoped sections) is replaced by
+  three role-scoped agent files. The split moves `Write` off the active
+  call paths' `tools:` declarations — V-1 (callee-side enforcement) is
+  now a static property of the agent file, not a runtime contract that
+  the prompt has to negotiate per turn.
+
+  | File | Role | `tools:` | Caller |
+  |---|---|---|---|
+  | `agents/wiki-synthesizer-analysis.md` | Stage 1 single-source A5 analysis (page_plan + sub-threshold inline_bodies) | `[Read, Glob, Grep, WebFetch]` (Write **absent**) | `commands/wiki-ingest.md` Step 7.5.M-A (single-source) |
+  | `agents/wiki-synthesizer-worker.md` | multi-source A4 worker + 2nd-pass collision merge (worker mode + `colliding_drafts` input) | `[Read, Glob, Grep, WebFetch]` (Write **absent**) | `commands/wiki-ingest.md` Step 7.5.M-B + Step 7.6.B-post |
+  | `agents/wiki-synthesizer-inline.md` | DORMANT — preserves the v1.3.0 inline-mode contract (page-write-on-emit) for future restoration | `[Read, Write, Glob, Grep, WebFetch]` | (no active caller; `status: dormant`) |
+
+- **Old `agents/wiki-synthesizer.md` deleted (Option B per §3.4 — no
+  shim)**: the unified agent file is removed in v1.4.1. There is no
+  compatibility shim. External callers that were dispatching
+  `subagent_type: "wiki-synthesizer"` directly MUST migrate to the
+  qualified-namespace forms below — see Migration.
+
+- **Qualified-namespace routing (V-0 empirical finding)**: 12 dispatch
+  sites in `commands/wiki-ingest.md` were updated from the unqualified
+  `subagent_type: "wiki-synthesizer"` (now Agent-not-found) to the
+  qualified forms `deep-wiki:wiki-synthesizer-analysis`,
+  `deep-wiki:wiki-synthesizer-worker`, and `deep-wiki:wiki-page-writer`.
+  V-0 verification (Mechanism B forced-attempt probe) confirmed
+  empirically that:
+  - Qualified namespace `deep-wiki:wiki-X` resolves correctly via
+    Claude Code's plugin agent registration.
+  - Unqualified names return an explicit Agent-not-found error
+    (no silent substitution to `general-purpose`).
+  This means the v1.4.0 dogfood failure was NOT caused by runtime
+  auto-substitution. The real root cause was **main-session voluntary
+  downgrade** of `wiki-page-writer` workers to
+  `subagent_type: "general-purpose"`, which granted them Read+Write+Edit
+  and enabled writes to `/tmp/v140-workers-out/*` outside the Stage 3
+  lock. Step 7.6.A now carries an explicit V-0/C3 comment forbidding
+  this downgrade going forward.
+
+- **Inline rot-mitigation (v1.3.0 contract preserved)**:
+  `agents/wiki-synthesizer-inline.md` ships dormant but
+  contract-frozen. Its frontmatter / header carries:
+  - `status: dormant`
+  - `last_known_active: v1.3.0`
+  - `contract_frozen_at: a9966c7` (the SHA of the unified-agent
+    deletion commit). When future restoration is needed, the inline
+    contract is recoverable from that exact SHA without spec
+    archaeology.
+
+### Tooling
+
+- **`scripts/lint-agent-tools.sh` (new, 225 lines, Bash 3.2 portable)**:
+  static frontmatter lint for the four agent files
+  (analysis + worker + inline + page-writer). Verifies each agent's
+  declared `tools:` matches a hardcoded manifest, plus a string-match
+  WebFetch URL allowlist check. Catches drift if a future spec change
+  inadvertently adds `Write` back to an active agent. Bash 3.2 portable
+  per CLAUDE.md (no `declare -A`, no `mapfile`, no `${var,,}`,
+  newline-delimited string + `grep -Fxq` pattern).
+
+- **`_post_dispatch_dirty_scan()` (new shell function in
+  `commands/wiki-ingest.md`)**: in-root mutation defense at three
+  invocation sites — Step 7.5.M-A (post single-source analysis), Step
+  7.5.M-B Case B2 (post multi-source worker dispatch), Step 7.6.B-post
+  (post 2nd-pass collision merge). Computes a sha256 hash over
+  `<wiki_root>/pages/` + `<wiki_root>/.wiki-meta/` before and after each
+  agent dispatch; on mismatch, emits a stderr warning and aborts the
+  ingest with `PARTIAL_FAIL`. **`WIKI_TEST_MODE=1` env-gated** —
+  production `/wiki-ingest` runs skip the scan entirely (zero cost). See
+  Known limitations L2 for scope.
+
+### Backward compatibility
+
+- **Single-source A5 + multi-source A4 paths**: structurally equivalent
+  to v1.4.0 (same pages produced, same provenance, same log events).
+  NOT byte-identical — the split-agent dispatch changes which agent
+  emits the JSON (analysis vs worker, both with Write absent), but
+  `pages_created` semantics, lock acquisition, Stage 3 atomic-write,
+  and metadata pipeline are unchanged.
+- **All v1.4.0 invariants preserved**: A5 three-stage pipeline,
+  mandatory C3 concurrency check, `partial_fail` sentinel + Step 1.5
+  cascading, `pages_failed` log field, `ingest-fail` 3-strike
+  promotion, `.config.json` knobs.
+- **All v1.3.0 contracts preserved**: B5 dual-classification ledger,
+  `colliding_drafts` second-pass input (now consumed by
+  `wiki-synthesizer-worker`), hook YAML parser broaden.
+
+### Migration
+
+External callers that used `subagent_type: "wiki-synthesizer"` directly
+MUST switch to the qualified namespace per their use case:
+
+- Single-source analysis: `subagent_type: "deep-wiki:wiki-synthesizer-analysis"`
+- Multi-source worker (or 2nd-pass collision merge): `subagent_type: "deep-wiki:wiki-synthesizer-worker"`
+- Inline mode (DORMANT, restoration only): `subagent_type: "deep-wiki:wiki-synthesizer-inline"`
+
+The old single-agent name is removed in v1.4.1 — there is no
+compatibility shim per §3.4 Option B. `commands/wiki-ingest.md` itself
+was migrated as part of this release; only out-of-tree callers need
+action.
+
+### V-0 / V-1 / V-2 / V-3 verification task results
+
+Track C verification ran four behavioral probes (`scripts/v0-probe/`)
+to validate the trust-boundary closure end-to-end:
+
+- **V-0 PASS via Mechanism B (forced-attempt probe)**: qualified
+  namespace `deep-wiki:wiki-X` resolves; unqualified returns explicit
+  Agent-not-found error (no silent substitution to general-purpose).
+  This empirical finding closes the v1.4.0 dogfood root-cause analysis
+  (the failure was caller voluntary downgrade, not runtime
+  auto-substitution).
+- **V-1 ALL 3 surfaces PASS**: `wiki-page-writer` correctly refuses
+  prompt-injection (returns `worker_status: failed` + `tools:[]` cited
+  + Rule 2 cited); refuses nested-agent dispatch (contract violation
+  cited); output-forgery from worker JSON is rejected by Step 7.6.B
+  Gate 3.5 basename validation.
+- **V-2 / V-3 UNDETERMINED-extrapolated**: stub agents required for
+  V-2 / V-3 fault-injection were not in the plugin distribution cache
+  during testing (Path A acceptance per §6 fix-and-go cap). PASS is
+  evidence-extrapolated via the V-0 + V-1 chain. Final-file empirical
+  re-run is deferred to post-distribution dogfood.
+- **L1 caveat (cycle-4 R4-2)**: V-0 PASS is best-effort without a
+  Claude Code runtime metadata API; the cache distribution gap on V-2/V-3
+  stubs is treated as Path A acceptance.
+
+### Known limitations (mandatory per §11.5 — Path A acceptance posture)
+
+**L1. V-0 false-pass risk without dispatch-metadata API:**
+
+> Trust-boundary closure achieved at agent-file-metadata level (`tools:` declarations) and via static lint + in-root runtime guard (§3.9). Empirical proof of caller-side `subagent_type` resolution is best-effort due to Claude Code runtime not exposing dispatch metadata. False-pass risk remains for caller-substitution scenarios identical to v1.4.0 dogfood. Track C v2 deferred until runtime-API supports metadata exposure.
+
+**L2. §3.9 in-root scope only:**
+
+> §3.9 post-dispatch dirty-file scan covers `<wiki_root>/`-internal mutations (state-corruption defense), NOT off-root writes (information-disclosure-via-side-channel). The v1.4.0 dogfood failure mode (worker writes to `/tmp/`) is NOT detected by §3.9. v1.4.1 trust boundary is layered defense-in-depth, not comprehensive enforcement. Process-level sandboxing deferred to v1.5.0+.
+
+**Production-cost note (cycle-3 N3.4):** §3.9 is `WIKI_TEST_MODE=1`
+env-gated. Production `/wiki-ingest` invocations skip the dirty-file
+scan entirely (zero cost). Sandbox + re-dogfood opt-in only.
+
+### Deferred to v1.4.x or v1.5.0+
+
+- Track C v2 (post-runtime-metadata-API or post-process-sandbox)
+- Real-vault re-dogfood (Task 11 — user discretion)
+- Sandbox T1–T6 tests (Task 10 — user discretion per v1.4.0 Phase 6
+  precedent)
+- B1 fault-injection harness, B2 A4×A5 combination, B3
+  `phase_timing_ms` telemetry
+- §3.9 symlink-coverage tightening + post-Stage-3-close race hash-check
+
+### Implementation references
+
+- Plan: `docs/superpowers/plans/2026-05-05-wiki-synthesizer-agent-split.md`
+  (825 lines, 4 review cycles)
+- Handoff (V-0 empirical finding root-cause analysis):
+  `docs/handoff-2026-05-06-v1.4.1-task4.md`
+- 11 commits on `feature/v1.4.1-track-c` branch (Tasks 4–12 + this
+  CHANGELOG commit, Task 13)
+
 ## [1.4.0] — 2026-05-05
 
 A5 page-level fanout. Single-source `/wiki-ingest` parallelizes

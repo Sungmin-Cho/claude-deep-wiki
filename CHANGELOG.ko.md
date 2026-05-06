@@ -2,6 +2,192 @@
 
 deep-wiki의 주요 변경사항을 기록합니다.
 
+## [1.4.1] — 2026-05-06
+
+신뢰 경계 폐쇄 (best-effort, layered defense). 단일 `wiki-synthesizer.md`
+에이전트를 역할별 3개 파일 (`wiki-synthesizer-{analysis,worker,inline}.md`)로
+분할하고, 활성 경로의 `tools:` 선언에서 `Write`를 모두 제거. Claude Code의
+qualified-namespace (`deep-wiki:<agent>`)로 `/wiki-ingest`를 라우팅.
+프론트매터 lint (`scripts/lint-agent-tools.sh`)와 in-root post-dispatch
+dirty-file scan (`WIKI_TEST_MODE=1` env-gated, 프로덕션 비용 0)이 결합되어
+v1.4.0 dogfood 실패의 진짜 원인 — **caller 측 자발적 downgrade
+(`subagent_type: "general-purpose"`)** 로 인해 `wiki-page-writer`가
+Read+Write+Edit를 부여받아 Stage 3 lock 외부에 쓴 패턴 — 을 차단.
+단일 소스 A5 + 다중 소스 A4 경로는 v1.4.0과 **structurally equivalent**
+(byte-identical 아님 — split-agent dispatch가 누가 페이지를 쓰는지를 바꾸지,
+페이지 생성 의미를 바꾸지 않음).
+
+**프로덕션 비용 주석:** §3.9 dirty-file scan은 `WIKI_TEST_MODE=1` env로
+gating됨. 프로덕션 `/wiki-ingest` 실행은 scan을 완전히 skip (비용 0).
+sandbox + 재 dogfood 시나리오에 한해 opt-in — cycle-3 N3.4 / plan §3.9
+참조.
+
+### 아키텍처
+
+- **3-에이전트 split (Track C closure)**: v1.3.0 / v1.4.0의 단일
+  `agents/wiki-synthesizer.md` (mode-scoped 섹션) 파일이 역할별 3개
+  파일로 대체됨. 분할로 `Write`가 활성 호출 경로의 `tools:` 선언에서
+  제거되어, V-1 (callee 측 enforcement)이 매 턴 prompt가 협상해야 하는
+  런타임 contract가 아니라 에이전트 파일의 정적 속성이 됨.
+
+  | 파일 | 역할 | `tools:` | 호출자 |
+  |---|---|---|---|
+  | `agents/wiki-synthesizer-analysis.md` | Stage 1 단일 소스 A5 분석 (page_plan + sub-threshold inline_bodies) | `[Read, Glob, Grep, WebFetch]` (Write **부재**) | `commands/wiki-ingest.md` Step 7.5.M-A (단일 소스) |
+  | `agents/wiki-synthesizer-worker.md` | 다중 소스 A4 worker + 2nd-pass collision merge (worker mode + `colliding_drafts` input) | `[Read, Glob, Grep, WebFetch]` (Write **부재**) | `commands/wiki-ingest.md` Step 7.5.M-B + Step 7.6.B-post |
+  | `agents/wiki-synthesizer-inline.md` | DORMANT — v1.3.0 inline-mode contract (page-write-on-emit) 미래 복원용 보존 | `[Read, Write, Glob, Grep, WebFetch]` | (활성 호출자 없음; `status: dormant`) |
+
+- **기존 `agents/wiki-synthesizer.md` 삭제 (Option B per §3.4 — shim
+  없음)**: 통합 에이전트 파일이 v1.4.1에서 제거됨. 호환성 shim 없음.
+  `subagent_type: "wiki-synthesizer"`를 직접 dispatch하던 외부 caller는
+  반드시 아래 qualified-namespace 형식으로 마이그레이션 — Migration 섹션
+  참조.
+
+- **Qualified-namespace 라우팅 (V-0 empirical finding)**:
+  `commands/wiki-ingest.md`의 12개 dispatch 사이트가 unqualified
+  `subagent_type: "wiki-synthesizer"` (이제 Agent-not-found)에서
+  qualified 형식 `deep-wiki:wiki-synthesizer-analysis`,
+  `deep-wiki:wiki-synthesizer-worker`,
+  `deep-wiki:wiki-page-writer`로 갱신됨. V-0 검증 (Mechanism B
+  forced-attempt probe)이 실증적으로 확인:
+  - Qualified namespace `deep-wiki:wiki-X`는 Claude Code의 plugin
+    agent registration을 통해 정확히 resolve됨.
+  - Unqualified 이름은 명시적 Agent-not-found 에러 반환
+    (`general-purpose`로의 silent substitution 없음).
+  즉, v1.4.0 dogfood 실패는 런타임 auto-substitution이 **아니다**.
+  진짜 원인은 main 세션이 `wiki-page-writer` worker를 자발적으로
+  `subagent_type: "general-purpose"`로 downgrade한 것 — 이로 인해
+  Read+Write+Edit가 부여되어 Stage 3 lock 외부의 `/tmp/v140-workers-out/*`
+  로 쓰기 발생. Step 7.6.A에 향후 이 downgrade를 금지하는 명시적
+  V-0/C3 코멘트 추가.
+
+- **Inline rot-mitigation (v1.3.0 contract 보존)**:
+  `agents/wiki-synthesizer-inline.md`는 dormant 상태로 ship되지만
+  contract-frozen. frontmatter / header에 다음을 명시:
+  - `status: dormant`
+  - `last_known_active: v1.3.0`
+  - `contract_frozen_at: a9966c7` (통합 에이전트 삭제 commit SHA).
+    미래에 복원이 필요할 때, inline contract를 그 정확한 SHA에서
+    spec archaeology 없이 복구 가능.
+
+### 도구 (Tooling)
+
+- **`scripts/lint-agent-tools.sh` (신규, 225 lines, Bash 3.2 portable)**:
+  4개 에이전트 파일 (analysis + worker + inline + page-writer)에 대한
+  정적 frontmatter lint. 각 에이전트의 선언된 `tools:`가 hardcoded
+  manifest와 일치하는지 검증, WebFetch URL allowlist의 string-match
+  체크 추가. 미래 spec 변경이 활성 에이전트에 `Write`를 다시 추가하는
+  drift를 catch. CLAUDE.md 규약대로 Bash 3.2 portable (no `declare -A`,
+  no `mapfile`, no `${var,,}`, newline-delimited string + `grep -Fxq`
+  패턴).
+
+- **`_post_dispatch_dirty_scan()` (신규 shell 함수,
+  `commands/wiki-ingest.md` 내부)**: 3개 invocation 사이트에서 in-root
+  mutation 방어 — Step 7.5.M-A (post 단일 소스 분석), Step 7.5.M-B
+  Case B2 (post 다중 소스 worker dispatch), Step 7.6.B-post (post 2nd-pass
+  collision merge). 각 에이전트 dispatch 전후로
+  `<wiki_root>/pages/` + `<wiki_root>/.wiki-meta/`의 sha256 hash 계산;
+  mismatch 시 stderr warning 후 `PARTIAL_FAIL`로 ingest abort.
+  **`WIKI_TEST_MODE=1` env-gated** — 프로덕션 `/wiki-ingest` 실행은 scan
+  완전히 skip (비용 0). 범위는 Known limitations L2 참조.
+
+### 하위 호환성
+
+- **단일 소스 A5 + 다중 소스 A4 경로**: v1.4.0과 structurally equivalent
+  (같은 페이지 생성, 같은 provenance, 같은 log event). byte-identical
+  아님 — split-agent dispatch가 어떤 에이전트가 JSON을 emit하는지
+  (analysis vs worker, 둘 다 Write 부재) 변경하지만, `pages_created`
+  의미, lock 획득, Stage 3 atomic-write, metadata pipeline은 변경 없음.
+- **모든 v1.4.0 invariant 보존**: A5 3-stage pipeline, mandatory C3
+  concurrency check, `partial_fail` sentinel + Step 1.5 cascading,
+  `pages_failed` log 필드, `ingest-fail` 3-strike promote, `.config.json`
+  knob.
+- **모든 v1.3.0 contract 보존**: B5 dual-classification ledger,
+  `colliding_drafts` second-pass input (이제 `wiki-synthesizer-worker`가
+  consume), hook YAML parser broaden.
+
+### Migration
+
+`subagent_type: "wiki-synthesizer"`를 직접 사용하던 외부 caller는
+용도에 맞는 qualified namespace로 반드시 전환:
+
+- 단일 소스 분석: `subagent_type: "deep-wiki:wiki-synthesizer-analysis"`
+- 다중 소스 worker (또는 2nd-pass collision merge): `subagent_type: "deep-wiki:wiki-synthesizer-worker"`
+- Inline mode (DORMANT, 복원 전용): `subagent_type: "deep-wiki:wiki-synthesizer-inline"`
+
+기존 단일 에이전트 이름은 v1.4.1에서 제거됨 — §3.4 Option B에 따라
+호환성 shim 없음. `commands/wiki-ingest.md` 자체는 본 release의 일환으로
+이미 마이그레이션 완료; out-of-tree caller만 조치 필요.
+
+### V-0 / V-1 / V-2 / V-3 검증 결과
+
+Track C 검증은 신뢰 경계 폐쇄를 end-to-end로 validate하기 위해
+4개의 행동 probe (`scripts/v0-probe/`)를 실행:
+
+- **V-0 PASS via Mechanism B (forced-attempt probe)**: qualified
+  namespace `deep-wiki:wiki-X`는 resolve됨; unqualified는 명시적
+  Agent-not-found 에러 반환 (general-purpose로의 silent substitution
+  없음). 이 실증 finding이 v1.4.0 dogfood root-cause 분석을 마무리
+  (실패 원인은 caller 자발적 downgrade였지, 런타임 auto-substitution이
+  아니었음).
+- **V-1 ALL 3 surfaces PASS**: `wiki-page-writer`가 prompt-injection
+  거부 (`worker_status: failed` + `tools:[]` 인용 + Rule 2 인용),
+  nested-agent dispatch 거부 (contract violation 인용), worker JSON의
+  output-forgery는 Step 7.6.B Gate 3.5 basename validation으로 거부.
+- **V-2 / V-3 UNDETERMINED-extrapolated**: V-2 / V-3 fault-injection에
+  필요한 stub 에이전트가 테스트 시점에 plugin distribution cache에
+  부재 (Path A acceptance per §6 fix-and-go cap). PASS는 V-0 + V-1
+  체인을 통해 evidence-extrapolated. 최종 파일에 대한 empirical 재실행은
+  post-distribution dogfood로 보류.
+- **L1 caveat (cycle-4 R4-2)**: V-0 PASS는 Claude Code 런타임 metadata
+  API 부재로 best-effort; V-2/V-3 stub에 대한 cache distribution gap은
+  Path A acceptance로 처리.
+
+### Known limitations (§11.5에 따라 mandatory — Path A acceptance 자세)
+
+**L1. dispatch-metadata API 부재로 인한 V-0 false-pass 위험:**
+
+> Trust-boundary closure achieved at agent-file-metadata level (`tools:` declarations) and via static lint + in-root runtime guard (§3.9). Empirical proof of caller-side `subagent_type` resolution is best-effort due to Claude Code runtime not exposing dispatch metadata. False-pass risk remains for caller-substitution scenarios identical to v1.4.0 dogfood. Track C v2 deferred until runtime-API supports metadata exposure.
+
+(번역: 신뢰 경계 폐쇄는 에이전트 파일 metadata 수준 (`tools:` 선언)과
+정적 lint + in-root 런타임 가드 (§3.9)에서 달성됨. caller 측
+`subagent_type` resolution의 실증적 증명은 Claude Code 런타임이 dispatch
+metadata를 노출하지 않아 best-effort에 그침. v1.4.0 dogfood와 동일한
+caller-substitution 시나리오에 대한 false-pass 위험은 잔존. Track C v2는
+런타임 API가 metadata 노출을 지원할 때까지 보류.)
+
+**L2. §3.9는 in-root 범위만:**
+
+> §3.9 post-dispatch dirty-file scan covers `<wiki_root>/`-internal mutations (state-corruption defense), NOT off-root writes (information-disclosure-via-side-channel). The v1.4.0 dogfood failure mode (worker writes to `/tmp/`) is NOT detected by §3.9. v1.4.1 trust boundary is layered defense-in-depth, not comprehensive enforcement. Process-level sandboxing deferred to v1.5.0+.
+
+(번역: §3.9 post-dispatch dirty-file scan은 `<wiki_root>/` 내부의
+mutation (state-corruption 방어) 만 커버. off-root 쓰기
+(information-disclosure-via-side-channel)는 검출 NOT. v1.4.0 dogfood의
+실제 실패 모드 (worker가 `/tmp/`에 쓰기)는 §3.9가 검출하지 못함. v1.4.1
+신뢰 경계는 layered defense-in-depth이지, comprehensive enforcement 아님.
+프로세스 수준 sandboxing은 v1.5.0+로 보류.)
+
+**프로덕션 비용 주석 (cycle-3 N3.4):** §3.9는 `WIKI_TEST_MODE=1`
+env-gated. 프로덕션 `/wiki-ingest` 실행은 dirty-file scan을 완전히 skip
+(비용 0). sandbox + 재 dogfood opt-in 전용.
+
+### v1.4.x 또는 v1.5.0+로 보류
+
+- Track C v2 (post-runtime-metadata-API 또는 post-process-sandbox)
+- Real-vault 재 dogfood (Task 11 — 사용자 재량)
+- Sandbox T1–T6 tests (Task 10 — v1.4.0 Phase 6 선례에 따라 사용자 재량)
+- B1 fault-injection harness, B2 A4×A5 결합, B3 `phase_timing_ms`
+  telemetry
+- §3.9 symlink coverage 강화 + post-Stage-3-close race hash-check
+
+### 구현 참조
+
+- Plan: `docs/superpowers/plans/2026-05-05-wiki-synthesizer-agent-split.md`
+  (825 lines, 4 review cycles)
+- Handoff (V-0 empirical finding root-cause 분석):
+  `docs/handoff-2026-05-06-v1.4.1-task4.md`
+- `feature/v1.4.1-track-c` 브랜치의 11개 commit (Tasks 4–12 + 본
+  CHANGELOG commit, Task 13)
+
 ## [1.4.0] — 2026-05-05
 
 A5 페이지 단위 fanout. 단일 소스 `/wiki-ingest`가 페이지 본문 생성을

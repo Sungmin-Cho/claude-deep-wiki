@@ -494,7 +494,7 @@ The following 3 shell functions implement the §3.9 post-dispatch dirty-file sca
 # _post_dispatch_dirty_scan — invoked at 3 sites (Step 7.5.M-A / 7.5.M-B / 7.6.B-post)
 # Args: $1 = phase label ("A4-fanout" | "A4-second-pass" | "A5-fanout")
 # Reads/sets globals: PRE_DISPATCH_HASH (pre-snapshot), PARTIAL_FAIL, FAILED_REASON
-# Side effect: if mismatch, sets PARTIAL_FAIL=1 and triggers abort
+# Side effect: if mismatch, sets PARTIAL_FAIL=true and triggers abort
 
 _compute_wiki_hash() {
   # Single-line digest of <WIKI_ROOT>/pages + <WIKI_ROOT>/.wiki-meta tree.
@@ -530,7 +530,7 @@ _post_dispatch_dirty_scan() {
   post_hash=$(_compute_wiki_hash)
   if [ -n "${PRE_DISPATCH_HASH:-}" ] && [ "$PRE_DISPATCH_HASH" != "$post_hash" ]; then
     echo "FATAL: $phase worker mutated wiki_root (pre=$PRE_DISPATCH_HASH, post=$post_hash)" >&2
-    PARTIAL_FAIL=1
+    PARTIAL_FAIL=true
     FAILED_REASON="worker_mutation_detected ($phase)"
     # Trigger Step 7.7.A worker-mutation failure handling here:
     # - Emit partial_fail sentinel for all source slugs in the batch
@@ -767,11 +767,13 @@ done <<< "$SORTED_SOURCES"
 
 Before building the in-batch ledger, verify no worker mutated the wiki tree during their LLM execution window (gated by `WIKI_TEST_MODE=1`; production skips):
 
+*Note: `abort_ingest` is shorthand for the abort sequence documented inside `_post_dispatch_dirty_scan` (set sentinel, log event, do not promote `.pending-scan`); implementer inlines those steps per Step 7.7.A worker-mutation failure handling. Same convention applies at the other 2 invocation sites (Step 7.5.M-B Case B2 and Step 7.6.B-post).*
+
 ```bash
 _post_dispatch_dirty_scan "A4-fanout" || abort_ingest
 ```
 
-On mismatch: function emits `FATAL: ...` to stderr, sets `PARTIAL_FAIL=1` + `FAILED_REASON="worker_mutation_detected (A4-fanout)"`, and triggers Step 7.7.A worker-mutation failure handling. The ingest aborts; `.pending-scan` is NOT promoted.
+On mismatch: function emits `FATAL: ...` to stderr, sets `PARTIAL_FAIL=true` + `FAILED_REASON="worker_mutation_detected (A4-fanout)"`, and triggers Step 7.7.A worker-mutation failure handling. The ingest aborts; `.pending-scan` is NOT promoted.
 
 Once all workers return, the agent collects their `drafts[]` arrays into a
 single `ALL_DRAFTS` list. The aggregation runs B5 dual-classification with
@@ -830,7 +832,7 @@ the v1.2.1 rules extended for fanout:
        _post_dispatch_dirty_scan "A4-second-pass" || abort_ingest
        ```
 
-       On mismatch: same handling as Site 1 (Step 7.7.A failure path, PARTIAL_FAIL=1, ingest aborts).
+       On mismatch: same handling as Site 1 (Step 7.7.A failure path, PARTIAL_FAIL=true, ingest aborts).
 
          1. Main dispatches a **single** wiki-synthesizer subagent in
             `mode: "worker"` with the new `colliding_drafts` input field
@@ -1299,7 +1301,7 @@ _post_dispatch_dirty_scan "A5-fanout" || abort_ingest
 
 **CRITICAL ordering** (cycle-3 N1.2 fix): this scan MUST fire BEFORE Step 7.6.C atomic-write, not after — otherwise main's legitimate Phase 3 writes register as worker-mutation false positives and abort every ingest.
 
-On mismatch: function emits `FATAL: A5-fanout worker mutated wiki_root (pre=..., post=...)` to stderr, sets `PARTIAL_FAIL=1` + `FAILED_REASON="worker_mutation_detected (A5-fanout)"`, and triggers Step 7.7.A worker-mutation failure handling. The ingest aborts; lock is released; `.pending-scan` is NOT promoted.
+On mismatch: function emits `FATAL: A5-fanout worker mutated wiki_root (pre=..., post=...)` to stderr, sets `PARTIAL_FAIL=true` + `FAILED_REASON="worker_mutation_detected (A5-fanout)"`, and triggers Step 7.7.A worker-mutation failure handling. The ingest aborts; lock is released; `.pending-scan` is NOT promoted.
 
 #### Step 7.6.C — Atomic write under lock (mandatory C3 concurrency check + manifest conversion)
 

@@ -508,11 +508,11 @@ _compute_wiki_hash() {
               || sha256sum -- "$f" 2>/dev/null; } \
             | awk '{print $1, $2}'
           done; } \
-      | shasum -a 256 \
+      | { shasum -a 256 2>/dev/null || sha256sum 2>/dev/null; } \
       | awk '{print $1}'
   else
     # First-ingest case: empty/non-existent paths produce a deterministic empty digest.
-    printf '' | shasum -a 256 | awk '{print $1}'
+    printf '' | { shasum -a 256 2>/dev/null || sha256sum 2>/dev/null; } | awk '{print $1}'
   fi
 }
 

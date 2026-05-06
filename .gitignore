@@ -9,3 +9,19 @@
 # These are author-local artifacts and must never reach the remote.
 docs/
 .deep-review/
+
+# V-0 / V-1 / V-2 / V-3 probe results (per scripts/v0-probe/{v0,v1,v2-v3}-procedure.md §5)
+# — outcomes are session-specific and authored by the main session at run
+# time, not artifacts of the v1.4.1 commit history.
+scripts/v0-probe/results.tsv
+scripts/v0-probe/v1-results.tsv
+scripts/v0-probe/v2-results.tsv
+scripts/v0-probe/v3-results.tsv
+
+# V-2 / V-3 webfetch-exfil stub server runtime artifacts (per
+# scripts/v0-probe/v2-v3-procedure.md §2). The stub server runs only
+# during probe execution; logs are session-specific runtime captures, not
+# artifacts of the v1.4.1 commit history.
+scripts/v0-probe/webfetch-stub.log
+scripts/v0-probe/webfetch-stub-stdout.log
+scripts/v0-probe/__pycache__/

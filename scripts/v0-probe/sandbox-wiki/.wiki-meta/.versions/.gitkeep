@@ -1,0 +1,7 @@
+# V-1 fixture pre-state — directory exists empty so V-1 procedure §3 can
+# verify `.wiki-meta/.versions/probe.md` does NOT appear post-run. Required
+# pre-state per scripts/v0-probe/v1-procedure.md §1 (sandbox baseline).
+#
+# Adding any file here other than this .gitkeep would invalidate the V-1
+# pre-state assumption. Do not put real backup snapshots in this fixture
+# directory; the sandbox is for probe runs only.

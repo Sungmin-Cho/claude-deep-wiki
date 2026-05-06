@@ -463,7 +463,7 @@ INBOX_FILES=()
 
 Sources of other types (`url`, `file`, `deep-work-report`) are unchanged and have their `origin` already set from Step 1.
 
-### 7. Dispatch to wiki-synthesizer (always)
+### 7. Dispatch to wiki-synthesizer-{analysis|worker} (split agents, v1.4.1+)
 
 > **v1.4.0+ change:** synthesizer invocation branches on source count AND
 > on `len(page_plan)` for single-source. See "Step 7.5 — Synthesizer
@@ -473,9 +473,9 @@ Sources of other types (`url`, `file`, `deep-work-report`) are unchanged and hav
 > (page_plan emit) rather than `mode: "inline"` (v1.3.0 single-source).
 > Multi-source path is unchanged from v1.3.0 (A4 fanout, Approach B).
 
-Spawn the `wiki-synthesizer` agent via the Agent tool. This happens for **every** ingest — single-source, multi-source, URL, file, pasted text, or deep-work report alike. The main session does not read source content or page bodies; it only passes paths and the candidate list.
+Spawn the appropriate split agent via the Agent tool: `deep-wiki:wiki-synthesizer-analysis` for single-source ingests (v1.4.0+ A5 page-fanout) OR `deep-wiki:wiki-synthesizer-worker` for multi-source ingests (v1.3.0+ A4 fanout). This happens for **every** ingest — single-source, multi-source, URL, file, pasted text, or deep-work report alike. The main session does not read source content or page bodies; it only passes paths and the candidate list.
 
-**Input and output contracts are defined in `agents/wiki-synthesizer.md` (Input contract / Output contract sections). That file is the single source of truth. This step summarizes what the caller does with the returned manifest; for field semantics, see the agent file.**
+**Input and output contracts are defined in `agents/wiki-synthesizer-analysis.md` (Input contract / Analysis output contract sections — single-source path) and `agents/wiki-synthesizer-worker.md` (Input contract / Worker output contract sections — multi-source path). Those files are the single source of truth. This step summarizes what the caller does with the returned manifest; for field semantics, see the agent files.**
 
 Input (summary):
 - `wiki_root`
@@ -485,6 +485,70 @@ Input (summary):
 Output (summary): structured entries for `created` / `updated` carrying `{file, title, tags, aliases, sources}`, plus `versioned`, `source_hashes` (per-slug sha256), and `failed` (may include `orphan_version`).
 
 If `failed` is non-empty, continue with metadata updates for whatever succeeded and include the failures in the final report (Step 14). Always release the lock. **In auto-ingest mode, do NOT promote `.pending-scan → .last-scan` on any partial or full failure** — the next session's hook will re-detect the window. See Error Handling below.
+
+### Step 7 — Shared utility: §3.9 worker mutation detection (`WIKI_TEST_MODE=1` gated)
+
+The following 3 shell functions implement the §3.9 post-dispatch dirty-file scan (per plan §3.9, cycle-3 N1.1/N1.2/N1.3 fixes). They are invoked at 3 dispatch sites (Step 7.5.M-A / Step 7.5.M-B Case B2 / Step 7.6.B-post) to detect worker LLM mutations of `<wiki_root>/` files outside the lock-protected atomic-write windows. Production runs skip (zero cost); re-dogfood + sandbox tests opt in via `WIKI_TEST_MODE=1`.
+
+```bash
+# _post_dispatch_dirty_scan — invoked at 3 sites (Step 7.5.M-A / 7.5.M-B / 7.6.B-post)
+# Args: $1 = phase label ("A4-fanout" | "A4-second-pass" | "A5-fanout")
+# Reads/sets globals: PRE_DISPATCH_HASH (pre-snapshot), PARTIAL_FAIL, FAILED_REASON
+# Side effect: if mismatch, sets PARTIAL_FAIL=true and triggers abort
+
+_compute_wiki_hash() {
+  # Single-line digest of <WIKI_ROOT>/pages + <WIKI_ROOT>/.wiki-meta tree.
+  # Bash 3.2 portable: no mapfile, no declare -A, no &>/dev/null.
+  # Pre-hash stored in shell variable, NOT in scanned tree (cycle-3 N1.1 fix).
+  if [ -d "$WIKI_ROOT/pages" ] || [ -d "$WIKI_ROOT/.wiki-meta" ]; then
+    find "$WIKI_ROOT/pages" "$WIKI_ROOT/.wiki-meta" -type f 2>/dev/null \
+      | sort \
+      | { while IFS= read -r f; do
+            { shasum -a 256 -- "$f" 2>/dev/null \
+              || sha256sum -- "$f" 2>/dev/null; } \
+            | awk '{print $1, $2}'
+          done; } \
+      | { shasum -a 256 2>/dev/null || sha256sum 2>/dev/null; } \
+      | awk '{print $1}'
+  else
+    # First-ingest case: empty/non-existent paths produce a deterministic empty digest.
+    printf '' | { shasum -a 256 2>/dev/null || sha256sum 2>/dev/null; } | awk '{print $1}'
+  fi
+}
+
+_post_dispatch_pre_snapshot() {
+  if [ "${WIKI_TEST_MODE:-0}" = "1" ]; then
+    PRE_DISPATCH_HASH=$(_compute_wiki_hash)
+  fi
+}
+
+_post_dispatch_dirty_scan() {
+  # $1 = phase label
+  local phase="${1:-unknown}"
+  if [ "${WIKI_TEST_MODE:-0}" != "1" ]; then return 0; fi
+  local post_hash
+  post_hash=$(_compute_wiki_hash)
+  if [ -n "${PRE_DISPATCH_HASH:-}" ] && [ "$PRE_DISPATCH_HASH" != "$post_hash" ]; then
+    echo "FATAL: $phase worker mutated wiki_root (pre=$PRE_DISPATCH_HASH, post=$post_hash)" >&2
+    PARTIAL_FAIL=true
+    FAILED_REASON="worker_mutation_detected ($phase)"
+    # Trigger Step 7.7.A worker-mutation failure handling here:
+    # - Emit partial_fail sentinel for all source slugs in the batch
+    # - Log worker_mutation_detected event with phase label
+    # - Abort the ingest (do NOT promote .pending-scan)
+    return 1
+  fi
+  return 0
+}
+```
+
+**Acceptance gate (cycle-3 N1.1 clean no-op):** `_post_dispatch_pre_snapshot` + `_post_dispatch_dirty_scan` MUST pass when no worker mutation occurs between them — pre-hash and post-hash equal, function returns 0. Any non-clean baseline indicates §3.9 is broken (e.g., scan walking files modified by main's bookkeeping during the window) and MUST not ship.
+
+**Production cost trade-off:** zero by default (env-gated). Sandbox/dogfood adds one filesystem walk per dispatch site per ingest (~300 stat calls + sha256 hashes; sub-second on local SSD). Production trusts V-0/V-1/V-2/V-3 chain alone (per cycle-3 N3.4 reframing).
+
+**Limitations** (refined cycle-3 N1.5 — honest framing): catches Stage-2-direct mutation; does NOT cover post-Stage-3-close race, atomic-rename via /tmp/, or symbolic links. See plan §3.9 limitations subsection for v1.4.1.x follow-up candidates.
+
+**Bash 3.2 portability** (per CLAUDE.md): no `declare -A`, no `mapfile`, no `${var,,}`. The `local` keyword IS Bash 3.2-compatible (built-in to functions). `shasum -a 256 || sha256sum` dual fallback (R-P1 fix per plan).
 
 ### 7.5. Synthesizer dispatch (v1.4.0+: single-source A5 / multi-source A4)
 
@@ -549,7 +613,7 @@ if sources_count == 1:
     # threshold=9999 + 5-page plan, Stage 1 would NOT emit inline_bodies
     # (5 ≥ 3 → fanout under default), main then chooses sub-threshold
     # branch (5 < 9999) and aborts on lex-set mismatch.
-    invoke wiki-synthesizer mode="analysis" a5_fanout_threshold=$A5_FANOUT_THRESHOLD
+    invoke deep-wiki:wiki-synthesizer-analysis a5_fanout_threshold=$A5_FANOUT_THRESHOLD  # qualified namespace per V-0 empirical finding (handoff §0); mode arg dropped (agent identity replaces it)
     page_plan = synthesizer.page_plan
     inline_bodies = synthesizer.inline_bodies
     source_hashes = synthesizer.source_hashes
@@ -647,7 +711,17 @@ same atomic-write algorithm, parameterized only by the source of drafts
 
 #### Step 7.5.M-A — Parallel worker dispatch (multi-source A4 — Phase 1)
 
-Split sources across **`min(3, ${#SOURCES[@]})`** wiki-synthesizer worker
+**§3.9 worker mutation detection — pre-snapshot:**
+
+Before dispatching the parallel workers, capture a baseline hash of the wiki tree (gated by `WIKI_TEST_MODE=1`; production skips):
+
+```bash
+_post_dispatch_pre_snapshot   # Sets PRE_DISPATCH_HASH if WIKI_TEST_MODE=1
+```
+
+The matching `_post_dispatch_dirty_scan "A4-fanout"` invocation fires at the start of Step 7.5.M-B (before the B5 ledger build), bracketing the worker LLM execution window.
+
+Split sources across **`min(3, ${#SOURCES[@]})`** deep-wiki:wiki-synthesizer-worker
 subagents. Sources are sorted lexicographically by `origin` (source path)
 for deterministic worker assignment across reruns. Round-robin distribution:
 `source[i] → worker (i % WORKER_COUNT)`. **Dispatch all N workers in a
@@ -655,14 +729,17 @@ single Agent-tool-message-turn** (the LLM emits N parallel Agent tool
 invocations in one assistant turn — that is the actual parallel mechanism
 in Claude Code; there is no shell-side orchestrator).
 
-Each worker invocation specifies `subagent_type: "wiki-synthesizer"` with
+Each worker invocation specifies `subagent_type: "deep-wiki:wiki-synthesizer-worker"` (qualified namespace per V-0 empirical finding) with
 input descriptor:
+
+(The `mode` field is removed in v1.4.1+ — agent identity `deep-wiki:wiki-synthesizer-worker` replaces it.)
 
 ```json
 {
-  "mode": "worker",
   "wiki_root": "<absolute path>",
-  "sources": [<source descriptors assigned to this worker, sorted>],
+  "source_shard": {
+    "sources": [<source descriptors assigned to this worker, sorted>]
+  },
   "candidates": [<candidate descriptors — same snapshot for all workers>]
 }
 ```
@@ -688,6 +765,18 @@ done <<< "$SORTED_SOURCES"
 ```
 
 #### Step 7.5.M-B — Aggregate drafts (multi-source A4 — Phase 2, sequential, in-memory)
+
+**§3.9 worker mutation detection — post-dispatch scan:**
+
+Before building the in-batch ledger, verify no worker mutated the wiki tree during their LLM execution window (gated by `WIKI_TEST_MODE=1`; production skips):
+
+*Note: `abort_ingest` is shorthand for the abort sequence documented inside `_post_dispatch_dirty_scan` (set sentinel, log event, do not promote `.pending-scan`); implementer inlines those steps per Step 7.7.A worker-mutation failure handling. Same convention applies at the other 2 invocation sites (Step 7.5.M-B Case B2 and Step 7.6.B-post).*
+
+```bash
+_post_dispatch_dirty_scan "A4-fanout" || abort_ingest
+```
+
+On mismatch: function emits `FATAL: ...` to stderr, sets `PARTIAL_FAIL=true` + `FAILED_REASON="worker_mutation_detected (A4-fanout)"`, and triggers Step 7.7.A worker-mutation failure handling. The ingest aborts; `.pending-scan` is NOT promoted.
 
 Once all workers return, the agent collects their `drafts[]` arrays into a
 single `ALL_DRAFTS` list. The aggregation runs B5 dual-classification with
@@ -731,14 +820,31 @@ the v1.2.1 rules extended for fanout:
        bodies. Run a SECOND PASS — but use **`mode: "worker"`** (NOT
        `"inline"`, which would write files during Phase 2 and break the
        single-writer invariant):
-         1. Main dispatches a **single** wiki-synthesizer subagent in
-            `mode: "worker"` with the new `colliding_drafts` input field
-            (defined in Task 8 Plan #2.1 extension). Input shape:
+
+       **§3.9 worker mutation detection — pre-snapshot (B2 only, conditional):**
+
+       Before dispatching the second-pass synthesizer worker, re-snapshot (gated by `WIKI_TEST_MODE=1`):
+
+       ```bash
+       _post_dispatch_pre_snapshot   # re-captures PRE_DISPATCH_HASH for the B2 window
+       ```
+
+       After the second-pass worker returns its merged draft (BEFORE main proceeds to write merged content during Phase 3), invoke the scan:
+
+       ```bash
+       _post_dispatch_dirty_scan "A4-second-pass" || abort_ingest
+       ```
+
+       On mismatch: same handling as Site 1 (Step 7.7.A failure path, PARTIAL_FAIL=true, ingest aborts).
+
+         1. Main dispatches a **single** `deep-wiki:wiki-synthesizer-worker` subagent (qualified namespace per V-0 empirical finding) with the new `colliding_drafts` input field
+            (defined in Task 8 Plan #2.1 extension). The `mode` field is removed in v1.4.1+ — agent identity replaces it. Input shape:
             ```json
             {
-              "mode": "worker",
               "wiki_root": "...",
-              "sources": [<union of contributing source descriptors>],
+              "source_shard": {
+                "sources": [<union of contributing source descriptors>]
+              },
               "candidates": [<existing wiki page if action=update, else []>],
               "colliding_drafts": [
                 {"source_slug": "a", "page_content": "<body from worker A>"},
@@ -751,7 +857,10 @@ the v1.2.1 rules extended for fanout:
             `page_content` honoring v1.2.1 multi-source merge semantics
             (Rule 6 conflict notation when sources disagree). Returns
             ONE draft via the standard worker output contract — NO
-            file writes (worker mode contract enforced).
+            file writes (worker mode contract enforced). **§3.9 scan:
+            `_post_dispatch_dirty_scan "A4-second-pass"` fires HERE
+            (between worker return and main's Phase 3 write below) per
+            the pre-snapshot/scan pair documented above.**
          3. Main writes the merged content during Phase 3 (under the
             already-held lock); all contributing slugs go into
             `sources` (sorted lexicographically per W12).
@@ -1018,11 +1127,23 @@ After Step 7.5's analysis-mode invocation, when `len(page_plan) >= a5_fanout_thr
 
 #### Step 7.6.A — Parallel page-writer dispatch
 
+**§3.9 worker mutation detection — pre-snapshot:**
+
+Before dispatching the parallel page-writer workers, capture a baseline hash (gated by `WIKI_TEST_MODE=1`):
+
+```bash
+_post_dispatch_pre_snapshot   # Sets PRE_DISPATCH_HASH if WIKI_TEST_MODE=1
+```
+
+The matching `_post_dispatch_dirty_scan "A5-fanout"` fires AFTER worker output validation (Step 7.6.B) but BEFORE Step 7.6.C atomic-write — bracketing the worker LLM execution window. Cycle-3 N1.2 fix: scan MUST run BEFORE main's legitimate writes, not after.
+
+**§3.2 + V-0 empirical finding (handoff §0): subagent_type MUST be `deep-wiki:wiki-page-writer` (qualified namespace), NOT `general-purpose`.** The v1.4.0 dogfood failure root cause was main session voluntarily downgrading to `subagent_type: "general-purpose"` for `wiki-page-writer` workers — granting Read+Write+Edit and enabling unsafe writes outside the lock. V-0 empirically confirmed (per docs/handoff-2026-05-06-v1.4.1-task4.md Section 0 + scripts/v0-probe/results.tsv) that qualified namespace `deep-wiki:wiki-page-writer` resolves correctly; unqualified `wiki-page-writer` returns explicit Agent-not-found error (no silent substitution). DO NOT downgrade dispatch fallback to general-purpose under any circumstance — the explicit error is preferable to silent contract violation.
+
 For each entry in `page_plan`, dispatch one `wiki-page-writer` agent in a single message (concurrent execution):
 
 ```
 Agent({
-  subagent_type: "wiki-page-writer",
+  subagent_type: "deep-wiki:wiki-page-writer",
   run_in_background: true,
   prompt: <JSON-encoded {wiki_root, page_plan_entry: <entry>}>
 })
@@ -1174,6 +1295,18 @@ done
 ```
 
 If `len(SUCCESS_DRAFTS) == 0`, ALL workers failed → see Step 7.7.B (all-fail path).
+
+#### Step 7.6.B-post — §3.9 worker mutation detection (pre-Step-7.6.C)
+
+After Step 7.6.B aggregation + validation completes, verify no `wiki-page-writer` worker mutated the wiki tree during their LLM execution window (gated by `WIKI_TEST_MODE=1`; production skips):
+
+```bash
+_post_dispatch_dirty_scan "A5-fanout" || abort_ingest
+```
+
+**CRITICAL ordering** (cycle-3 N1.2 fix): this scan MUST fire BEFORE Step 7.6.C atomic-write, not after — otherwise main's legitimate Phase 3 writes register as worker-mutation false positives and abort every ingest.
+
+On mismatch: function emits `FATAL: A5-fanout worker mutated wiki_root (pre=..., post=...)` to stderr, sets `PARTIAL_FAIL=true` + `FAILED_REASON="worker_mutation_detected (A5-fanout)"`, and triggers Step 7.7.A worker-mutation failure handling. The ingest aborts; lock is released; `.pending-scan` is NOT promoted.
 
 #### Step 7.6.C — Atomic write under lock (mandatory C3 concurrency check + manifest conversion)
 
@@ -1873,7 +2006,7 @@ The classification change emits a one-line note in the Step 14 report ("N entrie
 
 **Note on bash 3.2 portability (CR-B v1.2.1+):** the prior `("${ARR[@]:-}")` snapshot pattern is **broken** for empty arrays in bash 3.2.57. The Self-Review checklist that initially claimed it as "set-u-safe array deref" conflated *iteration* (where `${ARR[@]:-}` is correctly empty) with *array literal initialization* (where the `:-}` substitutes a single empty string). All four sites in this task use the length-guarded `[ ${#ARR[@]} -gt 0 ] && ...` pattern instead.
 
-**d. Normalize `source_hashes`.** The agent returns `source_hashes` with one entry per source slug (the caller rejected the manifest in Step 7 / Error Handling if any passed-in slug was missing). The *values*, however, may not all be valid sha256 digests: the default `wiki-synthesizer` agent has no shell/hashing capability (its tool scope is `Read, Write, Glob, Grep, WebFetch`), so it returns a sentinel placeholder value for each slug. The caller is responsible for normalizing these to real digests before Step 8e.
+**d. Normalize `source_hashes`.** The agent returns `source_hashes` with one entry per source slug (the caller rejected the manifest in Step 7 / Error Handling if any passed-in slug was missing). The *values*, however, may not all be valid sha256 digests: all three split agents (`deep-wiki:wiki-synthesizer-{analysis|worker|inline}`) have no shell/hashing capability — their tool scopes (`Read, [Write,] Glob, Grep, WebFetch` — Write only on dormant inline) exclude any hashing tool, so they return a sentinel placeholder value for each slug. The caller is responsible for normalizing these to real digests before Step 8e.
 
 For each slug, validate its value against `^[0-9a-f]{64}$` (case-insensitive — authoritative agent-computed digest). If it matches, use it verbatim as the `content_hash`. If it does NOT match (sentinel, empty, wrong length, non-hex chars, etc.), recompute from the source's `origin`:
 
@@ -2014,7 +2147,7 @@ Show the user:
 
 ## Agent Delegation (always on)
 
-Every ingest — single-source, multi-source, URL, file, or deep-work report — dispatches to the `wiki-synthesizer` agent at Step 7. The agent owns source reading, page-body reading, create-vs-update judgment, page writing, and version backup; this command owns lock, pre-batch snapshot, metadata (index.json, log.jsonl, sources/*.yaml), human artifacts (index.md, log.md), and auto-lint. This separation keeps page content out of main's context window, which matters especially for batch auto-ingests (see below).
+Every ingest — single-source, multi-source, URL, file, or deep-work report — dispatches to `deep-wiki:wiki-synthesizer-analysis` (single-source A5 path) or `deep-wiki:wiki-synthesizer-worker` (multi-source A4 path) at Step 7. The agent owns source reading, page-body reading, create-vs-update judgment, page writing, and version backup; this command owns lock, pre-batch snapshot, metadata (index.json, log.jsonl, sources/*.yaml), human artifacts (index.md, log.md), and auto-lint. This separation keeps page content out of main's context window, which matters especially for batch auto-ingests (see below).
 
 The `--synthesize` flag remains accepted for backward compatibility but is now a **hint only**: it signals the caller expects cross-source synthesis, which the agent already performs for any batch with multiple sources. No branching logic is gated on this flag.
 
@@ -2032,7 +2165,7 @@ In this case:
    This "snapshot" lets us detect concurrent hook activity: if another session's hook runs and overwrites `.pending-scan` during our batch, we must NOT promote a timestamp later than what we actually covered.
 3. Group related files by directory/topic
 4. For each group, follow the standard ingest workflow (Steps 1-14). Each group is a full ingest cycle minus lock acquisition — critically, `PRE_BATCH_PAGES` (Step 6) is captured **per group** (NOT once for the whole batch), so pages created by an earlier group are correctly classified as `pages_updated` if a later group touches them.
-5. Each group is dispatched to `wiki-synthesizer` as a multi-source batch (Step 7) — no flag needed
+5. Each group is dispatched to `deep-wiki:wiki-synthesizer-worker` as a multi-source batch (Step 7) — no flag needed
 6. **After all files are processed successfully, and before the `rmdir` that releases the `.wiki-lock` directory** (i.e. between writing the last page/log entry and releasing the lock), promote `.pending-scan` → `.last-scan` with race, size, and regression guards:
    ```bash
    PENDING_FILE="<wiki_root>/.wiki-meta/.pending-scan"
@@ -2089,7 +2222,16 @@ In this case:
 ## Error Handling
 
 - If the lock cannot be acquired, report the error and stop
-- If the `wiki-synthesizer` agent cannot be spawned or returns an unparseable response, release the lock and report the error. Do NOT promote `.pending-scan` — the next session will re-detect the window. "Unparseable" means one of: (a) not valid JSON, (b) missing any of `created`/`updated`/`versioned`/`source_hashes`/`failed` at the top level, (c) entries in `created`/`updated` missing required fields (`file`/`title`/`tags`/`aliases`/`sources`), (d) `source_hashes` missing a slug the caller passed in. Note that invalid-format `source_hashes` *values* (sentinels, empty strings, non-hex) are NOT fatal — Step 8d normalizes them via main-side recompute. Only a missing key for a slug the caller passed in is fatal.
+- If any of the split agents (`deep-wiki:wiki-synthesizer-{analysis|worker}`, also `deep-wiki:wiki-page-writer` for A5 fanout) cannot be spawned or returns an unparseable response, release the lock and report the error. Do NOT promote `.pending-scan` — the next session will re-detect the window.
+
+  "Unparseable" depends on which split agent returned the response (per-agent contracts differ in v1.4.1+):
+  - `deep-wiki:wiki-synthesizer-analysis`: missing `mode: "analysis"` literal, OR missing `page_plan` array (may be empty), OR missing `source_hashes` map. `inline_bodies` array required (may be empty when above-threshold).
+  - `deep-wiki:wiki-synthesizer-worker`: missing `mode: "worker"` literal, OR missing `drafts` array, OR missing `source_hashes` map.
+  - `deep-wiki:wiki-page-writer`: missing `file` field, OR missing `page_content`, OR missing `frontmatter_meta` (object), OR missing `worker_status` field.
+  - For `wiki-synthesizer-analysis` AND `wiki-synthesizer-worker`: `source_hashes` missing a slug the caller passed in is fatal.
+  - For `wiki-page-writer`: any worker-output validation failure is handled per Step 7.6.B Gates 1-4 (file basename, status branch, page_content non-empty, frontmatter_meta subfields) — the per-agent contract above is the BEFORE-Gate-1 baseline.
+  - Note: invalid-format `source_hashes` *values* (sentinels like `"main-computes"`, empty strings, non-hex) are NOT fatal — Step 8d normalizes them via main-side recompute. Only a missing key for a slug the caller passed in is fatal.
+  - Legacy `created`/`updated`/`versioned`/`failed` shape applies ONLY to the Step 8 manifest AFTER main reconciles drafts/page_plans (i.e., post-aggregation, NOT raw split-agent output). Step 8a's manifest construction generates this shape from per-agent outputs; Step 8b+ validation operates on this constructed manifest, not on the raw agent JSON.
 - Always release the lock in case of errors (use trap in bash operations)
 - **Inbox cleanup (type: text)**: The trap that releases the lock also deletes each file in `INBOX_FILES` (populated in Step 6.5). Never use `.inbox/*.txt` wildcards — stale inbox files from a prior crashed session belong to that session and may still be needed for recovery. This cleanup runs on success AND failure so pasted text never lingers on disk
 - **Orphan versions**: If any `failed` entry carries an `orphan_version`, surface it in the Step 14 report so the user knows a backup exists for a page that did NOT get overwritten. Auto-lint's retention prune (Step 13) handles actual cleanup — no special action here

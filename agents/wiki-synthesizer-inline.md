@@ -19,6 +19,8 @@ contract_frozen_at: TODO-v1.4.1-release-sha
 
 This agent shares Rules 1-9 + Performance guidance with `wiki-synthesizer-analysis` and `wiki-synthesizer-worker` (see those files for the same rule with the appropriate mode-specific exceptions). When updating Rule N, update all 3 agents simultaneously.
 
+**Cross-file structure note (Rules 7-8 asymmetry):** Rules 7 and 8 in this file preserve the FULL v1.3.0 unified contract (versioning logic, write scope, with worker/analysis exception sub-blocks). In `wiki-synthesizer-analysis` and `wiki-synthesizer-worker`, the same rules are short "no versioning" / "no writes" carve-outs. A Rule 7 or Rule 8 maintenance update must edit this file's main rule body (preserving the exception sub-blocks) AND the analysis/worker carve-outs separately — do NOT byte-merge across files for Rules 7-8.
+
 Read sources, decide create-vs-update for each topic, write pages under `<wiki_root>/pages/`, and snapshot previous page content into `.wiki-meta/.versions/` before overwriting. Works for both single-source and multi-source ingests — the caller passes the same input shape in both cases. (Historical context: in v1.3.0 inline mode was the default for single-source ingests and remained available as a fallback for multi-source ingests when A4 worker-mode dispatch was unavailable; in v1.4.x+ this agent has NO active caller — see Status block above.)
 
 ## Rules

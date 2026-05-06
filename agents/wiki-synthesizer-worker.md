@@ -40,7 +40,7 @@ Read source shard, decide create-vs-update-vs-skip for each topic, and emit stru
 
 6. **Note conflicts** — If sources disagree, include both perspectives with attribution: "According to [Source A], X. However, [Source B] states Y." This applies to body content emitted in `page_content` and is especially important for second-pass `colliding_drafts` merges where multiple workers' bodies must be reconciled.
 
-7. **No versioning** — worker mode does NOT version or backup any page. Main session performs all version backups under the lock during Phase 3 of the A4 fanout flow. Set `merge_against` in each draft so main knows which page to back up.
+7. **No versioning** — worker mode does NOT version or backup any page. Main session performs all version backups under the lock during Phase 3 of the A4 fanout flow. Set `merge_against` in each draft (so main knows which page to back up); main owns the version snapshot.
 
 8. **No writes** — write NOTHING under `<wiki_root>/`. Return `drafts[]` via the worker output contract; main performs all writes under lock during Phase 3.
 
@@ -141,7 +141,7 @@ If a worker detects an unrecoverable error (e.g., a source URL 404), it returns 
 > **Trust boundary acknowledgement (M1 — v1.4.1 Track C closure):**
 > This agent's frontmatter `tools:` list omits `Write` (Edit, MultiEdit also absent). The "no writes" contract (Rule 8) is enforced at TWO layers in v1.4.1:
 > 1. **Tool-level (primary):** the runtime tool whitelist `[Read, Glob, Grep, WebFetch]` makes Write physically unavailable — a non-compliant agent slip cannot mutate `<wiki_root>/` files because the Write tool is not in scope. This closes the v1.4.0 prompt-obedience-only gap (M1).
-> 2. **Prompt obedience (secondary):** the body Rules above explicitly forbid writes; runtime V-1/V-3 verification per plan §3.3 confirms enforcement at dispatch time.
+> 2. **Prompt obedience (secondary):** the body Rules above explicitly forbid writes; runtime V-1 (callee enforcement) + V-3 (worker resolution probe) verification per plan §3.3 confirms enforcement at dispatch time.
 >
 > Caller substitution (e.g., main session voluntarily downgrading to `subagent_type: "general-purpose"`) is the residual risk — addressed by V-0 caller-side resolution probe (per plan §3.3) and the `_post_dispatch_dirty_scan()` guard at Steps 7.5.M-A and 7.5.M-B (per plan §3.9).
 
@@ -266,7 +266,7 @@ Input:
     {"source_slug": "blog-b", "page_content": "---\ntitle: React Server Components\nsources: [blog-b]\n...\n---\n\n# React Server Components\n\n... blog-b body ..."}
   ]
 }
-Agent: Read both sources in parallel (already-fetched bytes are NOT re-fetched — the colliding_drafts entries already encode the worker's prior synthesis; this re-fetch grounds Rule 6 conflict-notation decisions). Read colliding_drafts. Synthesize ONE merged body that cross-references both, with Rule 6 attribution where they disagree. lex-sort sources_final per W12. Return ONE draft.
+Agent: Re-fetch source bytes — each worker invocation has no cross-invocation cache, so the second-pass synthesizer re-reads bytes to ground Rule 6 conflict-notation decisions in this merge pass. Read colliding_drafts. Synthesize ONE merged body that cross-references both, with Rule 6 attribution where they disagree. lex-sort sources_final per W12. Return ONE draft.
 Output:
 {
   "mode": "worker",

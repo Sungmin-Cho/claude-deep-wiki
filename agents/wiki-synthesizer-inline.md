@@ -8,7 +8,7 @@ whenToUse: |
 tools: [Read, Write, Glob, Grep, WebFetch]
 status: dormant
 last_known_active: v1.3.0
-contract_frozen_at: TODO-v1.4.1-release-sha
+contract_frozen_at: a9966c7  # Task 9 deletion commit — moment the unified wiki-synthesizer.md was removed and the v1.3.0 contract became dormant-only. Task 15 (post-merge) MAY update to the v1.4.1 release/merge commit SHA.
 ---
 
 # Wiki Synthesizer (Inline Mode — DORMANT in v1.4.x+)

@@ -98,6 +98,8 @@ fi
 
 ### 1. Identify Source Type
 
+> **B3 v1.4.2 phase_timing_ms capture** — capture `INGEST_T0_MS=$(_ts_ms)` at the very entry of Step 1 (before source-type detection runs), so the `total` field of `phase_timing_ms` covers the entire `/wiki-ingest` wall-clock from argument parse to log emit. The `_ts_ms` helper is defined in "Step 7 — Shared utility: phase timing telemetry" below; spec ordering is not strict — implementer may inline `_ts_ms` definition before Step 1 or treat it as a forward declaration.
+
 Determine the source type from the argument **without reading file bodies or fetching URLs** — the agent is responsible for source I/O and hashing:
 
 - **URL**: Starts with `http://` or `https://` → type `url`, origin = the URL.
@@ -544,6 +546,65 @@ _post_dispatch_dirty_scan() {
 
 **Acceptance gate (cycle-3 N1.1 clean no-op):** `_post_dispatch_pre_snapshot` + `_post_dispatch_dirty_scan` MUST pass when no worker mutation occurs between them — pre-hash and post-hash equal, function returns 0. Any non-clean baseline indicates §3.9 is broken (e.g., scan walking files modified by main's bookkeeping during the window) and MUST not ship.
 
+### Step 7 — Shared utility: phase timing telemetry (`phase_timing_ms` capture, v1.4.2 B3)
+
+`/wiki-ingest` runs in three macro-phases (Stage 1 analysis / Stage 2 fanout / Stage 3 atomic write). v1.4.0 dogfood (14-page plan, 295-page wiki) measured ~17 minutes wall-clock with anecdotal Stage 1 ~7 min + Stage 2 ~10 min splits — but no per-phase timing was recorded in `log.jsonl`, so the breakdown was unverifiable post-hoc. v1.4.2 closes this gap with a `phase_timing_ms` field in the `ingest` log line (Step 10), schema-additive.
+
+**Helper function** (defined alongside §3.9 utilities; Bash 3.2 portable; ms precision via Python with second-precision fallback):
+
+```bash
+# _ts_ms — emit current epoch milliseconds.
+# python3 is preferred (sub-second precision; available on macOS + Linux).
+# date +%s000 fallback yields second precision (Bash 3.2 + BSD date safe).
+_ts_ms() {
+  python3 -c "import time; print(int(time.time()*1000))" 2>/dev/null \
+    || printf '%s000' "$(date +%s)"
+}
+```
+
+**Capture points** (timestamps stored in shell variables; phase-end triggers a delta against phase-start):
+
+| Variable | Capture point |
+|---|---|
+| `INGEST_T0_MS` | Step 1 entry (immediately after `/wiki-ingest` parses arguments) |
+| `STAGE_1_START_MS` | Single-source: before `_post_dispatch_pre_snapshot` at Step 7.5 (F2 site). Multi-source: before `_post_dispatch_pre_snapshot` at Step 7.5.M-A. |
+| `STAGE_1_END_MS` | Single-source: after `_post_dispatch_dirty_scan "A5-analysis"` at Step 7.5. Multi-source: after `_post_dispatch_dirty_scan "A4-fanout"` at Step 7.5.M-B (which delimits worker fanout's analysis return). |
+| `STAGE_2_START_MS` | A5 fanout single-source ONLY: before `_post_dispatch_pre_snapshot` at Step 7.6.A page-writer dispatch. Multi-source: re-uses `STAGE_1_END_MS` (workers are Stage 1 in A4 path; no separate Stage 2 fanout). Sub-threshold inline + empty-plan: 0 (no Stage 2). |
+| `STAGE_2_END_MS` | A5 fanout single-source: after worker output validation at Step 7.6.B end. Multi-source: not separately captured (re-uses STAGE_1_END for A4-collision-merge end too — implementer may extend with `STAGE_2_END_MS` for second-pass collision resolution). |
+| `STAGE_3_START_MS` | At `mkdir <wiki>/.wiki-meta/.wiki-lock` line (Step 7.6.C single-source / Step 7.5.M-C multi-source). |
+| `LOG_EMIT_MS` | Inside Step 10 immediately before the log.jsonl line is appended (becomes Stage 3 end-of-write watermark; auto-lint + lock release after Step 10 are excluded from `stage_3_write` since they're idempotent post-write maintenance). |
+
+**Field schema** (added to log.jsonl `ingest` line — schema-additive; the `wiki-lint` Step 6 LOG-INVARIANT scan ignores unknown top-level fields):
+
+```jsonc
+{
+  "ts": "...",
+  "action": "ingest",
+  "source": "...",
+  "pages_created": [],
+  "pages_updated": [...],
+  "phase_timing_ms": {
+    "stage_1_analysis": 420000,    // STAGE_1_END_MS - STAGE_1_START_MS
+    "stage_2_fanout": 600000,      // STAGE_2_END_MS - STAGE_2_START_MS (or 0 when sub-threshold/empty/multi-source)
+    "stage_3_write": 2000,         // LOG_EMIT_MS - STAGE_3_START_MS
+    "total": 1022000               // LOG_EMIT_MS - INGEST_T0_MS
+  }
+}
+```
+
+**Path coverage:**
+
+- **Single-source A5 fanout**: all four sub-fields populated. `stage_1_analysis` covers Stage 1 LLM execution; `stage_2_fanout` covers parallel `wiki-page-writer` workers; `stage_3_write` covers lock acquire + atomic write loop + Step 8-10.
+- **Single-source sub-threshold inline**: `stage_2_fanout = 0` (Stage 1 emits inline_bodies; no Stage 2 dispatch); other fields populated.
+- **Single-source empty page_plan terminal-skip** (Step 7.8): `stage_2_fanout = 0`, `stage_3_write` covers `do_ingest_skip_terminal_under_lock` path.
+- **Multi-source A4 fanout**: `stage_1_analysis` covers worker fanout (analysis decisions happen in workers, in parallel); `stage_2_fanout = 0` for first-pass-clean batches; non-zero only when Step 7.5.M-B Case B2 second-pass collision-merge fires; `stage_3_write` covers Step 7.5.M-C atomic write.
+- **Re-ingest hash-skip** (Step 1.5 terminal-skip): minimal phase_timing_ms with only `stage_3_write` (covers the brief lock-acquire + log-append) and `total`. `stage_1_analysis = 0`, `stage_2_fanout = 0`.
+- **Ingest-fail / 3-strike abort** (Step 7.5.M-D): `stage_1_analysis` partial (workers ran), `stage_2_fanout = 0`, `stage_3_write` ≈ 0 (no successful write). Records the failure-loop wall-clock for operator audit.
+
+**Bash 3.2 portability**: `_ts_ms` python3 fallback chain works on macOS BSD + Linux (no `date +%s.%N` non-portability). Numeric arithmetic uses POSIX `$((LOG_EMIT_MS - STAGE_3_START_MS))` (works in Bash 3.2). The phase_timing_ms JSON object can be assembled with simple `printf` interpolation; no `jq` dependency added.
+
+**Production cost:** ~6 `_ts_ms` calls per ingest (≤ 12 ms total on macOS — Python startup is the dominant cost; on warm cache ~2ms each). Negligible compared to LLM phases (minutes). Skip option not provided — telemetry is always-on (cf. v1.4.0 lesson where dogfood wall-clock was anecdotal).
+
 **Production cost trade-off:** zero by default (env-gated). Sandbox/dogfood adds one filesystem walk per dispatch site per ingest (~300 stat calls + sha256 hashes; sub-second on local SSD). Production trusts V-0/V-1/V-2/V-3 chain alone (per cycle-3 N3.4 reframing).
 
 **Limitations** (refined cycle-3 N1.5 — honest framing): catches Stage-2-direct mutation; does NOT cover post-Stage-3-close race, atomic-rename via /tmp/, or symbolic links. See plan §3.9 limitations subsection for v1.4.1.x follow-up candidates.
@@ -624,12 +685,14 @@ if sources_count == 1:
     # captures baseline before Stage 1 runs; post-scan after Stage 1
     # returns + before page_plan branching catches Stage 1 mutation
     # regardless of sub-threshold vs A5 fanout downstream branch.
+    STAGE_1_START_MS=$(_ts_ms)    # B3 v1.4.2 — phase_timing_ms capture
     _post_dispatch_pre_snapshot   # Sets PRE_DISPATCH_HASH if WIKI_TEST_MODE=1
     invoke deep-wiki:wiki-synthesizer-analysis a5_fanout_threshold=$A5_FANOUT_THRESHOLD  # qualified namespace per V-0 empirical finding (handoff §0); mode arg dropped (agent identity replaces it)
     page_plan = synthesizer.page_plan
     inline_bodies = synthesizer.inline_bodies
     source_hashes = synthesizer.source_hashes
     _post_dispatch_dirty_scan "A5-analysis" || abort_ingest  # F2 v1.4.2 fix — bracket Stage 1 LLM execution window
+    STAGE_1_END_MS=$(_ts_ms)      # B3 v1.4.2 — Stage 1 wall-clock end
 
     # F1 fix (v1.4.2 — handoff §1.F1) — main re-reads existing page bytes
     # from DISK as the authoritative C3 hash baseline. v1.4.1 dogfood found
@@ -774,9 +837,10 @@ same atomic-write algorithm, parameterized only by the source of drafts
 
 **§3.9 worker mutation detection — pre-snapshot:**
 
-Before dispatching the parallel workers, capture a baseline hash of the wiki tree (gated by `WIKI_TEST_MODE=1`; production skips):
+Before dispatching the parallel workers, capture a baseline hash of the wiki tree (gated by `WIKI_TEST_MODE=1`; production skips), AND capture the multi-source path's Stage 1 start timestamp for `phase_timing_ms`:
 
 ```bash
+STAGE_1_START_MS=$(_ts_ms)    # B3 v1.4.2 — phase_timing_ms capture (multi-source path)
 _post_dispatch_pre_snapshot   # Sets PRE_DISPATCH_HASH if WIKI_TEST_MODE=1
 ```
 
@@ -835,6 +899,7 @@ Before building the in-batch ledger, verify no worker mutated the wiki tree duri
 
 ```bash
 _post_dispatch_dirty_scan "A4-fanout" || abort_ingest
+STAGE_1_END_MS=$(_ts_ms)      # B3 v1.4.2 — multi-source A4 Stage 1 end (worker-fanout return)
 ```
 
 On mismatch: function emits `FATAL: ...` to stderr, sets `PARTIAL_FAIL=true` + `FAILED_REASON="worker_mutation_detected (A4-fanout)"`, and triggers Step 7.7.A worker-mutation failure handling. The ingest aborts; `.pending-scan` is NOT promoted.
@@ -958,6 +1023,8 @@ the v1.2.1 rules extended for fanout:
 The lock state depends on the branch (per Step 7.5 preamble): held from
 Phase 0 (multi-source) OR acquired here (single-source — exactly as
 v1.2.1).
+
+**B3 v1.4.2 phase_timing_ms capture** — at Step 7.5.M-C entry (immediately before the manifest conversion below), capture `STAGE_3_START_MS=$(_ts_ms)`. For the multi-source A4 path, the lock is already held (acquired at Phase 0/Step 7.5.M-A entry); the timestamp here marks transition from collision-resolved drafts to atomic write loop.
 
 **Manifest conversion before Step 8 (Cycle-3 CV3-B fix):** Step 8's
 existing parser expects the inline-mode response shape with top-level
@@ -1190,9 +1257,10 @@ After Step 7.5's analysis-mode invocation, when `len(page_plan) >= a5_fanout_thr
 
 **§3.9 worker mutation detection — pre-snapshot:**
 
-Before dispatching the parallel page-writer workers, capture a baseline hash (gated by `WIKI_TEST_MODE=1`):
+Before dispatching the parallel page-writer workers, capture a baseline hash (gated by `WIKI_TEST_MODE=1`) AND capture the Stage 2 fanout start timestamp:
 
 ```bash
+STAGE_2_START_MS=$(_ts_ms)    # B3 v1.4.2 — phase_timing_ms capture (A5 fanout Stage 2 start)
 _post_dispatch_pre_snapshot   # Sets PRE_DISPATCH_HASH if WIKI_TEST_MODE=1
 ```
 
@@ -1363,6 +1431,7 @@ After Step 7.6.B aggregation + validation completes, verify no `wiki-page-writer
 
 ```bash
 _post_dispatch_dirty_scan "A5-fanout" || abort_ingest
+STAGE_2_END_MS=$(_ts_ms)      # B3 v1.4.2 — A5 fanout Stage 2 end (post worker validation, pre Step 7.6.C lock)
 ```
 
 **CRITICAL ordering** (cycle-3 N1.2 fix): this scan MUST fire BEFORE Step 7.6.C atomic-write, not after — otherwise main's legitimate Phase 3 writes register as worker-mutation false positives and abort every ingest.
@@ -1372,6 +1441,7 @@ On mismatch: function emits `FATAL: A5-fanout worker mutated wiki_root (pre=...,
 #### Step 7.6.C — Atomic write under lock (mandatory C3 concurrency check + manifest conversion)
 
 ```bash
+STAGE_3_START_MS=$(_ts_ms)    # B3 v1.4.2 — phase_timing_ms capture (Stage 3 start = lock acquire attempt)
 mkdir "<wiki>/.wiki-meta/.wiki-lock" || { echo "Wiki locked"; exit 1; }
 trap 'rmdir "<wiki>/.wiki-meta/.wiki-lock" 2>/dev/null || true' EXIT
 
@@ -1551,6 +1621,14 @@ After Step 7.6.D's manifest conversion, run `commands/wiki-ingest.md` Steps 8 th
   Stage 3 succeeds cleanly otherwise must still record retry-required pages).
   Payload value = union of `FAILED_PAGE_FILES` + `FAILED_WORKER_FILES`, matching
   the Step 7.6.F sentinel payload.
+  **B3 fix (v1.4.2 — handoff §1.B3)**: capture `LOG_EMIT_MS=$(_ts_ms)` immediately
+  before the log line is appended; embed `phase_timing_ms` JSON object built from
+  the captured stage timestamps (see "Step 7 — Shared utility: phase timing
+  telemetry" above for capture-point list and per-path coverage). Schema-additive —
+  `wiki-lint` Step 6 LOG-INVARIANT scan ignores unknown top-level fields; existing
+  consumers of `pages_created` / `pages_updated` are unaffected. Phase timing absent
+  on `ingest-skip`, `ingest-repair`, `ingest-fail`, `lint`, `rebuild`, `delete`,
+  `query-filed`, `setup` lifecycle actions (only `ingest` carries it).
 - **Step 11** (Update Human-Readable Wiki Artifacts — `log.md` + `index.md`).
 
 > **Post-review fix — fixes round-4 missed: C2 (lock ordering / partial_fail
@@ -2112,13 +2190,24 @@ Read the current `.wiki-meta/index.json`. For each entry in `CREATED_ENTRIES` �
 
 > **Timestamp format:** All `ts` and `generated_at` values MUST be UTC ISO 8601 with a `Z` suffix. Generate with `date -u +"%Y-%m-%dT%H:%M:%SZ"`. Never use local timezone offsets (e.g. `+09:00`) — the wiki's log is consumed by tooling that assumes a single canonical timezone.
 
+**B3 v1.4.2 phase_timing_ms capture** — immediately before the first log line is appended (after all per-slug filtering / dedup is complete), capture `LOG_EMIT_MS=$(_ts_ms)`. Build the `phase_timing_ms` JSON object from the captured stage timestamps. Per the schema in "Step 7 — Shared utility: phase timing telemetry" above, deltas are:
+
+```bash
+PT_STAGE_1_MS=$(( STAGE_1_END_MS - STAGE_1_START_MS ))
+PT_STAGE_2_MS=$(( ${STAGE_2_END_MS:-${STAGE_1_END_MS}} - ${STAGE_2_START_MS:-${STAGE_1_END_MS}} ))   # 0 when sub-threshold/empty/multi-source
+PT_STAGE_3_MS=$(( LOG_EMIT_MS - STAGE_3_START_MS ))
+PT_TOTAL_MS=$((  LOG_EMIT_MS - INGEST_T0_MS ))
+PHASE_TIMING_JSON=$(printf '{"stage_1_analysis":%d,"stage_2_fanout":%d,"stage_3_write":%d,"total":%d}' \
+                   "$PT_STAGE_1_MS" "$PT_STAGE_2_MS" "$PT_STAGE_3_MS" "$PT_TOTAL_MS")
+```
+
 Append one log line **per source in the batch**, using the per-slug filter applied to the **post-dedup** `CREATED_ENTRIES` / `UPDATED_ENTRIES` arrays — *not* the per-source yaml lists, which after the B5 fix (v1.2.1+) are intentionally pre-dedup. The yamls record full per-source attribution (both contributing slugs in a co-create get `pages_created:[X.md]`); the log lines apply the intra-batch dedup so the log invariant (each filename appears in `pages_created` at most once across log lines) is preserved at the log-emission layer:
 
 ```json
-{"ts":"<iso_timestamp>","action":"ingest","source":"<slug>","pages_created":[...filtered_for_slug],"pages_updated":[...filtered_for_slug]}
+{"ts":"<iso_timestamp>","action":"ingest","source":"<slug>","pages_created":[...filtered_for_slug],"pages_updated":[...filtered_for_slug],"phase_timing_ms":{"stage_1_analysis":<int>,"stage_2_fanout":<int>,"stage_3_write":<int>,"total":<int>}}
 ```
 
-For a single-source ingest this is one line; for multi-source batch it is one line per source, identical `ts`. This matches the per-source yaml written in Step 8e — any page whose frontmatter `sources:` field lists a given slug MUST appear under that slug's log line (`pages_created` or `pages_updated`).
+For a single-source ingest this is one line; for multi-source batch it is one line per source, identical `ts` and identical `phase_timing_ms` (timing is per-batch, not per-source — workers split sources by `i % WORKER_COUNT`, no per-source decomposition is meaningful). This matches the per-source yaml written in Step 8e — any page whose frontmatter `sources:` field lists a given slug MUST appear under that slug's log line (`pages_created` or `pages_updated`). The `phase_timing_ms` field is **schema-additive** (`wiki-lint` Step 6 LOG-INVARIANT scan filters via `select(.action != "ingest-repair") | .pages_created[]?` — unknown top-level fields ignored). Field is **omitted** from `ingest-skip`, `ingest-repair`, `ingest-fail`, `lint`, `rebuild`, `delete`, `query-filed`, `setup` lifecycle actions (only `ingest` carries it).
 
 > **Drain note (RW2 review fix, v1.2.1+):** the `SKIPPED` and `REPAIR` arrays populated by Step 1.5 are *drained here in Step 10*, not in Step 8 — see the `(v1.2.1+, R3C1 + IW3)` blockquote immediately below for the exact replacement-vs-supplement semantics. Step 8e per-source yamls are still written for SKIPPED slugs (no-op — yaml is already authoritative) and for REPAIR slugs (per current cycle's restoration). The two paths converge here.
 

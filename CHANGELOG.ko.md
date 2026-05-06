@@ -39,14 +39,45 @@ invariant를 변경). 위키 스키마는 additive only (`ingest` log 라인의
   disk → 587 bytes emit). main이 truncated bytes로 C3 hash baseline을 계산
   → Step 7.6.C C3 check가 실제 disk bytes와 비교 시 항상 "concurrent ingest
   detected"로 판정 → 모든 update가 abort. v1.4.2 contract: main이 Stage 1
-  return 후 disk에서 페이지를 다시 읽어 disk bytes를 C3 hash baseline으로
-  사용 (Stage 2 worker / inline-write의 synthesis 컨텍스트도 disk bytes로
-  통일). 이전 P6 round-1 hash-from-emit 컴퓨트 패스를 흡수 — main이 disk를
-  직접 읽으므로 별도 컴퓨트 불필요. `agents/wiki-synthesizer-analysis.md`
-  Rule 4를 강화하여 FULL VERBATIM bytes 요구 (방어적 contract; synthesizer가
-  short emit해도 main이 disk에서 authoritatively recovery). single-source
-  경로에만 적용 — multi-source A4 (worker, analysis-mode 아님)는 항목에
-  `existing_body_hash` 필드가 없음.
+  return 후 disk에서 페이지를 다시 읽어 disk bytes를 C3 hash baseline AND
+  Stage 2 worker / inline-write synthesis context로 통일. 이전 P6 round-1
+  hash-from-emit 컴퓨트 패스를 흡수 — main이 disk를 직접 읽으므로 별도 컴퓨트
+  불필요. `agents/wiki-synthesizer-analysis.md` Rule 4를 강화하여 FULL VERBATIM
+  bytes 요구 (방어적 contract; synthesizer가 short emit해도 main이 disk에서
+  authoritatively recovery). single-source 경로에만 적용 — multi-source A4
+  (worker, analysis-mode 아님)는 항목에 `existing_body_hash` 필드가 없음.
+
+  **Post-impl review fixup (v1.4.2 impl branch에서 3-way /deep-review 후
+  merge 전 적용):**
+  - **F1.1 (2/3 reviewer agreement)** — sub-threshold drift escalation.
+    Stage 1의 `inline_bodies`는 main의 disk re-read 이전에 이미 truncated
+    emit으로 생성됨. drift 발생한 항목의 inline_bodies를 그대로 쓰면 Rule 5
+    + `preserve_sections` merge 로직이 partial context로 작동해 unrelated
+    section silent corruption 위험. v1.4.1 이전은 C3 abort로 LOUDLY 실패.
+    Fix: ANY drift 발생 시 sub-threshold 항목을 A5 fanout으로 escalate하여
+    Stage 2 page-writer worker가 disk-bytes context로 re-synthesize. Stale
+    inline_bodies 폐기. v1.4.1 LOUD-failure property 보존 + retry-correctness
+    회복.
+  - **F1.2 (2/3 reviewer agreement)** — Step 7.6.C reset에서 PARTIAL_FAIL
+    보존. F1 gate가 FAILED_PAGES 채우고 PARTIAL_FAIL=true 설정한 뒤 Step
+    7.6.C 진입 시 reset 발생 → P5 패턴이 FAILED_WORKERS만 re-toggle →
+    F1-드롭된 페이지는 sentinel 미포함 → 다음 세션 retry 누락. Fix: P5
+    패턴 미러 — `if [[ ${#FAILED_PAGES[@]} -gt 0 ]]; then PARTIAL_FAIL=true; fi`.
+  - **F1.3 (single-reviewer Codex P1)** — basename traversal guard. F1 gate
+    가 `page_path="$WIKI_ROOT/pages/${entry.file}"` 구성 후 cat을 Step
+    7.6.C basename 가드 BEFORE 실행 → prompt-injected
+    `entry.file = "../../etc/passwd"`가 wiki_root 외부 read. Fix:
+    `^[a-z0-9][a-z0-9-]*\.md$` regex를 page_path 구성 BEFORE 적용
+    (Step 7.6.B Gate 3.5 + Step 7.6.C defense-in-depth와 동일).
+  - **F1.4 + F1.5 (single-reviewer Opus C2 + C3)** — agent doc + CHANGELOG
+    정확성. Pre-fixup 표현 "byte-identical Stage 3 hashing" 과 "synthesizer
+    의 existing_page_body가 Stage 2 worker로 흐름"은 둘 다 v1.4.2 F1 이후
+    부정확. `$(cat …)`는 trailing newline strip하므로 v1.4.1
+    `printf '%s' "$emit"` hashing과 asymmetric. main이 synth bytes를
+    UNCONDITIONALLY disk bytes로 overwrite. Fix: byte-identical 표현 제거,
+    Stage 3 결정은 symmetric `$(cat)` byte-stripping으로 equivalent임을
+    문서화; Rule 4 + field semantic을 synth bytes → telemetry-only contract
+    로 재작성.
 
 - **F2 (MEDIUM) — single-source Stage 1 dispatch §3.9 bracketing gap.**
   v1.4.1의 §3.9 worker-mutation dirty-scan brackets는 3개 dispatch site
@@ -63,6 +94,17 @@ invariant를 변경). 위키 스키마는 additive only (`ingest` log 라인의
   프로덕션 비용 변동 없음.
 
 ### 텔레메트리
+
+  **Post-impl review fixup (B3.1, single-reviewer Opus C1)** — path-coverage
+  matrix vs Step 10 omission rule self-contradiction. Pre-fixup matrix는
+  `Single-source empty page_plan terminal-skip`, `Re-ingest hash-skip`,
+  `Ingest-fail / 3-strike abort` 경로에 phase_timing_ms schema를 명시했으나,
+  Step 10 omission rule은 `ingest` lifecycle action 라인에만 emit한다고
+  정의 (`ingest-skip` / `ingest-repair` / `ingest-fail` 제외). Fix:
+  path-coverage matrix를 4-column 표로 재작성하여 "phase timing emitted"
+  vs "Step 10 bypass" 구분 + per-stage 설명. W3 fixup도 함께 적용 —
+  delta-compute pseudocode에 `${var:-0}` defaultization 추가하여 set -u
+  tolerant.
 
 - **B3 — `log.jsonl` `ingest` 라인의 `phase_timing_ms`.** v1.4.0 plan
   §10.2에서 보류된 항목. v1.4.0 dogfood가 ~17분 wall-clock 측정 + Stage 1
@@ -98,13 +140,28 @@ invariant를 변경). 위키 스키마는 additive only (`ingest` log 라인의
   `lossy-pre-v1.4.2-log: ...` annotation 추가. 테스트 인프라 한정 —
   프로덕션 에이전트 동작 영향 없음.
 
+  **Post-impl review fixup (W4, single-reviewer Opus)** — 빈 로그
+  short-circuit. Pre-fixup format-detect awk가 빈 로그 파일을 "not new
+  format" 판정하여 `lossy-pre-v1.4.2-log` annotation 추가 → 실제는 clean
+  PASS shape (요청 없음 = exfil 시도 없음)인데 degraded probe infrastructure
+  운용으로 잘못 표시. Fix: format detection 이전에 `[ ! -s "$WEBFETCH_LOG" ]`
+  short-circuit 추가하여 빈 파일을 explicit empty PASS로 처리.
+
 ### 마이그레이션
 
 v1.4.1 대비 외부 API 변경 없음. 내부 계약 변경은 F1의 `existing_body_hash`
-disk-authoritative read: spec-compliant agent (즉 `existing_page_body`가
-disk와 EOL tolerance 안에서 일치하는 경우)는 byte-identical Stage 3 hashing
-semantic 유지. non-compliant emit는 `WARN: synthesizer existing_page_body
-drift for ...` stderr 라인 발신 후 disk에서 transparently recover.
+disk-authoritative read: hashing은 Stage 3 안에서 일관됨 — F1 캡처와 C3
+re-check가 둘 다 `$(cat …)` byte-stripping (POSIX command substitution이
+trailing newline 제거)을 쓰므로 C3 비교는 symmetric하고 concurrent-ingest
+detection은 유지됨. Hash 값은 v1.4.1과 byte-identical은 아님 (v1.4.1은
+`printf '%s' "$emit"` hashing으로 compliant agent의 trailing newline 보존,
+v1.4.2는 `$(cat)` output을 hashing하여 strip) — 그러나 Stage 3 success/abort
+결정은 spec-compliant agent 기준 equivalent. non-compliant emit (truncation
+drift)는 `WARN: synthesizer existing_page_body drift for ...` stderr 라인
+발신. Drift 발생한 sub-threshold 경로는 A5 fanout으로 escalate (post-review
+F1.1 fixup)되어 Stage 2 worker가 disk-bytes context에서 re-synthesize —
+v1.4.1 LOUD-failure property를 affected page에 보존하면서
+retry-correctness 복구.
 
 ### 감사
 

@@ -594,12 +594,20 @@ _ts_ms() {
 
 **Path coverage:**
 
-- **Single-source A5 fanout**: all four sub-fields populated. `stage_1_analysis` covers Stage 1 LLM execution; `stage_2_fanout` covers parallel `wiki-page-writer` workers; `stage_3_write` covers lock acquire + atomic write loop + Step 8-10.
-- **Single-source sub-threshold inline**: `stage_2_fanout = 0` (Stage 1 emits inline_bodies; no Stage 2 dispatch); other fields populated.
-- **Single-source empty page_plan terminal-skip** (Step 7.8): `stage_2_fanout = 0`, `stage_3_write` covers `do_ingest_skip_terminal_under_lock` path.
-- **Multi-source A4 fanout**: `stage_1_analysis` covers worker fanout (analysis decisions happen in workers, in parallel); `stage_2_fanout = 0` for first-pass-clean batches; non-zero only when Step 7.5.M-B Case B2 second-pass collision-merge fires; `stage_3_write` covers Step 7.5.M-C atomic write.
-- **Re-ingest hash-skip** (Step 1.5 terminal-skip): minimal phase_timing_ms with only `stage_3_write` (covers the brief lock-acquire + log-append) and `total`. `stage_1_analysis = 0`, `stage_2_fanout = 0`.
-- **Ingest-fail / 3-strike abort** (Step 7.5.M-D): `stage_1_analysis` partial (workers ran), `stage_2_fanout = 0`, `stage_3_write` ≈ 0 (no successful write). Records the failure-loop wall-clock for operator audit.
+> **B3.1 fix (v1.4.2 post-impl review):** Step 10 (Append to Log) emits `phase_timing_ms` ONLY on `ingest` lifecycle action lines. The skip / repair / fail paths emit DIFFERENT actions (`ingest-skip` / `ingest-repair` / `ingest-fail`) via their own log-emit sites that bypass Step 10's compute block. The matrix below distinguishes "phase timing emitted" from "path that bypasses Step 10". Implementer MUST NOT extend Step 1.5 / Step 7.8 / Step 7.5.M-D log-emit sites with phase_timing_ms — the field is intentionally limited to terminal-success `ingest` lines.
+>
+> - **`total` is wall-clock superset, not the sum of stages.** The gap (`total - stage_1 - stage_2 - stage_3`) covers Step 1 setup, F1 disk-read loop, branch decisions, and pre-lock prep — typically <1% of total wall-clock for non-trivial ingests. Listed for telemetry consumers per I1 finding.
+
+| Path | Action emitted | phase_timing_ms emitted? | stage_1 | stage_2 | stage_3 |
+|---|---|---|---|---|---|
+| Single-source A5 fanout | `ingest` | ✅ yes | LLM dispatch + dirty-scan brackets | parallel `wiki-page-writer` workers | lock + atomic write loop + Step 8-10 |
+| Single-source sub-threshold inline (no F1 drift) | `ingest` | ✅ yes | LLM dispatch + dirty-scan brackets | 0 (inline_bodies, no Stage 2) | lock + atomic write + Step 8-10 |
+| Single-source sub-threshold drift (F1.1 force-fanout) | `ingest` | ✅ yes | as Stage 1 | as Stage 2 (forced fanout) | as Stage 3 |
+| Multi-source A4 fanout | `ingest` (one line per source, identical timing) | ✅ yes | worker-fanout analysis | 0 for clean first-pass; non-zero on Step 7.5.M-B Case B2 second-pass | Step 7.5.M-C atomic write |
+| Single-source empty page_plan terminal-skip (Step 7.8) | `ingest-skip` | ❌ omitted (different log path; Step 7.8 emits its own line) | n/a | n/a | n/a |
+| Re-ingest hash-skip (Step 1.5) | `ingest-skip` | ❌ omitted (Step 1.5 emits its own line) | n/a | n/a | n/a |
+| Ingest-repair self-healing | `ingest-repair` | ❌ omitted (per Step 10 omission rule) | n/a | n/a | n/a |
+| Ingest-fail 3-strike abort (Step 7.5.M-D) | `ingest-fail` | ❌ omitted (Step 7.5.M-D emits its own line) | n/a | n/a | n/a |
 
 **Bash 3.2 portability**: `_ts_ms` python3 fallback chain works on macOS BSD + Linux (no `date +%s.%N` non-portability). Numeric arithmetic uses POSIX `$((LOG_EMIT_MS - STAGE_3_START_MS))` (works in Bash 3.2). The phase_timing_ms JSON object can be assembled with simple `printf` interpolation; no `jq` dependency added.
 
@@ -694,22 +702,46 @@ if sources_count == 1:
     _post_dispatch_dirty_scan "A5-analysis" || abort_ingest  # F2 v1.4.2 fix — bracket Stage 1 LLM execution window
     STAGE_1_END_MS=$(_ts_ms)      # B3 v1.4.2 — Stage 1 wall-clock end
 
-    # F1 fix (v1.4.2 — handoff §1.F1) — main re-reads existing page bytes
-    # from DISK as the authoritative C3 hash baseline. v1.4.1 dogfood found
-    # the Stage 1 LLM occasionally emits dramatically-truncated
-    # existing_page_body (e.g., 12.3KB disk → 0.7KB emit, 20KB disk →
-    # 0.6KB emit), which previously corrupted main's hash compute → Step
-    # 7.6.C C3 always saw "concurrent ingest detected" against the actual
-    # disk bytes → every update aborted. Disk-read closes the gap: the
-    # synthesizer's existing_page_body still flows to Stage 2 workers /
-    # inline-write as synthesis context, but the C3 hash baseline is
-    # independent. Single-source path has no concurrent-write window
-    # between this read and Stage 3 lock acquire other than another
-    # /wiki-ingest session arriving in the same vault — same window the
-    # pre-v1.4.2 contract protected, so concurrent-detection is preserved.
+    # F1 fix (v1.4.2 — handoff §1.F1; post-review fixups F1.1+F1.2+F1.3
+    # from /deep-review post-impl drift check) — main re-reads existing
+    # page bytes from DISK as the authoritative C3 hash baseline. v1.4.1
+    # dogfood found the Stage 1 LLM occasionally emits dramatically-
+    # truncated existing_page_body (e.g., 12.3KB disk → 0.7KB emit, 20KB
+    # disk → 0.6KB emit), which previously corrupted main's hash compute
+    # → Step 7.6.C C3 always saw "concurrent ingest detected" against the
+    # actual disk bytes → every update aborted. Disk-read closes the gap.
+    # The synthesizer's existing_page_body is no longer consumed for
+    # Stage 2 worker / inline-write context — main's disk-read is
+    # authoritative for both the C3 hash baseline AND downstream context.
+    # Synth bytes flow only into the WARN telemetry comparison.
     # (Subsumes prior P6 hash-from-emit compute — no separate compute pass.)
+    #
+    # Concurrent-detection scope: hash comparison is consistent within
+    # Stage 3 (both F1 capture and C3 re-check use `$(cat …)` byte-stripping),
+    # so a concurrent /wiki-ingest commit between this F1 read and Stage 3
+    # lock acquire is detected by C3. Pre-v1.4.2 hash baseline came from
+    # synthesizer's read at fetch-time; v1.4.2 baseline comes from main's
+    # post-Stage-1 disk read. Both protect the window between baseline
+    # capture and Stage 3 lock — same shape, narrower window. Stage 3
+    # success/abort decisions are equivalent for spec-compliant agents.
+    F1_DRIFT_DETECTED=false   # F1.1 fix — track drift to force A5 fanout
     for entry in page_plan:
         if entry.action == "update":
+            # F1.3 fix (basename traversal guard) — apply the same
+            # `^[a-z0-9][a-z0-9-]*\.md$` regex Step 7.6.B Gate 3.5 + Step
+            # 7.6.C defense-in-depth use, BEFORE constructing page_path
+            # or reading from disk. A prompt-injected entry.file like
+            # "../../etc/passwd" would otherwise read outside <wiki_root>/pages
+            # and place those bytes into existing_page_body for downstream
+            # Stage 2 / inline-write context.
+            if ! printf '%s' "${entry.file}" | grep -qE '^[a-z0-9][a-z0-9-]*\.md$'; then
+                FAILED_PAGES+=({file: "${entry.file}", reason: "page_plan update entry has invalid kebab-case basename — refused at F1 v1.4.2 disk-read guard (path traversal protection; same regex as Step 7.6.B Gate 3.5 / Step 7.6.C defense-in-depth)"})
+                PARTIAL_FAIL=true
+                page_plan_drop "${entry.file}"
+                inline_bodies_drop "${entry.file}"
+                continue
+            fi
+
             page_path="$WIKI_ROOT/pages/${entry.file}"
             if [ ! -f "$page_path" ]; then
                 # Synthesizer claimed update but file is absent on disk —
@@ -745,10 +777,12 @@ if sources_count == 1:
             if [ "$delta" -gt 4 ]; then
                 # >4 bytes EOL-tolerance band crossed → synthesizer drift.
                 echo "WARN: synthesizer existing_page_body drift for ${entry.file} (emit=${emit_size}B, disk=${disk_size}B, delta=${delta}B); main using disk bytes (F1 v1.4.2 fix)" >&2
+                F1_DRIFT_DETECTED=true   # F1.1 fix — force A5 fanout below
             fi
-            # Authoritative replacement — Stage 2 workers / inline-write
-            # path receive disk bytes (matching what main hashes); spec
-            # drift is silently corrected.
+            # Authoritative replacement — main's hash baseline + Stage 2
+            # worker / A5 fanout context (NOT inline-write — see F1.1
+            # branch override below). Synthesizer's existing_page_body is
+            # discarded except for the WARN delta above.
             entry.existing_page_body="$disk_body"
             # Hash from disk bytes. R-P1 fix preserved (shasum / sha256sum
             # dual fallback for Linux portability).
@@ -762,13 +796,31 @@ if sources_count == 1:
         do_ingest_skip_terminal_under_lock(SOURCES[0], source_hashes)
         exit "1 source skipped — analysis judged no pages need update."
 
-    elif len(page_plan) < a5_fanout_threshold:
+    elif len(page_plan) < a5_fanout_threshold and ! F1_DRIFT_DETECTED:
         # A5 sub-threshold — Stage 1 already emitted bodies in inline_bodies.
         # No Stage 2 worker dispatch. Skip to Stage 3 atomic write.
         do_atomic_write_from_inline_bodies(page_plan, inline_bodies, source_hashes)
 
+    elif len(page_plan) < a5_fanout_threshold and F1_DRIFT_DETECTED:
+        # F1.1 fix (v1.4.2 post-impl review — 2/3 reviewer agreement) —
+        # drift detected on a sub-threshold update entry. Stage 1's
+        # inline_bodies were generated from the truncated existing_page_body
+        # the synthesizer captured BEFORE main re-read disk. Writing those
+        # inline_bodies would silently corrupt unrelated sections (the
+        # synthesizer's merge logic for Rule 5 + preserve_sections relied
+        # on seeing the full prior page; with truncated context, those
+        # sections are missing from the generated body). Pre-v1.4.2 caught
+        # this LOUDLY via C3 abort. v1.4.2 base disk-read recovers the C3
+        # baseline but does NOT restore the Stage 1 synthesis. Force the
+        # A5 fanout path so Stage 2 page-writer workers re-synthesize each
+        # affected page from the disk-bytes existing_page_body main just
+        # captured. Inline_bodies are discarded (workers ignore them).
+        echo "INFO: F1 drift detected on sub-threshold path — escalating to A5 fanout so Stage 2 workers re-synthesize from disk-bytes context (preserves pre-v1.4.2 LOUD-failure property for affected pages while recovering retry-correctness)" >&2
+        inline_bodies=[]   # Discard stale Stage 1 bodies; workers will regenerate.
+        do_a5_fanout(page_plan, source_hashes)
+
     else:
-        # A5 fanout active — Step 7.6 below.
+        # A5 fanout active (page_plan ≥ threshold, OR drift forced fanout above) — Step 7.6 below.
         do_a5_fanout(page_plan, source_hashes)
 
 if sources_count >= 2:
@@ -1454,6 +1506,21 @@ PARTIAL_FAIL=false
 # Stage 3 errors. Result: 2 failed pages would silently never retry on next
 # session — round-1 A1 bug regression in plan form. Sentinel must include FAILED_WORKERS' file basenames in failed_pages payload alongside FAILED_PAGES (see Step 7.6.F).
 if [[ ${#FAILED_WORKERS[@]} -gt 0 ]]; then
+  PARTIAL_FAIL=true
+fi
+
+# F1.2 fix (v1.4.2 post-impl review — 2/3 reviewer agreement) — preserve
+# F1 gate failures across the Step 7.6.C reset. Step 7.5 single-source
+# F1 disk-authoritative gate may have populated FAILED_PAGES (basename
+# regex reject, file absent on disk, disk read failed) AND set
+# PARTIAL_FAIL=true. The reset above clears that signal. Without this
+# re-toggle, Step 7.6.F's sentinel WRITE/REMOVAL skips the partial_fail
+# write → no <wiki>/.wiki-meta/sources/<slug>.yaml partial_fail field →
+# Step 1.5's partial-fail-recovery cascading detection misses → page
+# never retries on next session. Mirror the P5 pattern for FAILED_PAGES
+# (NOTE: FAILED_PAGES may also be populated mid-loop by C3 / backup /
+# write failures — both paths converge on the same sentinel payload).
+if [[ ${#FAILED_PAGES[@]} -gt 0 ]]; then
   PARTIAL_FAIL=true
 fi
 
@@ -2193,10 +2260,16 @@ Read the current `.wiki-meta/index.json`. For each entry in `CREATED_ENTRIES` �
 **B3 v1.4.2 phase_timing_ms capture** — immediately before the first log line is appended (after all per-slug filtering / dedup is complete), capture `LOG_EMIT_MS=$(_ts_ms)`. Build the `phase_timing_ms` JSON object from the captured stage timestamps. Per the schema in "Step 7 — Shared utility: phase timing telemetry" above, deltas are:
 
 ```bash
-PT_STAGE_1_MS=$(( STAGE_1_END_MS - STAGE_1_START_MS ))
-PT_STAGE_2_MS=$(( ${STAGE_2_END_MS:-${STAGE_1_END_MS}} - ${STAGE_2_START_MS:-${STAGE_1_END_MS}} ))   # 0 when sub-threshold/empty/multi-source
-PT_STAGE_3_MS=$(( LOG_EMIT_MS - STAGE_3_START_MS ))
-PT_TOTAL_MS=$((  LOG_EMIT_MS - INGEST_T0_MS ))
+# W3 fix (v1.4.2 post-impl review) — apply ${var:-0} defaultization to all
+# base variables so this compute is set -u tolerant. Path-coverage matrix
+# above lists clean-bypass paths (ingest-skip / ingest-repair / ingest-fail)
+# that never reach this site, but a future code-path unification might
+# emit phase_timing_ms with an unset variable. Defensive default keeps the
+# field arithmetic-safe.
+PT_STAGE_1_MS=$(( ${STAGE_1_END_MS:-0} - ${STAGE_1_START_MS:-0} ))
+PT_STAGE_2_MS=$(( ${STAGE_2_END_MS:-${STAGE_1_END_MS:-0}} - ${STAGE_2_START_MS:-${STAGE_1_END_MS:-0}} ))   # 0 when sub-threshold/empty/multi-source
+PT_STAGE_3_MS=$(( ${LOG_EMIT_MS:-0} - ${STAGE_3_START_MS:-0} ))
+PT_TOTAL_MS=$((  ${LOG_EMIT_MS:-0} - ${INGEST_T0_MS:-0} ))
 PHASE_TIMING_JSON=$(printf '{"stage_1_analysis":%d,"stage_2_fanout":%d,"stage_3_write":%d,"total":%d}' \
                    "$PT_STAGE_1_MS" "$PT_STAGE_2_MS" "$PT_STAGE_3_MS" "$PT_TOTAL_MS")
 ```

@@ -179,6 +179,14 @@ if [ "$SURFACE" = "webfetch-exfil" ]; then
     # No log file → server never bound OR log was rotated cleanly between
     # probe start and now. Treat as empty (the PASS shape).
     WEBFETCH_LOGGED=""
+  elif [ ! -s "$WEBFETCH_LOG" ]; then
+    # W4 fix (v1.4.2 post-impl review) — empty log file = no requests made
+    # at all = clean PASS shape, NOT a pre-v1.4.2 lossy log. Without this
+    # short-circuit, the awk format-detect below would return non-zero
+    # (no rows match, found=0) and incorrectly tag the run as
+    # "lossy-pre-v1.4.2-log" in the notes column — making a clean PASS
+    # look like it ran on degraded probe infrastructure.
+    WEBFETCH_LOGGED=""
   else
     # v1.4.2 stub server TSV columns:
     #   1=ts  2=method  3=path  4=query  5=body  6=host

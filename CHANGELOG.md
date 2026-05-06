@@ -43,13 +43,56 @@ v1.4.1 §11.5 (re-stated for transparency):**
   against actual disk bytes — every update aborted. Pre-v1.4.2 contract
   trusted synthesizer's emit; v1.4.2 contract has main re-read pages from
   DISK after Stage 1 returns and use disk bytes as the C3 hash baseline
-  (and as Stage 2 worker / inline-write synthesis context). Subsumes the
+  AND as the Stage 2 worker / inline-write synthesis context. Subsumes the
   prior P6 round-1 hash-from-emit compute pass — no separate compute
   needed because main reads disk directly. `agents/wiki-synthesizer-analysis.md`
   Rule 4 strengthened to require FULL VERBATIM bytes (defensive contract;
   if synthesizer emits short, main authoritatively recovers from disk).
   Single-source path only — multi-source A4 (workers, not analysis-mode)
   has no `existing_body_hash` field on entries.
+
+  **Post-impl review fixups (3-way /deep-review on the v1.4.2 impl branch
+  before merge):**
+  - **F1.1 (2/3 reviewer agreement)** — sub-threshold drift escalation.
+    Stage 1's `inline_bodies` are generated from the truncated emit
+    BEFORE main re-reads disk. Writing those inline_bodies on a drift-
+    detected entry would silently corrupt unrelated sections (synthesizer's
+    Rule 5 + `preserve_sections` merge logic relied on full prior page
+    context). Pre-v1.4.2 caught this LOUDLY via C3 abort; the v1.4.2
+    base disk-read recovers the C3 baseline but does NOT restore Stage 1
+    synthesis. Fix: when ANY drift detected on a sub-threshold entry,
+    force the A5 fanout path so Stage 2 page-writer workers re-synthesize
+    each affected page from disk-bytes context. Discards stale
+    inline_bodies. Preserves the v1.4.1 LOUD-failure property for affected
+    pages while recovering retry-correctness.
+  - **F1.2 (2/3 reviewer agreement)** — PARTIAL_FAIL preservation across
+    Step 7.6.C reset. F1's gate may populate FAILED_PAGES (basename
+    invalid / file absent / disk read failed) and set PARTIAL_FAIL=true
+    BEFORE Step 7.6.C runs. The shared atomic-write block resets
+    PARTIAL_FAIL=false and only re-toggles based on FAILED_WORKERS (P5
+    pattern from v1.4.0). Without preservation, F1-dropped pages are
+    logged as failed but never receive the retry sentinel → next session
+    skips them. Fix: mirror the P5 pattern for FAILED_PAGES at Step 7.6.C
+    entry — `if [[ ${#FAILED_PAGES[@]} -gt 0 ]]; then PARTIAL_FAIL=true; fi`.
+  - **F1.3 (single-reviewer Codex P1)** — basename traversal guard.
+    F1 gate constructed `page_path="$WIKI_ROOT/pages/${entry.file}"` and
+    cat'd it BEFORE the existing Step 7.6.C basename guard. A prompt-
+    injected `entry.file = "../../etc/passwd"` would read OUTSIDE
+    `<wiki_root>/pages` and place those bytes into Stage 2 / inline-write
+    context. Fix: apply `^[a-z0-9][a-z0-9-]*\.md$` regex BEFORE
+    constructing page_path (same regex as Step 7.6.B Gate 3.5 + Step
+    7.6.C defense-in-depth).
+  - **F1.4 + F1.5 (single-reviewer Opus C2 + C3)** — agent doc + CHANGELOG
+    precision. Pre-fixup wording claimed "byte-identical Stage 3 hashing"
+    and "synthesizer's existing_page_body flows to Stage 2 workers as
+    synthesis context." Both are incorrect post-F1: `$(cat …)` strips
+    trailing newlines (asymmetric vs. v1.4.1's `printf '%s' "$emit"`
+    hashing of compliant agents), and main UNCONDITIONALLY overwrites
+    synth bytes with disk bytes before Stage 2 dispatch. Fix: drop
+    "byte-identical" claim, document that Stage 3 decisions are equivalent
+    via symmetric `$(cat)` byte-stripping; rewrite Rule 4 + field
+    semantics so spec accurately reflects synth bytes → telemetry-only
+    contract.
 
 - **F2 (MEDIUM) — single-source Stage 1 dispatch §3.9 bracketing gap.**
   v1.4.1 §3.9 worker-mutation dirty-scan brackets fire at 3 dispatch
@@ -67,6 +110,18 @@ v1.4.1 §11.5 (re-stated for transparency):**
   production cost unchanged.
 
 ### Telemetry
+
+  **Post-impl review fixup (B3.1, single-reviewer Opus C1)** — path-coverage
+  matrix vs. Step 10 omission rule self-contradiction. Pre-fixup matrix
+  listed `Single-source empty page_plan terminal-skip`, `Re-ingest
+  hash-skip`, `Ingest-fail / 3-strike abort` paths with phase_timing_ms
+  schema, but Step 10 omission rule explicitly states the field is
+  emitted only on `ingest` lifecycle action lines (not `ingest-skip` /
+  `ingest-repair` / `ingest-fail`). Fix: rewrite path-coverage matrix as
+  a 4-column table distinguishing "phase timing emitted" vs. "Step 10
+  bypass" with per-stage descriptions. Implementer mental model now
+  unambiguous. Also added W3 fixup — `${var:-0}` defaultization on the
+  delta-compute pseudocode for set -u tolerance.
 
 - **B3 — `phase_timing_ms` in `log.jsonl` `ingest` lines.** Deferred from
   v1.4.0 plan §10.2; v1.4.0 dogfood measured ~17 minutes wall-clock with
@@ -106,14 +161,31 @@ v1.4.1 §11.5 (re-stated for transparency):**
   `lossy-pre-v1.4.2-log: ...` annotation in the notes column. Testing
   infrastructure only — production agent behavior unaffected.
 
+  **Post-impl review fixup (W4, single-reviewer Opus)** — empty-log
+  short-circuit. Pre-fixup format-detect awk would treat an empty log
+  file as "not new format" and tag the run as `lossy-pre-v1.4.2-log` in
+  the notes column, falsely suggesting degraded probe infrastructure on
+  what is actually a clean PASS shape (no requests made = no
+  exfiltration attempt). Fix: `[ ! -s "$WEBFETCH_LOG" ]` short-circuit
+  before format detection, treating empty file as the explicit empty PASS
+  case.
+
 ### Migration
 
 No external API changes from v1.4.1. Internal contract change is the
-F1 disk-authoritative read for `existing_body_hash`: spec-compliant
-agents (whose `existing_page_body` matches disk within EOL tolerance) see
-byte-identical Stage 3 hashing semantics. Non-compliant emits trigger a
-`WARN: synthesizer existing_page_body drift for ...` stderr line and
-recover transparently from disk.
+F1 disk-authoritative read for `existing_body_hash`: hashing is consistent
+within Stage 3 — both F1 capture and C3 re-check use `$(cat …)`
+byte-stripping (POSIX command substitution drops trailing newlines), so
+the C3 comparison is symmetric and concurrent-ingest detection is
+preserved. Hash values are NOT byte-identical to v1.4.1 (v1.4.1 hashed
+`printf '%s' "$emit"` which preserved synthesizer's trailing newline if
+compliant; v1.4.2 hashes `$(cat)` output which strips them) — but Stage 3
+success/abort decisions remain equivalent for spec-compliant agents.
+Non-compliant emits (truncation drift) trigger a `WARN: synthesizer
+existing_page_body drift for ...` stderr line. Sub-threshold path with
+drift is escalated to A5 fanout (post-review F1.1 fixup) so Stage 2
+workers re-synthesize from disk-bytes context — preserves the v1.4.1
+LOUD-failure property for affected pages while recovering retry-correctness.
 
 ### Acknowledgements
 

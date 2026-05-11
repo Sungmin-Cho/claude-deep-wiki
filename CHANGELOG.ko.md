@@ -2,6 +2,127 @@
 
 deep-wiki의 주요 변경사항을 기록합니다.
 
+## [1.5.0] — 2026-05-11
+
+**M3 envelope 도입** — `<wiki_root>/.wiki-meta/index.json`이 M3 cross-plugin
+envelope([claude-deep-suite/docs/envelope-migration.md](https://github.com/Sungmin-Cho/claude-deep-suite/blob/main/docs/envelope-migration.md)
+§1) 안으로 들어갑니다. 기존의 `{pages, generated_at}` 구조는 그대로
+`payload` 내부에 보존되며, 소비자는 envelope-aware reader 를 통해 envelope-
+wrap 여부와 무관하게 legacy 구조를 그대로 받습니다.
+
+M3 Phase 2 의 **6 번째 (마지막)** plugin migration 입니다. 본 PR merge 후
+suite-repo 측 Phase 3 (marketplace.json SHA bump, payload-registry schema
+교체, adoption ledger 갱신) 가 진행됩니다.
+
+### 왜 envelope 인가
+
+- **Cross-plugin trace**: ULID `run_id` + 선택적 `parent_run_id` chain —
+  M4 telemetry / Phase 3 dashboard 가 cross-plugin lineage 재구성.
+- **Producer attribution**: `producer = "deep-wiki"`, `producer_version` 은
+  `plugin.json.version` (단일 진실원본) 을 mirror.
+- **Schema drift 감지**: `schema.name = "index"`, identity guards 가 외부
+  envelope 를 read-time 에 거부.
+- **Reproducibility**: `git.{head,branch,dirty}` + `provenance.
+  tool_versions` snapshot.
+- **Multi-source aggregator**: page 들이 `provenance.source_artifacts[]`
+  에 path-only 로 기록됨 (markdown — envelope detect 불가). `parent_run_id`
+  는 default omit — index.json 의 단일 parent artifact 부재.
+
+### 추가
+
+- **`hooks/scripts/envelope.js`** — zero-dep 공유 라이브러리: ULID
+  generator (MSB-first Crockford Base32), `detectGit`,
+  `loadProducerVersion`, `wrapEnvelope`, `unwrapEnvelope`, `isEnvelope`,
+  `isValidEnvelope`. producer version 은 module 파일 기준 상대 경로로
+  `.claude-plugin/plugin.json` 을 읽어, agent 실행 cwd 와 무관하게 동작
+  (literal-cwd-resolve — handoff §4 deep-docs round-1 lesson).
+- **`hooks/scripts/wrap-index-envelope.js`** — CLI writer. payload JSON
+  파일을 envelope 로 감싸 `<wiki_root>/.wiki-meta/index.json` 에 atomic
+  write (temp + rename — handoff §4 deep-work round-1 C1 lesson). 반복
+  가능한 `--source-page` (markdown 페이지 path-only) + 일반
+  `--source-artifact path[:run_id]` (self-consistency auto-harvest —
+  handoff §4 deep-evolve round-1 W4 lesson) 지원. forward-compat
+  `--parent-run-id` 는 CLI 경계에서 ULID 만 허용 (defense-in-depth — handoff
+  §4 deep-evolve round-1 C3 lesson).
+- **`hooks/scripts/read-index-envelope.js`** — CLI reader. v1.5.0+ envelope
+  wrap 이든 pre-1.5.0 legacy 든 항상 stdout 으로 legacy `{pages,
+  generated_at}` 구조를 emit. identity guards 가 foreign / corrupt
+  envelope 를 exit 1 로 거부.
+- **`scripts/validate-envelope-emit.js`** — release-lint validator. 외부
+  의존 없이 suite envelope schema 를 mirror: 모든 nested object 에
+  `additionalProperties: false`, ULID/SemVer 2.0.0/RFC 3339/kebab-case
+  regex, identity check (producer=deep-wiki, artifact_kind=index,
+  schema.name=index), corrupt-payload defense.
+- **`tests/envelope-emit.test.js` + `tests/envelope-chain.test.js`** —
+  Node test runner. 87+ tests — wrap roundtrip, identity gates, parseArgs
+  경계 (scalar + repeatable 빈 값 거부, deep-review round-1 Q6 lesson),
+  atomic-write residue check, envelope-aware reader legacy pass-through,
+  multi-source aggregator contract (parent_run_id 부재, source_artifacts
+  path-only).
+- **`tests/fixtures/sample-index.json`** — release sample emit. Phase 3
+  가 `claude-deep-suite/schemas/payload-registry/deep-wiki/index/v1.0.schema.json`
+  의 placeholder 를 교체할 때 input 으로 사용.
+- **`package.json`** — `npm test` 가 envelope 테스트 suite 실행, `npm run
+  validate-fixture` 가 sample fixture 검증.
+
+### 변경
+
+- **`commands/wiki-setup.md`** — Step 3 scaffold 가 literal JSON 작성
+  대신 `wrap-index-envelope.js` 호출. caller 가 `WIKI_ROOT` 를
+  스니펫 진입 전에 설정해야 함 (deep-evolve round-2 R2-3
+  self-containedness lesson).
+- **`commands/wiki-rebuild.md`** — Step 3 가 envelope-wrap contract,
+  반복 가능한 `--source-page` multi-source flag, bash-only fast-path
+  (deep-work round-1 W6 lesson — hot-path 에서 per-file `node -e` 회피)
+  를 문서화.
+- **`commands/wiki-ingest.md`** — Step 2 (Read Existing Wiki State) +
+  Step 9 (Update Index) 가 envelope-aware helper 를 통해 read/write.
+  in-memory merge 로직은 unwrapped payload (legacy shape) 위에서 동작하므로
+  기존 jq pipeline 이 그대로 동작.
+- **`commands/wiki-query.md`** — Layer 1 Index scan 이
+  `read-index-envelope.js` 사용.
+- **`commands/wiki-lint.md`** — Step 5 (Duplicate/Alias Conflict) + Step
+  10 (Index Drift Detection) 가 `read-index-envelope.js` 사용.
+- **`skills/wiki-schema/SKILL.md` §Index** — envelope wrapper, identity
+  contract, multi-source aggregator 패턴을 문서화. legacy + envelope-
+  wrapped 두 예시 모두 표시.
+
+### 호환성
+
+- **Forward 호환 (v1.5.0+ → legacy 코드 read)**: envelope-aware reader
+  (`read-index-envelope.js`) 가 stdout 으로 legacy `{pages, generated_at}`
+  구조를 emit 하므로 기존 jq pipeline (`.pages[].file`,
+  `.generated_at`) 이 수정 없이 동작.
+- **Backward 호환 (pre-1.5.0 → legacy index.json 보유 user wiki)**:
+  reader 가 legacy input 을 그대로 통과시킴. 사용자는 업그레이드 후
+  `/wiki-rebuild` 를 강제 실행할 필요 없음 — 기존 `index.json` 이
+  그대로 작동. `/wiki-rebuild` 실행 시 envelope-wrapped 형태로 재생성
+  (데이터 손실 없음; payload shape 동일).
+- **Atomic write**: writer 가 `outputPath + .tmp.<pid>.<Date.now()>` →
+  `fs.renameSync` 사용 (deep-work round-1 C1 lesson). mid-write 중단 시
+  truncated index.json 이 남지 않음.
+- **Identity guards**: reader 가 foreign-producer envelope (예: deep-evolve
+  envelope 가 index.json 경로에 잘못 위치) 를 exit 1 로 거부 — 수동 복구는
+  `/wiki-rebuild` 이며 이는 page frontmatter (skills/wiki-schema/SKILL.md
+  명시 source of truth) 로부터 재생성.
+
+### Suite-side 협업 (Phase 3, 본 PR 아님)
+
+T+0 timer 기록 (suite-repo `docs/envelope-migration.md` §6.1 adoption
+ledger) 은 Phase 2 §1 정책에 따라 의도적으로 claude-deep-suite Phase 3
+로 연기 — 모든 suite-repo 변경 (marketplace.json SHA bump,
+payload-registry schema 교체, adoption ledger 갱신) 은 6 개 Phase 2 plugin
+PR 가 모두 머지된 후 단일 Phase 3 PR 로 일괄 처리. 자세한 내용은
+claude-deep-suite/`docs/superpowers/plans/2026-05-07-m3-phase2-handoff.md`
+§1 (handoff "Probe F" cross-repo doc drift lesson).
+
+### Migration
+
+데이터 migration 불필요. 기존 `index.json` 파일 (legacy shape) 은 v1.5.0
+consumer 가 그대로 읽을 수 있으며, 다음 번 `/wiki-rebuild` 또는
+`/wiki-ingest` 실행 시 envelope 형태로 재포장됩니다. 즉시 migration 을
+강제하려면 `/wiki-rebuild` 를 실행하세요.
+
 ## [1.4.2] — 2026-05-07
 
 `docs/handoff-2026-05-06-v1.4.2.md`의 v1.4.1 backlog 4개 항목을 닫는 패치

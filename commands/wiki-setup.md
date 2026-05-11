@@ -59,12 +59,34 @@ touch "<wiki_root>/log.jsonl"
 
 > **Timestamp format:** All `ts` and `generated_at` values MUST be UTC ISO 8601 with a `Z` suffix. Generate with `date -u +"%Y-%m-%dT%H:%M:%SZ"`. Never use local timezone offsets (e.g. `+09:00`) — the wiki's log is consumed by tooling that assumes a single canonical timezone.
 
-```json
-// <wiki_root>/.wiki-meta/index.json
+**`<wiki_root>/.wiki-meta/index.json`** — v1.5.0+ emits the M3 cross-plugin envelope wrap around the legacy payload shape. Caller MUST set `WIKI_ROOT` (absolute path) before invoking the snippet below.
+
+```bash
+set -euo pipefail
+: "${WIKI_ROOT:?caller must set WIKI_ROOT to the wiki root absolute path}"
+
+# Build the empty payload (legacy shape preserved inside `payload`).
+PAYLOAD_TMP="${WIKI_ROOT}/.wiki-meta/index.payload.tmp.$$.$(date +%s).json"
+cat > "$PAYLOAD_TMP" <<JSON
 {
   "pages": [],
-  "generated_at": "<current_iso_timestamp>"
+  "generated_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 }
+JSON
+
+# Envelope-wrap. The helper writes atomically (temp + rename) and emits
+# `wrapped: <path> ...` on stdout. Multi-source aggregator: no parent_run_id;
+# empty source_artifacts on first setup (pages/ is empty by definition).
+# Cleanup payload temp file ONLY on helper success — failure preserves it
+# for retry (deep-work round-1 C2 gated-cleanup lesson).
+if node "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/wrap-index-envelope.js" \
+     --payload-file "$PAYLOAD_TMP" \
+     --output "${WIKI_ROOT}/.wiki-meta/index.json"; then
+  rm -f "$PAYLOAD_TMP"
+else
+  echo "ERROR: wrap-index-envelope.js failed; payload preserved at $PAYLOAD_TMP for retry" >&2
+  exit 1
+fi
 ```
 
 Create the initial human-readable wiki artifacts:

@@ -1,0 +1,44 @@
+{
+  "$schema": "https://raw.githubusercontent.com/Sungmin-Cho/claude-deep-suite/main/schemas/artifact-envelope.schema.json",
+  "schema_version": "1.0",
+  "envelope": {
+    "producer": "deep-wiki",
+    "producer_version": "1.5.0",
+    "artifact_kind": "index",
+    "run_id": "01JTKZQ7N3ABCDEFGHJKMNPQRS",
+    "generated_at": "2026-05-11T10:00:00Z",
+    "schema": { "name": "index", "version": "1.0" },
+    "git": { "head": "abc1234", "branch": "main", "dirty": false },
+    "provenance": {
+      "source_artifacts": [
+        { "path": "pages/react-hooks.md" },
+        { "path": "pages/postgres-indexing.md" },
+        { "path": "pages/llm-wiki-philosophy.md" }
+      ],
+      "tool_versions": { "node": "v20.11.0" }
+    }
+  },
+  "payload": {
+    "pages": [
+      {
+        "file": "llm-wiki-philosophy.md",
+        "title": "LLM Wiki Philosophy",
+        "tags": ["llm", "knowledge-management"],
+        "aliases": ["wiki philosophy", "karpathy wiki"]
+      },
+      {
+        "file": "postgres-indexing.md",
+        "title": "Postgres Indexing",
+        "tags": ["database", "postgres", "performance"],
+        "aliases": ["postgres indexes", "btree index"]
+      },
+      {
+        "file": "react-hooks.md",
+        "title": "React Hooks",
+        "tags": ["programming", "react", "frontend"],
+        "aliases": ["hooks", "useState"]
+      }
+    ],
+    "generated_at": "2026-05-11T10:00:00Z"
+  }
+}

@@ -34,7 +34,18 @@ Use the argument as the search query. If no argument, ask the user what they wan
 Perform a multi-layer search to find relevant pages:
 
 **Layer 1 — Index scan:**
-Read `.wiki-meta/index.json`. Match the query against page titles, tags, and aliases. Collect candidate page filenames.
+Read `.wiki-meta/index.json` (envelope-aware in v1.5.0+). Match the query
+against page titles, tags, and aliases. Collect candidate page filenames.
+
+```bash
+set -euo pipefail
+: "${WIKI_ROOT:?caller must set WIKI_ROOT to the wiki root absolute path}"
+# Envelope-aware read — emits legacy {pages, generated_at} shape on stdout
+# whether the file is pre-1.5.0 legacy or v1.5.0+ envelope-wrapped.
+INDEX_JSON=$(node "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/read-index-envelope.js" \
+              "${WIKI_ROOT}/.wiki-meta/index.json")
+# Existing jq pipelines on $INDEX_JSON (.pages[].title etc.) work unchanged.
+```
 
 **Layer 2 — Content search:**
 Use Grep to search `pages/` directory for keywords from the query. Add matching files to candidates.

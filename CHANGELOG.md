@@ -2,6 +2,133 @@
 
 All notable changes to deep-wiki are documented here.
 
+## [1.5.0] — 2026-05-11
+
+**M3 envelope adoption** — `<wiki_root>/.wiki-meta/index.json` is now wrapped
+in the M3 cross-plugin envelope (cf.
+[claude-deep-suite/docs/envelope-migration.md](https://github.com/Sungmin-Cho/claude-deep-suite/blob/main/docs/envelope-migration.md)
+§1). The legacy `{pages, generated_at}` shape is preserved verbatim inside
+`payload`; consumers use the envelope-aware reader to get the legacy shape
+back regardless of whether the file is v1.5.0+ envelope-wrapped or pre-1.5.0
+legacy.
+
+This is the **6th and final** of the M3 Phase 2 plugin migrations. After
+this merge, suite-side Phase 3 (marketplace.json SHA bump, payload-registry
+schema replacement, adoption ledger) is unblocked.
+
+### Why envelope
+
+- **Cross-plugin trace**: every emit carries a ULID `run_id` + optional
+  `parent_run_id` chain — M4 telemetry / Phase 3 dashboard can reconstruct
+  cross-plugin lineage.
+- **Producer attribution**: `producer = "deep-wiki"`, `producer_version`
+  mirrors `plugin.json.version` (single source of truth).
+- **Schema drift detection**: `schema.name = "index"`, `schema.version =
+  "1.0"`; identity guards (handoff §4 round-4) reject foreign envelopes
+  at read-time.
+- **Reproducibility**: `git.{head,branch,dirty}` snapshot + `provenance.
+  tool_versions` snapshot.
+- **Multi-source aggregator**: pages contribute to
+  `provenance.source_artifacts[]` path-only (markdown — no envelope
+  detect). `parent_run_id` is omitted by default — index.json has no
+  single parent artifact.
+
+### Added
+
+- **`hooks/scripts/envelope.js`** — shared zero-dep library: ULID generator
+  (MSB-first Crockford Base32), `detectGit`, `loadProducerVersion`,
+  `wrapEnvelope`, `unwrapEnvelope`, `isEnvelope`, `isValidEnvelope`.
+  Producer version is read from `.claude-plugin/plugin.json` relative to
+  the module file (literal-cwd-resolve — handoff §4 deep-docs round-1
+  lesson) so the helper works regardless of which directory the agent
+  invokes it from.
+- **`hooks/scripts/wrap-index-envelope.js`** — CLI writer. Wraps a payload
+  JSON file into envelope form and atomically writes to
+  `<wiki_root>/.wiki-meta/index.json` (temp + rename — handoff §4 deep-work
+  round-1 C1 lesson). Supports `--source-page` (repeatable, path-only for
+  markdown pages) and generic `--source-artifact path[:run_id]` with
+  self-consistency auto-harvest (handoff §4 deep-evolve round-1 W4
+  lesson). Forward-compat `--parent-run-id` accepts only ULIDs at the CLI
+  boundary (defense-in-depth — handoff §4 deep-evolve round-1 C3 lesson).
+- **`hooks/scripts/read-index-envelope.js`** — CLI reader. Emits the legacy
+  `{pages, generated_at}` shape on stdout whether the input is v1.5.0+
+  envelope-wrapped or pre-1.5.0 legacy. Identity guards reject foreign or
+  corrupt envelopes with exit 1.
+- **`scripts/validate-envelope-emit.js`** — release-lint validator. Mirrors
+  the suite envelope schema without external deps: `additionalProperties:
+  false` on every nested object, ULID/SemVer 2.0.0/RFC 3339/kebab-case
+  regex, identity check (producer=deep-wiki, artifact_kind=index,
+  schema.name=index), corrupt-payload defense.
+- **`tests/envelope-emit.test.js` + `tests/envelope-chain.test.js`** —
+  Node test runner. 87+ tests covering wrap roundtrip, identity gates,
+  parseArgs boundary (scalar + repeatable empty-value rejection, deep-review
+  round-1 Q6 lesson), atomic-write residue check, envelope-aware reader
+  legacy pass-through, multi-source aggregator contract (no parent_run_id,
+  source_artifacts path-only).
+- **`tests/fixtures/sample-index.json`** — release sample emit. Phase 3
+  uses this as input when replacing the placeholder schema at
+  `claude-deep-suite/schemas/payload-registry/deep-wiki/index/v1.0.schema.json`.
+- **`package.json`** — `npm test` runs the envelope test suite, `npm run
+  validate-fixture` validates the sample fixture.
+
+### Changed
+
+- **`commands/wiki-setup.md`** — Step 3 scaffold now invokes
+  `wrap-index-envelope.js` instead of writing a literal JSON. Caller
+  contract: set `WIKI_ROOT` before invoking the snippet (deep-evolve
+  round-2 R2-3 self-containedness lesson).
+- **`commands/wiki-rebuild.md`** — Step 3 documents the envelope-wrap
+  contract, the multi-source `--source-page` repeatable flag, and a
+  bash-only fast-path (deep-work round-1 W6 lesson) for hot-path
+  envelope detection without spawning per-file Node processes.
+- **`commands/wiki-ingest.md`** — Step 2 (Read Existing Wiki State) and
+  Step 9 (Update Index) read/write via envelope-aware helpers. The
+  in-memory merge logic operates on the unwrapped payload (legacy shape),
+  so existing jq pipelines work unchanged.
+- **`commands/wiki-query.md`** — Layer 1 Index scan uses
+  `read-index-envelope.js`.
+- **`commands/wiki-lint.md`** — Step 5 (Duplicate/Alias Conflict) and
+  Step 10 (Index Drift Detection) use `read-index-envelope.js`.
+- **`skills/wiki-schema/SKILL.md` §Index** — documents the envelope
+  wrapper, identity contract, and multi-source aggregator pattern. Both
+  legacy and envelope-wrapped examples are shown.
+
+### Compatibility
+
+- **Forward compatibility (v1.5.0+ → consumers reading legacy code)**: the
+  envelope-aware reader (`read-index-envelope.js`) emits the legacy
+  `{pages, generated_at}` shape on stdout, so existing jq pipelines
+  (`.pages[].file`, `.generated_at`) work without modification.
+- **Backward compatibility (pre-1.5.0 → user wikis with legacy
+  index.json)**: the reader passes legacy input through unchanged. Users
+  do not need to run `/wiki-rebuild` after upgrading — existing
+  `index.json` files continue to work. Running `/wiki-rebuild` regenerates
+  in envelope-wrapped form (no data loss; payload shape is identical).
+- **Atomic write**: the writer uses `outputPath + .tmp.<pid>.<Date.now()>`
+  → `fs.renameSync` (deep-work round-1 C1 lesson). Mid-write interruption
+  cannot leave a truncated index.json.
+- **Identity guards**: the reader rejects foreign-producer envelopes
+  (e.g., a deep-evolve envelope accidentally at the index.json path) with
+  exit 1 — manual recovery is `/wiki-rebuild` which regenerates from page
+  frontmatter (the source of truth per skills/wiki-schema/SKILL.md).
+
+### Suite-side coordination (Phase 3, NOT this PR)
+
+T+0 timer recording (suite-side `docs/envelope-migration.md` §6.1
+adoption ledger) is intentionally deferred to claude-deep-suite Phase 3
+per the Phase 2 §1 policy — all suite-repo changes (marketplace.json SHA
+bump, payload-registry schema replacement, adoption ledger update) batch
+in a single Phase 3 PR after all six Phase 2 plugin PRs land. See
+claude-deep-suite/`docs/superpowers/plans/2026-05-07-m3-phase2-handoff.md`
+§1 (handoff "Probe F" cross-repo doc drift lesson).
+
+### Migration
+
+No data migration needed. Existing `index.json` files (legacy shape)
+remain readable by v1.5.0 consumers; they get re-wrapped into envelope
+form the next time `/wiki-rebuild` or `/wiki-ingest` runs. To force an
+immediate migration, run `/wiki-rebuild`.
+
 ## [1.4.2] — 2026-05-07
 
 Patch release closing four v1.4.1 backlog items captured in

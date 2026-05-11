@@ -142,7 +142,7 @@ Raw Sources  →  Wiki (마크다운 페이지)  →  Schema (관리 규칙)
 ├── index.md                  # LLM이 작성한 카탈로그 (사람이 읽는 용도)
 ├── log.md                    # LLM이 작성한 연대기 (사람이 읽는 용도)
 ├── .wiki-meta/
-│   ├── index.json            # 머신 리더블 페이지 카탈로그 (파생)
+│   ├── index.json            # 머신 리더블 페이지 카탈로그 (파생; v1.5.0+ M3 envelope-wrapped — CHANGELOG 참조)
 │   ├── sources/              # 소스별 출처 추적 YAML 파일
 │   └── .versions/            # 덮어쓰기 전 페이지 백업 (최근 3개)
 ├── log.jsonl                 # append-only 구조화 이벤트 로그

@@ -44,9 +44,30 @@ Read every `.md` file in `pages/`. For each page, parse the YAML frontmatter to 
 
 > **Timestamp format:** All `ts` and `generated_at` values MUST be UTC ISO 8601 with a `Z` suffix. Generate with `date -u +"%Y-%m-%dT%H:%M:%SZ"`. Never use local timezone offsets (e.g. `+09:00`) — the wiki's log is consumed by tooling that assumes a single canonical timezone.
 
-Build a new `index.json` from the scanned data:
+Build a new `index.json` from the scanned data. v1.5.0+ wraps the page catalog
+in the M3 cross-plugin envelope (cf. claude-deep-suite/docs/envelope-migration.md
+§1) — the legacy `{pages, generated_at}` shape lives inside `payload`. The
+envelope is added at write-time by `wrap-index-envelope.js`; consumers of
+`index.json` use `read-index-envelope.js` to unwrap (or jq-equivalent: if
+`.envelope` is present, treat `.payload` as the legacy structure; else use
+the root). See "Envelope-aware read" sidebar below.
 
-```json
+**Step 3.a — Build payload (legacy shape inside `payload`):**
+
+Caller MUST set `WIKI_ROOT` (absolute path) before invoking the snippet
+(Bash tool spawns a fresh shell per invocation — deep-evolve round-2 R2-3
+self-containedness lesson). The payload structure is identical to pre-1.5.0
+`index.json` (no schema changes), so wiki-lint/wiki-query etc. that already
+operate on `.pages[]` continue to work after envelope-aware unwrap.
+
+```bash
+set -euo pipefail
+: "${WIKI_ROOT:?caller must set WIKI_ROOT to the wiki root absolute path}"
+
+# Pages array is sorted alphabetically by filename, built from Step 2 scan.
+# (Below is a structural template — caller substitutes actual page entries.)
+PAYLOAD_TMP="${WIKI_ROOT}/.wiki-meta/index.payload.tmp.$$.$(date +%s).json"
+cat > "$PAYLOAD_TMP" <<JSON
 {
   "pages": [
     {
@@ -56,11 +77,75 @@ Build a new `index.json` from the scanned data:
       "aliases": ["hooks", "useState"]
     }
   ],
-  "generated_at": "<current_iso_timestamp>"
+  "generated_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 }
+JSON
 ```
 
-Sort pages alphabetically by filename.
+**Step 3.b — Envelope-wrap and atomic write:**
+
+Multi-source aggregator: every scanned page contributes one `--source-page`
+entry (path relative to `<wiki_root>`, e.g. `pages/react-hooks.md`). Pages
+are markdown → recorded path-only (no envelope detect). `parent_run_id` is
+omitted (multi-source aggregator default). Helper writes atomically (temp +
+rename); cleanup is gated on helper success (deep-work round-1 C1+C2 lessons).
+
+```bash
+# Collect --source-page args from scanned pages. Substitute <SCANNED_PAGE_PATHS>
+# with the actual sorted list (e.g. via `find "${WIKI_ROOT}/pages" -maxdepth 1
+# -name '*.md' -printf 'pages/%f\n' | sort`).
+SOURCE_PAGE_ARGS=()
+while IFS= read -r REL; do
+  [ -n "$REL" ] && SOURCE_PAGE_ARGS+=(--source-page "$REL")
+done < <(find "${WIKI_ROOT}/pages" -maxdepth 1 -name '*.md' -printf 'pages/%f\n' 2>/dev/null | sort)
+
+if node "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/wrap-index-envelope.js" \
+     --payload-file "$PAYLOAD_TMP" \
+     --output "${WIKI_ROOT}/.wiki-meta/index.json" \
+     "${SOURCE_PAGE_ARGS[@]}"; then
+  rm -f "$PAYLOAD_TMP"
+else
+  echo "ERROR: wrap-index-envelope.js failed; payload preserved at $PAYLOAD_TMP for retry" >&2
+  exit 1
+fi
+```
+
+Sort pages alphabetically by filename inside the payload.
+
+**Envelope-aware read (any consumer of index.json):**
+
+When reading `index.json` (e.g. wiki-query, wiki-lint, wiki-ingest Step 4
+overlap filter), use the envelope-aware reader so v1.5.0+ envelope-wrapped
+files and pre-1.5.0 legacy files both yield the legacy `{pages, generated_at}`
+shape on stdout. The reader enforces an identity guard (producer=deep-wiki,
+artifact_kind=index, schema.name=index) and rejects foreign or corrupt
+envelopes (handoff §4 round-4 + round-5/7 lessons).
+
+```bash
+# Returns payload-only JSON (legacy shape) on stdout. Exit codes:
+# 0 ok, 1 identity mismatch / corrupt payload, 2 IO / parse error.
+INDEX_JSON=$(node "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/read-index-envelope.js" \
+              "${WIKI_ROOT}/.wiki-meta/index.json")
+# Now use jq normally: echo "$INDEX_JSON" | jq -r '.pages[].file'
+```
+
+If `node` is unavailable in the agent context, a bash-only fast-path
+(deep-work round-1 W6 lesson) checks the wrapper without spawning a
+per-file Node process:
+
+```bash
+# Fast-path: detect envelope without invoking node per file.
+if grep -q '"envelope":' "${WIKI_ROOT}/.wiki-meta/index.json" && \
+   grep -q '"schema_version": *"1.0"' "${WIKI_ROOT}/.wiki-meta/index.json" && \
+   grep -q '"producer": *"deep-wiki"' "${WIKI_ROOT}/.wiki-meta/index.json" && \
+   grep -q '"artifact_kind": *"index"' "${WIKI_ROOT}/.wiki-meta/index.json"; then
+  # Envelope: extract payload via jq.
+  INDEX_JSON=$(jq '.payload' "${WIKI_ROOT}/.wiki-meta/index.json")
+else
+  # Legacy: use root directly.
+  INDEX_JSON=$(cat "${WIKI_ROOT}/.wiki-meta/index.json")
+fi
+```
 
 ### 4. Append to Log
 

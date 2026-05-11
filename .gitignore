@@ -25,3 +25,7 @@ scripts/v0-probe/v3-results.tsv
 scripts/v0-probe/webfetch-stub.log
 scripts/v0-probe/webfetch-stub-stdout.log
 scripts/v0-probe/__pycache__/
+
+# Node test runner (v1.5.0+ — npm test for envelope test suite)
+node_modules/
+package-lock.json

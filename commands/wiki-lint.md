@@ -266,10 +266,19 @@ obsidian unresolved format=json 2>/dev/null
 
 ### 5. Duplicate/Alias Conflict Detection
 
-Check `index.json` for:
+Check `index.json` (envelope-aware in v1.5.0+) for:
 - Pages with identical titles
 - Pages where one page's title matches another page's alias
 - Suggest merge candidates
+
+```bash
+set -euo pipefail
+: "${WIKI_ROOT:?caller must set WIKI_ROOT to the wiki root absolute path}"
+INDEX_JSON=$(node "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/read-index-envelope.js" \
+              "${WIKI_ROOT}/.wiki-meta/index.json")
+# $INDEX_JSON has legacy { pages, generated_at } shape — duplicate scan works
+# on .pages[].title and .pages[].aliases[] unchanged.
+```
 
 ### 6. Log Invariant Check — `pages_created` Duplication
 
@@ -326,6 +335,17 @@ Compare `index.json` entries against actual page files:
 - Pages on disk but not in index (unindexed pages)
 
 If drift is found, suggest running `/wiki-rebuild`.
+
+```bash
+set -euo pipefail
+: "${WIKI_ROOT:?caller must set WIKI_ROOT to the wiki root absolute path}"
+# Envelope-aware read of index.json (v1.5.0+ envelope-wrapped or legacy).
+INDEX_JSON=$(node "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/read-index-envelope.js" \
+              "${WIKI_ROOT}/.wiki-meta/index.json")
+INDEX_FILES=$(echo "$INDEX_JSON" | jq -r '.pages[].file' | sort)
+DISK_FILES=$(find "${WIKI_ROOT}/pages" -maxdepth 1 -name '*.md' -printf '%f\n' 2>/dev/null | sort)
+# Compare INDEX_FILES vs DISK_FILES with comm -23 / comm -13 as usual.
+```
 
 ### 11. Scan-Window Invariant Check (v1.2.0+)
 

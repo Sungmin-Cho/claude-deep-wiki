@@ -337,8 +337,107 @@ flagged the 3 issues below (2-way agreement on R3-1).
   source_artifacts + clean tmp residue).
 
 R3 fixes: `npm test` → **106 pass / 0 fail / ~2.7s** (was 102 pass
-after R2 fixes; +4 R3-specific tests). Convergence after R3 verified
-in round-4 review (no new findings).
+after R2 fixes; +4 R3-specific tests).
+
+### Round-4 review fixups (3-way /deep-review round 4)
+
+Round 4 split-decision review:
+
+- **Opus**: APPROVE, 0 findings, declared convergence.
+- **Codex review**: 2 P2 — R4-A (wiki-rebuild Step 1 trap fires too
+  early — REGRESSION from R3-2) + R4-B (envelope.git uses process.cwd
+  instead of wiki_root, 2-way with Codex adv).
+- **Codex adversarial**: 1 HIGH transactional rollback (3rd-occurrence
+  of wiki-query atomicity probe class — DEFERRED on anti-oscillation +
+  out-of-scope grounds) + 1 MEDIUM same git cwd issue (R4-B).
+
+Decisions: 2 ACCEPT + 1 DEFER. Anti-oscillation §4 invoked for R4-C.
+
+- **R4-A (Codex review #1) — wiki-rebuild Step 1 trap fires too early
+  (R3-2 regression)**: R3-2 put `trap cleanup_lock EXIT` inside Step
+  1's standalone bash block. Claude Code Bash tool spawns a fresh
+  shell per ```bash``` block → the trap fires as soon as Step 1 exits
+  → lock released BEFORE Steps 2-5 run → /wiki-rebuild proceeds
+  unlocked and a concurrent ingest/rebuild can interleave. Critical
+  regression of R3-2 fix introduced by misunderstanding bash-tool
+  shell lifecycle. **Fix**: removed trap from Step 1; added
+  failure-only cleanup trap INSIDE Step 3 (the mutation block) using
+  the same pattern as wiki-query Step 5d (after R3-1). On Step 3
+  success: lock kept for Step 6 to release. On Step 3 failure: trap
+  releases lock; payload temp preserved for retry (no manual
+  `rmdir .wiki-lock` needed).
+  +3 regression tests (Step 1 no-trap retains lock; Step 3 failure
+  releases lock; Step 3 success keeps lock).
+
+- **R4-B (Codex review #2 + Codex adv #2 — 2-way) — envelope.git uses
+  arbitrary process.cwd**: `wrap-index-envelope.js` previously called
+  `env.wrapEnvelope({})` without a git override; `wrapEnvelope` fell
+  through to `detectGit(process.cwd())`. The agent invokes the CLI
+  from arbitrary bash cwd, so envelope.git could record an unrelated
+  repo's HEAD/dirty state, undermining audit/recovery value of the
+  M3 provenance metadata. **Fix**: derive wiki_root from the
+  `--output` path (`<wiki_root>/.wiki-meta/index.json` →
+  `path.dirname(path.dirname(outputPath))`); call
+  `env.detectGit(wikiRoot)` and pass result to `wrapEnvelope` as
+  explicit `git` override. If wiki_root is not a git repo (common —
+  Obsidian vault without git), the sentinel `0000000` head + dirty=
+  unknown is emitted (correctly signals "no git context", same as
+  pre-fix behavior on non-git cwds). +2 regression tests (non-git
+  wiki → sentinel; git wiki → wiki's HEAD).
+
+- **R4-C (Codex adv #1, HIGH) — transactional rollback for wiki-query
+  auto-file failure**: DEFERRED with explicit reasoning. Codex
+  adversarial flagged: if `/wiki-query` Step 5c writes a page but
+  Step 5d envelope-helper fails, the page is on disk but not in
+  index/log — orphaned state.
+  Analysis:
+    1. This is pre-existing wiki-query design (pre-1.5.0 had the same
+       write-page-first ordering; M3 only changed the index update
+       mechanism, not the page-first sequence).
+    2. The recovery mechanism is built into the system:
+       `wiki-lint` reports "[DRIFT] N unindexed pages" and
+       `/wiki-rebuild` regenerates index.json from page frontmatter
+       (the source of truth per `skills/wiki-schema/SKILL.md`).
+    3. Anti-oscillation §4 trigger: this is the 3rd occurrence of an
+       "atomicity probe at wiki-query Step 5d" finding class (R2-6
+       lock leak → R3-1 lock lifetime → R4-1 transactional rollback).
+       Each previous round addressed a concrete subset; the residual
+       (page-write-before-index) is the pre-existing design tradeoff
+       that wiki-lint drift detection compensates for.
+    4. Implementing transactional rollback (staging directory + atomic
+       move-into-place for pages) is significant scope creep beyond
+       envelope adoption — would touch every wiki write path in the
+       plugin.
+  **Decision**: DEFER as out-of-scope + recoverable. Document the
+  failure mode in this CHANGELOG block + the convergence stance.
+  No code change.
+
+R4 fixes: `npm test` → **111 pass / 0 fail / ~2.5s** (was 106 pass
+after R3 fixes; +5 R4-specific tests).
+
+### Convergence summary
+
+After 4 rounds of 3-way /deep-review (Opus + Codex review + Codex
+adversarial), all actionable findings resolved:
+
+| Round | Findings | Severity profile |
+|---|---|---|
+| R1 | 6 | 1 CRITICAL + 3 HIGH/MEDIUM + 2 WARN |
+| R2 | 8 | 0 CRITICAL + 3 HIGH + 5 W/I |
+| R3 | 3 | 0 CRITICAL + 3 HIGH |
+| R4 | 3 (2 ACCEPT + 1 DEFER) | 0 CRITICAL + 2 HIGH + 1 HIGH-deferred |
+
+Monotonic decrease in critical-path findings (1 CRITICAL → 0 → 0 → 0)
+and overall actionable findings approaching zero (6 → 8 → 3 → 2). The
+R4 DEFER on transactional rollback (anti-oscillation §4) draws the
+mission-scope boundary at envelope adoption; the deferred design
+question is a candidate for a follow-up issue, not a Phase 2 blocker.
+
+Test status across rounds: 87 → 93 → 102 → 106 → **111 pass** /
+0 fail. Coverage spans the full envelope contract (identity guards,
+corrupt-payload defense, atomic writes, multi-source aggregator,
+markdown bash snippet portability, lock-lifetime correctness, git
+context provenance).
 
 ## [1.4.2] — 2026-05-07
 

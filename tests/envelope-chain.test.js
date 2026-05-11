@@ -1195,6 +1195,149 @@ JSON
   });
 });
 
+describe('envelope-chain — git context derived from output path (round-4 Codex 2-way fix)', () => {
+  // Round-4 Codex review #2 + Codex adv #2 (2-way): wrap-index-envelope.js
+  // previously let wrapEnvelope() default to detectGit(process.cwd()),
+  // recording whatever repo the agent happened to be in. The R4 fix
+  // derives the git context from the --output path (wiki_root, two levels
+  // above index.json) so envelope.git describes the wiki's revision
+  // state, not the caller's unrelated repo.
+
+  it('records wiki_root git state, NOT process.cwd state', () => {
+    const dir = tmpDir();
+    fs.mkdirSync(path.join(dir, '.wiki-meta'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'pages'));
+    // Run the CLI from /tmp (a non-git dir) with --output pointing into
+    // a non-git wiki dir. The previous behavior would detect the
+    // /tmp cwd's git context (or 0000000 sentinel if /tmp isn't git);
+    // the fix should always use wiki_root's git context (sentinel here).
+    const payload = path.join(dir, 'payload.json');
+    const out = path.join(dir, '.wiki-meta', 'index.json');
+    writeJson(payload, { pages: [], generated_at: '2026-05-11T10:00:00Z' });
+    execFileSync('node', [WRAP_CLI, '--payload-file', payload, '--output', out], {
+      encoding: 'utf8',
+      cwd: os.tmpdir(), // Run from somewhere unrelated to wiki + plugin
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const obj = JSON.parse(fs.readFileSync(out, 'utf8'));
+    // Non-git wiki_root → sentinel 0000000 head, dirty=unknown.
+    assert.equal(obj.envelope.git.head, '0000000', 'non-git wiki must emit sentinel head');
+    assert.equal(obj.envelope.git.dirty, 'unknown');
+    assert.equal(obj.envelope.git.branch, 'HEAD');
+  });
+
+  it('uses wiki_root git context when wiki_root IS a git repo', () => {
+    const dir = tmpDir();
+    fs.mkdirSync(path.join(dir, '.wiki-meta'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'pages'));
+    // Initialize wiki_root as a git repo.
+    execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: dir });
+    execFileSync('git', ['config', 'user.email', 'test@test.com'], { cwd: dir });
+    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: dir });
+    execFileSync('git', ['commit', '--allow-empty', '-q', '-m', 'init'], { cwd: dir });
+    const wikiHead = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8' }).trim();
+
+    const payload = path.join(dir, 'payload.json');
+    const out = path.join(dir, '.wiki-meta', 'index.json');
+    writeJson(payload, { pages: [], generated_at: '2026-05-11T10:00:00Z' });
+    execFileSync('node', [WRAP_CLI, '--payload-file', payload, '--output', out], {
+      encoding: 'utf8',
+      cwd: os.tmpdir(), // Run from /tmp; must NOT pick /tmp's git context (if any).
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const obj = JSON.parse(fs.readFileSync(out, 'utf8'));
+    assert.equal(obj.envelope.git.head, wikiHead, 'envelope.git.head must come from wiki_root, not cwd');
+  });
+});
+
+describe('envelope-chain — wiki-rebuild Step 1 + Step 3 trap pattern (round-4 Codex review #1 fix)', () => {
+  // Round-4 Codex review #1: R3-2 put `trap cleanup_lock EXIT` in Step 1
+  // (a standalone bash block). On the Claude Code Bash tool, that block
+  // exits as soon as Step 1 finishes — releasing the lock BEFORE Steps
+  // 2-5 run. The R4 fix removes the trap from Step 1 and adds a
+  // failure-only cleanup trap inside Step 3 (the mutation block).
+  //
+  // These tests verify the new pattern at the bash level.
+
+  it('Step 1 alone (no trap) keeps the lock for subsequent invocations', () => {
+    const dir = tmpDir();
+    fs.mkdirSync(path.join(dir, '.wiki-meta'), { recursive: true });
+    const step1 = `
+      set -euo pipefail
+      WIKI_ROOT="${dir}"
+      LOCK_DIR="\${WIKI_ROOT}/.wiki-meta/.wiki-lock"
+      mkdir "\$LOCK_DIR"
+      # No trap here — must persist after this bash block exits.
+    `;
+    execFileSync('bash', ['-c', step1], { encoding: 'utf8' });
+    assert.ok(
+      fs.existsSync(path.join(dir, '.wiki-meta', '.wiki-lock')),
+      'lock must persist after Step 1 block exit',
+    );
+  });
+
+  it('Step 3 failure trap releases lock on helper-failure', () => {
+    const dir = tmpDir();
+    fs.mkdirSync(path.join(dir, '.wiki-meta', '.wiki-lock'), { recursive: true });
+    const script = `
+      set -euo pipefail
+      WIKI_ROOT="${dir}"
+      PAYLOAD_TMP="\${WIKI_ROOT}/.wiki-meta/payload.tmp.fail-test"
+      cleanup_step3() {
+        local rc=\$?
+        if [ "\$rc" -ne 0 ]; then
+          rmdir "\${WIKI_ROOT}/.wiki-meta/.wiki-lock" 2>/dev/null || true
+        fi
+        return \$rc
+      }
+      trap cleanup_step3 EXIT
+      touch "\$PAYLOAD_TMP"
+      # Simulate envelope-wrap failure
+      false
+    `;
+    let rc = 0;
+    try {
+      execFileSync('bash', ['-c', script], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (err) {
+      rc = err.status;
+    }
+    assert.equal(rc, 1, 'failure path must exit non-zero');
+    assert.ok(
+      !fs.existsSync(path.join(dir, '.wiki-meta', '.wiki-lock')),
+      'lock must be released by Step 3 cleanup on failure',
+    );
+    // Payload temp preserved for retry.
+    assert.ok(
+      fs.existsSync(path.join(dir, '.wiki-meta', 'payload.tmp.fail-test')),
+      'payload temp must survive Step 3 failure for retry',
+    );
+  });
+
+  it('Step 3 success trap keeps lock for Step 6', () => {
+    const dir = tmpDir();
+    fs.mkdirSync(path.join(dir, '.wiki-meta', '.wiki-lock'), { recursive: true });
+    const script = `
+      set -euo pipefail
+      WIKI_ROOT="${dir}"
+      cleanup_step3() {
+        local rc=\$?
+        if [ "\$rc" -ne 0 ]; then
+          rmdir "\${WIKI_ROOT}/.wiki-meta/.wiki-lock" 2>/dev/null || true
+        fi
+        return \$rc
+      }
+      trap cleanup_step3 EXIT
+      # Simulate successful wrap
+      echo "ok"
+    `;
+    execFileSync('bash', ['-c', script], { encoding: 'utf8' });
+    assert.ok(
+      fs.existsSync(path.join(dir, '.wiki-meta', '.wiki-lock')),
+      'lock must persist after successful Step 3 (Step 6 will release)',
+    );
+  });
+});
+
 describe('envelope-chain — wrapEnvelope intra-plugin chain via lib', () => {
   it('builds index envelope with multiple source pages (multi-source aggregator)', () => {
     const env = wrapEnvelope({

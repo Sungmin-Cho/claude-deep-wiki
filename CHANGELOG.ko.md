@@ -308,8 +308,101 @@ Opus Round 3: APPROVE (8 → 0). Codex Round 3 (review + adversarial) 가
   테스트 +1.
 
 R3 수정 후 테스트 상태: `npm test` → **106 pass / 0 fail / ~2.7s** (R2
-수정 후 102 pass; R3 수정 검증용 +4 테스트). R3 후 수렴은 round 4
-리뷰에서 검증 (new finding 부재).
+수정 후 102 pass; R3 수정 검증용 +4 테스트).
+
+### Round-4 review fixups (3-way /deep-review round 4)
+
+R4 split-decision:
+- **Opus**: APPROVE, 0 findings, convergence 선언.
+- **Codex review**: 2 P2 — R4-A (wiki-rebuild Step 1 trap 너무 일찍
+  발동 — R3-2 regression) + R4-B (envelope.git 이 wiki_root 대신
+  process.cwd 사용; Codex adv 와 2-way).
+- **Codex adversarial**: 1 HIGH transactional rollback (wiki-query
+  atomicity probe class 3rd-occurrence — anti-oscillation + out-of-scope
+  로 DEFER) + 1 MEDIUM 같은 git cwd 이슈 (R4-B).
+
+판정: 2 ACCEPT + 1 DEFER. R4-C 에 대해 anti-oscillation §4 발동.
+
+- **R4-A (Codex review #1) — wiki-rebuild Step 1 trap 너무 일찍 발동
+  (R3-2 regression)**: R3-2 가 Step 1 standalone bash 블록 안에
+  `trap cleanup_lock EXIT` 등록. Claude Code Bash tool 이 invocation
+  마다 fresh shell spawn → Step 1 끝나자마자 trap 발동 → lock release
+  → Steps 2-5 가 unlocked 로 진행 → 동시 ingest/rebuild interleave
+  가능. R3-2 의 critical regression — bash-tool shell lifecycle 오해
+  로 도입됨. **Fix**: Step 1 에서 trap 제거; Step 3 (mutation 블록)
+  안에 failure-only cleanup trap 추가, wiki-query Step 5d (R3-1) 와
+  동일 패턴. Step 3 성공 시: lock 이 Step 6 까지 유지. Step 3 실패
+  시: trap 이 lock release; payload temp 는 retry 위해 보존
+  (`rmdir .wiki-lock` 수동 정리 불필요). 회귀 테스트 +3 (Step 1
+  no-trap 가 lock 유지, Step 3 실패 시 lock release, Step 3 성공 시
+  lock 유지).
+
+- **R4-B (Codex review #2 + Codex adv #2 — 2-way) — envelope.git 이
+  arbitrary process.cwd 사용**: `wrap-index-envelope.js` 가 git
+  override 없이 `env.wrapEnvelope({})` 호출 → `wrapEnvelope` 가
+  `detectGit(process.cwd())` 로 fallback. agent 의 bash cwd 는 임의
+  → envelope.git 이 wiki 와 무관한 repo 의 HEAD/dirty state 기록
+  가능 → M3 provenance metadata 의 audit/recovery 가치 훼손. **Fix**:
+  `--output` 경로에서 wiki_root derive
+  (`<wiki_root>/.wiki-meta/index.json` →
+  `path.dirname(path.dirname(outputPath))`); `env.detectGit(wikiRoot)`
+  호출 후 결과를 `wrapEnvelope` 의 explicit `git` override 로 전달.
+  wiki_root 가 git repo 가 아니면 (Obsidian vault 의 흔한 경우),
+  sentinel `0000000` head + dirty=unknown emit ("no git context" 정확
+  signal, fix 전 non-git cwd 동작과 동일). 회귀 테스트 +2 (non-git
+  wiki → sentinel; git wiki → wiki 의 HEAD).
+
+- **R4-C (Codex adv #1, HIGH) — wiki-query auto-file 실패 시
+  transactional rollback**: 명시적 사유로 DEFER. Codex adv 가 flag:
+  `/wiki-query` Step 5c 가 page 작성 성공 후 Step 5d envelope-helper
+  실패 시, page 는 디스크에 있지만 index/log 에는 없음 — orphaned
+  state.
+  분석:
+    1. 이는 pre-existing wiki-query 디자인 (pre-1.5.0 도 같은
+       write-page-first 순서; M3 는 index update 메커니즘만 변경,
+       page-first 순서는 그대로).
+    2. 시스템에 recovery 메커니즘 내장: `wiki-lint` 가 "[DRIFT] N
+       unindexed pages" 보고, `/wiki-rebuild` 가 page frontmatter
+       (skills/wiki-schema/SKILL.md 명시 source of truth) 로부터
+       index.json 재생성.
+    3. Anti-oscillation §4 trigger: "wiki-query Step 5d atomicity
+       probe" finding 클래스의 3차 occurrence (R2-6 lock leak →
+       R3-1 lock lifetime → R4-1 transactional rollback). 각 라운드
+       구체적 subset 처리; 잔여 (page-write-before-index) 는
+       wiki-lint drift detection 으로 보완되는 pre-existing 디자인
+       trade-off.
+    4. Transactional rollback 구현 (페이지 staging 디렉토리 + atomic
+       move-into-place) 은 envelope adoption 범위를 크게 벗어남 —
+       plugin 의 모든 wiki write path 를 건드림.
+  **결정**: out-of-scope + recoverable 로 DEFER. 본 CHANGELOG 블록 +
+  convergence 입장에서 failure mode 명시. 코드 변경 없음.
+
+R4 수정 후 테스트 상태: `npm test` → **111 pass / 0 fail / ~2.5s** (R3
+수정 후 106 pass; R4 수정 검증용 +5 테스트).
+
+### 수렴 요약
+
+4 라운드의 3-way /deep-review (Opus + Codex review + Codex
+adversarial) 후 모든 actionable findings 해결:
+
+| 라운드 | Findings | 심각도 분포 |
+|---|---|---|
+| R1 | 6 | 1 CRITICAL + 3 HIGH/MEDIUM + 2 WARN |
+| R2 | 8 | 0 CRITICAL + 3 HIGH + 5 W/I |
+| R3 | 3 | 0 CRITICAL + 3 HIGH |
+| R4 | 3 (2 ACCEPT + 1 DEFER) | 0 CRITICAL + 2 HIGH + 1 HIGH-deferred |
+
+Critical-path finding count monotonic decrease (1 CRITICAL → 0 → 0 →
+0), overall actionable findings 도 zero 에 접근 (6 → 8 → 3 → 2).
+R4 의 transactional rollback DEFER (anti-oscillation §4) 가 mission
+scope 를 envelope adoption 으로 limit; deferred 디자인 question 은
+follow-up issue 후보이지 Phase 2 blocker 아님.
+
+라운드 별 테스트 상태: 87 → 93 → 102 → 106 → **111 pass** / 0 fail.
+Coverage 가 envelope contract 전체를 포괄 (identity guards,
+corrupt-payload defense, atomic writes, multi-source aggregator,
+markdown bash snippet portability, lock-lifetime correctness, git
+context provenance).
 
 ## [1.4.2] — 2026-05-07
 

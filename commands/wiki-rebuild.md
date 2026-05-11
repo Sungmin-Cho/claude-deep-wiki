@@ -32,19 +32,28 @@ set -euo pipefail
 : "${WIKI_ROOT:?caller must set WIKI_ROOT to the wiki root absolute path}"
 LOCK_DIR="${WIKI_ROOT}/.wiki-meta/.wiki-lock"
 mkdir "$LOCK_DIR" 2>/dev/null || { echo "ERROR: Wiki is locked by another session."; exit 1; }
-
-# Round-3 Codex adv #2 fix: register a cleanup trap immediately after lock
-# acquisition. Without this, an envelope helper failure (missing node,
-# unset CLAUDE_PLUGIN_ROOT, invalid payload JSON, helper IO error) in
-# Step 3 would strand the lock and block all subsequent wiki writes until
-# manual `rmdir <wiki_root>/.wiki-meta/.wiki-lock`. The trap fires on
-# every exit path (success → no-op rmdir already-released; failure →
-# releases the lock for next caller).
-cleanup_lock() {
-  rmdir "$LOCK_DIR" 2>/dev/null || true
-}
-trap cleanup_lock EXIT
 ```
+
+**No trap here — round-4 Codex review #1 fix.** The Claude Code Bash
+tool spawns a fresh shell per ```bash``` block, so registering an EXIT
+trap inside this standalone lock-acquisition block would fire as soon
+as the block ends — releasing the lock BEFORE Steps 2-5 run, leaving
+the rebuild to proceed unlocked and allowing concurrent ingest/rebuild
+to interleave. The lock instead has the following lifecycle:
+
+- Step 1 (this block): `mkdir` acquires the lock (no trap).
+- Step 3 (envelope wrap block below): registers an in-block EXIT trap
+  that releases the lock ONLY on failure (`rc != 0`), so a helper
+  failure in Step 3 cleans up its own lock without leaking. On success
+  the lock stays held for Step 6 to release after the rebuild's other
+  steps complete.
+- Step 6 (Release Lock and Report): unconditional `rmdir` on the
+  success path.
+
+Crash recovery between Bash invocations (e.g. agent abort between Step
+2 and Step 3) still leaks the lock — that is pre-existing wiki-rebuild
+behaviour from the mkdir-based lock design and unchanged by M3. Manual
+recovery: `rmdir <wiki_root>/.wiki-meta/.wiki-lock`.
 
 ### 2. Scan All Pages
 
@@ -90,10 +99,27 @@ set -euo pipefail
 : "${WIKI_ROOT:?caller must set WIKI_ROOT to the wiki root absolute path}"
 : "${CLAUDE_PLUGIN_ROOT:?caller must have CLAUDE_PLUGIN_ROOT set (Claude Code session env)}"
 
+# Round-4 Codex review #1 + Codex adv #2 fix: register a FAILURE-ONLY
+# cleanup trap inside the mutation block. On success (rc=0) the lock
+# stays held for Step 6 to release. On any failure (helper exit non-zero,
+# jq exit, unset variable abort) the trap releases the lock to prevent
+# the stranded-lock condition R3-2 targeted, without the R3-2 mistake
+# of putting the trap in Step 1's standalone block (which fires
+# immediately on Step 1 block exit and kills the lock before Step 2).
+PAYLOAD_TMP="${WIKI_ROOT}/.wiki-meta/index.payload.tmp.$$.$(date +%s).json"
+cleanup_step3() {
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    rmdir "${WIKI_ROOT}/.wiki-meta/.wiki-lock" 2>/dev/null || true
+    echo "ERROR: /wiki-rebuild Step 3 failed (rc=$rc); lock released; payload preserved at $PAYLOAD_TMP" >&2
+  fi
+  return $rc
+}
+trap cleanup_step3 EXIT
+
 # 3.a — Build payload. Pages array sorted alphabetically by filename
 # (built from Step 2 scan; below is a structural template — caller
 # substitutes actual page entries from the scan result).
-PAYLOAD_TMP="${WIKI_ROOT}/.wiki-meta/index.payload.tmp.$$.$(date +%s).json"
 cat > "$PAYLOAD_TMP" <<JSON
 {
   "pages": [
@@ -124,15 +150,14 @@ done < <(cd "${WIKI_ROOT}" 2>/dev/null && find pages -maxdepth 1 -name '*.md' -t
 
 # 3.c — Envelope-wrap + atomic write. Helper writes atomically (temp +
 # rename); cleanup is gated on helper success (deep-work round-1 C2).
-if node "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/wrap-index-envelope.js" \
+node "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/wrap-index-envelope.js" \
      --payload-file "$PAYLOAD_TMP" \
      --output "${WIKI_ROOT}/.wiki-meta/index.json" \
-     ${SOURCE_PAGE_ARGS[@]+"${SOURCE_PAGE_ARGS[@]}"}; then
-  rm -f "$PAYLOAD_TMP"
-else
-  echo "ERROR: wrap-index-envelope.js failed; payload preserved at $PAYLOAD_TMP for retry" >&2
-  exit 1
-fi
+     ${SOURCE_PAGE_ARGS[@]+"${SOURCE_PAGE_ARGS[@]}"}
+rm -f "$PAYLOAD_TMP"
+# On success: trap fires with rc=0 → no rmdir; lock kept for Step 6.
+# On failure: trap fires with rc!=0 → rmdir lock; payload temp preserved
+# above (no rm reached). User can retry without manual lock cleanup.
 ```
 
 Sort pages alphabetically by filename inside the payload.

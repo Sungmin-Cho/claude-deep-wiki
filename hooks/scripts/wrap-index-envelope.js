@@ -303,6 +303,19 @@ function main() {
     }
   }
 
+  // Round-4 Codex review #2 + Codex adv #2 (2-way fix): derive the
+  // intended git context from the artifact's location (the wiki root),
+  // NOT from process.cwd(). The CLI is invoked from agent bash blocks
+  // whose cwd is arbitrary (often the user's home or repo checkout that
+  // is unrelated to the wiki). Without this fix, envelope.git could
+  // record the wrong repo's HEAD/dirty state when the wiki itself is
+  // not a git repo (Obsidian vault). Output path shape is
+  // `<wiki_root>/.wiki-meta/index.json` → wiki_root = dirname(dirname).
+  // If wiki_root is not a git repo, detectGit returns the 0000000
+  // sentinel (envelope-schema-valid; correctly signals "no git context").
+  const wikiRoot = path.dirname(path.dirname(outputPath));
+  const gitContext = env.detectGit(wikiRoot);
+
   let wrapped;
   try {
     wrapped = env.wrapEnvelope({
@@ -311,6 +324,7 @@ function main() {
       parentRunId,
       sessionId: args['session-id'] || undefined,
       sourceArtifacts,
+      git: gitContext,
     });
   } catch (err) {
     process.stderr.write(`error: ${err.message}\n`);

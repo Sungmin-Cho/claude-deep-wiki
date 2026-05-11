@@ -411,6 +411,24 @@ The skipped slugs go into the final report (Step 14) as a separate "Unchanged (s
 
 Read `.wiki-meta/index.json` to know existing pages, titles, tags, and aliases. This is a small, low-context read used for the overlap filter in Step 4 and for index updates in Step 9.
 
+**v1.5.0+ envelope-aware read:** `index.json` is M3 envelope-wrapped (cf.
+claude-deep-suite/docs/envelope-migration.md §1). Use `read-index-envelope.js`
+to get the legacy `{pages, generated_at}` shape regardless of whether the
+file is envelope-wrapped (v1.5.0+) or legacy (pre-1.5.0). The reader enforces
+an identity guard (producer=deep-wiki, artifact_kind=index, schema.name=index)
+and rejects foreign envelopes or corrupt payloads (exit 1 with stderr reason)
+— Step 2 should propagate that failure.
+
+```bash
+set -euo pipefail
+: "${WIKI_ROOT:?caller must set WIKI_ROOT to the wiki root absolute path}"
+INDEX_JSON=$(node "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/read-index-envelope.js" \
+              "${WIKI_ROOT}/.wiki-meta/index.json")
+# INDEX_JSON now contains { "pages": [...], "generated_at": "..." } regardless
+# of v1.5.0 envelope wrap. Existing jq pipelines (.pages[].file etc.) work
+# unchanged on $INDEX_JSON.
+```
+
 ### 3. Acquire Lock
 
 ```bash
@@ -2504,7 +2522,108 @@ Per-slug `pages_created`/`pages_updated` filtering uses each entry's `sources` l
 
 > **Timestamp format:** All `ts` and `generated_at` values MUST be UTC ISO 8601 with a `Z` suffix. Generate with `date -u +"%Y-%m-%dT%H:%M:%SZ"`. Never use local timezone offsets (e.g. `+09:00`) — the wiki's log is consumed by tooling that assumes a single canonical timezone.
 
-Read the current `.wiki-meta/index.json`. For each entry in `CREATED_ENTRIES` ∪ `UPDATED_ENTRIES`, use the entry's `{file, title, tags, aliases}` directly — do NOT re-read the page body. `CREATED_ENTRIES` produce new index entries; `UPDATED_ENTRIES` overwrite existing ones. Update `generated_at` to the current UTC timestamp, write back.
+Read the current `.wiki-meta/index.json` (envelope-aware). For each entry in
+`CREATED_ENTRIES` ∪ `UPDATED_ENTRIES`, use the entry's `{file, title, tags,
+aliases}` directly — do NOT re-read the page body. `CREATED_ENTRIES` produce
+new index entries; `UPDATED_ENTRIES` overwrite existing ones. Update
+`generated_at` to the current UTC timestamp, then re-wrap via
+`wrap-index-envelope.js`.
+
+**v1.5.0+ envelope contract:** `index.json` is wrapped in the M3 cross-plugin
+envelope (cf. claude-deep-suite/docs/envelope-migration.md §1). The legacy
+`{pages, generated_at}` shape is preserved verbatim inside `payload`, so the
+in-memory merge logic operates on the unwrapped payload. The reader handles
+legacy (pre-1.5.0) input transparently; the writer always emits the wrapped
+form. Multi-source aggregator: each scanned page is recorded in
+`provenance.source_artifacts[]` path-only (markdown — no envelope detect);
+`parent_run_id` is omitted by default.
+
+**Caller contract for the bash snippet below.** The bash block expects the
+following variables to be set by the calling agent before entry (Bash tool
+spawns a fresh shell per invocation — deep-evolve round-2 R2-3
+self-containedness lesson; Opus round-1 W1 documentation gap):
+
+- `WIKI_ROOT` — absolute path to the wiki root.
+- `CLAUDE_PLUGIN_ROOT` — set by Claude Code at session start (deep-wiki
+  plugin install path). The snippet uses it to locate helper scripts.
+- `CREATED_ENTRIES_JSON` — JSON-array-serialised form of the `CREATED_ENTRIES`
+  bash array from Step 8 (each element `{file, title, tags, aliases}`).
+  Typically produced as `CREATED_ENTRIES_JSON=$(printf '%s\n' "${CREATED_ENTRIES[@]}" | jq -s '.')`
+  if entries are already JSON strings, or constructed by the agent from the
+  Step 8 structured data.
+- `UPDATED_ENTRIES_JSON` — same shape, for `UPDATED_ENTRIES`.
+
+If any required variable is absent the `${VAR:?msg}` guards abort with a
+clear error before mutation; the wrap helper's atomic temp+rename design
+ensures no partial write reaches `index.json`.
+
+```bash
+set -euo pipefail
+: "${WIKI_ROOT:?caller must set WIKI_ROOT to the wiki root absolute path}"
+: "${CLAUDE_PLUGIN_ROOT:?caller must have CLAUDE_PLUGIN_ROOT set (Claude Code session env)}"
+: "${CREATED_ENTRIES_JSON:?caller must set CREATED_ENTRIES_JSON (jq -s '.' of Step 8 entries)}"
+: "${UPDATED_ENTRIES_JSON:?caller must set UPDATED_ENTRIES_JSON (same shape)}"
+
+# 9.a — Read existing index (envelope-aware unwrap → legacy shape).
+# read-index-envelope.js exits 0 on success (legacy or unwrapped envelope),
+# 1 on identity mismatch / corrupt payload, 2 on IO / parse error.
+EXISTING_INDEX=$(node "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/read-index-envelope.js" \
+                   "${WIKI_ROOT}/.wiki-meta/index.json")
+
+# 9.b — Merge in-memory: apply CREATED_ENTRIES + UPDATED_ENTRIES. The merged
+# JSON has the legacy { pages, generated_at } shape. Sort pages alphabetically
+# by filename. (See ingest implementation for the actual jq/node merge logic.)
+MERGED_TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+PAYLOAD_TMP="${WIKI_ROOT}/.wiki-meta/index.payload.tmp.$$.$(date +%s).json"
+echo "$EXISTING_INDEX" | jq \
+  --argjson created "$CREATED_ENTRIES_JSON" \
+  --argjson updated "$UPDATED_ENTRIES_JSON" \
+  --arg ts "$MERGED_TS" \
+  '.generated_at = $ts
+   | (.pages // []) as $existing
+   | ($created + $updated) as $delta_raw
+   # Round-2 Codex review P2-A: in multi-source batches where two sources
+   # touch the same page, $delta_raw can contain duplicate filenames (Step 8
+   # demotes duplicate-created entries into UPDATED_ENTRIES, but no global
+   # dedup is applied). Collapse $delta by .file before merging so the
+   # rewritten payload contains at most one entry per file (UPDATED takes
+   # precedence over CREATED because it appears last in $delta_raw).
+   | ($delta_raw | reverse | unique_by(.file)) as $delta
+   | ($delta | map(.file) | unique) as $delta_files
+   | ($existing | map(select(.file as $f | $delta_files | index($f) | not))) as $kept
+   | .pages = (($kept + $delta) | sort_by(.file))' \
+  > "$PAYLOAD_TMP"
+
+# 9.c — Envelope-wrap + atomic write. Each scanned page contributes one
+# --source-page entry; the helper writes atomically (temp + rename) and
+# gated cleanup keeps the payload temp on failure for retry. The page list
+# is derived from the merged payload (.pages[].file) so the recorded
+# source_artifacts always matches what the index actually catalogs.
+SOURCE_PAGE_ARGS=()
+while IFS= read -r REL; do
+  [ -n "$REL" ] && SOURCE_PAGE_ARGS+=(--source-page "$REL")
+done < <(jq -r '.pages[].file' "$PAYLOAD_TMP" 2>/dev/null | awk 'NF { print "pages/" $0 }')
+
+# Round-2 Opus W2-2: bash 3.2 + set -u safe array expansion. Empty
+# SOURCE_PAGE_ARGS (very unusual for /wiki-ingest since at least one page
+# was just created/updated) would otherwise crash the snippet under
+# /bin/bash 3.2 on macOS.
+if node "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/wrap-index-envelope.js" \
+     --payload-file "$PAYLOAD_TMP" \
+     --output "${WIKI_ROOT}/.wiki-meta/index.json" \
+     ${SOURCE_PAGE_ARGS[@]+"${SOURCE_PAGE_ARGS[@]}"}; then
+  rm -f "$PAYLOAD_TMP"
+else
+  echo "ERROR: wrap-index-envelope.js failed; payload preserved at $PAYLOAD_TMP for retry" >&2
+  exit 1
+fi
+```
+
+If the existing `index.json` fails identity check (e.g. a foreign envelope
+mistakenly placed there) the reader exits 1 — Step 9 aborts and surfaces the
+identity-mismatch reason. Manual recovery: invoke `/wiki-rebuild` which
+regenerates the index from scratch (page frontmatter is the source of truth;
+`index.json` is derived per skills/wiki-schema/SKILL.md).
 
 ### 10. Append to Log
 
@@ -2600,9 +2719,17 @@ obsidian backlinks path="<wiki_prefix>/pages/<page>.md" format=json
 
 > **Wiki boundary filtering is mandatory.** `obsidian orphans` and `obsidian unresolved` return vault-wide results. Always post-filter against `<wiki_prefix>/pages/` to avoid reporting unrelated vault notes as wiki issues.
 
-**Auto-fix** what can be fixed without human judgment:
-- Add missing pages to `index.json`
-- Remove ghost entries from `index.json`
+**Auto-fix** what can be fixed without human judgment. v1.5.0+: index
+mutations MUST go through the envelope-wrap helper to preserve the
+envelope wrapper (round-2 Codex review P2-B). Recommended form is to
+delegate to `/wiki-rebuild` (regenerates the full envelope-wrapped index
+from page frontmatter — the source of truth per
+`skills/wiki-schema/SKILL.md`); an in-place patch path follows the same
+read-merge-write pattern as Step 9 above.
+
+- Add missing pages to `index.json` (via envelope helpers — delegate to
+  `/wiki-rebuild` or apply the Step 9 read-merge-write pattern)
+- Remove ghost entries from `index.json` (same)
 - Prune excess page versions (keep last 3)
 
 **Report issues** that require human judgment (only if found):

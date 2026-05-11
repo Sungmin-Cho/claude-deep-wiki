@@ -142,7 +142,7 @@ Raw Sources  →  Wiki (markdown pages)  →  Schema (management rules)
 ├── index.md                  # LLM-written catalog (human-readable)
 ├── log.md                    # LLM-written chronicle (human-readable)
 ├── .wiki-meta/
-│   ├── index.json            # Machine-readable page catalog (derived)
+│   ├── index.json            # Machine-readable page catalog (derived; v1.5.0+ M3 envelope-wrapped — see CHANGELOG)
 │   ├── sources/              # Per-source provenance YAML files
 │   └── .versions/            # Page backups before overwrite (last 3)
 ├── log.jsonl                 # Append-only structured event log

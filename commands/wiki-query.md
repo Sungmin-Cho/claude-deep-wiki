@@ -34,7 +34,18 @@ Use the argument as the search query. If no argument, ask the user what they wan
 Perform a multi-layer search to find relevant pages:
 
 **Layer 1 — Index scan:**
-Read `.wiki-meta/index.json`. Match the query against page titles, tags, and aliases. Collect candidate page filenames.
+Read `.wiki-meta/index.json` (envelope-aware in v1.5.0+). Match the query
+against page titles, tags, and aliases. Collect candidate page filenames.
+
+```bash
+set -euo pipefail
+: "${WIKI_ROOT:?caller must set WIKI_ROOT to the wiki root absolute path}"
+# Envelope-aware read — emits legacy {pages, generated_at} shape on stdout
+# whether the file is pre-1.5.0 legacy or v1.5.0+ envelope-wrapped.
+INDEX_JSON=$(node "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/read-index-envelope.js" \
+              "${WIKI_ROOT}/.wiki-meta/index.json")
+# Existing jq pipelines on $INDEX_JSON (.pages[].title etc.) work unchanged.
+```
 
 **Layer 2 — Content search:**
 Use Grep to search `pages/` directory for keywords from the query. Add matching files to candidates.
@@ -122,7 +133,87 @@ Search `index.json` for a page that already covers this topic (by title or alias
 
 > **Timestamp format:** All `ts` and `generated_at` values MUST be UTC ISO 8601 with a `Z` suffix. Generate with `date -u +"%Y-%m-%dT%H:%M:%SZ"`. Never use local timezone offsets (e.g. `+09:00`) — the wiki's log is consumed by tooling that assumes a single canonical timezone.
 
-- Add/update the page entry in `.wiki-meta/index.json`
+**v1.5.0+ envelope-aware index update.** The auto-filing write path MUST
+read-merge-write through the envelope helpers so the envelope wrapper is
+preserved across query-filed updates. Direct `index.json` mutation drops
+`run_id` / `provenance` and breaks subsequent envelope-aware reads
+(round-1 Codex adversarial #1).
+
+**Caller contract for the bash snippet below** (round-2 Opus W2-1
+documentation gap; mirrors Step 9 of `/wiki-ingest`):
+
+- `WIKI_ROOT` — absolute path to the wiki root.
+- `CLAUDE_PLUGIN_ROOT` — set by Claude Code at session start; helper
+  script locations.
+- `QUERY_FILED_ENTRY_JSON` — JSON object describing the query-filed page,
+  shape `{"file": "query-<topic>.md", "title": "...", "tags": [...],
+  "aliases": [...]}`. The agent constructs this from Step 5c frontmatter.
+
+If any required variable is absent the `${VAR:?msg}` guards abort with a
+clear error before any mutation. A trap on EXIT releases the
+`.wiki-lock` directory **only on failure paths** (round-3 Codex adv #1 +
+Codex review #1 — 2-way fix). On the success path the lock is held
+across the index update AND the log append (which happens after this
+snippet exits, as the bullet below describes), and Step 5e releases the
+lock once all writes are done. On any failure (read-helper exit 1, jq
+exit, undefined-variable abort) the trap fires and releases the lock so
+the wiki is never left in a stranded locked state.
+
+```bash
+set -euo pipefail
+: "${WIKI_ROOT:?caller must set WIKI_ROOT to the wiki root absolute path}"
+: "${CLAUDE_PLUGIN_ROOT:?caller must have CLAUDE_PLUGIN_ROOT set (Claude Code session env)}"
+: "${QUERY_FILED_ENTRY_JSON:?caller must set QUERY_FILED_ENTRY_JSON to a JSON object {file,title,tags,aliases}}"
+
+# Failure-only lock release — round-3 Codex adv #1 + Codex review #1
+# (2-way fix). On success the lock stays held until Step 5e (after the
+# log.jsonl append) so the index update + log append are one critical
+# section. On any failure exit, the trap releases the lock to prevent
+# stranded-lock state.
+PAYLOAD_TMP="${WIKI_ROOT}/.wiki-meta/index.payload.tmp.$$.$(date +%s).json"
+cleanup() {
+  local rc=$?
+  rm -f "$PAYLOAD_TMP" 2>/dev/null || true
+  if [ "$rc" -ne 0 ]; then
+    rmdir "${WIKI_ROOT}/.wiki-meta/.wiki-lock" 2>/dev/null || true
+    echo "ERROR: /wiki-query auto-file failed (exit $rc); lock released for retry" >&2
+  fi
+  return $rc
+}
+trap cleanup EXIT
+
+# Read existing index (envelope-aware unwrap → legacy shape).
+EXISTING_INDEX=$(node "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/read-index-envelope.js" \
+                   "${WIKI_ROOT}/.wiki-meta/index.json")
+
+# Merge the query-filed page. If the page already exists in pages[],
+# overwrite its entry; otherwise insert.
+MERGED_TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+echo "$EXISTING_INDEX" | jq \
+  --argjson entry "$QUERY_FILED_ENTRY_JSON" \
+  --arg ts "$MERGED_TS" \
+  '.generated_at = $ts
+   | (.pages // []) as $existing
+   | ($existing | map(select(.file != $entry.file))) as $kept
+   | .pages = (($kept + [$entry]) | sort_by(.file))' \
+  > "$PAYLOAD_TMP"
+
+# Envelope-wrap + atomic write. Page paths gathered via portable BSD find
+# (round-1 C1). Use ${ARR[@]+"${ARR[@]}"} expansion so bash 3.2 with set -u
+# tolerates an empty pages directory (round-2 Opus W2-2 empty-array fix).
+SOURCE_PAGE_ARGS=()
+while IFS= read -r REL; do
+  [ -n "$REL" ] && SOURCE_PAGE_ARGS+=(--source-page "$REL")
+done < <(cd "${WIKI_ROOT}" 2>/dev/null && find pages -maxdepth 1 -name '*.md' -type f 2>/dev/null | sort)
+
+node "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/wrap-index-envelope.js" \
+   --payload-file "$PAYLOAD_TMP" \
+   --output "${WIKI_ROOT}/.wiki-meta/index.json" \
+   ${SOURCE_PAGE_ARGS[@]+"${SOURCE_PAGE_ARGS[@]}"}
+# On success: cleanup fires with rc=0 → tmp removed, lock kept for Step 5e.
+# On failure: cleanup fires with rc!=0 → tmp removed, lock released.
+```
+
 - Append to `log.jsonl`:
   ```json
   {"ts":"<iso_timestamp>","action":"query-filed","source":"query-derived","pages_created":["query-topic.md"],"pages_updated":[]}

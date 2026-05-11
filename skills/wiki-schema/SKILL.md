@@ -101,7 +101,48 @@ The `content_hash` field stores a hash of the source content at ingest time, ena
 
 ## Index
 
-`.wiki-meta/index.json` is a machine-readable catalog:
+`.wiki-meta/index.json` is a machine-readable catalog. Since v1.5.0 it is
+wrapped in the M3 cross-plugin envelope (cf. claude-deep-suite/docs/
+envelope-migration.md §1) — the legacy `{pages, generated_at}` shape lives
+inside `payload`. Producers use `hooks/scripts/wrap-index-envelope.js` to
+emit; consumers use `hooks/scripts/read-index-envelope.js` to unwrap.
+
+**Envelope-wrapped (v1.5.0+):**
+
+```json
+{
+  "$schema": "https://raw.githubusercontent.com/Sungmin-Cho/claude-deep-suite/main/schemas/artifact-envelope.schema.json",
+  "schema_version": "1.0",
+  "envelope": {
+    "producer": "deep-wiki",
+    "producer_version": "1.5.0",
+    "artifact_kind": "index",
+    "run_id": "01JTKZQ7N3ABCDEFGHJKMNPQRS",
+    "generated_at": "2026-05-11T10:00:00Z",
+    "schema": { "name": "index", "version": "1.0" },
+    "git": { "head": "abc1234", "branch": "main", "dirty": false },
+    "provenance": {
+      "source_artifacts": [
+        { "path": "pages/react-hooks.md" }
+      ],
+      "tool_versions": { "node": "v20.11.0" }
+    }
+  },
+  "payload": {
+    "pages": [
+      {
+        "file": "react-hooks.md",
+        "title": "React Hooks",
+        "tags": ["programming", "react"],
+        "aliases": ["hooks", "useState"]
+      }
+    ],
+    "generated_at": "2026-05-11T10:00:00Z"
+  }
+}
+```
+
+**Legacy (pre-1.5.0, still readable):**
 
 ```json
 {
@@ -118,6 +159,20 @@ The `content_hash` field stores a hash of the source content at ingest time, ena
 ```
 
 This file is **derived** — it can always be rebuilt from page frontmatter using `/wiki-rebuild`. Update it during ingest, but never treat it as the source of truth.
+
+**Envelope contract:**
+
+- `producer === "deep-wiki"`, `artifact_kind === "index"`, `schema.name === "index"`
+  (3-way identity guard enforced by `unwrapEnvelope()` — handoff §4 round-4).
+- `producer_version` mirrors `.claude-plugin/plugin.json.version` (single source of truth).
+- `run_id` is a 26-char Crockford Base32 ULID per ULID spec (lex sort = time sort).
+- **Multi-source aggregator**: `parent_run_id` is omitted by default — index.json
+  is built by scanning every page's frontmatter, no single source artifact
+  acts as parent. Pages are recorded in `provenance.source_artifacts[]`
+  path-only (markdown — no envelope detect).
+- The payload shape is unchanged from pre-1.5.0; tools that read
+  `index.json` use `read-index-envelope.js` which unwraps the envelope or
+  passes legacy through transparently.
 
 ## Event Log
 

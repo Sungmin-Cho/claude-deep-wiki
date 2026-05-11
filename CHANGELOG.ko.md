@@ -2,6 +2,408 @@
 
 deep-wiki의 주요 변경사항을 기록합니다.
 
+## [1.5.0] — 2026-05-11
+
+**M3 envelope 도입** — `<wiki_root>/.wiki-meta/index.json`이 M3 cross-plugin
+envelope([claude-deep-suite/docs/envelope-migration.md](https://github.com/Sungmin-Cho/claude-deep-suite/blob/main/docs/envelope-migration.md)
+§1) 안으로 들어갑니다. 기존의 `{pages, generated_at}` 구조는 그대로
+`payload` 내부에 보존되며, 소비자는 envelope-aware reader 를 통해 envelope-
+wrap 여부와 무관하게 legacy 구조를 그대로 받습니다.
+
+M3 Phase 2 의 **6 번째 (마지막)** plugin migration 입니다. 본 PR merge 후
+suite-repo 측 Phase 3 (marketplace.json SHA bump, payload-registry schema
+교체, adoption ledger 갱신) 가 진행됩니다.
+
+### 왜 envelope 인가
+
+- **Cross-plugin trace**: ULID `run_id` + 선택적 `parent_run_id` chain —
+  M4 telemetry / Phase 3 dashboard 가 cross-plugin lineage 재구성.
+- **Producer attribution**: `producer = "deep-wiki"`, `producer_version` 은
+  `plugin.json.version` (단일 진실원본) 을 mirror.
+- **Schema drift 감지**: `schema.name = "index"`, identity guards 가 외부
+  envelope 를 read-time 에 거부.
+- **Reproducibility**: `git.{head,branch,dirty}` + `provenance.
+  tool_versions` snapshot.
+- **Multi-source aggregator**: page 들이 `provenance.source_artifacts[]`
+  에 path-only 로 기록됨 (markdown — envelope detect 불가). `parent_run_id`
+  는 default omit — index.json 의 단일 parent artifact 부재.
+
+### 추가
+
+- **`hooks/scripts/envelope.js`** — zero-dep 공유 라이브러리: ULID
+  generator (MSB-first Crockford Base32), `detectGit`,
+  `loadProducerVersion`, `wrapEnvelope`, `unwrapEnvelope`, `isEnvelope`,
+  `isValidEnvelope`. producer version 은 module 파일 기준 상대 경로로
+  `.claude-plugin/plugin.json` 을 읽어, agent 실행 cwd 와 무관하게 동작
+  (literal-cwd-resolve — handoff §4 deep-docs round-1 lesson).
+- **`hooks/scripts/wrap-index-envelope.js`** — CLI writer. payload JSON
+  파일을 envelope 로 감싸 `<wiki_root>/.wiki-meta/index.json` 에 atomic
+  write (temp + rename — handoff §4 deep-work round-1 C1 lesson). 반복
+  가능한 `--source-page` (markdown 페이지 path-only) + 일반
+  `--source-artifact path[:run_id]` (self-consistency auto-harvest —
+  handoff §4 deep-evolve round-1 W4 lesson) 지원. forward-compat
+  `--parent-run-id` 는 CLI 경계에서 ULID 만 허용 (defense-in-depth — handoff
+  §4 deep-evolve round-1 C3 lesson).
+- **`hooks/scripts/read-index-envelope.js`** — CLI reader. v1.5.0+ envelope
+  wrap 이든 pre-1.5.0 legacy 든 항상 stdout 으로 legacy `{pages,
+  generated_at}` 구조를 emit. identity guards 가 foreign / corrupt
+  envelope 를 exit 1 로 거부.
+- **`scripts/validate-envelope-emit.js`** — release-lint validator. 외부
+  의존 없이 suite envelope schema 를 mirror: 모든 nested object 에
+  `additionalProperties: false`, ULID/SemVer 2.0.0/RFC 3339/kebab-case
+  regex, identity check (producer=deep-wiki, artifact_kind=index,
+  schema.name=index), corrupt-payload defense.
+- **`tests/envelope-emit.test.js` + `tests/envelope-chain.test.js`** —
+  Node test runner. 87+ tests — wrap roundtrip, identity gates, parseArgs
+  경계 (scalar + repeatable 빈 값 거부, deep-review round-1 Q6 lesson),
+  atomic-write residue check, envelope-aware reader legacy pass-through,
+  multi-source aggregator contract (parent_run_id 부재, source_artifacts
+  path-only).
+- **`tests/fixtures/sample-index.json`** — release sample emit. Phase 3
+  가 `claude-deep-suite/schemas/payload-registry/deep-wiki/index/v1.0.schema.json`
+  의 placeholder 를 교체할 때 input 으로 사용.
+- **`package.json`** — `npm test` 가 envelope 테스트 suite 실행, `npm run
+  validate-fixture` 가 sample fixture 검증.
+
+### 변경
+
+- **`commands/wiki-setup.md`** — Step 3 scaffold 가 literal JSON 작성
+  대신 `wrap-index-envelope.js` 호출. caller 가 `WIKI_ROOT` 를
+  스니펫 진입 전에 설정해야 함 (deep-evolve round-2 R2-3
+  self-containedness lesson).
+- **`commands/wiki-rebuild.md`** — Step 3 가 envelope-wrap contract,
+  반복 가능한 `--source-page` multi-source flag, bash-only fast-path
+  (deep-work round-1 W6 lesson — hot-path 에서 per-file `node -e` 회피)
+  를 문서화.
+- **`commands/wiki-ingest.md`** — Step 2 (Read Existing Wiki State) +
+  Step 9 (Update Index) 가 envelope-aware helper 를 통해 read/write.
+  in-memory merge 로직은 unwrapped payload (legacy shape) 위에서 동작하므로
+  기존 jq pipeline 이 그대로 동작.
+- **`commands/wiki-query.md`** — Layer 1 Index scan 이
+  `read-index-envelope.js` 사용.
+- **`commands/wiki-lint.md`** — Step 5 (Duplicate/Alias Conflict) + Step
+  10 (Index Drift Detection) 가 `read-index-envelope.js` 사용.
+- **`skills/wiki-schema/SKILL.md` §Index** — envelope wrapper, identity
+  contract, multi-source aggregator 패턴을 문서화. legacy + envelope-
+  wrapped 두 예시 모두 표시.
+
+### 호환성
+
+- **Forward 호환 (v1.5.0+ → legacy 코드 read)**: envelope-aware reader
+  (`read-index-envelope.js`) 가 stdout 으로 legacy `{pages, generated_at}`
+  구조를 emit 하므로 기존 jq pipeline (`.pages[].file`,
+  `.generated_at`) 이 수정 없이 동작.
+- **Backward 호환 (pre-1.5.0 → legacy index.json 보유 user wiki)**:
+  reader 가 legacy input 을 그대로 통과시킴. 사용자는 업그레이드 후
+  `/wiki-rebuild` 를 강제 실행할 필요 없음 — 기존 `index.json` 이
+  그대로 작동. `/wiki-rebuild` 실행 시 envelope-wrapped 형태로 재생성
+  (데이터 손실 없음; payload shape 동일).
+- **Atomic write**: writer 가 `outputPath + .tmp.<pid>.<Date.now()>` →
+  `fs.renameSync` 사용 (deep-work round-1 C1 lesson). mid-write 중단 시
+  truncated index.json 이 남지 않음.
+- **Identity guards**: reader 가 foreign-producer envelope (예: deep-evolve
+  envelope 가 index.json 경로에 잘못 위치) 를 exit 1 로 거부 — 수동 복구는
+  `/wiki-rebuild` 이며 이는 page frontmatter (skills/wiki-schema/SKILL.md
+  명시 source of truth) 로부터 재생성.
+
+### Suite-side 협업 (Phase 3, 본 PR 아님)
+
+T+0 timer 기록 (suite-repo `docs/envelope-migration.md` §6.1 adoption
+ledger) 은 Phase 2 §1 정책에 따라 의도적으로 claude-deep-suite Phase 3
+로 연기 — 모든 suite-repo 변경 (marketplace.json SHA bump,
+payload-registry schema 교체, adoption ledger 갱신) 은 6 개 Phase 2 plugin
+PR 가 모두 머지된 후 단일 Phase 3 PR 로 일괄 처리. 자세한 내용은
+claude-deep-suite/`docs/superpowers/plans/2026-05-07-m3-phase2-handoff.md`
+§1 (handoff "Probe F" cross-repo doc drift lesson).
+
+### Migration
+
+데이터 migration 불필요. 기존 `index.json` 파일 (legacy shape) 은 v1.5.0
+consumer 가 그대로 읽을 수 있으며, 다음 번 `/wiki-rebuild` 또는
+`/wiki-ingest` 실행 시 envelope 형태로 재포장됩니다. 즉시 migration 을
+강제하려면 `/wiki-rebuild` 를 실행하세요.
+
+### Post-impl review fixups (3-way /deep-review round 1, all ACCEPT)
+
+Round 1 (Opus + Codex review + Codex adversarial — 세 리뷰어 모두 timeout
+없이 완료) 에서 1 CRITICAL (3-way 합의) + 3 HIGH/MEDIUM (single-reviewer 이나
+실제 문제) 가 도출됨. 머지 전 모두 수정.
+
+- **C1 (3-way 합의 — `find -printf` GNU 전용, macOS BSD 회귀)**:
+  `commands/wiki-rebuild.md` Step 3 + `commands/wiki-lint.md` Step 10 이
+  `find ... -printf` 사용. macOS `/usr/bin/find` (BSD) 가 `-printf` 거부 →
+  `set -euo pipefail` + `2>/dev/null` + process substitution 조합에서
+  실패가 silent → `SOURCE_PAGE_ARGS` 가 비어있는 채로 envelope 가 emit 됨
+  (multi-source aggregator contract 위반). wiki-lint Step 10 은 모든 disk
+  페이지를 drift 로 false-report. 실제 macOS BSD find 에서 실패 모드 검증.
+  **Fix**: `cd "${WIKI_ROOT}" && find pages -maxdepth 1 -name '*.md'
+  -type f` (BSD + GNU 양쪽 호환). wiki-lint Step 10 은 `sed 's|^\./||'`
+  로 대칭 패턴. `tests/envelope-chain.test.js` 에 회귀 테스트 추가 — bash
+  snippet 자체를 end-to-end 실행 ("markdown bash snippet portability"
+  suite 3 tests).
+
+- **C2 (Codex review P2#1 — `isEnvelope` 가 payload 없는 envelope 거부)**:
+  기존 `isEnvelope` 는 `obj.payload !== undefined` 요구. `{schema_version:
+  "1.0", envelope: {...}}` 인데 payload key 가 없는 malformed envelope 가
+  false 반환 → unwrapEnvelope 가 legacy pass-through 로 빠짐 → 소비자
+  (wiki-ingest jq `.pages // []`) 가 corrupt top-level 받아 빈 page set
+  으로 index 재빌드 (silent corruption). **Fix**: `isEnvelope` 가 이제
+  `schema_version + envelope` 만으로 envelope 모양 감지 (payload key 없어도
+  OK); `unwrapEnvelope` 의 corrupt-payload guard 가 `undefined` 도
+  `null`/array/non-object 와 함께 거부. Reader exit 1 + stderr `corrupt
+  payload: expected object, got undefined`. emit + chain 테스트에
+  absent-payload-key 케이스 추가.
+
+- **C3 (Codex adversarial #1 HIGH — `/wiki-query` 자동 파일링 write path 가
+  envelope 우회)**: Step 5d Auto-Filing 이 `index.json` 을 직접 작성하여
+  성공적인 query synthesis 마다 envelope wrapper 가 떨어져 나감. 이후
+  envelope-aware read 는 항목을 못 보거나 stale legacy shape 을 봄.
+  **Fix**: Step 5d 가 이제 `read-index-envelope.js` + `wrap-index-envelope.js`
+  로 read-merge-write 수행 (`/wiki-ingest` Step 9 와 동일 패턴),
+  `--source-page` 수집에 portable BSD-호환 find 사용. helper 실패 시 lock
+  해제하여 wiki 가 locked 상태로 남지 않도록.
+
+- **C4 (Codex adversarial #2 MEDIUM — `/wiki-lint --fix` 의 raw index 편집)**:
+  Step 13 `--fix` path 가 `index.json` 직접 add/remove 명시. **Fix**: Step
+  13 이 이제 `/wiki-rebuild` (envelope-wrap helper 를 end-to-end 사용) 에
+  위임을 권장 형태로 명시; 대안적 in-place envelope-aware patch path 는
+  `/wiki-ingest` Step 9 + `/wiki-query` Step 5d 패턴 참조.
+
+- **W1 (Opus W1 — `CREATED_ENTRIES_JSON`/`UPDATED_ENTRIES_JSON` caller
+  contract 미문서화)**: `commands/wiki-ingest.md` Step 9 bash snippet 이
+  `--argjson` 변수를 사용하나 사전 문서화 부재. **Fix**: snippet 위에
+  caller-contract 블록 추가 — 모든 필수 변수 (`WIKI_ROOT`,
+  `CLAUDE_PLUGIN_ROOT`, `CREATED_ENTRIES_JSON`, `UPDATED_ENTRIES_JSON`) +
+  Step 8 array 를 `jq -s` 로 직렬화하는 1-line 예시. defense-in-depth 로
+  bash snippet 내부에도 `: "${VAR:?msg}"` 가드 추가.
+
+- **W2 (Opus W2 — bash fast-path heuristic 명확성)**: `commands/
+  wiki-rebuild.md` fast-path bash detection 블록에 "Fast-path heuristic —
+  node helper is authoritative" preamble 추가 — trade-off (grep-only path
+  에는 corrupt-payload defense 부재) 명시.
+
+수정 후 테스트 상태: `npm test` → **93 pass / 0 fail / ~2.4s** (수정 전
+87 pass; round-1 수정 검증용 +6 테스트).
+
+### Round-2 review fixups (3-way /deep-review round 2)
+
+Round 2 (Opus + Codex review + Codex adversarial — 세 리뷰어 모두 timeout
+없이 완료) 가 R1 6 수정을 모두 검증 + 6 인접 이슈 surface. Critical 도
+강력한 monotonic decrease (R1: 1 C + 3 H/M + 2 W; R2: 0 C + 3 H +
+3 W/I). Mission-scope-conflict 없음 — anti-oscillation 미발동.
+
+- **R2-1 (Codex adv HIGH-A — malformed envelope block bypass; R1 C2
+  deepening)**: R1 fix 가 payload 누락 경우만 처리, 인접 경우 (envelope 블록
+  missing/null/array, schema_version="1.0" 인데) 가 여전히 legacy pass-through
+  로 빠짐. **Fix**: `isEnvelope` 를 marker-only detector 로 통합
+  (`schema_version === "1.0"` 만으로 marker 인식); envelope-block shape
+  검증을 `unwrapEnvelope` 로 이동, 거기서 "malformed envelope" stderr 명시.
+  `isValidEnvelope` 도 envelope-block shape 재확인하여 chain extraction 안전.
+  +3 회귀 테스트 (envelope-missing, envelope-null, envelope-array).
+
+- **R2-2 (Codex adv HIGH-B — non-index payload 가 valid index 로 wrap;
+  PARTIAL ACCEPT)**: writer 가 non-null/non-array object 만 검증. `{}` 나
+  `{foo: 'bar'}` 가 valid envelope 로 디스크에 작성됨 → read-index-envelope.js
+  가 unwrap 성공 → 소비자 `.pages // []` 가 empty catalog 반환. **Fix
+  (writer 경계 defense-in-depth)**: `artifactKind === "index"` 시 `payload.
+  pages` 가 array 일 것을 요구. authoritative payload schema 강제는 여전히
+  `claude-deep-suite/schemas/payload-registry/deep-wiki/index/v1.0.schema.json`
+  (Phase 3 batch 가 placeholder 교체); plugin-side 검사는 명백한
+  mis-wrap 만 잡고 Phase 3 scope 중복 회피. +3 회귀 테스트 (missing
+  pages, non-array pages, valid empty pages).
+
+- **R2-3 (Codex review P2-A — wiki-ingest §9 jq merge 가 중복 index 항목
+  생성)**: 두 source 가 같은 page 를 건드는 multi-source ingest 에서 Step
+  8 이 `UPDATED_ENTRIES` 에 중복 filename 남김. Step 9 merge 는 기존
+  항목을 한 번 제거하지만 `$delta` 전체를 그대로 append → 동일 file 에
+  대한 `.pages[]` 레코드 두 개 생성 → index uniqueness 깨짐. **Fix**:
+  jq 의 `reverse | unique_by(.file)` 로 `$delta` 를 .file 단위로 정리한 후 merge
+  (UPDATED 가 `$delta_raw` 의 마지막에 위치하므로 reverse 후 우선 보존).
+
+- **R2-4 (Codex review P2-B — wiki-ingest auto-lint Step 13 raw 편집)**:
+  R1 C4 와 평행 — `wiki-lint.md` Step 13 이 아닌 `wiki-ingest.md` 의
+  Auto-Lint section 에 존재. **Fix**: 동일 위임 패턴 — Step 13 auto-fix
+  가 `/wiki-rebuild` (envelope-wrap end-to-end) 를 가리키고 in-place
+  patch 는 Step 9 read-merge-write 패턴 참조.
+
+- **R2-5 (Codex review P3 — validator 가 non-string git.head 수용)**:
+  `validate-envelope-emit.js#validateGit` 가 `typeof head === 'string'`
+  일 때만 SHA regex 적용 → numeric / null head 통과. **Fix**: 명시적
+  `typeof !== 'string'` 거부를 regex 전에; typed error message. +1
+  회귀 테스트 (numeric head).
+
+- **R2-6 (Opus W2-1 — wiki-query Step 5d caller-contract + lock leak)**:
+  R1 C3 에서 새로 추가된 Step 5d 가 `set -euo pipefail` 선언했지만
+  `WIKI_ROOT` 만 가드. `CLAUDE_PLUGIN_ROOT`, `QUERY_FILED_ENTRY_JSON` 은
+  비가드 → `set -u` 에서 unset var 가 명시적 lock-release 라인 도달 전
+  스크립트 abort → wiki 가 stuck-locked. Codex adv MEDIUM #3 가 같은
+  lock-leak 패턴 flag. **Fix**: snippet 위에 caller-contract 블록 추가
+  (세 변수 모두 + `QUERY_FILED_ENTRY_JSON` shape `{file, title, tags,
+  aliases}`); 세 변수 모두 `${VAR:?msg}` 가드; trap-기반 unconditional
+  cleanup (`trap cleanup EXIT`) — read-helper failure, jq failure,
+  undefined-var abort 등 모든 exit path 에서 lock 해제.
+
+- **R2-7 (Opus W2-2 — bash 3.2 empty-array foot-gun in
+  SOURCE_PAGE_ARGS)**: `"${SOURCE_PAGE_ARGS[@]}"` 이 `set -u` 아래
+  macOS `/bin/bash` 3.2 에서 빈 배열일 때 abort (fresh wiki / post-prune
+  /wiki-rebuild 시나리오). **Fix**: 모든 helper 호출 사이트
+  (`wiki-rebuild.md` Step 3.b, `wiki-ingest.md` §9, `wiki-query.md`
+  Step 5d) 에서 `${ARR[@]+"${ARR[@]}"}` POSIX-호환 empty-array fallback
+  사용. +3 회귀 테스트 (bash 3.2 동작 end-to-end).
+
+- **R2-8 (Opus I2-1 — isValidEnvelope coverage symmetry)**:
+  `isValidEnvelope` 가 absent payload key 를 거부하는지 명시적 테스트
+  추가 (R1 invariant 를 triple 로 fully testable: isEnvelope detects,
+  isValidEnvelope rejects, unwrapEnvelope rejects).
+
+R2 수정 후 테스트 상태: `npm test` → **102 pass / 0 fail / ~2.6s** (R1
+수정 후 93 pass; R2 수정 검증용 +9 테스트).
+
+### Round-3 review fixups (3-way /deep-review round 3)
+
+Round 3 (Opus + Codex review + Codex adversarial — 세 리뷰어 모두 timeout
+없이 완료) 가 R2 8 수정을 모두 검증 + 3 인접 lock-lifetime / cross-shell
+이슈 surface. Monotonic decrease 지속: R1 6 → R2 8 → R3 3. 모두 ACCEPT.
+Mission-scope-conflict 없음 → anti-oscillation 미발동.
+
+Opus Round 3: APPROVE (8 → 0). Codex Round 3 (review + adversarial) 가
+아래 3 이슈 flag (R3-1 에서 2-way 합의).
+
+- **R3-1 (Codex adv #1 + Codex review #1 — 2-way) — wiki-query Step 5d
+  trap 이 log.jsonl append 전에 lock release**: R2-6 fix 가 도입한
+  `trap cleanup EXIT` 가 bash block 종료 시 무조건 lock rmdir. 그러나
+  `log.jsonl` append 는 bash block 다음에 (agent 가 별도로 실행할
+  bullet 로) 위치. 결과: 성공 경로에서 lock 이 log append 전에
+  release 됨 → 동시 ingest/query 가 index update 와 log entry 사이
+  상태 관찰 가능 + log append 중단 시 index update 만 남고 audit
+  trail 없음. **Fix**: cleanup() 이 이제 실패 경로 (`rc != 0`) 에서만
+  lock rmdir; 성공 시 lock 이 Step 5e 까지 유지 (명시적 log append
+  이후). Critical section: index update + log append 가 이제 한 locked
+  region. cleanup-on-success (lock 유지) + cleanup-on-failure (lock
+  release) 회귀 테스트 +2.
+
+- **R3-2 (Codex adv #2) — wiki-rebuild 가 lock cleanup trap 부재**:
+  Step 1 이 `mkdir` 으로 `.wiki-lock` 획득하지만 trap 등록 부재.
+  envelope helper 실패 (missing node, unset CLAUDE_PLUGIN_ROOT,
+  invalid payload JSON, helper IO error) 시 lock 이 stranded → 이후
+  모든 wiki write 가 차단됨 (수동 `rmdir .wiki-meta/.wiki-lock` 필요).
+  특히 `/wiki-rebuild` 가 corrupt/foreign envelope 의 documented
+  recovery path 이라 위험. **Fix**: `mkdir LOCK_DIR` 직후
+  `cleanup_lock` trap 등록 → 모든 exit path (envelope helper 실패 포함)
+  에서 lock release. helper failure → lock release 시나리오 회귀
+  테스트 +1.
+
+- **R3-3 (Codex review #2) — wiki-rebuild Step 3.a + 3.b 분할이
+  PAYLOAD_TMP 를 Bash invocation 간 잃음**: R1 wiki-rebuild 재작성이
+  Step 3 을 Step 3.a (payload 빌드) + Step 3.b (envelope wrap) 으로
+  분할, 각자 별도 ```bash``` 블록. Claude Code Bash tool 이 invocation
+  마다 fresh shell spawn → Step 3.a 의 `PAYLOAD_TMP` 가 Step 3.b 에서
+  undefined → wrap-index-envelope.js 가 빈 `--payload-file` 값 받아
+  empty-rejection caller-contract guard 가 abort → rebuild 미실행.
+  **Fix**: Step 3.a + 3.b 를 단일 ```bash``` 블록으로 통합 (단일
+  Bash invocation) → `PAYLOAD_TMP` 가 두 phase 모두 유효. caller-
+  contract 블록을 `WIKI_ROOT` + `CLAUDE_PLUGIN_ROOT` 양쪽 명시.
+  combined block end-to-end (payload build + envelope wrap 단일 bash
+  session, non-empty source_artifacts + clean tmp residue 검증) 회귀
+  테스트 +1.
+
+R3 수정 후 테스트 상태: `npm test` → **106 pass / 0 fail / ~2.7s** (R2
+수정 후 102 pass; R3 수정 검증용 +4 테스트).
+
+### Round-4 review fixups (3-way /deep-review round 4)
+
+R4 split-decision:
+- **Opus**: APPROVE, 0 findings, convergence 선언.
+- **Codex review**: 2 P2 — R4-A (wiki-rebuild Step 1 trap 너무 일찍
+  발동 — R3-2 regression) + R4-B (envelope.git 이 wiki_root 대신
+  process.cwd 사용; Codex adv 와 2-way).
+- **Codex adversarial**: 1 HIGH transactional rollback (wiki-query
+  atomicity probe class 3rd-occurrence — anti-oscillation + out-of-scope
+  로 DEFER) + 1 MEDIUM 같은 git cwd 이슈 (R4-B).
+
+판정: 2 ACCEPT + 1 DEFER. R4-C 에 대해 anti-oscillation §4 발동.
+
+- **R4-A (Codex review #1) — wiki-rebuild Step 1 trap 너무 일찍 발동
+  (R3-2 regression)**: R3-2 가 Step 1 standalone bash 블록 안에
+  `trap cleanup_lock EXIT` 등록. Claude Code Bash tool 이 invocation
+  마다 fresh shell spawn → Step 1 끝나자마자 trap 발동 → lock release
+  → Steps 2-5 가 unlocked 로 진행 → 동시 ingest/rebuild interleave
+  가능. R3-2 의 critical regression — bash-tool shell lifecycle 오해
+  로 도입됨. **Fix**: Step 1 에서 trap 제거; Step 3 (mutation 블록)
+  안에 failure-only cleanup trap 추가, wiki-query Step 5d (R3-1) 와
+  동일 패턴. Step 3 성공 시: lock 이 Step 6 까지 유지. Step 3 실패
+  시: trap 이 lock release; payload temp 는 retry 위해 보존
+  (`rmdir .wiki-lock` 수동 정리 불필요). 회귀 테스트 +3 (Step 1
+  no-trap 가 lock 유지, Step 3 실패 시 lock release, Step 3 성공 시
+  lock 유지).
+
+- **R4-B (Codex review #2 + Codex adv #2 — 2-way) — envelope.git 이
+  arbitrary process.cwd 사용**: `wrap-index-envelope.js` 가 git
+  override 없이 `env.wrapEnvelope({})` 호출 → `wrapEnvelope` 가
+  `detectGit(process.cwd())` 로 fallback. agent 의 bash cwd 는 임의
+  → envelope.git 이 wiki 와 무관한 repo 의 HEAD/dirty state 기록
+  가능 → M3 provenance metadata 의 audit/recovery 가치 훼손. **Fix**:
+  `--output` 경로에서 wiki_root derive
+  (`<wiki_root>/.wiki-meta/index.json` →
+  `path.dirname(path.dirname(outputPath))`); `env.detectGit(wikiRoot)`
+  호출 후 결과를 `wrapEnvelope` 의 explicit `git` override 로 전달.
+  wiki_root 가 git repo 가 아니면 (Obsidian vault 의 흔한 경우),
+  sentinel `0000000` head + dirty=unknown emit ("no git context" 정확
+  signal, fix 전 non-git cwd 동작과 동일). 회귀 테스트 +2 (non-git
+  wiki → sentinel; git wiki → wiki 의 HEAD).
+
+- **R4-C (Codex adv #1, HIGH) — wiki-query auto-file 실패 시
+  transactional rollback**: 명시적 사유로 DEFER. Codex adv 가 flag:
+  `/wiki-query` Step 5c 가 page 작성 성공 후 Step 5d envelope-helper
+  실패 시, page 는 디스크에 있지만 index/log 에는 없음 — orphaned
+  state.
+  분석:
+    1. 이는 pre-existing wiki-query 디자인 (pre-1.5.0 도 같은
+       write-page-first 순서; M3 는 index update 메커니즘만 변경,
+       page-first 순서는 그대로).
+    2. 시스템에 recovery 메커니즘 내장: `wiki-lint` 가 "[DRIFT] N
+       unindexed pages" 보고, `/wiki-rebuild` 가 page frontmatter
+       (skills/wiki-schema/SKILL.md 명시 source of truth) 로부터
+       index.json 재생성.
+    3. Anti-oscillation §4 trigger: "wiki-query Step 5d atomicity
+       probe" finding 클래스의 3차 occurrence (R2-6 lock leak →
+       R3-1 lock lifetime → R4-1 transactional rollback). 각 라운드
+       구체적 subset 처리; 잔여 (page-write-before-index) 는
+       wiki-lint drift detection 으로 보완되는 pre-existing 디자인
+       trade-off.
+    4. Transactional rollback 구현 (페이지 staging 디렉토리 + atomic
+       move-into-place) 은 envelope adoption 범위를 크게 벗어남 —
+       plugin 의 모든 wiki write path 를 건드림.
+  **결정**: out-of-scope + recoverable 로 DEFER. 본 CHANGELOG 블록 +
+  convergence 입장에서 failure mode 명시. 코드 변경 없음.
+
+R4 수정 후 테스트 상태: `npm test` → **111 pass / 0 fail / ~2.5s** (R3
+수정 후 106 pass; R4 수정 검증용 +5 테스트).
+
+### 수렴 요약
+
+4 라운드의 3-way /deep-review (Opus + Codex review + Codex
+adversarial) 후 모든 actionable findings 해결:
+
+| 라운드 | Findings | 심각도 분포 |
+|---|---|---|
+| R1 | 6 | 1 CRITICAL + 3 HIGH/MEDIUM + 2 WARN |
+| R2 | 8 | 0 CRITICAL + 3 HIGH + 5 W/I |
+| R3 | 3 | 0 CRITICAL + 3 HIGH |
+| R4 | 3 (2 ACCEPT + 1 DEFER) | 0 CRITICAL + 2 HIGH + 1 HIGH-deferred |
+
+Critical-path finding count monotonic decrease (1 CRITICAL → 0 → 0 →
+0), overall actionable findings 도 zero 에 접근 (6 → 8 → 3 → 2).
+R4 의 transactional rollback DEFER (anti-oscillation §4) 가 mission
+scope 를 envelope adoption 으로 limit; deferred 디자인 question 은
+follow-up issue 후보이지 Phase 2 blocker 아님.
+
+라운드 별 테스트 상태: 87 → 93 → 102 → 106 → **111 pass** / 0 fail.
+Coverage 가 envelope contract 전체를 포괄 (identity guards,
+corrupt-payload defense, atomic writes, multi-source aggregator,
+markdown bash snippet portability, lock-lifetime correctness, git
+context provenance).
+
 ## [1.4.2] — 2026-05-07
 
 `docs/handoff-2026-05-06-v1.4.2.md`의 v1.4.1 backlog 4개 항목을 닫는 패치

@@ -2,6 +2,443 @@
 
 All notable changes to deep-wiki are documented here.
 
+## [1.5.0] — 2026-05-11
+
+**M3 envelope adoption** — `<wiki_root>/.wiki-meta/index.json` is now wrapped
+in the M3 cross-plugin envelope (cf.
+[claude-deep-suite/docs/envelope-migration.md](https://github.com/Sungmin-Cho/claude-deep-suite/blob/main/docs/envelope-migration.md)
+§1). The legacy `{pages, generated_at}` shape is preserved verbatim inside
+`payload`; consumers use the envelope-aware reader to get the legacy shape
+back regardless of whether the file is v1.5.0+ envelope-wrapped or pre-1.5.0
+legacy.
+
+This is the **6th and final** of the M3 Phase 2 plugin migrations. After
+this merge, suite-side Phase 3 (marketplace.json SHA bump, payload-registry
+schema replacement, adoption ledger) is unblocked.
+
+### Why envelope
+
+- **Cross-plugin trace**: every emit carries a ULID `run_id` + optional
+  `parent_run_id` chain — M4 telemetry / Phase 3 dashboard can reconstruct
+  cross-plugin lineage.
+- **Producer attribution**: `producer = "deep-wiki"`, `producer_version`
+  mirrors `plugin.json.version` (single source of truth).
+- **Schema drift detection**: `schema.name = "index"`, `schema.version =
+  "1.0"`; identity guards (handoff §4 round-4) reject foreign envelopes
+  at read-time.
+- **Reproducibility**: `git.{head,branch,dirty}` snapshot + `provenance.
+  tool_versions` snapshot.
+- **Multi-source aggregator**: pages contribute to
+  `provenance.source_artifacts[]` path-only (markdown — no envelope
+  detect). `parent_run_id` is omitted by default — index.json has no
+  single parent artifact.
+
+### Added
+
+- **`hooks/scripts/envelope.js`** — shared zero-dep library: ULID generator
+  (MSB-first Crockford Base32), `detectGit`, `loadProducerVersion`,
+  `wrapEnvelope`, `unwrapEnvelope`, `isEnvelope`, `isValidEnvelope`.
+  Producer version is read from `.claude-plugin/plugin.json` relative to
+  the module file (literal-cwd-resolve — handoff §4 deep-docs round-1
+  lesson) so the helper works regardless of which directory the agent
+  invokes it from.
+- **`hooks/scripts/wrap-index-envelope.js`** — CLI writer. Wraps a payload
+  JSON file into envelope form and atomically writes to
+  `<wiki_root>/.wiki-meta/index.json` (temp + rename — handoff §4 deep-work
+  round-1 C1 lesson). Supports `--source-page` (repeatable, path-only for
+  markdown pages) and generic `--source-artifact path[:run_id]` with
+  self-consistency auto-harvest (handoff §4 deep-evolve round-1 W4
+  lesson). Forward-compat `--parent-run-id` accepts only ULIDs at the CLI
+  boundary (defense-in-depth — handoff §4 deep-evolve round-1 C3 lesson).
+- **`hooks/scripts/read-index-envelope.js`** — CLI reader. Emits the legacy
+  `{pages, generated_at}` shape on stdout whether the input is v1.5.0+
+  envelope-wrapped or pre-1.5.0 legacy. Identity guards reject foreign or
+  corrupt envelopes with exit 1.
+- **`scripts/validate-envelope-emit.js`** — release-lint validator. Mirrors
+  the suite envelope schema without external deps: `additionalProperties:
+  false` on every nested object, ULID/SemVer 2.0.0/RFC 3339/kebab-case
+  regex, identity check (producer=deep-wiki, artifact_kind=index,
+  schema.name=index), corrupt-payload defense.
+- **`tests/envelope-emit.test.js` + `tests/envelope-chain.test.js`** —
+  Node test runner. 87+ tests covering wrap roundtrip, identity gates,
+  parseArgs boundary (scalar + repeatable empty-value rejection, deep-review
+  round-1 Q6 lesson), atomic-write residue check, envelope-aware reader
+  legacy pass-through, multi-source aggregator contract (no parent_run_id,
+  source_artifacts path-only).
+- **`tests/fixtures/sample-index.json`** — release sample emit. Phase 3
+  uses this as input when replacing the placeholder schema at
+  `claude-deep-suite/schemas/payload-registry/deep-wiki/index/v1.0.schema.json`.
+- **`package.json`** — `npm test` runs the envelope test suite, `npm run
+  validate-fixture` validates the sample fixture.
+
+### Changed
+
+- **`commands/wiki-setup.md`** — Step 3 scaffold now invokes
+  `wrap-index-envelope.js` instead of writing a literal JSON. Caller
+  contract: set `WIKI_ROOT` before invoking the snippet (deep-evolve
+  round-2 R2-3 self-containedness lesson).
+- **`commands/wiki-rebuild.md`** — Step 3 documents the envelope-wrap
+  contract, the multi-source `--source-page` repeatable flag, and a
+  bash-only fast-path (deep-work round-1 W6 lesson) for hot-path
+  envelope detection without spawning per-file Node processes.
+- **`commands/wiki-ingest.md`** — Step 2 (Read Existing Wiki State) and
+  Step 9 (Update Index) read/write via envelope-aware helpers. The
+  in-memory merge logic operates on the unwrapped payload (legacy shape),
+  so existing jq pipelines work unchanged.
+- **`commands/wiki-query.md`** — Layer 1 Index scan uses
+  `read-index-envelope.js`.
+- **`commands/wiki-lint.md`** — Step 5 (Duplicate/Alias Conflict) and
+  Step 10 (Index Drift Detection) use `read-index-envelope.js`.
+- **`skills/wiki-schema/SKILL.md` §Index** — documents the envelope
+  wrapper, identity contract, and multi-source aggregator pattern. Both
+  legacy and envelope-wrapped examples are shown.
+
+### Compatibility
+
+- **Forward compatibility (v1.5.0+ → consumers reading legacy code)**: the
+  envelope-aware reader (`read-index-envelope.js`) emits the legacy
+  `{pages, generated_at}` shape on stdout, so existing jq pipelines
+  (`.pages[].file`, `.generated_at`) work without modification.
+- **Backward compatibility (pre-1.5.0 → user wikis with legacy
+  index.json)**: the reader passes legacy input through unchanged. Users
+  do not need to run `/wiki-rebuild` after upgrading — existing
+  `index.json` files continue to work. Running `/wiki-rebuild` regenerates
+  in envelope-wrapped form (no data loss; payload shape is identical).
+- **Atomic write**: the writer uses `outputPath + .tmp.<pid>.<Date.now()>`
+  → `fs.renameSync` (deep-work round-1 C1 lesson). Mid-write interruption
+  cannot leave a truncated index.json.
+- **Identity guards**: the reader rejects foreign-producer envelopes
+  (e.g., a deep-evolve envelope accidentally at the index.json path) with
+  exit 1 — manual recovery is `/wiki-rebuild` which regenerates from page
+  frontmatter (the source of truth per skills/wiki-schema/SKILL.md).
+
+### Suite-side coordination (Phase 3, NOT this PR)
+
+T+0 timer recording (suite-side `docs/envelope-migration.md` §6.1
+adoption ledger) is intentionally deferred to claude-deep-suite Phase 3
+per the Phase 2 §1 policy — all suite-repo changes (marketplace.json SHA
+bump, payload-registry schema replacement, adoption ledger update) batch
+in a single Phase 3 PR after all six Phase 2 plugin PRs land. See
+claude-deep-suite/`docs/superpowers/plans/2026-05-07-m3-phase2-handoff.md`
+§1 (handoff "Probe F" cross-repo doc drift lesson).
+
+### Migration
+
+No data migration needed. Existing `index.json` files (legacy shape)
+remain readable by v1.5.0 consumers; they get re-wrapped into envelope
+form the next time `/wiki-rebuild` or `/wiki-ingest` runs. To force an
+immediate migration, run `/wiki-rebuild`.
+
+### Post-impl review fixups (3-way /deep-review round 1, all ACCEPT)
+
+Round 1 (Opus + Codex review + Codex adversarial — all three completed
+without timeout) surfaced one CRITICAL (3-way agreement) + three HIGH /
+MEDIUM (single-reviewer but real). All fixed before merge.
+
+- **C1 (3-way agreement — `find -printf` GNU-only on macOS BSD)**:
+  `commands/wiki-rebuild.md` Step 3 and `commands/wiki-lint.md` Step 10
+  used `find ... -printf 'pages/%f\n'`. macOS `/usr/bin/find` (BSD) rejects
+  `-printf` as unknown primary; under `set -euo pipefail` +
+  `2>/dev/null` + process substitution, the failure was silently swallowed
+  → empty `SOURCE_PAGE_ARGS` → envelope emitted with empty
+  `provenance.source_artifacts[]` (violates the multi-source aggregator
+  contract). Wiki-lint Step 10 silently reported every disk page as drift.
+  Verified failure mode on real macOS BSD find. **Fix**: `cd "${WIKI_ROOT}"
+  && find pages -maxdepth 1 -name '*.md' -type f` (portable to BSD + GNU).
+  Wiki-lint Step 10 uses the symmetric pattern with `sed 's|^\./||'`.
+  Added regression test `tests/envelope-chain.test.js` exercising the
+  actual bash form end-to-end (3 new tests under "markdown bash snippet
+  portability").
+
+- **C2 (Codex review P2#1 — `isEnvelope` rejects envelope missing payload)**:
+  Previously `isEnvelope` required `obj.payload !== undefined`. A malformed
+  envelope with `{schema_version: "1.0", envelope: {...}}` but no `payload`
+  key returned false → unwrapEnvelope fell through to legacy pass-through
+  → consumers (e.g. wiki-ingest jq `.pages // []`) received the corrupt
+  top-level object and rebuilt the index from an empty page set (silent
+  corruption). **Fix**: `isEnvelope` now detects envelope shape based on
+  `schema_version + envelope` only (payload key may be absent);
+  `unwrapEnvelope`'s corrupt-payload guard now also rejects `undefined`
+  alongside `null`/array/non-object. Reader exit code 1 with stderr
+  `corrupt payload: expected object, got undefined`. Added emit + chain
+  tests covering the absent-payload-key case.
+
+- **C3 (Codex adversarial #1 HIGH — `/wiki-query` auto-file write path
+  bypassed envelope)**: Step 5d Auto-Filing wrote `index.json` directly,
+  stripping the envelope wrapper on every successful query synthesis.
+  Subsequent envelope-aware reads either missed the entry or saw a stale
+  legacy shape. **Fix**: Step 5d now read-merge-writes through
+  `read-index-envelope.js` + `wrap-index-envelope.js` (same pattern as
+  Step 9 of `/wiki-ingest`), using portable BSD-compatible `find` for
+  `--source-page` collection. Lock released on helper failure so the wiki
+  is never left locked.
+
+- **C4 (Codex adversarial #2 MEDIUM — `/wiki-lint --fix` raw index edits)**:
+  Step 13 `--fix` path described raw add/remove operations against
+  `index.json`. **Fix**: Step 13 now delegates to `/wiki-rebuild` (which
+  uses the envelope-wrap helper end-to-end) as the recommended form; an
+  alternative in-place envelope-aware patch path references the
+  `/wiki-ingest` Step 9 + `/wiki-query` Step 5d patterns.
+
+- **W1 (Opus W1 — `CREATED_ENTRIES_JSON`/`UPDATED_ENTRIES_JSON` caller
+  contract undocumented)**: `commands/wiki-ingest.md` Step 9 bash snippet
+  references `--argjson` variables not previously documented. **Fix**:
+  added an explicit caller-contract block above the snippet listing every
+  required variable (`WIKI_ROOT`, `CLAUDE_PLUGIN_ROOT`,
+  `CREATED_ENTRIES_JSON`, `UPDATED_ENTRIES_JSON`) with a one-line
+  reference example for serializing the Step 8 arrays via `jq -s`. Added
+  `: "${VAR:?msg}"` guards inside the bash snippet for defense-in-depth.
+
+- **W2 (Opus W2 — bash fast-path heuristic clarity)**: `commands/
+  wiki-rebuild.md` fast-path bash detection block now carries an explicit
+  "Fast-path heuristic — node helper is authoritative" preamble that
+  documents the trade-off (no corrupt-payload defense in the grep-only
+  path).
+
+Test status after fixes: `npm test` → **93 pass / 0 fail / ~2.4s** (was
+87 pass before fixes; +6 tests covering the round-1 fixes).
+
+### Round-2 review fixups (3-way /deep-review round 2)
+
+Round 2 (Opus + Codex review + Codex adversarial — three reviewers, no
+timeouts) confirmed all six round-1 fixes correct AND surfaced six
+adjacent issues that were not covered. Monotonic decrease in
+criticality (round 1: 1 CRITICAL + 3 HIGH/MEDIUM + 2 WARN; round 2: 0
+CRITICAL + 3 HIGH + 3 WARN/INFO). No mission-scope-conflict findings —
+no anti-oscillation trigger.
+
+- **R2-1 (Codex adv HIGH-A — malformed envelope block bypass; deepens R1
+  C2)**: previous R1 fix addressed payload-missing case but adjacent
+  cases (envelope block missing/null/array under `schema_version="1.0"`)
+  still fell through legacy pass-through. **Fix**: unified `isEnvelope`
+  as marker-only detector (`schema_version === "1.0"` alone); moved
+  envelope-block shape validation into `unwrapEnvelope` where it emits
+  specific "malformed envelope" stderr. `isValidEnvelope` also re-checks
+  envelope-block shape so chain extraction is safe. +3 regression tests
+  (envelope-missing, envelope-null, envelope-array).
+
+- **R2-2 (Codex adv HIGH-B — non-index payload wrapped as valid index;
+  PARTIAL ACCEPT)**: writer accepted any non-null/non-array object as
+  payload. Wrapping a `{}` or `{foo: 'bar'}` produced a structurally-
+  valid envelope on disk that read-index-envelope.js unwrapped
+  successfully, then consumers' `.pages // []` yielded empty catalog.
+  **Fix (defense-in-depth at writer boundary)**: for
+  `artifactKind === "index"`, require `payload.pages` to be an array.
+  Authoritative payload schema enforcement still lives in
+  `claude-deep-suite/schemas/payload-registry/deep-wiki/index/v1.0.schema.json`
+  (Phase 3 batch replaces the placeholder); plugin-side check catches
+  obvious mis-wrap without duplicating Phase 3 scope. +3 regression
+  tests (missing pages, non-array pages, valid empty pages).
+
+- **R2-3 (Codex review P2-A — wiki-ingest §9 jq merge produces duplicate
+  index entries)**: in multi-source ingests where two sources touch the
+  same page, Step 8 leaves duplicate filenames in `UPDATED_ENTRIES`. The
+  Step 9 merge dropped the existing entry once but appended the entire
+  `$delta`, producing two `.pages[]` records for the same file → breaks
+  index uniqueness, downstream wiki-query / wiki-lint duplicate
+  behavior. **Fix**: collapse `$delta` by `.file` via `reverse |
+  unique_by(.file)` before merging (UPDATED takes precedence over
+  CREATED because it appears last in `$delta_raw`).
+
+- **R2-4 (Codex review P2-B — wiki-ingest auto-lint Step 13 raw edits)**:
+  parallel to R1 C4 but lived in `wiki-ingest.md` (different command's
+  Auto-Lint section) not `wiki-lint.md` Step 13. **Fix**: same
+  delegation pattern — Step 13 auto-fix now points to `/wiki-rebuild`
+  (envelope-wrap end-to-end) and references the Step 9 read-merge-write
+  pattern for in-place patches.
+
+- **R2-5 (Codex review P3 — validator accepts non-string git.head)**:
+  `validate-envelope-emit.js#validateGit` applied the SHA regex only
+  when `typeof head === 'string'`, so a numeric or null head passed.
+  **Fix**: explicit `typeof !== 'string'` rejection before regex; typed
+  error message. +1 regression test (numeric head).
+
+- **R2-6 (Opus W2-1 — wiki-query Step 5d caller-contract + lock leak)**:
+  Step 5d (newly added in R1 C3) declared `set -euo pipefail` but only
+  guarded `WIKI_ROOT`; `CLAUDE_PLUGIN_ROOT` and `QUERY_FILED_ENTRY_JSON`
+  were unguarded. Under `set -u` any unset variable crashed the script
+  before reaching the explicit lock-release path → wiki stuck-locked.
+  Codex adv MEDIUM #3 flagged the same lock-leak pattern. **Fix**:
+  caller-contract block above the snippet listing all three required
+  variables (with `QUERY_FILED_ENTRY_JSON` shape `{file, title, tags,
+  aliases}`); `${VAR:?msg}` guards for all three; trap-based unconditional
+  cleanup (`trap cleanup EXIT`) so the lock is released on every exit
+  path including read-helper failure, jq failure, or undefined-variable
+  abort.
+
+- **R2-7 (Opus W2-2 — bash 3.2 empty-array foot-gun in SOURCE_PAGE_ARGS)**:
+  `"${SOURCE_PAGE_ARGS[@]}"` under `set -u` aborts on macOS `/bin/bash`
+  3.2 when the array is empty (e.g. fresh wiki with no pages, scenario
+  reachable for `/wiki-setup` or post-prune `/wiki-rebuild`). **Fix**:
+  use `${ARR[@]+"${ARR[@]}"}` POSIX-compatible empty-array fallback at
+  every helper invocation site (`wiki-rebuild.md` Step 3.b,
+  `wiki-ingest.md` §9, `wiki-query.md` Step 5d). +3 regression tests
+  exercising bash 3.2 behavior end-to-end.
+
+- **R2-8 (Opus I2-1 — isValidEnvelope coverage symmetry)**: added
+  explicit test for `isValidEnvelope` rejecting envelope with absent
+  payload key (makes the round-1 invariant fully testable as a triple:
+  isEnvelope detects, isValidEnvelope rejects, unwrapEnvelope rejects).
+
+Test status after R2 fixes: `npm test` → **102 pass / 0 fail / ~2.6s**
+(was 93 pass after R1 fixes; +9 tests covering R2 fixes).
+
+### Round-3 review fixups (3-way /deep-review round 3)
+
+Round 3 (Opus + Codex review + Codex adversarial — three reviewers, no
+timeouts) confirmed all eight round-2 fixes correct and surfaced 3
+adjacent lock-lifetime / cross-shell issues that the R2 fixes didn't
+cover. Monotonic decrease continues: R1 6 → R2 8 → R3 3. All ACCEPT.
+No mission-scope-conflict — no anti-oscillation trigger.
+
+Opus Round 3: APPROVE (8 → 0). Codex Round 3 (review + adversarial)
+flagged the 3 issues below (2-way agreement on R3-1).
+
+- **R3-1 (Codex adv #1 + Codex review #1 — 2-way) — wiki-query Step 5d
+  trap releases lock BEFORE log.jsonl append**: The R2-6 fix introduced
+  `trap cleanup EXIT` that unconditionally rmdir'd the lock when the
+  bash block exited. But the `log.jsonl` append happens AFTER the bash
+  block (described as a bullet for the agent to execute). Result: on
+  success, the lock was released before the log append → a concurrent
+  ingest/query could observe the wiki state between index update and
+  log entry, and an interrupted log append would leave the index update
+  with no audit trail. **Fix**: cleanup() now only rmdirs the lock on
+  failure path (`rc != 0`); on success the lock stays held until Step
+  5e (after the explicit log append). Critical section semantics:
+  index update + log append are now one locked region. +2 regression
+  tests covering cleanup-on-success (lock retained) and cleanup-on-
+  failure (lock released).
+
+- **R3-2 (Codex adv #2) — wiki-rebuild has no lock cleanup trap**: Step 1
+  acquired `.wiki-lock` via `mkdir`, but no trap was registered. If
+  the new envelope helper failed (missing node, unset
+  CLAUDE_PLUGIN_ROOT, invalid payload JSON, helper IO error), the lock
+  was stranded → all subsequent wiki writes blocked until manual
+  `rmdir .wiki-meta/.wiki-lock`. Especially dangerous because
+  `/wiki-rebuild` is the documented recovery path for corrupt or
+  foreign envelopes. **Fix**: register `cleanup_lock` trap immediately
+  after `mkdir LOCK_DIR` so every exit path (including envelope helper
+  failure) releases the lock. +1 regression test simulating helper
+  failure → asserts lock released.
+
+- **R3-3 (Codex review #2) — wiki-rebuild Step 3.a + 3.b split lost
+  PAYLOAD_TMP across Bash invocations**: The R1 wiki-rebuild rewrite
+  split Step 3 into Step 3.a (build payload) and Step 3.b (envelope
+  wrap), each in its own ```bash``` block. The Claude Code Bash tool
+  spawns a fresh shell per invocation → `PAYLOAD_TMP` defined in Step
+  3.a was undefined in Step 3.b → wrap-index-envelope.js received an
+  empty/undefined `--payload-file` value and the empty-rejection
+  caller-contract guard aborted the rebuild. **Fix**: merge Step 3.a +
+  3.b into a single ```bash``` block (single Bash invocation) so
+  `PAYLOAD_TMP` lives through both phases. Added explicit caller-
+  contract block for both `WIKI_ROOT` + `CLAUDE_PLUGIN_ROOT`. +1
+  regression test exercises the combined block end-to-end (payload
+  build + envelope wrap in a single bash session, verifies non-empty
+  source_artifacts + clean tmp residue).
+
+R3 fixes: `npm test` → **106 pass / 0 fail / ~2.7s** (was 102 pass
+after R2 fixes; +4 R3-specific tests).
+
+### Round-4 review fixups (3-way /deep-review round 4)
+
+Round 4 split-decision review:
+
+- **Opus**: APPROVE, 0 findings, declared convergence.
+- **Codex review**: 2 P2 — R4-A (wiki-rebuild Step 1 trap fires too
+  early — REGRESSION from R3-2) + R4-B (envelope.git uses process.cwd
+  instead of wiki_root, 2-way with Codex adv).
+- **Codex adversarial**: 1 HIGH transactional rollback (3rd-occurrence
+  of wiki-query atomicity probe class — DEFERRED on anti-oscillation +
+  out-of-scope grounds) + 1 MEDIUM same git cwd issue (R4-B).
+
+Decisions: 2 ACCEPT + 1 DEFER. Anti-oscillation §4 invoked for R4-C.
+
+- **R4-A (Codex review #1) — wiki-rebuild Step 1 trap fires too early
+  (R3-2 regression)**: R3-2 put `trap cleanup_lock EXIT` inside Step
+  1's standalone bash block. Claude Code Bash tool spawns a fresh
+  shell per ```bash``` block → the trap fires as soon as Step 1 exits
+  → lock released BEFORE Steps 2-5 run → /wiki-rebuild proceeds
+  unlocked and a concurrent ingest/rebuild can interleave. Critical
+  regression of R3-2 fix introduced by misunderstanding bash-tool
+  shell lifecycle. **Fix**: removed trap from Step 1; added
+  failure-only cleanup trap INSIDE Step 3 (the mutation block) using
+  the same pattern as wiki-query Step 5d (after R3-1). On Step 3
+  success: lock kept for Step 6 to release. On Step 3 failure: trap
+  releases lock; payload temp preserved for retry (no manual
+  `rmdir .wiki-lock` needed).
+  +3 regression tests (Step 1 no-trap retains lock; Step 3 failure
+  releases lock; Step 3 success keeps lock).
+
+- **R4-B (Codex review #2 + Codex adv #2 — 2-way) — envelope.git uses
+  arbitrary process.cwd**: `wrap-index-envelope.js` previously called
+  `env.wrapEnvelope({})` without a git override; `wrapEnvelope` fell
+  through to `detectGit(process.cwd())`. The agent invokes the CLI
+  from arbitrary bash cwd, so envelope.git could record an unrelated
+  repo's HEAD/dirty state, undermining audit/recovery value of the
+  M3 provenance metadata. **Fix**: derive wiki_root from the
+  `--output` path (`<wiki_root>/.wiki-meta/index.json` →
+  `path.dirname(path.dirname(outputPath))`); call
+  `env.detectGit(wikiRoot)` and pass result to `wrapEnvelope` as
+  explicit `git` override. If wiki_root is not a git repo (common —
+  Obsidian vault without git), the sentinel `0000000` head + dirty=
+  unknown is emitted (correctly signals "no git context", same as
+  pre-fix behavior on non-git cwds). +2 regression tests (non-git
+  wiki → sentinel; git wiki → wiki's HEAD).
+
+- **R4-C (Codex adv #1, HIGH) — transactional rollback for wiki-query
+  auto-file failure**: DEFERRED with explicit reasoning. Codex
+  adversarial flagged: if `/wiki-query` Step 5c writes a page but
+  Step 5d envelope-helper fails, the page is on disk but not in
+  index/log — orphaned state.
+  Analysis:
+    1. This is pre-existing wiki-query design (pre-1.5.0 had the same
+       write-page-first ordering; M3 only changed the index update
+       mechanism, not the page-first sequence).
+    2. The recovery mechanism is built into the system:
+       `wiki-lint` reports "[DRIFT] N unindexed pages" and
+       `/wiki-rebuild` regenerates index.json from page frontmatter
+       (the source of truth per `skills/wiki-schema/SKILL.md`).
+    3. Anti-oscillation §4 trigger: this is the 3rd occurrence of an
+       "atomicity probe at wiki-query Step 5d" finding class (R2-6
+       lock leak → R3-1 lock lifetime → R4-1 transactional rollback).
+       Each previous round addressed a concrete subset; the residual
+       (page-write-before-index) is the pre-existing design tradeoff
+       that wiki-lint drift detection compensates for.
+    4. Implementing transactional rollback (staging directory + atomic
+       move-into-place for pages) is significant scope creep beyond
+       envelope adoption — would touch every wiki write path in the
+       plugin.
+  **Decision**: DEFER as out-of-scope + recoverable. Document the
+  failure mode in this CHANGELOG block + the convergence stance.
+  No code change.
+
+R4 fixes: `npm test` → **111 pass / 0 fail / ~2.5s** (was 106 pass
+after R3 fixes; +5 R4-specific tests).
+
+### Convergence summary
+
+After 4 rounds of 3-way /deep-review (Opus + Codex review + Codex
+adversarial), all actionable findings resolved:
+
+| Round | Findings | Severity profile |
+|---|---|---|
+| R1 | 6 | 1 CRITICAL + 3 HIGH/MEDIUM + 2 WARN |
+| R2 | 8 | 0 CRITICAL + 3 HIGH + 5 W/I |
+| R3 | 3 | 0 CRITICAL + 3 HIGH |
+| R4 | 3 (2 ACCEPT + 1 DEFER) | 0 CRITICAL + 2 HIGH + 1 HIGH-deferred |
+
+Monotonic decrease in critical-path findings (1 CRITICAL → 0 → 0 → 0)
+and overall actionable findings approaching zero (6 → 8 → 3 → 2). The
+R4 DEFER on transactional rollback (anti-oscillation §4) draws the
+mission-scope boundary at envelope adoption; the deferred design
+question is a candidate for a follow-up issue, not a Phase 2 blocker.
+
+Test status across rounds: 87 → 93 → 102 → 106 → **111 pass** /
+0 fail. Coverage spans the full envelope contract (identity guards,
+corrupt-payload defense, atomic writes, multi-source aggregator,
+markdown bash snippet portability, lock-lifetime correctness, git
+context provenance).
+
 ## [1.4.2] — 2026-05-07
 
 Patch release closing four v1.4.1 backlog items captured in

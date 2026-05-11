@@ -2538,9 +2538,31 @@ form. Multi-source aggregator: each scanned page is recorded in
 `provenance.source_artifacts[]` path-only (markdown — no envelope detect);
 `parent_run_id` is omitted by default.
 
+**Caller contract for the bash snippet below.** The bash block expects the
+following variables to be set by the calling agent before entry (Bash tool
+spawns a fresh shell per invocation — deep-evolve round-2 R2-3
+self-containedness lesson; Opus round-1 W1 documentation gap):
+
+- `WIKI_ROOT` — absolute path to the wiki root.
+- `CLAUDE_PLUGIN_ROOT` — set by Claude Code at session start (deep-wiki
+  plugin install path). The snippet uses it to locate helper scripts.
+- `CREATED_ENTRIES_JSON` — JSON-array-serialised form of the `CREATED_ENTRIES`
+  bash array from Step 8 (each element `{file, title, tags, aliases}`).
+  Typically produced as `CREATED_ENTRIES_JSON=$(printf '%s\n' "${CREATED_ENTRIES[@]}" | jq -s '.')`
+  if entries are already JSON strings, or constructed by the agent from the
+  Step 8 structured data.
+- `UPDATED_ENTRIES_JSON` — same shape, for `UPDATED_ENTRIES`.
+
+If any required variable is absent the `${VAR:?msg}` guards abort with a
+clear error before mutation; the wrap helper's atomic temp+rename design
+ensures no partial write reaches `index.json`.
+
 ```bash
 set -euo pipefail
 : "${WIKI_ROOT:?caller must set WIKI_ROOT to the wiki root absolute path}"
+: "${CLAUDE_PLUGIN_ROOT:?caller must have CLAUDE_PLUGIN_ROOT set (Claude Code session env)}"
+: "${CREATED_ENTRIES_JSON:?caller must set CREATED_ENTRIES_JSON (jq -s '.' of Step 8 entries)}"
+: "${UPDATED_ENTRIES_JSON:?caller must set UPDATED_ENTRIES_JSON (same shape)}"
 
 # 9.a — Read existing index (envelope-aware unwrap → legacy shape).
 # read-index-envelope.js exits 0 on success (legacy or unwrapped envelope),
@@ -2567,11 +2589,13 @@ echo "$EXISTING_INDEX" | jq \
 
 # 9.c — Envelope-wrap + atomic write. Each scanned page contributes one
 # --source-page entry; the helper writes atomically (temp + rename) and
-# gated cleanup keeps the payload temp on failure for retry.
+# gated cleanup keeps the payload temp on failure for retry. The page list
+# is derived from the merged payload (.pages[].file) so the recorded
+# source_artifacts always matches what the index actually catalogs.
 SOURCE_PAGE_ARGS=()
 while IFS= read -r REL; do
   [ -n "$REL" ] && SOURCE_PAGE_ARGS+=(--source-page "$REL")
-done < <(jq -r '.pages[].file' "$PAYLOAD_TMP" 2>/dev/null | awk '{ print "pages/" $0 }')
+done < <(jq -r '.pages[].file' "$PAYLOAD_TMP" 2>/dev/null | awk 'NF { print "pages/" $0 }')
 
 if node "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/wrap-index-envelope.js" \
      --payload-file "$PAYLOAD_TMP" \

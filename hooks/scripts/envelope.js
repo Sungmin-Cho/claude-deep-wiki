@@ -215,11 +215,19 @@ function wrapEnvelope(opts) {
 /**
  * M3 envelope shape detector (loose).
  *
- * Returns true for {schema_version: "1.0", envelope: {...}, payload: <any>} —
- * structural detection only. Does NOT validate envelope contents OR payload
- * shape. Use `unwrapEnvelope()` for full identity + corrupt-payload checks,
- * or use the stricter `isValidEnvelope()` when consumers also need payload
- * to be a non-null/non-array object.
+ * Returns true for {schema_version: "1.0", envelope: {...}} — structural
+ * detection only. Payload key MAY be absent (the corrupt-payload guard in
+ * `unwrapEnvelope()` rejects undefined/null/array/non-object payloads). This
+ * is the deliberate fix for Codex review round-1 P2#1: a malformed envelope
+ * missing `payload` must be detected as envelope-shaped so that downstream
+ * reader path can reject it on identity-or-payload grounds, instead of
+ * silently falling through the legacy pass-through and feeding the corrupt
+ * top-level object to consumers (whose `.pages // []` would yield an empty
+ * catalog and trigger a silent rebuild from zero).
+ *
+ * Use `unwrapEnvelope()` for full identity + corrupt-payload checks, or use
+ * the stricter `isValidEnvelope()` when consumers also need payload to be a
+ * non-null/non-array object.
  *
  * Defends against legacy index.json files whose top-level numeric
  * `schema_version` (none currently; reserved) or absent envelope key collide
@@ -229,7 +237,9 @@ function isEnvelope(obj) {
   if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false;
   if (obj.schema_version !== '1.0') return false;
   if (!obj.envelope || typeof obj.envelope !== 'object' || Array.isArray(obj.envelope)) return false;
-  if (obj.payload === undefined) return false;
+  // Payload key may be absent — unwrapEnvelope's corrupt-payload guard rejects it.
+  // Round-1 P2#1 lesson: requiring payload here would route corrupt envelopes
+  // through the legacy pass-through and feed consumers garbage.
   return true;
 }
 
@@ -281,12 +291,14 @@ function unwrapEnvelope(obj, expectedKind) {
     return null;
   }
   const payload = obj.payload;
-  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+  if (payload === undefined || payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
     // Round-5/7 lesson: corrupt-payload defense — non-object payload must not
-    // pass through silently.
+    // pass through silently. Round-1 P2#1 extension: `undefined` (key absent)
+    // is treated the same as `null` so envelopes missing the payload field
+    // are rejected here rather than misclassified as legacy upstream.
     process.stderr.write(
       `[deep-wiki/envelope] corrupt payload: expected object, got ${
-        Array.isArray(payload) ? 'array' : typeof payload
+        payload === undefined ? 'undefined' : Array.isArray(payload) ? 'array' : typeof payload
       }\n`,
     );
     return null;

@@ -129,6 +129,75 @@ remain readable by v1.5.0 consumers; they get re-wrapped into envelope
 form the next time `/wiki-rebuild` or `/wiki-ingest` runs. To force an
 immediate migration, run `/wiki-rebuild`.
 
+### Post-impl review fixups (3-way /deep-review round 1, all ACCEPT)
+
+Round 1 (Opus + Codex review + Codex adversarial — all three completed
+without timeout) surfaced one CRITICAL (3-way agreement) + three HIGH /
+MEDIUM (single-reviewer but real). All fixed before merge.
+
+- **C1 (3-way agreement — `find -printf` GNU-only on macOS BSD)**:
+  `commands/wiki-rebuild.md` Step 3 and `commands/wiki-lint.md` Step 10
+  used `find ... -printf 'pages/%f\n'`. macOS `/usr/bin/find` (BSD) rejects
+  `-printf` as unknown primary; under `set -euo pipefail` +
+  `2>/dev/null` + process substitution, the failure was silently swallowed
+  → empty `SOURCE_PAGE_ARGS` → envelope emitted with empty
+  `provenance.source_artifacts[]` (violates the multi-source aggregator
+  contract). Wiki-lint Step 10 silently reported every disk page as drift.
+  Verified failure mode on real macOS BSD find. **Fix**: `cd "${WIKI_ROOT}"
+  && find pages -maxdepth 1 -name '*.md' -type f` (portable to BSD + GNU).
+  Wiki-lint Step 10 uses the symmetric pattern with `sed 's|^\./||'`.
+  Added regression test `tests/envelope-chain.test.js` exercising the
+  actual bash form end-to-end (3 new tests under "markdown bash snippet
+  portability").
+
+- **C2 (Codex review P2#1 — `isEnvelope` rejects envelope missing payload)**:
+  Previously `isEnvelope` required `obj.payload !== undefined`. A malformed
+  envelope with `{schema_version: "1.0", envelope: {...}}` but no `payload`
+  key returned false → unwrapEnvelope fell through to legacy pass-through
+  → consumers (e.g. wiki-ingest jq `.pages // []`) received the corrupt
+  top-level object and rebuilt the index from an empty page set (silent
+  corruption). **Fix**: `isEnvelope` now detects envelope shape based on
+  `schema_version + envelope` only (payload key may be absent);
+  `unwrapEnvelope`'s corrupt-payload guard now also rejects `undefined`
+  alongside `null`/array/non-object. Reader exit code 1 with stderr
+  `corrupt payload: expected object, got undefined`. Added emit + chain
+  tests covering the absent-payload-key case.
+
+- **C3 (Codex adversarial #1 HIGH — `/wiki-query` auto-file write path
+  bypassed envelope)**: Step 5d Auto-Filing wrote `index.json` directly,
+  stripping the envelope wrapper on every successful query synthesis.
+  Subsequent envelope-aware reads either missed the entry or saw a stale
+  legacy shape. **Fix**: Step 5d now read-merge-writes through
+  `read-index-envelope.js` + `wrap-index-envelope.js` (same pattern as
+  Step 9 of `/wiki-ingest`), using portable BSD-compatible `find` for
+  `--source-page` collection. Lock released on helper failure so the wiki
+  is never left locked.
+
+- **C4 (Codex adversarial #2 MEDIUM — `/wiki-lint --fix` raw index edits)**:
+  Step 13 `--fix` path described raw add/remove operations against
+  `index.json`. **Fix**: Step 13 now delegates to `/wiki-rebuild` (which
+  uses the envelope-wrap helper end-to-end) as the recommended form; an
+  alternative in-place envelope-aware patch path references the
+  `/wiki-ingest` Step 9 + `/wiki-query` Step 5d patterns.
+
+- **W1 (Opus W1 — `CREATED_ENTRIES_JSON`/`UPDATED_ENTRIES_JSON` caller
+  contract undocumented)**: `commands/wiki-ingest.md` Step 9 bash snippet
+  references `--argjson` variables not previously documented. **Fix**:
+  added an explicit caller-contract block above the snippet listing every
+  required variable (`WIKI_ROOT`, `CLAUDE_PLUGIN_ROOT`,
+  `CREATED_ENTRIES_JSON`, `UPDATED_ENTRIES_JSON`) with a one-line
+  reference example for serializing the Step 8 arrays via `jq -s`. Added
+  `: "${VAR:?msg}"` guards inside the bash snippet for defense-in-depth.
+
+- **W2 (Opus W2 — bash fast-path heuristic clarity)**: `commands/
+  wiki-rebuild.md` fast-path bash detection block now carries an explicit
+  "Fast-path heuristic — node helper is authoritative" preamble that
+  documents the trade-off (no corrupt-payload defense in the grep-only
+  path).
+
+Test status after fixes: `npm test` → **93 pass / 0 fail / ~2.4s** (was
+87 pass before fixes; +6 tests covering the round-1 fixes).
+
 ## [1.4.2] — 2026-05-07
 
 Patch release closing four v1.4.1 backlog items captured in

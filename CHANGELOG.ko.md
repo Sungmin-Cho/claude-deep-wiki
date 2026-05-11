@@ -123,6 +123,68 @@ consumer 가 그대로 읽을 수 있으며, 다음 번 `/wiki-rebuild` 또는
 `/wiki-ingest` 실행 시 envelope 형태로 재포장됩니다. 즉시 migration 을
 강제하려면 `/wiki-rebuild` 를 실행하세요.
 
+### Post-impl review fixups (3-way /deep-review round 1, all ACCEPT)
+
+Round 1 (Opus + Codex review + Codex adversarial — 세 리뷰어 모두 timeout
+없이 완료) 에서 1 CRITICAL (3-way 합의) + 3 HIGH/MEDIUM (single-reviewer 이나
+실제 문제) 가 도출됨. 머지 전 모두 수정.
+
+- **C1 (3-way 합의 — `find -printf` GNU 전용, macOS BSD 회귀)**:
+  `commands/wiki-rebuild.md` Step 3 + `commands/wiki-lint.md` Step 10 이
+  `find ... -printf` 사용. macOS `/usr/bin/find` (BSD) 가 `-printf` 거부 →
+  `set -euo pipefail` + `2>/dev/null` + process substitution 조합에서
+  실패가 silent → `SOURCE_PAGE_ARGS` 가 비어있는 채로 envelope 가 emit 됨
+  (multi-source aggregator contract 위반). wiki-lint Step 10 은 모든 disk
+  페이지를 drift 로 false-report. 실제 macOS BSD find 에서 실패 모드 검증.
+  **Fix**: `cd "${WIKI_ROOT}" && find pages -maxdepth 1 -name '*.md'
+  -type f` (BSD + GNU 양쪽 호환). wiki-lint Step 10 은 `sed 's|^\./||'`
+  로 대칭 패턴. `tests/envelope-chain.test.js` 에 회귀 테스트 추가 — bash
+  snippet 자체를 end-to-end 실행 ("markdown bash snippet portability"
+  suite 3 tests).
+
+- **C2 (Codex review P2#1 — `isEnvelope` 가 payload 없는 envelope 거부)**:
+  기존 `isEnvelope` 는 `obj.payload !== undefined` 요구. `{schema_version:
+  "1.0", envelope: {...}}` 인데 payload key 가 없는 malformed envelope 가
+  false 반환 → unwrapEnvelope 가 legacy pass-through 로 빠짐 → 소비자
+  (wiki-ingest jq `.pages // []`) 가 corrupt top-level 받아 빈 page set
+  으로 index 재빌드 (silent corruption). **Fix**: `isEnvelope` 가 이제
+  `schema_version + envelope` 만으로 envelope 모양 감지 (payload key 없어도
+  OK); `unwrapEnvelope` 의 corrupt-payload guard 가 `undefined` 도
+  `null`/array/non-object 와 함께 거부. Reader exit 1 + stderr `corrupt
+  payload: expected object, got undefined`. emit + chain 테스트에
+  absent-payload-key 케이스 추가.
+
+- **C3 (Codex adversarial #1 HIGH — `/wiki-query` 자동 파일링 write path 가
+  envelope 우회)**: Step 5d Auto-Filing 이 `index.json` 을 직접 작성하여
+  성공적인 query synthesis 마다 envelope wrapper 가 떨어져 나감. 이후
+  envelope-aware read 는 항목을 못 보거나 stale legacy shape 을 봄.
+  **Fix**: Step 5d 가 이제 `read-index-envelope.js` + `wrap-index-envelope.js`
+  로 read-merge-write 수행 (`/wiki-ingest` Step 9 와 동일 패턴),
+  `--source-page` 수집에 portable BSD-호환 find 사용. helper 실패 시 lock
+  해제하여 wiki 가 locked 상태로 남지 않도록.
+
+- **C4 (Codex adversarial #2 MEDIUM — `/wiki-lint --fix` 의 raw index 편집)**:
+  Step 13 `--fix` path 가 `index.json` 직접 add/remove 명시. **Fix**: Step
+  13 이 이제 `/wiki-rebuild` (envelope-wrap helper 를 end-to-end 사용) 에
+  위임을 권장 형태로 명시; 대안적 in-place envelope-aware patch path 는
+  `/wiki-ingest` Step 9 + `/wiki-query` Step 5d 패턴 참조.
+
+- **W1 (Opus W1 — `CREATED_ENTRIES_JSON`/`UPDATED_ENTRIES_JSON` caller
+  contract 미문서화)**: `commands/wiki-ingest.md` Step 9 bash snippet 이
+  `--argjson` 변수를 사용하나 사전 문서화 부재. **Fix**: snippet 위에
+  caller-contract 블록 추가 — 모든 필수 변수 (`WIKI_ROOT`,
+  `CLAUDE_PLUGIN_ROOT`, `CREATED_ENTRIES_JSON`, `UPDATED_ENTRIES_JSON`) +
+  Step 8 array 를 `jq -s` 로 직렬화하는 1-line 예시. defense-in-depth 로
+  bash snippet 내부에도 `: "${VAR:?msg}"` 가드 추가.
+
+- **W2 (Opus W2 — bash fast-path heuristic 명확성)**: `commands/
+  wiki-rebuild.md` fast-path bash detection 블록에 "Fast-path heuristic —
+  node helper is authoritative" preamble 추가 — trade-off (grep-only path
+  에는 corrupt-payload defense 부재) 명시.
+
+수정 후 테스트 상태: `npm test` → **93 pass / 0 fail / ~2.4s** (수정 전
+87 pass; round-1 수정 검증용 +6 테스트).
+
 ## [1.4.2] — 2026-05-07
 
 `docs/handoff-2026-05-06-v1.4.2.md`의 v1.4.1 backlog 4개 항목을 닫는 패치

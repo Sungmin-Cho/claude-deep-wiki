@@ -133,7 +133,55 @@ Search `index.json` for a page that already covers this topic (by title or alias
 
 > **Timestamp format:** All `ts` and `generated_at` values MUST be UTC ISO 8601 with a `Z` suffix. Generate with `date -u +"%Y-%m-%dT%H:%M:%SZ"`. Never use local timezone offsets (e.g. `+09:00`) — the wiki's log is consumed by tooling that assumes a single canonical timezone.
 
-- Add/update the page entry in `.wiki-meta/index.json`
+**v1.5.0+ envelope-aware index update.** The auto-filing write path MUST
+read-merge-write through the envelope helpers so the envelope wrapper is
+preserved across query-filed updates. Direct `index.json` mutation drops
+`run_id` / `provenance` and breaks subsequent envelope-aware reads.
+
+```bash
+set -euo pipefail
+: "${WIKI_ROOT:?caller must set WIKI_ROOT to the wiki root absolute path}"
+
+# Read existing index (envelope-aware unwrap → legacy shape).
+EXISTING_INDEX=$(node "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/read-index-envelope.js" \
+                   "${WIKI_ROOT}/.wiki-meta/index.json")
+
+# Merge the query-filed page (the new entry's {file, title, tags, aliases}
+# is supplied by the agent based on the page just written in Step 5c). If
+# the page already exists in pages[], overwrite its entry; otherwise insert.
+MERGED_TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+PAYLOAD_TMP="${WIKI_ROOT}/.wiki-meta/index.payload.tmp.$$.$(date +%s).json"
+# QUERY_FILED_ENTRY_JSON = JSON object {file, title, tags, aliases} for the
+# new/updated query page (agent-supplied).
+echo "$EXISTING_INDEX" | jq \
+  --argjson entry "$QUERY_FILED_ENTRY_JSON" \
+  --arg ts "$MERGED_TS" \
+  '.generated_at = $ts
+   | (.pages // []) as $existing
+   | ($existing | map(select(.file != $entry.file))) as $kept
+   | .pages = (($kept + [$entry]) | sort_by(.file))' \
+  > "$PAYLOAD_TMP"
+
+# Envelope-wrap + atomic write. Page paths gathered the same way as
+# /wiki-rebuild Step 3 (portable BSD find).
+SOURCE_PAGE_ARGS=()
+while IFS= read -r REL; do
+  [ -n "$REL" ] && SOURCE_PAGE_ARGS+=(--source-page "$REL")
+done < <(cd "${WIKI_ROOT}" 2>/dev/null && find pages -maxdepth 1 -name '*.md' -type f 2>/dev/null | sort)
+
+if node "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/wrap-index-envelope.js" \
+     --payload-file "$PAYLOAD_TMP" \
+     --output "${WIKI_ROOT}/.wiki-meta/index.json" \
+     "${SOURCE_PAGE_ARGS[@]}"; then
+  rm -f "$PAYLOAD_TMP"
+else
+  echo "ERROR: wrap-index-envelope.js failed; payload preserved at $PAYLOAD_TMP for retry" >&2
+  # Release lock before exiting so the wiki is not left locked.
+  rmdir "${WIKI_ROOT}/.wiki-meta/.wiki-lock" 2>/dev/null || true
+  exit 1
+fi
+```
+
 - Append to `log.jsonl`:
   ```json
   {"ts":"<iso_timestamp>","action":"query-filed","source":"query-derived","pages_created":["query-topic.md"],"pages_updated":[]}

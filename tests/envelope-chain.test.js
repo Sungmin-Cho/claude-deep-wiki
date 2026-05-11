@@ -792,6 +792,40 @@ describe('envelope-chain — read-index-envelope.js (envelope-aware reader)', ()
     assert.ok(threw, 'reader must reject corrupt payload envelope');
   });
 
+  it('rejects envelope MISSING payload key entirely (round-1 P2#1 fix)', () => {
+    // Round-1 Codex review P2#1: previously this slipped through legacy
+    // pass-through because isEnvelope returned false on absent payload.
+    // The fix routes it through unwrapEnvelope's corrupt-payload guard.
+    const dir = tmpDir();
+    const malformed = path.join(dir, 'index.json');
+    writeJson(malformed, {
+      schema_version: '1.0',
+      envelope: {
+        producer: 'deep-wiki',
+        producer_version: '1.5.0',
+        artifact_kind: 'index',
+        run_id: '01JTKEV0NHABCDEFGHJKMNPQRS',
+        generated_at: '2026-05-11T10:00:00Z',
+        schema: { name: 'index', version: '1.0' },
+        git: { head: 'abc1234', branch: 'main', dirty: false },
+        provenance: { source_artifacts: [], tool_versions: {} },
+      },
+      // payload key absent entirely — must NOT fall through legacy
+    });
+
+    let threw = false;
+    let stderr = '';
+    try {
+      runRead(malformed);
+    } catch (err) {
+      threw = true;
+      stderr = (err.stderr || '').toString();
+      assert.equal(err.status, 1, 'expected exit code 1 (missing payload)');
+    }
+    assert.ok(threw, 'reader must reject envelope with absent payload key');
+    assert.match(stderr, /corrupt payload|envelope-shaped but failed identity/, 'stderr should mention corrupt payload');
+  });
+
   it('exits 2 on missing argument', () => {
     let threw = false;
     try {
@@ -835,6 +869,80 @@ describe('envelope-chain — round-trip wrap → read', () => {
     runWrap(['--payload-file', payload, '--output', out]);
     const read = JSON.parse(runRead(out));
     assert.deepEqual(read, original);
+  });
+});
+
+describe('envelope-chain — markdown bash snippet portability (BSD/GNU find — round-1 C1 fix)', () => {
+  // Round-1 Opus C1 / Codex review P2#2 / Codex adversarial #3: the previous
+  // markdown snippets used `find ... -printf 'pages/%f\n'` which is GNU-only.
+  // On macOS BSD `find`, the `-printf` operator is unknown; under
+  // `set -euo pipefail` + `2>/dev/null` + process substitution `< <(...)`,
+  // the failure was silently swallowed, leaving SOURCE_PAGE_ARGS empty.
+  // The fix is `cd ${WIKI_ROOT} && find pages ... -type f` (portable).
+  // This test directly exercises the bash form (not the JS wrapper) so a
+  // regression to `-printf` would fail here even though the JS unit tests
+  // continue to pass.
+
+  it('portable find expression yields all .md page paths', () => {
+    const dir = tmpDir();
+    fs.mkdirSync(path.join(dir, 'pages'));
+    const want = ['alpha.md', 'beta.md', 'gamma.md'];
+    want.forEach((f) => fs.writeFileSync(path.join(dir, 'pages', f), `# ${f}\n`));
+    // Mirror commands/wiki-rebuild.md Step 3.b find form exactly.
+    const out = execFileSync('bash', ['-c', `cd "${dir}" 2>/dev/null && find pages -maxdepth 1 -name '*.md' -type f 2>/dev/null | sort`], {
+      encoding: 'utf8',
+    });
+    const got = out.trim().split('\n').sort();
+    assert.deepEqual(got, want.map((f) => `pages/${f}`).sort());
+  });
+
+  it('portable find expression for wiki-lint Step 10 yields basenames', () => {
+    const dir = tmpDir();
+    fs.mkdirSync(path.join(dir, 'pages'));
+    fs.writeFileSync(path.join(dir, 'pages', 'a.md'), '# a\n');
+    fs.writeFileSync(path.join(dir, 'pages', 'b.md'), '# b\n');
+    // Mirror commands/wiki-lint.md Step 10 find form exactly.
+    const out = execFileSync(
+      'bash',
+      ['-c', `cd "${dir}/pages" 2>/dev/null && find . -maxdepth 1 -name '*.md' -type f 2>/dev/null | sed 's|^\\./||' | sort`],
+      { encoding: 'utf8' },
+    );
+    const got = out.trim().split('\n').sort();
+    assert.deepEqual(got, ['a.md', 'b.md']);
+  });
+
+  it('end-to-end: wrap-index-envelope.js invoked with --source-page from portable find produces non-empty source_artifacts', () => {
+    const dir = tmpDir();
+    fs.mkdirSync(path.join(dir, 'pages'));
+    ['x.md', 'y.md'].forEach((f) =>
+      fs.writeFileSync(path.join(dir, 'pages', f), `---\ntitle: "${f}"\ntags: []\naliases: []\n---\n`),
+    );
+    const payload = path.join(dir, 'payload.json');
+    const out = path.join(dir, '.wiki-meta', 'index.json');
+    writeJson(payload, {
+      pages: [
+        { file: 'x.md', title: 'x.md', tags: [], aliases: [] },
+        { file: 'y.md', title: 'y.md', tags: [], aliases: [] },
+      ],
+      generated_at: '2026-05-11T10:00:00Z',
+    });
+    // Reproduce the wiki-rebuild Step 3.b loop end-to-end.
+    const bashScript = `
+      set -euo pipefail
+      WIKI_ROOT="${dir}"
+      SOURCE_PAGE_ARGS=()
+      while IFS= read -r REL; do
+        [ -n "$REL" ] && SOURCE_PAGE_ARGS+=(--source-page "$REL")
+      done < <(cd "$WIKI_ROOT" 2>/dev/null && find pages -maxdepth 1 -name '*.md' -type f 2>/dev/null | sort)
+      node "${WRAP_CLI}" --payload-file "${payload}" --output "${out}" "\${SOURCE_PAGE_ARGS[@]}"
+    `;
+    execFileSync('bash', ['-c', bashScript], { encoding: 'utf8' });
+
+    const obj = JSON.parse(fs.readFileSync(out, 'utf8'));
+    const sa = obj.envelope.provenance.source_artifacts;
+    assert.equal(sa.length, 2, 'multi-source aggregator contract: page paths must populate source_artifacts');
+    assert.deepEqual(sa.map((s) => s.path).sort(), ['pages/x.md', 'pages/y.md']);
+    sa.forEach((s) => assert.ok(!('run_id' in s), 'markdown page paths must not carry run_id'));
   });
 });
 

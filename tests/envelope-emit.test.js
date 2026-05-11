@@ -198,6 +198,19 @@ describe('envelope.js — isEnvelope / isValidEnvelope / unwrapEnvelope', () => 
     assert.equal(isEnvelope({ schema_version: '1.0', envelope: null, payload: {} }), false);
   });
 
+  it('isEnvelope detects envelope WITHOUT payload key (round-1 P2#1 fix)', () => {
+    // Codex review round-1 P2#1: an envelope missing the `payload` key MUST
+    // be detected as envelope-shaped so unwrapEnvelope's corrupt-payload
+    // guard rejects it on identity-or-payload grounds. The previous behaviour
+    // (returning false here) caused such envelopes to flow through the
+    // legacy pass-through and feed consumers `{schema_version, envelope}`
+    // whose `.pages // []` yielded an empty catalog — silent corruption.
+    assert.equal(
+      isEnvelope({ schema_version: '1.0', envelope: { producer: 'deep-wiki' } }),
+      true,
+    );
+  });
+
   it('isValidEnvelope rejects corrupt payloads (handoff §4 W4 lesson)', () => {
     const base = {
       schema_version: '1.0',
@@ -269,6 +282,25 @@ describe('envelope.js — isEnvelope / isValidEnvelope / unwrapEnvelope', () => 
     assert.equal(unwrapEnvelope(corrupt, 'index'), null);
     corrupt.payload = [1, 2, 3];
     assert.equal(unwrapEnvelope(corrupt, 'index'), null);
+  });
+
+  it('unwrapEnvelope rejects envelope missing payload key entirely (round-1 P2#1 fix)', () => {
+    // Codex review round-1 P2#1: previously this case slipped through the
+    // legacy pass-through because isEnvelope returned false; downstream
+    // jq `.pages // []` then yielded an empty array and silently rebuilt
+    // the index from zero. With the P2#1 fix, isEnvelope detects it and
+    // unwrapEnvelope's corrupt-payload guard rejects it.
+    const missingPayload = {
+      schema_version: '1.0',
+      envelope: {
+        producer: 'deep-wiki',
+        artifact_kind: 'index',
+        run_id: '01JTKEV0NHABCDEFGHJKMNPQRS',
+        schema: { name: 'index', version: '1.0' },
+      },
+      // payload key entirely absent
+    };
+    assert.equal(unwrapEnvelope(missingPayload, 'index'), null);
   });
 
   it('unwrapEnvelope throws on invalid expectedKind (catches typos)', () => {

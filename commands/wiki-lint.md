@@ -343,7 +343,10 @@ set -euo pipefail
 INDEX_JSON=$(node "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/read-index-envelope.js" \
               "${WIKI_ROOT}/.wiki-meta/index.json")
 INDEX_FILES=$(echo "$INDEX_JSON" | jq -r '.pages[].file' | sort)
-DISK_FILES=$(find "${WIKI_ROOT}/pages" -maxdepth 1 -name '*.md' -printf '%f\n' 2>/dev/null | sort)
+# macOS BSD `find` lacks `-printf`; portable alternative: cd into pages/ in a
+# subshell so output paths are already basename-relative. Strip leading `./`
+# that BSD find emits when the search root is `.`.
+DISK_FILES=$(cd "${WIKI_ROOT}/pages" 2>/dev/null && find . -maxdepth 1 -name '*.md' -type f 2>/dev/null | sed 's|^\./||' | sort)
 # Compare INDEX_FILES vs DISK_FILES with comm -23 / comm -13 as usual.
 ```
 
@@ -422,11 +425,35 @@ Present a structured report:
 
 If the user passed `--fix`:
 - Prune excess versions (keep last 3)
-- Add missing pages to index.json
-- Remove ghost entries from index.json
+- Add missing pages to index.json (v1.5.0+ — see envelope-aware index mutation below)
+- Remove ghost entries from index.json (v1.5.0+ — same)
 - Do NOT auto-fix content issues (schema violations, orphans, broken links) — these require human judgment
 - Drop stale `.pending-scan` (State B from Step 11 — `PENDING < LAST`)
 - Drop invalid `.pending-scan` content (State A on `.pending-scan`); leave `.last-scan` intact (State A on `.last-scan` requires manual intervention because dropping it would trigger first-run fallback).
+
+**v1.5.0+ envelope-aware index mutation.** When `--fix` adds missing pages
+or removes ghost entries from `index.json`, the write path MUST go through
+the envelope helpers. Direct mutation of the wrapped file drops
+`envelope.run_id` and provenance, breaking subsequent envelope-aware reads
+(round-1 Codex adversarial #2). The simplest safe form delegates to
+`/wiki-rebuild` (which already uses the envelope-wrap helper end-to-end):
+
+```bash
+set -euo pipefail
+: "${WIKI_ROOT:?caller must set WIKI_ROOT to the wiki root absolute path}"
+
+# Recommended: delegate index drift fix to /wiki-rebuild — it regenerates
+# index.json from page frontmatter (the source of truth per
+# skills/wiki-schema/SKILL.md) and emits envelope-wrapped output via the
+# same atomic temp+rename helper used by /wiki-ingest. Equivalent semantics
+# to a manual add-missing + remove-ghost cycle, without the envelope
+# preservation foot-gun.
+
+# Alternative — in-place envelope-aware index patch (for callers that
+# explicitly need to scope changes to specific pages without a full
+# rebuild). Same read-merge-write pattern as /wiki-query Step 5d and
+# /wiki-ingest Step 9 — see those steps for the full pattern.
+```
 
 ```bash
 # In the --fix path (SCAN-WINDOW auto-fix, v1.2.0+):

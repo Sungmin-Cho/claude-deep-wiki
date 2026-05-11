@@ -91,13 +91,18 @@ omitted (multi-source aggregator default). Helper writes atomically (temp +
 rename); cleanup is gated on helper success (deep-work round-1 C1+C2 lessons).
 
 ```bash
-# Collect --source-page args from scanned pages. Substitute <SCANNED_PAGE_PATHS>
-# with the actual sorted list (e.g. via `find "${WIKI_ROOT}/pages" -maxdepth 1
-# -name '*.md' -printf 'pages/%f\n' | sort`).
+# Collect --source-page args from scanned pages. macOS BSD `find` lacks
+# `-printf`, so we cd into ${WIKI_ROOT} inside a subshell and rely on the
+# already-relative `pages` prefix in the search root. Portable to both BSD
+# (macOS default) and GNU (Linux) find. The subshell isolates the cd from
+# the outer script's cwd; `set -euo pipefail` interactions are safe because
+# the failure of the inner find would surface via empty SOURCE_PAGE_ARGS
+# (which the helper accepts but is structurally incorrect; downstream tests
+# in tests/envelope-chain.test.js verify the multi-source contract).
 SOURCE_PAGE_ARGS=()
 while IFS= read -r REL; do
   [ -n "$REL" ] && SOURCE_PAGE_ARGS+=(--source-page "$REL")
-done < <(find "${WIKI_ROOT}/pages" -maxdepth 1 -name '*.md' -printf 'pages/%f\n' 2>/dev/null | sort)
+done < <(cd "${WIKI_ROOT}" 2>/dev/null && find pages -maxdepth 1 -name '*.md' -type f 2>/dev/null | sort)
 
 if node "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/wrap-index-envelope.js" \
      --payload-file "$PAYLOAD_TMP" \
@@ -130,11 +135,17 @@ INDEX_JSON=$(node "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/read-index-envelope.js" \
 ```
 
 If `node` is unavailable in the agent context, a bash-only fast-path
-(deep-work round-1 W6 lesson) checks the wrapper without spawning a
-per-file Node process:
+(deep-work round-1 W6 lesson) detects the wrapper without spawning a
+per-file Node process. **Note: this is a heuristic** — only
+`read-index-envelope.js` is authoritative (full identity guard + corrupt-
+payload defense). The grep-based path exists for environments lacking
+Node; prefer the node helper whenever available.
 
 ```bash
-# Fast-path: detect envelope without invoking node per file.
+# Fast-path heuristic — node helper is authoritative; this exists for
+# environments without node in PATH. Identity check is text-grep based
+# (deep-wiki/index/producer/schema_version anchors). corrupt-payload edge
+# cases (e.g. payload omitted entirely) are NOT detected here.
 if grep -q '"envelope":' "${WIKI_ROOT}/.wiki-meta/index.json" && \
    grep -q '"schema_version": *"1.0"' "${WIKI_ROOT}/.wiki-meta/index.json" && \
    grep -q '"producer": *"deep-wiki"' "${WIKI_ROOT}/.wiki-meta/index.json" && \

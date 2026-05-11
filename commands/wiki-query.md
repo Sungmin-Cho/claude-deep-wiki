@@ -151,10 +151,13 @@ documentation gap; mirrors Step 9 of `/wiki-ingest`):
 
 If any required variable is absent the `${VAR:?msg}` guards abort with a
 clear error before any mutation. A trap on EXIT releases the
-`.wiki-lock` directory acquired in Step 5a on every exit path (including
-read-helper failure, jq failure, undefined-variable abort) so the wiki
-is never left in a locked state (round-2 Codex adversarial #3 + Opus
-W2-1 lock leak fix).
+`.wiki-lock` directory **only on failure paths** (round-3 Codex adv #1 +
+Codex review #1 — 2-way fix). On the success path the lock is held
+across the index update AND the log append (which happens after this
+snippet exits, as the bullet below describes), and Step 5e releases the
+lock once all writes are done. On any failure (read-helper exit 1, jq
+exit, undefined-variable abort) the trap fires and releases the lock so
+the wiki is never left in a stranded locked state.
 
 ```bash
 set -euo pipefail
@@ -162,16 +165,18 @@ set -euo pipefail
 : "${CLAUDE_PLUGIN_ROOT:?caller must have CLAUDE_PLUGIN_ROOT set (Claude Code session env)}"
 : "${QUERY_FILED_ENTRY_JSON:?caller must set QUERY_FILED_ENTRY_JSON to a JSON object {file,title,tags,aliases}}"
 
-# Unconditional cleanup — fires on every exit path (round-2 Codex adv #3
-# lock-leak fix). The lock was acquired in Step 5a; release it here on
-# both success and any failure (read-helper exit 1, jq exit, etc.).
+# Failure-only lock release — round-3 Codex adv #1 + Codex review #1
+# (2-way fix). On success the lock stays held until Step 5e (after the
+# log.jsonl append) so the index update + log append are one critical
+# section. On any failure exit, the trap releases the lock to prevent
+# stranded-lock state.
 PAYLOAD_TMP="${WIKI_ROOT}/.wiki-meta/index.payload.tmp.$$.$(date +%s).json"
 cleanup() {
   local rc=$?
   rm -f "$PAYLOAD_TMP" 2>/dev/null || true
-  rmdir "${WIKI_ROOT}/.wiki-meta/.wiki-lock" 2>/dev/null || true
   if [ "$rc" -ne 0 ]; then
-    echo "ERROR: /wiki-query auto-file failed (exit $rc); lock released" >&2
+    rmdir "${WIKI_ROOT}/.wiki-meta/.wiki-lock" 2>/dev/null || true
+    echo "ERROR: /wiki-query auto-file failed (exit $rc); lock released for retry" >&2
   fi
   return $rc
 }
@@ -205,7 +210,8 @@ node "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/wrap-index-envelope.js" \
    --payload-file "$PAYLOAD_TMP" \
    --output "${WIKI_ROOT}/.wiki-meta/index.json" \
    ${SOURCE_PAGE_ARGS[@]+"${SOURCE_PAGE_ARGS[@]}"}
-# Successful exit fires `cleanup` (rm tmp + rmdir lock + rc=0).
+# On success: cleanup fires with rc=0 → tmp removed, lock kept for Step 5e.
+# On failure: cleanup fires with rc!=0 → tmp removed, lock released.
 ```
 
 - Append to `log.jsonl`:

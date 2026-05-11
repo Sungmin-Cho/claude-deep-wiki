@@ -259,6 +259,58 @@ Round 2 (Opus + Codex review + Codex adversarial — 세 리뷰어 모두 timeou
 R2 수정 후 테스트 상태: `npm test` → **102 pass / 0 fail / ~2.6s** (R1
 수정 후 93 pass; R2 수정 검증용 +9 테스트).
 
+### Round-3 review fixups (3-way /deep-review round 3)
+
+Round 3 (Opus + Codex review + Codex adversarial — 세 리뷰어 모두 timeout
+없이 완료) 가 R2 8 수정을 모두 검증 + 3 인접 lock-lifetime / cross-shell
+이슈 surface. Monotonic decrease 지속: R1 6 → R2 8 → R3 3. 모두 ACCEPT.
+Mission-scope-conflict 없음 → anti-oscillation 미발동.
+
+Opus Round 3: APPROVE (8 → 0). Codex Round 3 (review + adversarial) 가
+아래 3 이슈 flag (R3-1 에서 2-way 합의).
+
+- **R3-1 (Codex adv #1 + Codex review #1 — 2-way) — wiki-query Step 5d
+  trap 이 log.jsonl append 전에 lock release**: R2-6 fix 가 도입한
+  `trap cleanup EXIT` 가 bash block 종료 시 무조건 lock rmdir. 그러나
+  `log.jsonl` append 는 bash block 다음에 (agent 가 별도로 실행할
+  bullet 로) 위치. 결과: 성공 경로에서 lock 이 log append 전에
+  release 됨 → 동시 ingest/query 가 index update 와 log entry 사이
+  상태 관찰 가능 + log append 중단 시 index update 만 남고 audit
+  trail 없음. **Fix**: cleanup() 이 이제 실패 경로 (`rc != 0`) 에서만
+  lock rmdir; 성공 시 lock 이 Step 5e 까지 유지 (명시적 log append
+  이후). Critical section: index update + log append 가 이제 한 locked
+  region. cleanup-on-success (lock 유지) + cleanup-on-failure (lock
+  release) 회귀 테스트 +2.
+
+- **R3-2 (Codex adv #2) — wiki-rebuild 가 lock cleanup trap 부재**:
+  Step 1 이 `mkdir` 으로 `.wiki-lock` 획득하지만 trap 등록 부재.
+  envelope helper 실패 (missing node, unset CLAUDE_PLUGIN_ROOT,
+  invalid payload JSON, helper IO error) 시 lock 이 stranded → 이후
+  모든 wiki write 가 차단됨 (수동 `rmdir .wiki-meta/.wiki-lock` 필요).
+  특히 `/wiki-rebuild` 가 corrupt/foreign envelope 의 documented
+  recovery path 이라 위험. **Fix**: `mkdir LOCK_DIR` 직후
+  `cleanup_lock` trap 등록 → 모든 exit path (envelope helper 실패 포함)
+  에서 lock release. helper failure → lock release 시나리오 회귀
+  테스트 +1.
+
+- **R3-3 (Codex review #2) — wiki-rebuild Step 3.a + 3.b 분할이
+  PAYLOAD_TMP 를 Bash invocation 간 잃음**: R1 wiki-rebuild 재작성이
+  Step 3 을 Step 3.a (payload 빌드) + Step 3.b (envelope wrap) 으로
+  분할, 각자 별도 ```bash``` 블록. Claude Code Bash tool 이 invocation
+  마다 fresh shell spawn → Step 3.a 의 `PAYLOAD_TMP` 가 Step 3.b 에서
+  undefined → wrap-index-envelope.js 가 빈 `--payload-file` 값 받아
+  empty-rejection caller-contract guard 가 abort → rebuild 미실행.
+  **Fix**: Step 3.a + 3.b 를 단일 ```bash``` 블록으로 통합 (단일
+  Bash invocation) → `PAYLOAD_TMP` 가 두 phase 모두 유효. caller-
+  contract 블록을 `WIKI_ROOT` + `CLAUDE_PLUGIN_ROOT` 양쪽 명시.
+  combined block end-to-end (payload build + envelope wrap 단일 bash
+  session, non-empty source_artifacts + clean tmp residue 검증) 회귀
+  테스트 +1.
+
+R3 수정 후 테스트 상태: `npm test` → **106 pass / 0 fail / ~2.7s** (R2
+수정 후 102 pass; R3 수정 검증용 +4 테스트). R3 후 수렴은 round 4
+리뷰에서 검증 (new finding 부재).
+
 ## [1.4.2] — 2026-05-07
 
 `docs/handoff-2026-05-06-v1.4.2.md`의 v1.4.1 backlog 4개 항목을 닫는 패치

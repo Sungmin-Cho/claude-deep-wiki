@@ -1050,6 +1050,151 @@ describe('envelope-chain — bash 3.2 empty-array safety (round-2 Opus W2-2 fix)
   });
 });
 
+describe('envelope-chain — lock lifetime semantics (round-3 Codex 2-way fix)', () => {
+  // Round-3 Codex review #1 + Codex adv #1: wiki-query Step 5d trap was
+  // releasing the lock on EVERY exit including success, which freed the
+  // lock before the log.jsonl append step. The R3 fix releases the lock
+  // ONLY on failure; success path keeps the lock for Step 5e to release
+  // after log append.
+  //
+  // These tests mirror the cleanup() function shape from wiki-query.md
+  // Step 5d to verify the lock-lifetime invariant.
+
+  it('cleanup keeps lock on success path (rc=0)', () => {
+    const dir = tmpDir();
+    fs.mkdirSync(path.join(dir, '.wiki-meta', '.wiki-lock'), { recursive: true });
+    const script = `
+      set -euo pipefail
+      WIKI_ROOT="${dir}"
+      PAYLOAD_TMP="\${WIKI_ROOT}/.wiki-meta/payload.tmp.test"
+      touch "\$PAYLOAD_TMP"
+      cleanup() {
+        local rc=\$?
+        rm -f "\$PAYLOAD_TMP" 2>/dev/null || true
+        if [ "\$rc" -ne 0 ]; then
+          rmdir "\${WIKI_ROOT}/.wiki-meta/.wiki-lock" 2>/dev/null || true
+        fi
+        return \$rc
+      }
+      trap cleanup EXIT
+      # Normal success — no failure command, snippet ends successfully.
+      echo "OK"
+    `;
+    const out = execFileSync('bash', ['-c', script], { encoding: 'utf8' });
+    assert.match(out, /OK/);
+    // Lock MUST still be held after success exit (Step 5e will release it).
+    assert.ok(
+      fs.existsSync(path.join(dir, '.wiki-meta', '.wiki-lock')),
+      'lock must be retained on success path (Step 5e responsibility)',
+    );
+    // Payload tmp file removed.
+    assert.ok(!fs.existsSync(path.join(dir, '.wiki-meta', 'payload.tmp.test')));
+  });
+
+  it('cleanup releases lock on failure path (rc!=0)', () => {
+    const dir = tmpDir();
+    fs.mkdirSync(path.join(dir, '.wiki-meta', '.wiki-lock'), { recursive: true });
+    const script = `
+      set -euo pipefail
+      WIKI_ROOT="${dir}"
+      PAYLOAD_TMP="\${WIKI_ROOT}/.wiki-meta/payload.tmp.test"
+      touch "\$PAYLOAD_TMP"
+      cleanup() {
+        local rc=\$?
+        rm -f "\$PAYLOAD_TMP" 2>/dev/null || true
+        if [ "\$rc" -ne 0 ]; then
+          rmdir "\${WIKI_ROOT}/.wiki-meta/.wiki-lock" 2>/dev/null || true
+          echo "ERROR rc=\$rc" >&2
+        fi
+        return \$rc
+      }
+      trap cleanup EXIT
+      # Simulate failure (false → set -e → exit 1)
+      false
+    `;
+    let exitCode = 0;
+    try {
+      execFileSync('bash', ['-c', script], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (err) {
+      exitCode = err.status;
+    }
+    assert.equal(exitCode, 1, 'failure path must exit non-zero');
+    // Lock MUST be released on failure (defensive cleanup).
+    assert.ok(
+      !fs.existsSync(path.join(dir, '.wiki-meta', '.wiki-lock')),
+      'lock must be released on failure path',
+    );
+  });
+
+  it('wiki-rebuild Step 1 cleanup_lock trap releases lock on helper failure', () => {
+    // Round-3 Codex adv #2: wiki-rebuild was missing a cleanup trap. The
+    // R3 fix adds `cleanup_lock` trap after `mkdir LOCK_DIR` so envelope
+    // helper failure releases the lock. Mirror the wiki-rebuild.md Step 1
+    // shape.
+    const dir = tmpDir();
+    fs.mkdirSync(path.join(dir, '.wiki-meta'), { recursive: true });
+    const script = `
+      set -euo pipefail
+      WIKI_ROOT="${dir}"
+      LOCK_DIR="\${WIKI_ROOT}/.wiki-meta/.wiki-lock"
+      mkdir "\$LOCK_DIR" 2>/dev/null
+      cleanup_lock() {
+        rmdir "\$LOCK_DIR" 2>/dev/null || true
+      }
+      trap cleanup_lock EXIT
+      # Simulate envelope helper failure
+      false
+    `;
+    let exitCode = 0;
+    try {
+      execFileSync('bash', ['-c', script], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (err) {
+      exitCode = err.status;
+    }
+    assert.equal(exitCode, 1);
+    // Lock MUST be released — trap fires on EXIT for failure path.
+    assert.ok(
+      !fs.existsSync(path.join(dir, '.wiki-meta', '.wiki-lock')),
+      'wiki-rebuild lock cleanup trap must release on failure',
+    );
+  });
+
+  it('wiki-rebuild single-block payload + wrap (round-3 Codex review #2 fix)', () => {
+    // Round-3 Codex review #2: payload construction and envelope wrap MUST
+    // happen in a single Bash tool invocation so PAYLOAD_TMP survives.
+    // Mirror the combined Step 3 from wiki-rebuild.md.
+    const dir = tmpDir();
+    fs.mkdirSync(path.join(dir, '.wiki-meta'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'pages'));
+    fs.writeFileSync(path.join(dir, 'pages', 'a.md'), `# A\n`);
+    const script = `
+      set -euo pipefail
+      WIKI_ROOT="${dir}"
+      # Single block: payload + wrap. Verifies PAYLOAD_TMP is local-only
+      # and reaches the helper invocation in the same shell.
+      PAYLOAD_TMP="\${WIKI_ROOT}/.wiki-meta/index.payload.tmp.\$\$.test.json"
+      cat > "\$PAYLOAD_TMP" <<JSON
+      {"pages": [{"file": "a.md", "title": "A", "tags": [], "aliases": []}], "generated_at": "2026-05-11T10:00:00Z"}
+JSON
+      SOURCE_PAGE_ARGS=()
+      while IFS= read -r REL; do
+        [ -n "\$REL" ] && SOURCE_PAGE_ARGS+=(--source-page "\$REL")
+      done < <(cd "\$WIKI_ROOT" 2>/dev/null && find pages -maxdepth 1 -name '*.md' -type f 2>/dev/null | sort)
+      node "${WRAP_CLI}" --payload-file "\$PAYLOAD_TMP" --output "\${WIKI_ROOT}/.wiki-meta/index.json" \${SOURCE_PAGE_ARGS[@]+"\${SOURCE_PAGE_ARGS[@]}"}
+      rm -f "\$PAYLOAD_TMP"
+    `;
+    execFileSync('bash', ['-c', script], { encoding: 'utf8' });
+    assert.ok(fs.existsSync(path.join(dir, '.wiki-meta', 'index.json')));
+    const obj = JSON.parse(fs.readFileSync(path.join(dir, '.wiki-meta', 'index.json'), 'utf8'));
+    assert.equal(obj.envelope.producer, 'deep-wiki');
+    assert.equal(obj.payload.pages.length, 1);
+    assert.equal(obj.envelope.provenance.source_artifacts.length, 1);
+    // Verify PAYLOAD_TMP was cleaned up
+    const tmpResidue = fs.readdirSync(path.join(dir, '.wiki-meta')).filter((f) => f.includes('payload.tmp'));
+    assert.deepEqual(tmpResidue, [], 'PAYLOAD_TMP must be cleaned after success');
+  });
+});
+
 describe('envelope-chain — wrapEnvelope intra-plugin chain via lib', () => {
   it('builds index envelope with multiple source pages (multi-source aggregator)', () => {
     const env = wrapEnvelope({

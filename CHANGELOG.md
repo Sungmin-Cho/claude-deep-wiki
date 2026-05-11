@@ -283,6 +283,63 @@ no anti-oscillation trigger.
 Test status after R2 fixes: `npm test` → **102 pass / 0 fail / ~2.6s**
 (was 93 pass after R1 fixes; +9 tests covering R2 fixes).
 
+### Round-3 review fixups (3-way /deep-review round 3)
+
+Round 3 (Opus + Codex review + Codex adversarial — three reviewers, no
+timeouts) confirmed all eight round-2 fixes correct and surfaced 3
+adjacent lock-lifetime / cross-shell issues that the R2 fixes didn't
+cover. Monotonic decrease continues: R1 6 → R2 8 → R3 3. All ACCEPT.
+No mission-scope-conflict — no anti-oscillation trigger.
+
+Opus Round 3: APPROVE (8 → 0). Codex Round 3 (review + adversarial)
+flagged the 3 issues below (2-way agreement on R3-1).
+
+- **R3-1 (Codex adv #1 + Codex review #1 — 2-way) — wiki-query Step 5d
+  trap releases lock BEFORE log.jsonl append**: The R2-6 fix introduced
+  `trap cleanup EXIT` that unconditionally rmdir'd the lock when the
+  bash block exited. But the `log.jsonl` append happens AFTER the bash
+  block (described as a bullet for the agent to execute). Result: on
+  success, the lock was released before the log append → a concurrent
+  ingest/query could observe the wiki state between index update and
+  log entry, and an interrupted log append would leave the index update
+  with no audit trail. **Fix**: cleanup() now only rmdirs the lock on
+  failure path (`rc != 0`); on success the lock stays held until Step
+  5e (after the explicit log append). Critical section semantics:
+  index update + log append are now one locked region. +2 regression
+  tests covering cleanup-on-success (lock retained) and cleanup-on-
+  failure (lock released).
+
+- **R3-2 (Codex adv #2) — wiki-rebuild has no lock cleanup trap**: Step 1
+  acquired `.wiki-lock` via `mkdir`, but no trap was registered. If
+  the new envelope helper failed (missing node, unset
+  CLAUDE_PLUGIN_ROOT, invalid payload JSON, helper IO error), the lock
+  was stranded → all subsequent wiki writes blocked until manual
+  `rmdir .wiki-meta/.wiki-lock`. Especially dangerous because
+  `/wiki-rebuild` is the documented recovery path for corrupt or
+  foreign envelopes. **Fix**: register `cleanup_lock` trap immediately
+  after `mkdir LOCK_DIR` so every exit path (including envelope helper
+  failure) releases the lock. +1 regression test simulating helper
+  failure → asserts lock released.
+
+- **R3-3 (Codex review #2) — wiki-rebuild Step 3.a + 3.b split lost
+  PAYLOAD_TMP across Bash invocations**: The R1 wiki-rebuild rewrite
+  split Step 3 into Step 3.a (build payload) and Step 3.b (envelope
+  wrap), each in its own ```bash``` block. The Claude Code Bash tool
+  spawns a fresh shell per invocation → `PAYLOAD_TMP` defined in Step
+  3.a was undefined in Step 3.b → wrap-index-envelope.js received an
+  empty/undefined `--payload-file` value and the empty-rejection
+  caller-contract guard aborted the rebuild. **Fix**: merge Step 3.a +
+  3.b into a single ```bash``` block (single Bash invocation) so
+  `PAYLOAD_TMP` lives through both phases. Added explicit caller-
+  contract block for both `WIKI_ROOT` + `CLAUDE_PLUGIN_ROOT`. +1
+  regression test exercises the combined block end-to-end (payload
+  build + envelope wrap in a single bash session, verifies non-empty
+  source_artifacts + clean tmp residue).
+
+R3 fixes: `npm test` → **106 pass / 0 fail / ~2.7s** (was 102 pass
+after R2 fixes; +4 R3-specific tests). Convergence after R3 verified
+in round-4 review (no new findings).
+
 ## [1.4.2] — 2026-05-07
 
 Patch release closing four v1.4.1 backlog items captured in

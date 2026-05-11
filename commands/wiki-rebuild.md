@@ -28,8 +28,22 @@ obsidian version 2>/dev/null
 ### 1. Acquire Lock
 
 ```bash
-LOCK_DIR="<wiki_root>/.wiki-meta/.wiki-lock"
+set -euo pipefail
+: "${WIKI_ROOT:?caller must set WIKI_ROOT to the wiki root absolute path}"
+LOCK_DIR="${WIKI_ROOT}/.wiki-meta/.wiki-lock"
 mkdir "$LOCK_DIR" 2>/dev/null || { echo "ERROR: Wiki is locked by another session."; exit 1; }
+
+# Round-3 Codex adv #2 fix: register a cleanup trap immediately after lock
+# acquisition. Without this, an envelope helper failure (missing node,
+# unset CLAUDE_PLUGIN_ROOT, invalid payload JSON, helper IO error) in
+# Step 3 would strand the lock and block all subsequent wiki writes until
+# manual `rmdir <wiki_root>/.wiki-meta/.wiki-lock`. The trap fires on
+# every exit path (success → no-op rmdir already-released; failure →
+# releases the lock for next caller).
+cleanup_lock() {
+  rmdir "$LOCK_DIR" 2>/dev/null || true
+}
+trap cleanup_lock EXIT
 ```
 
 ### 2. Scan All Pages
@@ -52,20 +66,33 @@ envelope is added at write-time by `wrap-index-envelope.js`; consumers of
 `.envelope` is present, treat `.payload` as the legacy structure; else use
 the root). See "Envelope-aware read" sidebar below.
 
-**Step 3.a — Build payload (legacy shape inside `payload`):**
+**Caller contract for the bash snippet below.** Required environment:
 
-Caller MUST set `WIKI_ROOT` (absolute path) before invoking the snippet
-(Bash tool spawns a fresh shell per invocation — deep-evolve round-2 R2-3
-self-containedness lesson). The payload structure is identical to pre-1.5.0
-`index.json` (no schema changes), so wiki-lint/wiki-query etc. that already
-operate on `.pages[]` continue to work after envelope-aware unwrap.
+- `WIKI_ROOT` — absolute path to the wiki root.
+- `CLAUDE_PLUGIN_ROOT` — set by Claude Code at session start; helper
+  script locations.
+
+**Step 3 — Build payload + envelope-wrap + atomic write (single bash
+block).** Round-3 Codex review #2 fix: payload construction and envelope
+wrap MUST live in a single Bash tool invocation. The Claude Code Bash tool
+spawns a fresh shell per invocation, so a `PAYLOAD_TMP` variable defined in
+one block is unavailable to the next block (the file at that path may also
+have been cleaned up via the success-gated `rm -f`). Combining the two
+operations is the only safe form. Multi-source aggregator: every scanned
+page contributes one `--source-page` entry (path relative to `<wiki_root>`,
+e.g. `pages/react-hooks.md`); pages are markdown → recorded path-only (no
+envelope detect); `parent_run_id` is omitted. Helper writes atomically
+(temp + rename); payload temp cleanup is gated on helper success (failure
+preserves it for retry, deep-work round-1 C1+C2 lessons).
 
 ```bash
 set -euo pipefail
 : "${WIKI_ROOT:?caller must set WIKI_ROOT to the wiki root absolute path}"
+: "${CLAUDE_PLUGIN_ROOT:?caller must have CLAUDE_PLUGIN_ROOT set (Claude Code session env)}"
 
-# Pages array is sorted alphabetically by filename, built from Step 2 scan.
-# (Below is a structural template — caller substitutes actual page entries.)
+# 3.a — Build payload. Pages array sorted alphabetically by filename
+# (built from Step 2 scan; below is a structural template — caller
+# substitutes actual page entries from the scan result).
 PAYLOAD_TMP="${WIKI_ROOT}/.wiki-meta/index.payload.tmp.$$.$(date +%s).json"
 cat > "$PAYLOAD_TMP" <<JSON
 {
@@ -80,34 +107,23 @@ cat > "$PAYLOAD_TMP" <<JSON
   "generated_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 }
 JSON
-```
 
-**Step 3.b — Envelope-wrap and atomic write:**
-
-Multi-source aggregator: every scanned page contributes one `--source-page`
-entry (path relative to `<wiki_root>`, e.g. `pages/react-hooks.md`). Pages
-are markdown → recorded path-only (no envelope detect). `parent_run_id` is
-omitted (multi-source aggregator default). Helper writes atomically (temp +
-rename); cleanup is gated on helper success (deep-work round-1 C1+C2 lessons).
-
-```bash
-# Collect --source-page args from scanned pages. macOS BSD `find` lacks
-# `-printf`, so we cd into ${WIKI_ROOT} inside a subshell and rely on the
-# already-relative `pages` prefix. Portable to BSD (macOS) + GNU (Linux).
-# The subshell isolates the cd from the outer cwd.
+# 3.b — Collect --source-page args from scanned pages. macOS BSD `find`
+# lacks `-printf`, so we cd into ${WIKI_ROOT} inside a subshell and rely
+# on the already-relative `pages` prefix. Portable to BSD (macOS) + GNU
+# (Linux). The subshell isolates the cd from the outer cwd.
 #
-# Round-2 Opus W2-2 fix: use `${ARR[@]+"${ARR[@]}"}` expansion so that
-# bash 3.2 (default `/bin/bash` on macOS) under `set -u` does not abort
-# when SOURCE_PAGE_ARGS is empty (e.g. fresh wiki with no pages yet).
-# Without this guard, an empty pages directory would crash the snippet
-# before reaching the helper. The helper itself accepts zero
-# `--source-page` flags (envelope emit is still valid, just with an
-# empty source_artifacts[]).
+# Round-2 Opus W2-2: use `${ARR[@]+"${ARR[@]}"}` expansion so that bash
+# 3.2 (default `/bin/bash` on macOS) under `set -u` does not abort when
+# SOURCE_PAGE_ARGS is empty (e.g. fresh wiki with no pages). The helper
+# itself accepts zero `--source-page` flags.
 SOURCE_PAGE_ARGS=()
 while IFS= read -r REL; do
   [ -n "$REL" ] && SOURCE_PAGE_ARGS+=(--source-page "$REL")
 done < <(cd "${WIKI_ROOT}" 2>/dev/null && find pages -maxdepth 1 -name '*.md' -type f 2>/dev/null | sort)
 
+# 3.c — Envelope-wrap + atomic write. Helper writes atomically (temp +
+# rename); cleanup is gated on helper success (deep-work round-1 C2).
 if node "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/wrap-index-envelope.js" \
      --payload-file "$PAYLOAD_TMP" \
      --output "${WIKI_ROOT}/.wiki-meta/index.json" \

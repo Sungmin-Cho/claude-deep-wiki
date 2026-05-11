@@ -946,6 +946,110 @@ describe('envelope-chain — markdown bash snippet portability (BSD/GNU find —
   });
 });
 
+describe('envelope-chain — index payload shape gate (round-2 Codex adv HIGH-B PARTIAL ACCEPT)', () => {
+  // Defense-in-depth at the writer boundary for the `index` artifact kind:
+  // require `pages` to be an array before wrapping. Authoritative payload
+  // schema replacement lives in Phase 3 (claude-deep-suite payload-registry).
+  it('rejects payload missing pages array', () => {
+    const dir = tmpDir();
+    const payload = path.join(dir, 'payload.json');
+    const out = path.join(dir, 'index.json');
+    writeJson(payload, { generated_at: '2026-05-11T10:00:00Z' }); // no `pages`
+    let threw = false;
+    try {
+      runWrap(['--payload-file', payload, '--output', out]);
+    } catch (err) {
+      threw = true;
+      assert.equal(err.status, 2);
+      assert.match(err.stderr || '', /does not match deep-wiki\/index domain shape.*pages/);
+    }
+    assert.ok(threw, 'writer must reject payload without pages array');
+    assert.ok(!fs.existsSync(out), 'no output file written on rejection');
+  });
+
+  it('rejects payload with pages as non-array', () => {
+    const dir = tmpDir();
+    const payload = path.join(dir, 'payload.json');
+    const out = path.join(dir, 'index.json');
+    writeJson(payload, { pages: 'not-an-array', generated_at: '2026-05-11T10:00:00Z' });
+    let threw = false;
+    try {
+      runWrap(['--payload-file', payload, '--output', out]);
+    } catch (err) {
+      threw = true;
+      assert.equal(err.status, 2);
+      assert.match(err.stderr || '', /does not match.*pages.*string/);
+    }
+    assert.ok(threw);
+    assert.ok(!fs.existsSync(out));
+  });
+
+  it('accepts payload with empty pages array (new wiki scenario)', () => {
+    const dir = tmpDir();
+    const payload = path.join(dir, 'payload.json');
+    const out = path.join(dir, 'index.json');
+    writeJson(payload, { pages: [], generated_at: '2026-05-11T10:00:00Z' });
+    runWrap(['--payload-file', payload, '--output', out]);
+    assert.ok(fs.existsSync(out), 'empty pages array is valid (fresh wiki / /wiki-setup case)');
+    const obj = JSON.parse(fs.readFileSync(out, 'utf8'));
+    assert.deepEqual(obj.payload.pages, []);
+  });
+});
+
+describe('envelope-chain — bash 3.2 empty-array safety (round-2 Opus W2-2 fix)', () => {
+  // Round-2 Opus W2-2: empty pages directory caused `"${SOURCE_PAGE_ARGS[@]}"`
+  // expansion to abort under bash 3.2 + set -u, leaving wiki-query stuck-locked.
+  // Fix: use `${ARR[@]+"${ARR[@]}"}` expansion (POSIX-compatible empty-array
+  // fallback). This test verifies the actual bash snippet form from the
+  // markdown commands.
+  it('SOURCE_PAGE_ARGS expansion under set -u with empty array does not abort', () => {
+    const script = `
+      set -euo pipefail
+      SOURCE_PAGE_ARGS=()
+      echo "BEFORE_EXPAND"
+      echo "ARGS=" \${SOURCE_PAGE_ARGS[@]+"\${SOURCE_PAGE_ARGS[@]}"}
+      echo "AFTER_EXPAND"
+    `;
+    const out = execFileSync('bash', ['-c', script], { encoding: 'utf8' });
+    assert.match(out, /BEFORE_EXPAND/);
+    assert.match(out, /AFTER_EXPAND/, 'script must reach AFTER_EXPAND (not abort on empty array)');
+  });
+
+  it('SOURCE_PAGE_ARGS expansion under set -u with two entries passes args', () => {
+    // Use single-quoted heredoc-style to avoid JS template-string escape collisions.
+    const script = [
+      'set -euo pipefail',
+      'SOURCE_PAGE_ARGS=(--source-page "pages/a.md" --source-page "pages/b.md")',
+      'for arg in "${SOURCE_PAGE_ARGS[@]+"${SOURCE_PAGE_ARGS[@]}"}"; do echo "$arg"; done',
+    ].join('\n');
+    const out = execFileSync('bash', ['-c', script], { encoding: 'utf8' });
+    const lines = out.trim().split('\n');
+    assert.deepEqual(lines, ['--source-page', 'pages/a.md', '--source-page', 'pages/b.md']);
+  });
+
+  it('end-to-end: empty wiki pages/ does not crash wrap helper invocation', () => {
+    const dir = tmpDir();
+    fs.mkdirSync(path.join(dir, 'pages'));
+    // empty pages/ — no .md files
+    const payload = path.join(dir, 'payload.json');
+    const out = path.join(dir, '.wiki-meta', 'index.json');
+    writeJson(payload, { pages: [], generated_at: '2026-05-11T10:00:00Z' });
+    const bashScript = `
+      set -euo pipefail
+      WIKI_ROOT="${dir}"
+      SOURCE_PAGE_ARGS=()
+      while IFS= read -r REL; do
+        [ -n "$REL" ] && SOURCE_PAGE_ARGS+=(--source-page "$REL")
+      done < <(cd "$WIKI_ROOT" 2>/dev/null && find pages -maxdepth 1 -name '*.md' -type f 2>/dev/null | sort)
+      node "${WRAP_CLI}" --payload-file "${payload}" --output "${out}" \${SOURCE_PAGE_ARGS[@]+"\${SOURCE_PAGE_ARGS[@]}"}
+    `;
+    execFileSync('bash', ['-c', bashScript], { encoding: 'utf8' });
+    assert.ok(fs.existsSync(out), 'wrap succeeds with empty pages/');
+    const obj = JSON.parse(fs.readFileSync(out, 'utf8'));
+    assert.deepEqual(obj.envelope.provenance.source_artifacts, []);
+  });
+});
+
 describe('envelope-chain — wrapEnvelope intra-plugin chain via lib', () => {
   it('builds index envelope with multiple source pages (multi-source aggregator)', () => {
     const env = wrapEnvelope({

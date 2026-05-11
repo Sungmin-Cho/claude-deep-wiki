@@ -2581,7 +2581,14 @@ echo "$EXISTING_INDEX" | jq \
   --arg ts "$MERGED_TS" \
   '.generated_at = $ts
    | (.pages // []) as $existing
-   | ($created + $updated) as $delta
+   | ($created + $updated) as $delta_raw
+   # Round-2 Codex review P2-A: in multi-source batches where two sources
+   # touch the same page, $delta_raw can contain duplicate filenames (Step 8
+   # demotes duplicate-created entries into UPDATED_ENTRIES, but no global
+   # dedup is applied). Collapse $delta by .file before merging so the
+   # rewritten payload contains at most one entry per file (UPDATED takes
+   # precedence over CREATED because it appears last in $delta_raw).
+   | ($delta_raw | reverse | unique_by(.file)) as $delta
    | ($delta | map(.file) | unique) as $delta_files
    | ($existing | map(select(.file as $f | $delta_files | index($f) | not))) as $kept
    | .pages = (($kept + $delta) | sort_by(.file))' \
@@ -2597,10 +2604,14 @@ while IFS= read -r REL; do
   [ -n "$REL" ] && SOURCE_PAGE_ARGS+=(--source-page "$REL")
 done < <(jq -r '.pages[].file' "$PAYLOAD_TMP" 2>/dev/null | awk 'NF { print "pages/" $0 }')
 
+# Round-2 Opus W2-2: bash 3.2 + set -u safe array expansion. Empty
+# SOURCE_PAGE_ARGS (very unusual for /wiki-ingest since at least one page
+# was just created/updated) would otherwise crash the snippet under
+# /bin/bash 3.2 on macOS.
 if node "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/wrap-index-envelope.js" \
      --payload-file "$PAYLOAD_TMP" \
      --output "${WIKI_ROOT}/.wiki-meta/index.json" \
-     "${SOURCE_PAGE_ARGS[@]}"; then
+     ${SOURCE_PAGE_ARGS[@]+"${SOURCE_PAGE_ARGS[@]}"}; then
   rm -f "$PAYLOAD_TMP"
 else
   echo "ERROR: wrap-index-envelope.js failed; payload preserved at $PAYLOAD_TMP for retry" >&2
@@ -2708,9 +2719,17 @@ obsidian backlinks path="<wiki_prefix>/pages/<page>.md" format=json
 
 > **Wiki boundary filtering is mandatory.** `obsidian orphans` and `obsidian unresolved` return vault-wide results. Always post-filter against `<wiki_prefix>/pages/` to avoid reporting unrelated vault notes as wiki issues.
 
-**Auto-fix** what can be fixed without human judgment:
-- Add missing pages to `index.json`
-- Remove ghost entries from `index.json`
+**Auto-fix** what can be fixed without human judgment. v1.5.0+: index
+mutations MUST go through the envelope-wrap helper to preserve the
+envelope wrapper (round-2 Codex review P2-B). Recommended form is to
+delegate to `/wiki-rebuild` (regenerates the full envelope-wrapped index
+from page frontmatter — the source of truth per
+`skills/wiki-schema/SKILL.md`); an in-place patch path follows the same
+read-merge-write pattern as Step 9 above.
+
+- Add missing pages to `index.json` (via envelope helpers — delegate to
+  `/wiki-rebuild` or apply the Step 9 read-merge-write pattern)
+- Remove ghost entries from `index.json` (same)
 - Prune excess page versions (keep last 3)
 
 **Report issues** that require human judgment (only if found):

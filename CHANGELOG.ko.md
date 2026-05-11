@@ -185,6 +185,80 @@ Round 1 (Opus + Codex review + Codex adversarial — 세 리뷰어 모두 timeou
 수정 후 테스트 상태: `npm test` → **93 pass / 0 fail / ~2.4s** (수정 전
 87 pass; round-1 수정 검증용 +6 테스트).
 
+### Round-2 review fixups (3-way /deep-review round 2)
+
+Round 2 (Opus + Codex review + Codex adversarial — 세 리뷰어 모두 timeout
+없이 완료) 가 R1 6 수정을 모두 검증 + 6 인접 이슈 surface. Critical 도
+강력한 monotonic decrease (R1: 1 C + 3 H/M + 2 W; R2: 0 C + 3 H +
+3 W/I). Mission-scope-conflict 없음 — anti-oscillation 미발동.
+
+- **R2-1 (Codex adv HIGH-A — malformed envelope block bypass; R1 C2
+  deepening)**: R1 fix 가 payload 누락 경우만 처리, 인접 경우 (envelope 블록
+  missing/null/array, schema_version="1.0" 인데) 가 여전히 legacy pass-through
+  로 빠짐. **Fix**: `isEnvelope` 를 marker-only detector 로 통합
+  (`schema_version === "1.0"` 만으로 marker 인식); envelope-block shape
+  검증을 `unwrapEnvelope` 로 이동, 거기서 "malformed envelope" stderr 명시.
+  `isValidEnvelope` 도 envelope-block shape 재확인하여 chain extraction 안전.
+  +3 회귀 테스트 (envelope-missing, envelope-null, envelope-array).
+
+- **R2-2 (Codex adv HIGH-B — non-index payload 가 valid index 로 wrap;
+  PARTIAL ACCEPT)**: writer 가 non-null/non-array object 만 검증. `{}` 나
+  `{foo: 'bar'}` 가 valid envelope 로 디스크에 작성됨 → read-index-envelope.js
+  가 unwrap 성공 → 소비자 `.pages // []` 가 empty catalog 반환. **Fix
+  (writer 경계 defense-in-depth)**: `artifactKind === "index"` 시 `payload.
+  pages` 가 array 일 것을 요구. authoritative payload schema 강제는 여전히
+  `claude-deep-suite/schemas/payload-registry/deep-wiki/index/v1.0.schema.json`
+  (Phase 3 batch 가 placeholder 교체); plugin-side 검사는 명백한
+  mis-wrap 만 잡고 Phase 3 scope 중복 회피. +3 회귀 테스트 (missing
+  pages, non-array pages, valid empty pages).
+
+- **R2-3 (Codex review P2-A — wiki-ingest §9 jq merge 가 중복 index 항목
+  생성)**: 두 source 가 같은 page 를 건드는 multi-source ingest 에서 Step
+  8 이 `UPDATED_ENTRIES` 에 중복 filename 남김. Step 9 merge 는 기존
+  항목을 한 번 제거하지만 `$delta` 전체를 그대로 append → 동일 file 에
+  대한 `.pages[]` 레코드 두 개 생성 → index uniqueness 깨짐. **Fix**:
+  jq 의 `reverse | unique_by(.file)` 로 `$delta` 를 .file 단위로 정리한 후 merge
+  (UPDATED 가 `$delta_raw` 의 마지막에 위치하므로 reverse 후 우선 보존).
+
+- **R2-4 (Codex review P2-B — wiki-ingest auto-lint Step 13 raw 편집)**:
+  R1 C4 와 평행 — `wiki-lint.md` Step 13 이 아닌 `wiki-ingest.md` 의
+  Auto-Lint section 에 존재. **Fix**: 동일 위임 패턴 — Step 13 auto-fix
+  가 `/wiki-rebuild` (envelope-wrap end-to-end) 를 가리키고 in-place
+  patch 는 Step 9 read-merge-write 패턴 참조.
+
+- **R2-5 (Codex review P3 — validator 가 non-string git.head 수용)**:
+  `validate-envelope-emit.js#validateGit` 가 `typeof head === 'string'`
+  일 때만 SHA regex 적용 → numeric / null head 통과. **Fix**: 명시적
+  `typeof !== 'string'` 거부를 regex 전에; typed error message. +1
+  회귀 테스트 (numeric head).
+
+- **R2-6 (Opus W2-1 — wiki-query Step 5d caller-contract + lock leak)**:
+  R1 C3 에서 새로 추가된 Step 5d 가 `set -euo pipefail` 선언했지만
+  `WIKI_ROOT` 만 가드. `CLAUDE_PLUGIN_ROOT`, `QUERY_FILED_ENTRY_JSON` 은
+  비가드 → `set -u` 에서 unset var 가 명시적 lock-release 라인 도달 전
+  스크립트 abort → wiki 가 stuck-locked. Codex adv MEDIUM #3 가 같은
+  lock-leak 패턴 flag. **Fix**: snippet 위에 caller-contract 블록 추가
+  (세 변수 모두 + `QUERY_FILED_ENTRY_JSON` shape `{file, title, tags,
+  aliases}`); 세 변수 모두 `${VAR:?msg}` 가드; trap-기반 unconditional
+  cleanup (`trap cleanup EXIT`) — read-helper failure, jq failure,
+  undefined-var abort 등 모든 exit path 에서 lock 해제.
+
+- **R2-7 (Opus W2-2 — bash 3.2 empty-array foot-gun in
+  SOURCE_PAGE_ARGS)**: `"${SOURCE_PAGE_ARGS[@]}"` 이 `set -u` 아래
+  macOS `/bin/bash` 3.2 에서 빈 배열일 때 abort (fresh wiki / post-prune
+  /wiki-rebuild 시나리오). **Fix**: 모든 helper 호출 사이트
+  (`wiki-rebuild.md` Step 3.b, `wiki-ingest.md` §9, `wiki-query.md`
+  Step 5d) 에서 `${ARR[@]+"${ARR[@]}"}` POSIX-호환 empty-array fallback
+  사용. +3 회귀 테스트 (bash 3.2 동작 end-to-end).
+
+- **R2-8 (Opus I2-1 — isValidEnvelope coverage symmetry)**:
+  `isValidEnvelope` 가 absent payload key 를 거부하는지 명시적 테스트
+  추가 (R1 invariant 를 triple 로 fully testable: isEnvelope detects,
+  isValidEnvelope rejects, unwrapEnvelope rejects).
+
+R2 수정 후 테스트 상태: `npm test` → **102 pass / 0 fail / ~2.6s** (R1
+수정 후 93 pass; R2 수정 검증용 +9 테스트).
+
 ## [1.4.2] — 2026-05-07
 
 `docs/handoff-2026-05-06-v1.4.2.md`의 v1.4.1 backlog 4개 항목을 닫는 패치

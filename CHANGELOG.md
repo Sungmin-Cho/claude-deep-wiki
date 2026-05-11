@@ -198,6 +198,91 @@ MEDIUM (single-reviewer but real). All fixed before merge.
 Test status after fixes: `npm test` → **93 pass / 0 fail / ~2.4s** (was
 87 pass before fixes; +6 tests covering the round-1 fixes).
 
+### Round-2 review fixups (3-way /deep-review round 2)
+
+Round 2 (Opus + Codex review + Codex adversarial — three reviewers, no
+timeouts) confirmed all six round-1 fixes correct AND surfaced six
+adjacent issues that were not covered. Monotonic decrease in
+criticality (round 1: 1 CRITICAL + 3 HIGH/MEDIUM + 2 WARN; round 2: 0
+CRITICAL + 3 HIGH + 3 WARN/INFO). No mission-scope-conflict findings —
+no anti-oscillation trigger.
+
+- **R2-1 (Codex adv HIGH-A — malformed envelope block bypass; deepens R1
+  C2)**: previous R1 fix addressed payload-missing case but adjacent
+  cases (envelope block missing/null/array under `schema_version="1.0"`)
+  still fell through legacy pass-through. **Fix**: unified `isEnvelope`
+  as marker-only detector (`schema_version === "1.0"` alone); moved
+  envelope-block shape validation into `unwrapEnvelope` where it emits
+  specific "malformed envelope" stderr. `isValidEnvelope` also re-checks
+  envelope-block shape so chain extraction is safe. +3 regression tests
+  (envelope-missing, envelope-null, envelope-array).
+
+- **R2-2 (Codex adv HIGH-B — non-index payload wrapped as valid index;
+  PARTIAL ACCEPT)**: writer accepted any non-null/non-array object as
+  payload. Wrapping a `{}` or `{foo: 'bar'}` produced a structurally-
+  valid envelope on disk that read-index-envelope.js unwrapped
+  successfully, then consumers' `.pages // []` yielded empty catalog.
+  **Fix (defense-in-depth at writer boundary)**: for
+  `artifactKind === "index"`, require `payload.pages` to be an array.
+  Authoritative payload schema enforcement still lives in
+  `claude-deep-suite/schemas/payload-registry/deep-wiki/index/v1.0.schema.json`
+  (Phase 3 batch replaces the placeholder); plugin-side check catches
+  obvious mis-wrap without duplicating Phase 3 scope. +3 regression
+  tests (missing pages, non-array pages, valid empty pages).
+
+- **R2-3 (Codex review P2-A — wiki-ingest §9 jq merge produces duplicate
+  index entries)**: in multi-source ingests where two sources touch the
+  same page, Step 8 leaves duplicate filenames in `UPDATED_ENTRIES`. The
+  Step 9 merge dropped the existing entry once but appended the entire
+  `$delta`, producing two `.pages[]` records for the same file → breaks
+  index uniqueness, downstream wiki-query / wiki-lint duplicate
+  behavior. **Fix**: collapse `$delta` by `.file` via `reverse |
+  unique_by(.file)` before merging (UPDATED takes precedence over
+  CREATED because it appears last in `$delta_raw`).
+
+- **R2-4 (Codex review P2-B — wiki-ingest auto-lint Step 13 raw edits)**:
+  parallel to R1 C4 but lived in `wiki-ingest.md` (different command's
+  Auto-Lint section) not `wiki-lint.md` Step 13. **Fix**: same
+  delegation pattern — Step 13 auto-fix now points to `/wiki-rebuild`
+  (envelope-wrap end-to-end) and references the Step 9 read-merge-write
+  pattern for in-place patches.
+
+- **R2-5 (Codex review P3 — validator accepts non-string git.head)**:
+  `validate-envelope-emit.js#validateGit` applied the SHA regex only
+  when `typeof head === 'string'`, so a numeric or null head passed.
+  **Fix**: explicit `typeof !== 'string'` rejection before regex; typed
+  error message. +1 regression test (numeric head).
+
+- **R2-6 (Opus W2-1 — wiki-query Step 5d caller-contract + lock leak)**:
+  Step 5d (newly added in R1 C3) declared `set -euo pipefail` but only
+  guarded `WIKI_ROOT`; `CLAUDE_PLUGIN_ROOT` and `QUERY_FILED_ENTRY_JSON`
+  were unguarded. Under `set -u` any unset variable crashed the script
+  before reaching the explicit lock-release path → wiki stuck-locked.
+  Codex adv MEDIUM #3 flagged the same lock-leak pattern. **Fix**:
+  caller-contract block above the snippet listing all three required
+  variables (with `QUERY_FILED_ENTRY_JSON` shape `{file, title, tags,
+  aliases}`); `${VAR:?msg}` guards for all three; trap-based unconditional
+  cleanup (`trap cleanup EXIT`) so the lock is released on every exit
+  path including read-helper failure, jq failure, or undefined-variable
+  abort.
+
+- **R2-7 (Opus W2-2 — bash 3.2 empty-array foot-gun in SOURCE_PAGE_ARGS)**:
+  `"${SOURCE_PAGE_ARGS[@]}"` under `set -u` aborts on macOS `/bin/bash`
+  3.2 when the array is empty (e.g. fresh wiki with no pages, scenario
+  reachable for `/wiki-setup` or post-prune `/wiki-rebuild`). **Fix**:
+  use `${ARR[@]+"${ARR[@]}"}` POSIX-compatible empty-array fallback at
+  every helper invocation site (`wiki-rebuild.md` Step 3.b,
+  `wiki-ingest.md` §9, `wiki-query.md` Step 5d). +3 regression tests
+  exercising bash 3.2 behavior end-to-end.
+
+- **R2-8 (Opus I2-1 — isValidEnvelope coverage symmetry)**: added
+  explicit test for `isValidEnvelope` rejecting envelope with absent
+  payload key (makes the round-1 invariant fully testable as a triple:
+  isEnvelope detects, isValidEnvelope rejects, unwrapEnvelope rejects).
+
+Test status after R2 fixes: `npm test` → **102 pass / 0 fail / ~2.6s**
+(was 93 pass after R1 fixes; +9 tests covering R2 fixes).
+
 ## [1.4.2] — 2026-05-07
 
 Patch release closing four v1.4.1 backlog items captured in

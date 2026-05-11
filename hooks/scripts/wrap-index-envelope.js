@@ -248,6 +248,25 @@ function main() {
     process.exit(2);
   }
 
+  // Round-2 Codex adv HIGH-B (PARTIAL ACCEPT): defense-in-depth payload
+  // shape check at the writer boundary for `index` artifact kind. The
+  // authoritative payload schema replacement lives in claude-deep-suite/
+  // schemas/payload-registry/deep-wiki/index/v1.0.schema.json (Phase 3
+  // batch); plugin-side validation here catches the obvious "wrong-shape
+  // payload accidentally wrapped" case without duplicating Phase 3 scope.
+  // Specifically: an `index` payload MUST have `pages` as an array (legacy
+  // shape pre-1.5.0 + envelope payload shape v1.5.0+ both honor this).
+  if (artifactKind === 'index') {
+    if (!('pages' in payload) || !Array.isArray(payload.pages)) {
+      process.stderr.write(
+        `error: payload at ${payloadPath} does not match deep-wiki/index domain shape: required "pages" array (got ${
+          'pages' in payload ? typeof payload.pages : 'missing'
+        }). Wrapping a non-index payload would corrupt the wiki catalog (round-2 Codex adv HIGH-B defense). Authoritative payload schema is enforced by claude-deep-suite payload-registry in Phase 3.\n`,
+      );
+      process.exit(2);
+    }
+  }
+
   // Provenance: page paths (path-only — markdown, no envelope detect) +
   // optional generic --source-artifact entries.
   const sourceArtifacts = [];

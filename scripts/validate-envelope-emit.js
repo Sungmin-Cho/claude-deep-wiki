@@ -91,7 +91,14 @@ function validateGit(git, errors) {
     if (!(r in git)) errors.push(`envelope.git: missing required key "${r}"`);
   }
   checkAdditionalProps(git, GIT_KEYS, 'envelope.git', errors, false);
-  if (typeof git.head === 'string' && !GIT_HEAD_RE.test(git.head)) {
+  // Round-2 Codex review P3: reject non-string head values explicitly. The
+  // suite envelope schema declares `head: {type: string, pattern: ...}`, so
+  // a numeric 1234567 or null would have failed the schema — mirror that.
+  if (!('head' in git)) {
+    // required-field guard already adds "missing required" message above
+  } else if (typeof git.head !== 'string') {
+    errors.push(`envelope.git.head: must be string, got ${Array.isArray(git.head) ? 'array' : git.head === null ? 'null' : typeof git.head}`);
+  } else if (!GIT_HEAD_RE.test(git.head)) {
     errors.push(`envelope.git.head: must match /^[a-f0-9]{7,40}$/, got "${git.head}"`);
   }
   if (typeof git.branch !== 'string' || git.branch.length === 0) {

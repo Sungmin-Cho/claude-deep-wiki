@@ -136,23 +136,54 @@ Search `index.json` for a page that already covers this topic (by title or alias
 **v1.5.0+ envelope-aware index update.** The auto-filing write path MUST
 read-merge-write through the envelope helpers so the envelope wrapper is
 preserved across query-filed updates. Direct `index.json` mutation drops
-`run_id` / `provenance` and breaks subsequent envelope-aware reads.
+`run_id` / `provenance` and breaks subsequent envelope-aware reads
+(round-1 Codex adversarial #1).
+
+**Caller contract for the bash snippet below** (round-2 Opus W2-1
+documentation gap; mirrors Step 9 of `/wiki-ingest`):
+
+- `WIKI_ROOT` — absolute path to the wiki root.
+- `CLAUDE_PLUGIN_ROOT` — set by Claude Code at session start; helper
+  script locations.
+- `QUERY_FILED_ENTRY_JSON` — JSON object describing the query-filed page,
+  shape `{"file": "query-<topic>.md", "title": "...", "tags": [...],
+  "aliases": [...]}`. The agent constructs this from Step 5c frontmatter.
+
+If any required variable is absent the `${VAR:?msg}` guards abort with a
+clear error before any mutation. A trap on EXIT releases the
+`.wiki-lock` directory acquired in Step 5a on every exit path (including
+read-helper failure, jq failure, undefined-variable abort) so the wiki
+is never left in a locked state (round-2 Codex adversarial #3 + Opus
+W2-1 lock leak fix).
 
 ```bash
 set -euo pipefail
 : "${WIKI_ROOT:?caller must set WIKI_ROOT to the wiki root absolute path}"
+: "${CLAUDE_PLUGIN_ROOT:?caller must have CLAUDE_PLUGIN_ROOT set (Claude Code session env)}"
+: "${QUERY_FILED_ENTRY_JSON:?caller must set QUERY_FILED_ENTRY_JSON to a JSON object {file,title,tags,aliases}}"
+
+# Unconditional cleanup — fires on every exit path (round-2 Codex adv #3
+# lock-leak fix). The lock was acquired in Step 5a; release it here on
+# both success and any failure (read-helper exit 1, jq exit, etc.).
+PAYLOAD_TMP="${WIKI_ROOT}/.wiki-meta/index.payload.tmp.$$.$(date +%s).json"
+cleanup() {
+  local rc=$?
+  rm -f "$PAYLOAD_TMP" 2>/dev/null || true
+  rmdir "${WIKI_ROOT}/.wiki-meta/.wiki-lock" 2>/dev/null || true
+  if [ "$rc" -ne 0 ]; then
+    echo "ERROR: /wiki-query auto-file failed (exit $rc); lock released" >&2
+  fi
+  return $rc
+}
+trap cleanup EXIT
 
 # Read existing index (envelope-aware unwrap → legacy shape).
 EXISTING_INDEX=$(node "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/read-index-envelope.js" \
                    "${WIKI_ROOT}/.wiki-meta/index.json")
 
-# Merge the query-filed page (the new entry's {file, title, tags, aliases}
-# is supplied by the agent based on the page just written in Step 5c). If
-# the page already exists in pages[], overwrite its entry; otherwise insert.
+# Merge the query-filed page. If the page already exists in pages[],
+# overwrite its entry; otherwise insert.
 MERGED_TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-PAYLOAD_TMP="${WIKI_ROOT}/.wiki-meta/index.payload.tmp.$$.$(date +%s).json"
-# QUERY_FILED_ENTRY_JSON = JSON object {file, title, tags, aliases} for the
-# new/updated query page (agent-supplied).
 echo "$EXISTING_INDEX" | jq \
   --argjson entry "$QUERY_FILED_ENTRY_JSON" \
   --arg ts "$MERGED_TS" \
@@ -162,24 +193,19 @@ echo "$EXISTING_INDEX" | jq \
    | .pages = (($kept + [$entry]) | sort_by(.file))' \
   > "$PAYLOAD_TMP"
 
-# Envelope-wrap + atomic write. Page paths gathered the same way as
-# /wiki-rebuild Step 3 (portable BSD find).
+# Envelope-wrap + atomic write. Page paths gathered via portable BSD find
+# (round-1 C1). Use ${ARR[@]+"${ARR[@]}"} expansion so bash 3.2 with set -u
+# tolerates an empty pages directory (round-2 Opus W2-2 empty-array fix).
 SOURCE_PAGE_ARGS=()
 while IFS= read -r REL; do
   [ -n "$REL" ] && SOURCE_PAGE_ARGS+=(--source-page "$REL")
 done < <(cd "${WIKI_ROOT}" 2>/dev/null && find pages -maxdepth 1 -name '*.md' -type f 2>/dev/null | sort)
 
-if node "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/wrap-index-envelope.js" \
-     --payload-file "$PAYLOAD_TMP" \
-     --output "${WIKI_ROOT}/.wiki-meta/index.json" \
-     "${SOURCE_PAGE_ARGS[@]}"; then
-  rm -f "$PAYLOAD_TMP"
-else
-  echo "ERROR: wrap-index-envelope.js failed; payload preserved at $PAYLOAD_TMP for retry" >&2
-  # Release lock before exiting so the wiki is not left locked.
-  rmdir "${WIKI_ROOT}/.wiki-meta/.wiki-lock" 2>/dev/null || true
-  exit 1
-fi
+node "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/wrap-index-envelope.js" \
+   --payload-file "$PAYLOAD_TMP" \
+   --output "${WIKI_ROOT}/.wiki-meta/index.json" \
+   ${SOURCE_PAGE_ARGS[@]+"${SOURCE_PAGE_ARGS[@]}"}
+# Successful exit fires `cleanup` (rm tmp + rmdir lock + rc=0).
 ```
 
 - Append to `log.jsonl`:

@@ -93,12 +93,16 @@ rename); cleanup is gated on helper success (deep-work round-1 C1+C2 lessons).
 ```bash
 # Collect --source-page args from scanned pages. macOS BSD `find` lacks
 # `-printf`, so we cd into ${WIKI_ROOT} inside a subshell and rely on the
-# already-relative `pages` prefix in the search root. Portable to both BSD
-# (macOS default) and GNU (Linux) find. The subshell isolates the cd from
-# the outer script's cwd; `set -euo pipefail` interactions are safe because
-# the failure of the inner find would surface via empty SOURCE_PAGE_ARGS
-# (which the helper accepts but is structurally incorrect; downstream tests
-# in tests/envelope-chain.test.js verify the multi-source contract).
+# already-relative `pages` prefix. Portable to BSD (macOS) + GNU (Linux).
+# The subshell isolates the cd from the outer cwd.
+#
+# Round-2 Opus W2-2 fix: use `${ARR[@]+"${ARR[@]}"}` expansion so that
+# bash 3.2 (default `/bin/bash` on macOS) under `set -u` does not abort
+# when SOURCE_PAGE_ARGS is empty (e.g. fresh wiki with no pages yet).
+# Without this guard, an empty pages directory would crash the snippet
+# before reaching the helper. The helper itself accepts zero
+# `--source-page` flags (envelope emit is still valid, just with an
+# empty source_artifacts[]).
 SOURCE_PAGE_ARGS=()
 while IFS= read -r REL; do
   [ -n "$REL" ] && SOURCE_PAGE_ARGS+=(--source-page "$REL")
@@ -107,7 +111,7 @@ done < <(cd "${WIKI_ROOT}" 2>/dev/null && find pages -maxdepth 1 -name '*.md' -t
 if node "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/wrap-index-envelope.js" \
      --payload-file "$PAYLOAD_TMP" \
      --output "${WIKI_ROOT}/.wiki-meta/index.json" \
-     "${SOURCE_PAGE_ARGS[@]}"; then
+     ${SOURCE_PAGE_ARGS[@]+"${SOURCE_PAGE_ARGS[@]}"}; then
   rm -f "$PAYLOAD_TMP"
 else
   echo "ERROR: wrap-index-envelope.js failed; payload preserved at $PAYLOAD_TMP for retry" >&2

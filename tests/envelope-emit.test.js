@@ -189,13 +189,19 @@ describe('envelope.js — wrapEnvelope identity', () => {
 });
 
 describe('envelope.js — isEnvelope / isValidEnvelope / unwrapEnvelope', () => {
-  it('isEnvelope detects M3 envelope shape', () => {
+  it('isEnvelope detects M3 envelope shape (marker-only after round-2 Codex adv HIGH-A unification)', () => {
     assert.equal(isEnvelope({ schema_version: '1.0', envelope: {}, payload: {} }), true);
     assert.equal(isEnvelope({ pages: [], generated_at: '2026-05-11T10:00:00Z' }), false); // legacy
     assert.equal(isEnvelope(null), false);
     assert.equal(isEnvelope([]), false);
     assert.equal(isEnvelope({ schema_version: '2.0', envelope: {}, payload: {} }), false);
-    assert.equal(isEnvelope({ schema_version: '1.0', envelope: null, payload: {} }), false);
+    // Round-2 Codex adv HIGH-A: isEnvelope is now marker-only — schema_version === "1.0"
+    // alone is enough to claim envelope identity. unwrapEnvelope rejects
+    // malformed envelope-block cases with a specific reason rather than
+    // letting them silently fall through to legacy pass-through.
+    assert.equal(isEnvelope({ schema_version: '1.0', envelope: null, payload: {} }), true);
+    assert.equal(isEnvelope({ schema_version: '1.0', envelope: [], payload: {} }), true);
+    assert.equal(isEnvelope({ schema_version: '1.0', payload: {} }), true);
   });
 
   it('isEnvelope detects envelope WITHOUT payload key (round-1 P2#1 fix)', () => {
@@ -301,6 +307,38 @@ describe('envelope.js — isEnvelope / isValidEnvelope / unwrapEnvelope', () => 
       // payload key entirely absent
     };
     assert.equal(unwrapEnvelope(missingPayload, 'index'), null);
+  });
+
+  it('isValidEnvelope rejects envelope missing payload key (round-2 Opus I2-1 coverage gap)', () => {
+    // Symmetric to round-1 P2#1: isEnvelope detects the marker, but
+    // isValidEnvelope must reject undefined payload via typeof !== 'object'.
+    const missingPayload = {
+      schema_version: '1.0',
+      envelope: { producer: 'deep-wiki', artifact_kind: 'index' },
+    };
+    assert.equal(isEnvelope(missingPayload), true, 'marker detected');
+    assert.equal(isValidEnvelope(missingPayload), false, 'absent payload rejected');
+  });
+
+  it('unwrapEnvelope rejects malformed envelope block (round-2 Codex adv HIGH-A fix)', () => {
+    // Round-2 Codex adversarial HIGH-A: previously, schema_version="1.0"
+    // with envelope missing/null/array fell through to legacy pass-through
+    // because isEnvelope's envelope-shape check returned false. The fix
+    // unifies isEnvelope (marker detection only) and moves envelope-block
+    // shape validation into unwrapEnvelope where it rejects with a
+    // specific reason. isValidEnvelope also catches these.
+    const envelopeMissing = { schema_version: '1.0', payload: { pages: [] } };
+    const envelopeNull = { schema_version: '1.0', envelope: null, payload: { pages: [] } };
+    const envelopeArray = { schema_version: '1.0', envelope: [{ producer: 'x' }], payload: { pages: [] } };
+    assert.equal(isEnvelope(envelopeMissing), true, 'marker detected when envelope missing');
+    assert.equal(isEnvelope(envelopeNull), true, 'marker detected when envelope null');
+    assert.equal(isEnvelope(envelopeArray), true, 'marker detected when envelope is array');
+    assert.equal(unwrapEnvelope(envelopeMissing, 'index'), null, 'unwrap rejects envelope-missing');
+    assert.equal(unwrapEnvelope(envelopeNull, 'index'), null, 'unwrap rejects envelope-null');
+    assert.equal(unwrapEnvelope(envelopeArray, 'index'), null, 'unwrap rejects envelope-array');
+    assert.equal(isValidEnvelope(envelopeMissing), false);
+    assert.equal(isValidEnvelope(envelopeNull), false);
+    assert.equal(isValidEnvelope(envelopeArray), false);
   });
 
   it('unwrapEnvelope throws on invalid expectedKind (catches typos)', () => {
@@ -436,6 +474,18 @@ describe('validate-envelope-emit.js — schema enforcement', () => {
     const r = validateObj(env);
     assert.ok(!r.ok);
     assert.ok(r.errors.some((e) => /git\.head/.test(e)));
+  });
+
+  it('flags non-string git.head (round-2 Codex review P3 fix)', () => {
+    // Suite schema declares `head: {type: string, pattern: ...}`. Previously
+    // the validator only applied the regex when typeof head === 'string',
+    // so a numeric head (1234567) silently passed. Round-2 fix rejects
+    // non-string types explicitly with a typed error message.
+    const env = makeValid();
+    env.envelope.git.head = 1234567; // number, not string
+    const r = validateObj(env);
+    assert.ok(!r.ok);
+    assert.ok(r.errors.some((e) => /git\.head.*must be string.*number/.test(e)), r.errors.join('\n'));
   });
 
   it('accepts "unknown" git.dirty (non-git directory case)', () => {

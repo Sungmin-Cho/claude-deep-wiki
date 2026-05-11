@@ -215,43 +215,60 @@ function wrapEnvelope(opts) {
 /**
  * M3 envelope shape detector (loose).
  *
- * Returns true for {schema_version: "1.0", envelope: {...}} — structural
- * detection only. Payload key MAY be absent (the corrupt-payload guard in
- * `unwrapEnvelope()` rejects undefined/null/array/non-object payloads). This
- * is the deliberate fix for Codex review round-1 P2#1: a malformed envelope
- * missing `payload` must be detected as envelope-shaped so that downstream
- * reader path can reject it on identity-or-payload grounds, instead of
- * silently falling through the legacy pass-through and feeding the corrupt
- * top-level object to consumers (whose `.pages // []` would yield an empty
- * catalog and trigger a silent rebuild from zero).
+ * Returns true when the top-level object carries the M3 envelope marker
+ * `schema_version === "1.0"`. The remaining envelope-block shape and payload
+ * shape are validated downstream by `unwrapEnvelope()`. This is deliberate:
+ * a file that asserts itself as an M3 envelope (via `schema_version`) but
+ * has a malformed/missing `envelope` block or payload MUST be detected here
+ * so that downstream rejects it with a specific reason — not silently
+ * passed through the legacy fall-through.
  *
- * Use `unwrapEnvelope()` for full identity + corrupt-payload checks, or use
- * the stricter `isValidEnvelope()` when consumers also need payload to be a
- * non-null/non-array object.
+ * Round-1 P2#1 lesson (Codex review): an envelope missing the `payload`
+ * key returned false here, causing a corrupt envelope to be treated as
+ * legacy by `unwrapEnvelope()` and feeding consumers `{schema_version,
+ * envelope}` whose `.pages // []` yielded an empty catalog (silent
+ * corruption). Round-2 Codex adversarial HIGH-A: the same class of bug
+ * lived on adjacent code paths — when `envelope` itself was missing,
+ * null, or an array, the function returned false and `unwrapEnvelope()`
+ * fell through to legacy. The round-2 fix unifies the detector: any
+ * `schema_version === "1.0"` marker is considered envelope-shaped;
+ * `unwrapEnvelope()` is the single boundary that catches malformed
+ * envelope-block, identity drift, and corrupt-payload cases.
+ *
+ * Use `unwrapEnvelope()` for full identity + envelope-block + corrupt-
+ * payload checks, or use the stricter `isValidEnvelope()` when consumers
+ * also need envelope-block + payload to be plain object/non-array shapes.
  *
  * Defends against legacy index.json files whose top-level numeric
- * `schema_version` (none currently; reserved) or absent envelope key collide
- * with envelope's `schema_version: "1.0"`.
+ * `schema_version` (none currently; reserved) or absent envelope key
+ * collide with envelope's `schema_version: "1.0"`.
  */
 function isEnvelope(obj) {
   if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false;
   if (obj.schema_version !== '1.0') return false;
-  if (!obj.envelope || typeof obj.envelope !== 'object' || Array.isArray(obj.envelope)) return false;
-  // Payload key may be absent — unwrapEnvelope's corrupt-payload guard rejects it.
-  // Round-1 P2#1 lesson: requiring payload here would route corrupt envelopes
-  // through the legacy pass-through and feed consumers garbage.
+  // Envelope block + payload shape NOT validated here — that is
+  // unwrapEnvelope()'s job (round-2 Codex adv HIGH-A). isEnvelope() exists
+  // only to distinguish "claims to be M3 envelope" from "legacy
+  // {pages, generated_at} root shape".
   return true;
 }
 
 /**
- * Strict M3 envelope detector — adds the payload-shape gate on top of
- * `isEnvelope`. Returns true only when payload is itself a non-null,
- * non-array object (deep-work round-1 W4 lesson). Use this when extracting
- * sub-fields like `envelope.run_id` from a chain-source artifact, where a
- * corrupt envelope must not contribute trace data downstream.
+ * Strict M3 envelope detector — adds the envelope-block + payload shape
+ * gate on top of `isEnvelope`. Returns true only when:
+ *   - `envelope` is a non-null, non-array object (round-2 Codex adv
+ *     HIGH-A); AND
+ *   - `payload` is a non-null, non-array object (deep-work round-1 W4
+ *     lesson). `undefined` payload also fails since
+ *     `typeof undefined !== 'object'`.
+ *
+ * Use this when extracting sub-fields like `envelope.run_id` from a
+ * chain-source artifact, where a corrupt envelope must not contribute
+ * trace data downstream.
  */
 function isValidEnvelope(obj) {
   if (!isEnvelope(obj)) return false;
+  if (!obj.envelope || typeof obj.envelope !== 'object' || Array.isArray(obj.envelope)) return false;
   return obj.payload !== null && typeof obj.payload === 'object' && !Array.isArray(obj.payload);
 }
 
@@ -273,6 +290,18 @@ function unwrapEnvelope(obj, expectedKind) {
     throw new Error(
       `unwrapEnvelope: expectedKind must be one of ${[...ALLOWED_ARTIFACT_KINDS].join(', ')}, got ${JSON.stringify(expectedKind)}`,
     );
+  }
+  // Round-2 Codex adv HIGH-A: validate envelope-block shape here so
+  // malformed marker files (schema_version === "1.0" but envelope
+  // missing/null/array) are rejected as corrupt rather than silently
+  // routed through legacy pass-through.
+  if (!obj.envelope || typeof obj.envelope !== 'object' || Array.isArray(obj.envelope)) {
+    process.stderr.write(
+      `[deep-wiki/envelope] malformed envelope: schema_version="1.0" but envelope block is ${
+        obj.envelope === undefined ? 'undefined' : obj.envelope === null ? 'null' : Array.isArray(obj.envelope) ? 'array' : typeof obj.envelope
+      }\n`,
+    );
+    return null;
   }
   const env = obj.envelope;
   const id = {

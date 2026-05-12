@@ -1,0 +1,9 @@
+{
+  "description": "vault with 3 new .md files — all detected",
+  "vault_tree": {
+    "notes/alpha.md": "# alpha\n",
+    "notes/beta.md": "# beta\n",
+    "notes/gamma.md": "# gamma\n"
+  },
+  "config_yaml": "wiki_root: ${WIKI_ROOT}\n"
+}

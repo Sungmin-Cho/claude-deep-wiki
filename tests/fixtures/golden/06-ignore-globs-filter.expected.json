@@ -1,0 +1,6 @@
+{
+  "exit_code": 0,
+  "detected_count": 1,
+  "expected_files": ["notes/live.md"],
+  "forbidden_files": ["archive/old1.md", "archive/2024/old2.md"]
+}

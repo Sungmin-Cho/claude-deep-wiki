@@ -1,0 +1,9 @@
+{
+  "description": "auto_ingest.require_tag: only files with matching tag in frontmatter pass",
+  "vault_tree": {
+    "notes/tagged.md": "---\ntags: [project]\n---\n# tagged content\n",
+    "notes/untagged.md": "# no frontmatter, no tag\n",
+    "notes/wrong-tag.md": "---\ntags: [personal]\n---\n# wrong tag\n"
+  },
+  "config_yaml": "wiki_root: ${WIKI_ROOT}\nauto_ingest:\n  require_tag: project\n"
+}

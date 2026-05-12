@@ -2,6 +2,73 @@
 
 All notable changes to deep-wiki are documented here.
 
+## [1.5.1] — 2026-05-12
+
+**M5.5 #3 hook golden test** — pins `hooks/scripts/scan-vault-changes.sh`
+(SessionStart auto-ingest detection) behavior on a fixture corpus so the
+contract (detected count, file list, exit code, `.pending-scan`
+preservation) is regression-protected. Tests-only release; no plugin
+behavior change.
+
+Spec: `claude-deep-suite/docs/superpowers/plans/2026-05-12-m5.5-remaining-tests-handoff.md` §2 #3.
+Reference implementation: `claude-deep-work` PR #29 (phase-guard golden).
+
+### Added
+
+- **`hooks/scripts/test-helpers/run-scan-vault.js`** — hermetic test
+  helper. Exports `scrubHostEnv()` (removes HOME, CLAUDE_PROJECT_DIR,
+  DEEP_WIKI_ROOT so the developer's real `~/.claude/deep-wiki-config.yaml`
+  + vault cannot leak into the test process), `runScanVault()` (spawns
+  the hook with `HOME=tmpRoot`, materializes the YAML config inside
+  tmpRoot/.claude/), and `parseHookOutput()` (extracts the file list
+  and Korean header count from stdout). Pattern mirrors deep-work's
+  `run-phase-guard.js` (M5.5 #3, deep-work PR #29).
+- **`tests/auto-ingest-golden.test.js`** — node:test driver. Discovers
+  `tests/fixtures/golden/<name>.{input,expected}.json` pairs, fails
+  loud on half-commits, materializes each fixture's `vault_tree` into a
+  tmpdir, applies `mtime_offsets` via `fs.utimesSync` for deterministic
+  mtime-comparison tests, pre-seeds `.last-scan` / `.pending-scan` if
+  requested, then asserts exit code + header count + expected/forbidden
+  file sets + `pending_scan_preserved`.
+- **`tests/fixtures/golden/`** — 8-scenario corpus covering:
+  1. Empty vault → silent exit
+  2. 3 new .md files → all detected
+  3. `.obsidian/` + `.trash/` excluded (find prune)
+  4. Files older than `.last-scan` filtered (mtime comparison branch)
+  5. `auto_ingest.require_tag: project` → only tagged files pass
+  6. `auto_ingest.ignore_globs: [archive/**]` → archive subtree excluded
+  7. No `deep-wiki-config.yaml` → silent exit (CONFIG-missing branch)
+  8. Valid existing `.pending-scan` is preserved verbatim (not advanced)
+- **`tests/fixtures/golden/README.md`** — fixture schema reference.
+  Documents `${VAULT_ROOT}` / `${WIKI_ROOT}` template substitution in
+  `config_yaml`, `mtime_offsets` semantics, and the assertion catalog.
+
+### Deviation from deep-work reference
+
+- deep-work's golden assertions parse a stdout JSON `{decision, reason}`
+  object; scan-vault-changes.sh emits a free-form Korean system message
+  instead. Switched to header-count regex extraction + file-list line
+  parsing (`parseHookOutput`).
+- Added `mtime_offsets` and `${VAULT_ROOT}` / `${WIKI_ROOT}` template
+  substitution to the input schema because vault-fixture mtime control
+  is intrinsic to this hook (find + stat-mtime comparison), unlike
+  phase-guard which is stateless.
+- The Obsidian CLI path (`obsidian recents` supplement at lines
+  193-250) is NOT exercised here — the helper does not put `obsidian`
+  on PATH, so `command -v obsidian` returns empty and the recents
+  branch is naturally skipped. Adding obsidian-cli golden tests would
+  require a mock shim; out of scope for M5.5 #3.
+
+### Changed
+
+- `package.json`: `test` script now includes `tests/auto-ingest-golden.test.js`.
+- `package.json` + `.claude-plugin/plugin.json`: version `1.5.0` → `1.5.1`.
+
+### Test count
+
+- Before: 111
+- After: 119 (+8 golden fixtures)
+
 ## [1.5.0] — 2026-05-11
 
 **M3 envelope adoption** — `<wiki_root>/.wiki-meta/index.json` is now wrapped

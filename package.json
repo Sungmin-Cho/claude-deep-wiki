@@ -1,6 +1,6 @@
 {
   "name": "deep-wiki",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "description": "LLM-managed markdown wiki — M3 envelope adoption (deep-wiki plugin: tests + helpers only; plugin manifest at .claude-plugin/plugin.json)",
   "author": {
     "name": "Sungmin-Cho"
@@ -17,7 +17,7 @@
     "karpathy"
   ],
   "scripts": {
-    "test": "node --test tests/envelope-emit.test.js tests/envelope-chain.test.js",
+    "test": "node --test tests/envelope-emit.test.js tests/envelope-chain.test.js tests/auto-ingest-golden.test.js",
     "validate-fixture": "node scripts/validate-envelope-emit.js tests/fixtures/sample-index.json"
   }
 }

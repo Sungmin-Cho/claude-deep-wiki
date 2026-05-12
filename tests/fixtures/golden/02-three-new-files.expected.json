@@ -1,0 +1,10 @@
+{
+  "exit_code": 0,
+  "detected_count": 3,
+  "expected_files": [
+    "notes/alpha.md",
+    "notes/beta.md",
+    "notes/gamma.md"
+  ],
+  "stdout_contains": "[deep-wiki]"
+}

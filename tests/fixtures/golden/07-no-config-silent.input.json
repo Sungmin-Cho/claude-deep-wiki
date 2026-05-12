@@ -1,0 +1,6 @@
+{
+  "description": "no deep-wiki-config.yaml — silent exit 0 (config_yaml omitted)",
+  "vault_tree": {
+    "notes/orphan.md": "# would be detected if wiki configured\n"
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "exit_code": 0,
+  "detected_count": 0,
+  "forbidden_files": ["notes/ancient.md", "notes/recent.md"]
+}

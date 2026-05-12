@@ -1,0 +1,12 @@
+{
+  "description": "files older than .last-scan are filtered out (mtime comparison)",
+  "vault_tree": {
+    "notes/recent.md": "# fresh\n",
+    "notes/ancient.md": "# old\n"
+  },
+  "mtime_offsets": {
+    "notes/ancient.md": -86400
+  },
+  "last_scan": "2099-01-01T00:00:00Z",
+  "config_yaml": "wiki_root: ${WIKI_ROOT}\n"
+}

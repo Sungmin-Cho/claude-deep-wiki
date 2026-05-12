@@ -2,6 +2,35 @@
 
 All notable changes to deep-wiki are documented here.
 
+## [1.5.2] — 2026-05-12 (M5.5 #5 pending-scan recovery test)
+
+### Added — `.pending-scan` recovery integration test
+
+New `tests/pending-scan-recovery.test.js` (7 node:test cases) pins the `.pending-scan` contract of `hooks/scripts/scan-vault-changes.sh` against artificially-dangled state. Hermetic via `HOME=tmpRoot` + tmpRoot config — never touches the user's real `~/.claude/deep-wiki-config.yaml` or real vault.
+
+- A: invalid `.pending-scan` content (non-ISO-8601) → overwritten with fresh timestamp, hook does not crash.
+- B: valid `.pending-scan` → **preserved verbatim** across hook fires (H1 regression guard from ultrareview bug_006 — every-fire overwrite would erase the oldest-detection-window lower bound).
+- C: dangling `.pending-scan` older than `.last-scan` → both preserved, hook does not crash (wiki-lint Step 11 State B test target).
+- D: no `.last-scan` + valid `.pending-scan` → pending used as LAST_SCAN + preserved.
+- E: fresh install (neither file) → hook creates `.pending-scan` with current ISO-8601 timestamp.
+- F: empty `.pending-scan` (truncate crash mid-write) → overwritten with valid timestamp.
+- G: corrupt UTF-8 bytes in `.pending-scan` → overwritten cleanly, no non-printable bytes survive.
+
+This file is the executable companion to wiki-lint.md Step 11 / 12 stale-detection-and-fix protocol (which is a markdown protocol Claude follows, not directly testable). The hook is the upstream half that must tolerate stale state until the next `/wiki-lint --fix`.
+
+Test count: 119 → 126 (+7). Production code unchanged.
+
+### Changed
+
+- `.claude-plugin/plugin.json` + `package.json` version: 1.5.1 → 1.5.2.
+- `package.json` `scripts.test` glob: added `tests/pending-scan-recovery.test.js`.
+
+### Notes
+
+Stacked on PR #15 (M5.5 #3 scan-vault-changes auto-ingest golden, v1.5.1).
+
+Spec: `claude-deep-suite/docs/superpowers/plans/2026-05-12-m5.5-remaining-tests-handoff.md` §2 #5 (deep-wiki row).
+
 ## [1.5.1] — 2026-05-12
 
 **M5.5 #3 hook golden test** — pins `hooks/scripts/scan-vault-changes.sh`

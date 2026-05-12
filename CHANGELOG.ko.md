@@ -2,6 +2,35 @@
 
 deep-wiki의 주요 변경사항을 기록합니다.
 
+## [1.5.2] — 2026-05-12 (M5.5 #5 pending-scan 복구 테스트)
+
+### 추가 — `.pending-scan` 복구 통합 테스트
+
+신규 `tests/pending-scan-recovery.test.js` (7 node:test 케이스) — `hooks/scripts/scan-vault-changes.sh` 의 `.pending-scan` 계약을 인위적으로 손상된 state 에 대해 핀한다. `HOME=tmpRoot` + tmpRoot config 로 hermetic — 사용자의 실제 `~/.claude/deep-wiki-config.yaml` 이나 실제 vault 에 절대 접촉하지 않는다.
+
+- A: `.pending-scan` 의 invalid 내용 (non-ISO-8601) → fresh timestamp 로 overwrite, hook crash 없음.
+- B: 유효한 `.pending-scan` → **hook fire 마다 verbatim 보존** (ultrareview bug_006 의 H1 회귀 가드 — every-fire overwrite 는 oldest-detection-window 하한을 지워버린다).
+- C: `.last-scan` 보다 오래된 `.pending-scan` → 둘 다 보존, hook crash 없음 (wiki-lint Step 11 State B 테스트 타겟).
+- D: `.last-scan` 없음 + 유효한 `.pending-scan` → pending 이 LAST_SCAN 으로 사용 + 보존.
+- E: fresh install (둘 다 없음) → hook 이 현재 ISO-8601 timestamp 로 `.pending-scan` 생성.
+- F: 빈 `.pending-scan` (write 중 truncate crash) → 유효 timestamp 로 overwrite.
+- G: `.pending-scan` 의 corrupt UTF-8 bytes → 깨끗하게 overwrite, non-printable byte 잔존 없음.
+
+이 파일은 wiki-lint.md Step 11 / 12 stale-detection-and-fix 프로토콜의 실행 가능 동반 테스트이다 (wiki-lint 는 Claude 가 따르는 markdown 프로토콜 — 직접 테스트 불가). hook 은 다음 `/wiki-lint --fix` 까지 stale state 를 tolerate 해야 하는 upstream 반쪽.
+
+테스트 수: 119 → 126 (+7). 프로덕션 코드 변경 없음.
+
+### 변경
+
+- `.claude-plugin/plugin.json` + `package.json` version: 1.5.1 → 1.5.2.
+- `package.json` `scripts.test` glob: `tests/pending-scan-recovery.test.js` 추가.
+
+### 노트
+
+PR #15 (M5.5 #3 scan-vault-changes auto-ingest golden, v1.5.1) 위에 stack.
+
+Spec: `claude-deep-suite/docs/superpowers/plans/2026-05-12-m5.5-remaining-tests-handoff.md` §2 #5 (deep-wiki 행).
+
 ## [1.5.1] — 2026-05-12
 
 **M5.5 #3 hook golden test** — `hooks/scripts/scan-vault-changes.sh`

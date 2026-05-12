@@ -1,0 +1,6 @@
+{
+  "exit_code": 0,
+  "detected_count": 1,
+  "expected_files": ["notes/fresh.md"],
+  "pending_scan_preserved": "2025-01-01T00:00:00Z"
+}

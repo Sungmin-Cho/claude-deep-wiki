@@ -1,0 +1,10 @@
+{
+  "description": ".obsidian/ and .trash/ subdirs are excluded by find pruning",
+  "vault_tree": {
+    "notes/real.md": "# real note\n",
+    ".obsidian/workspace.md": "# obsidian internal\n",
+    ".obsidian/plugins/foo.md": "# plugin notes\n",
+    ".trash/deleted.md": "# trashed\n"
+  },
+  "config_yaml": "wiki_root: ${WIKI_ROOT}\n"
+}

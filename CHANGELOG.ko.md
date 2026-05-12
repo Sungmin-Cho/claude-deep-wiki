@@ -2,6 +2,73 @@
 
 deep-wiki의 주요 변경사항을 기록합니다.
 
+## [1.5.1] — 2026-05-12
+
+**M5.5 #3 hook golden test** — `hooks/scripts/scan-vault-changes.sh`
+(SessionStart auto-ingest 감지) 의 동작을 fixture corpus 로 고정하여
+contract (감지 개수, 파일 목록, exit code, `.pending-scan` 보존) 을
+regression-protected 로 전환. 테스트 전용 릴리스이며 플러그인 동작 변경
+없음.
+
+스펙: `claude-deep-suite/docs/superpowers/plans/2026-05-12-m5.5-remaining-tests-handoff.md` §2 #3.
+참조 구현: `claude-deep-work` PR #29 (phase-guard golden).
+
+### 추가
+
+- **`hooks/scripts/test-helpers/run-scan-vault.js`** — hermetic 테스트
+  헬퍼. `scrubHostEnv()` 가 HOME / CLAUDE_PROJECT_DIR / DEEP_WIKI_ROOT
+  를 제거해 개발자의 실제 `~/.claude/deep-wiki-config.yaml` 과 vault 가
+  테스트 프로세스로 새지 않도록 차단. `runScanVault()` 는 `HOME=tmpRoot`
+  로 hook 을 spawn 하고 YAML config 를 tmpRoot/.claude/ 안에 materialize.
+  `parseHookOutput()` 은 stdout 에서 파일 목록과 한국어 헤더 카운트를
+  추출. 패턴은 deep-work `run-phase-guard.js` (M5.5 #3, deep-work PR #29)
+  와 동일.
+- **`tests/auto-ingest-golden.test.js`** — node:test 드라이버. `tests/
+  fixtures/golden/<name>.{input,expected}.json` pair 를 발견하고 half-
+  commit 시 즉시 throw. 각 fixture 의 `vault_tree` 를 tmpdir 안에
+  materialize 하고, `mtime_offsets` 를 `fs.utimesSync` 로 적용하여
+  mtime-비교 분기를 결정적으로 테스트. `.last-scan` / `.pending-scan` 을
+  사전 시드한 뒤 exit code + 헤더 카운트 + expected/forbidden 파일 집합
+  + `pending_scan_preserved` 를 assert.
+- **`tests/fixtures/golden/`** — 8-시나리오 corpus:
+  1. 빈 vault → 조용히 exit
+  2. 새 .md 3 개 → 모두 감지
+  3. `.obsidian/` + `.trash/` 제외 (find prune)
+  4. `.last-scan` 보다 오래된 파일 필터링 (mtime 비교 분기)
+  5. `auto_ingest.require_tag: project` → 태그된 파일만 통과
+  6. `auto_ingest.ignore_globs: [archive/**]` → archive subtree 제외
+  7. `deep-wiki-config.yaml` 없음 → 조용히 exit (CONFIG-missing 분기)
+  8. 유효한 기존 `.pending-scan` 은 그대로 보존 (advance 하지 않음)
+- **`tests/fixtures/golden/README.md`** — fixture 스키마 레퍼런스.
+  `config_yaml` 의 `${VAULT_ROOT}` / `${WIKI_ROOT}` 템플릿 치환,
+  `mtime_offsets` 의미, assertion 목록을 문서화.
+
+### deep-work 참조와의 차이
+
+- deep-work 의 golden assertion 은 stdout JSON `{decision, reason}` 을
+  파싱하지만 scan-vault-changes.sh 는 자유 형식 한국어 system message 를
+  emit 함. 헤더 카운트 정규식 + 파일 목록 라인 파싱 (`parseHookOutput`)
+  으로 전환.
+- vault fixture 의 mtime 제어가 본 hook 의 본질 (find + stat-mtime 비교)
+  이기 때문에 input 스키마에 `mtime_offsets` 와 `${VAULT_ROOT}` /
+  `${WIKI_ROOT}` 템플릿 치환을 추가. phase-guard 는 stateless 라 불필요.
+- Obsidian CLI 경로 (lines 193-250 의 `obsidian recents` supplement) 는
+  여기서 exercise 하지 않음 — 헬퍼가 `obsidian` 을 PATH 에 두지 않아
+  `command -v obsidian` 이 비어있고 recents 분기가 자연스럽게 skip 됨.
+  obsidian-cli golden test 추가는 mock shim 이 필요하므로 M5.5 #3 범위
+  밖.
+
+### 변경
+
+- `package.json`: `test` 스크립트에 `tests/auto-ingest-golden.test.js`
+  포함.
+- `package.json` + `.claude-plugin/plugin.json`: 버전 `1.5.0` → `1.5.1`.
+
+### 테스트 카운트
+
+- 이전: 111
+- 이후: 119 (+8 golden fixtures)
+
 ## [1.5.0] — 2026-05-11
 
 **M3 envelope 도입** — `<wiki_root>/.wiki-meta/index.json`이 M3 cross-plugin

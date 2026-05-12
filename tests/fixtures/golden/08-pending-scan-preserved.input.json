@@ -1,0 +1,8 @@
+{
+  "description": "valid existing .pending-scan is preserved (not advanced) on hook fire",
+  "vault_tree": {
+    "notes/fresh.md": "# new since pending was set\n"
+  },
+  "pending_scan": "2025-01-01T00:00:00Z",
+  "config_yaml": "wiki_root: ${WIKI_ROOT}\n"
+}

@@ -1,0 +1,5 @@
+{
+  "description": "empty vault — no detection, exit 0 silent",
+  "vault_tree": {},
+  "config_yaml": "wiki_root: ${WIKI_ROOT}\n"
+}

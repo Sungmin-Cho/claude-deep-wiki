@@ -1,0 +1,9 @@
+{
+  "description": "auto_ingest.ignore_globs: archive/** excluded; live note retained",
+  "vault_tree": {
+    "notes/live.md": "# live note\n",
+    "archive/old1.md": "# archived 1\n",
+    "archive/2024/old2.md": "# archived 2\n"
+  },
+  "config_yaml": "wiki_root: ${WIKI_ROOT}\nauto_ingest:\n  ignore_globs:\n    - archive/**\n"
+}

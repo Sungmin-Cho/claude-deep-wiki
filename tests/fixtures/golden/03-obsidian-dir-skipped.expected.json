@@ -1,0 +1,10 @@
+{
+  "exit_code": 0,
+  "detected_count": 1,
+  "expected_files": ["notes/real.md"],
+  "forbidden_files": [
+    ".obsidian/workspace.md",
+    ".obsidian/plugins/foo.md",
+    ".trash/deleted.md"
+  ]
+}

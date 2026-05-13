@@ -25,18 +25,41 @@ source:
     - ingested_at    # ISO 8601 timestamp
     - type           # url | file | text | deep-work-report
     - origin         # URL, file path, or description
-    - pages_created  # List of page filenames created
-    - pages_updated  # List of page filenames updated
+    - pages_created  # List of page filenames created (may be empty array `[]`)
+    - pages_updated  # List of page filenames updated (may be empty array `[]`)
   optional_fields:
     - content_hash   # SHA-256 hash of source content at ingest time
+    - partial_fail   # v1.4.0+: {ts, failed_pages, reason} sentinel written by
+                     # commands/wiki-ingest.md Step 7.6.F when any page in an
+                     # A5 fanout run fails. Drives Step 1.5 hash-skip override
+                     # → `partial-fail-recovery` repair_reason on next session.
+                     # Removed on repair-on-success (Case ii).
 
 index:
   location: .wiki-meta/index.json
-  rebuild_from: pages  # Can always be regenerated from page frontmatter
+  rebuild_from: pages       # Can always be regenerated from page frontmatter
+  # v1.5.0+: M3 cross-plugin envelope wrapper. Legacy {pages, generated_at}
+  # shape is preserved inside `payload`; consumers MUST go through the
+  # envelope-aware reader for forward compatibility (legacy pass-through too).
+  envelope:
+    schema_ref: https://raw.githubusercontent.com/Sungmin-Cho/claude-deep-suite/main/schemas/artifact-envelope.schema.json
+    schema_version: "1.0"
+    identity:                 # 3-way guard enforced by unwrapEnvelope() (handoff §4 round-4)
+      producer: deep-wiki
+      artifact_kind: index
+      schema_name: index
+      schema_version: "1.0"
+    producer_version_source: .claude-plugin/plugin.json   # mirrors plugin.json.version (single source of truth)
+    run_id_format: "ULID — 26-char Crockford Base32, MSB-first (lex sort = time sort)"
+    parent_run_id: omitted    # multi-source aggregator — index.json은 page frontmatter scan 결과, single parent 없음
+    source_artifacts: path-only   # markdown 페이지 — envelope detect 불가
+    reader_path: hooks/scripts/read-index-envelope.js   # legacy + envelope 양쪽 통과 (graceful)
+    writer_path: hooks/scripts/wrap-index-envelope.js   # atomic temp+rename, crash-safe
+    validator_path: scripts/validate-envelope-emit.js   # release-lint, additionalProperties strict
 
 log:
   location: log.jsonl
-  format: jsonl        # Each line: {"ts": "...", "action": "...", "pages": [...], "source": "..."}
+  format: jsonl        # Each line: {"ts": "...", "action": "...", "pages_created": [...], "pages_updated": [...], "source": "..."}
   ts_format: "ISO 8601 UTC with Z suffix, e.g. 2026-04-06T15:00:00Z (NEVER use local time offsets like +09:00)"
   classification:
     pages_created:
@@ -44,19 +67,73 @@ log:
       invariant: "Each page filename appears in pages_created at most once across the entire log — including within a single multi-source batch."
     pages_updated:
       rule: "File existed before this action OR was already classified as created earlier in this batch (regardless of whether this source contributed before)."
+  optional_fields:     # v1.4.0+ schema-additive — wiki-lint Step 6 LOG-INVARIANT scan unaffected
+    pages_failed:
+      applies_to: [ingest]
+      version: "v1.4.0+"
+      rule: "Emitted on `ingest` lines whenever FAILED_PAGES OR FAILED_WORKERS is non-empty (A5 fanout partial-fail audit). Field omitted from non-ingest lifecycle actions."
+    phase_timing_ms:
+      applies_to: [ingest]
+      version: "v1.4.2+"
+      shape: "{stage_1_analysis, stage_2_fanout, stage_3_write, total} — ms integers"
+      rule: "B3 telemetry on `ingest` lines. Schema-additive — wiki-lint Step 6 LOG-INVARIANT scan unaffected. Field omitted from non-ingest lifecycle actions."
   actions:             # Valid action values
     - ingest
     - ingest-skip      # v1.2.0+: source dropped from batch because content_hash unchanged AND wiki-side state intact
     - ingest-repair    # v1.2.1+ (IC1 review fix): hash unchanged but wiki state drift detected (missing page, page-missing-slug, or non-terminal last log) — full ingest forced as self-repair. R3C1 review fix: pages_created MUST be [] (a self-repair restores an existing page's lifecycle, not a new creation; the historical `ingest` line is the canonical pages_created entry). All touched pages go to pages_updated regardless of PRE_BATCH_PAGES classification. wiki-lint Step 6 LOG-INVARIANT scan filters out ingest-repair lines as defense-in-depth.
+    - ingest-fail      # v1.3.0+: emitted when the all-workers-fail retry counter reaches 3 consecutive batches on the same `.pending-scan` window. Promotes window despite failure (releases stuck state); records affected source paths + 3 prior failure timestamps. Counter `.wiki-meta/.pending-scan-retry-count` (format `<window_epoch>:<count>`) resets on any successful batch (full or partial — partial relies on `.failed-sources.tsv` for per-source retry).
     - update
     - lint
     - rebuild
     - delete
-    - query-filed      # Auto-filed query synthesis
+    - query-filed      # Auto-filed query synthesis (cross-page synthesis from /wiki-query)
+    - setup            # v1.0.0+: emitted by /wiki-setup on initial scaffold (welcome.md seed)
+  repair_reasons:      # Valid `ingest-repair` reason values — see commands/wiki-ingest.md Step 1.5
+    - missing-page             # page in log but not on disk
+    - page-missing-slug        # page exists but its slug not in any provenance yaml
+    - no-prior-terminal-log    # v1.2.1+ R3W2: log.jsonl absence OR non-terminal last log
+    - partial-fail-recovery    # v1.4.0+: prior batch left `partial_fail` sentinel in sources/<slug>.yaml (A5 fanout audit)
 
 versions:
   location: .wiki-meta/.versions/
   keep: 3              # Versions to retain per page before pruning
+
+a5_fanout:             # v1.4.0+: optional <wiki>/.wiki-meta/.config.json knobs
+  location: .wiki-meta/.config.json
+  optional: true       # absence = defaults; no migration needed
+  loader: "python3 (preferred) or jq (fallback)"
+  knobs:
+    a5_fanout_threshold:
+      type: integer
+      default: 3
+      semantics: "Single-source A5 dispatches wiki-page-writer workers in parallel when len(page_plan) >= this value. Sub-threshold runs use inline_bodies from Stage 1 instead."
+    a5_worker_timeout_sec:
+      type: integer
+      default: 90
+      semantics: "Per-worker wall-clock budget (aspirational per W9; main aggregates results after Stage 2 join)."
+
+failure_state:         # v1.3.0+: partial-fail retry artifacts under .wiki-meta/
+  failed_sources_manifest:
+    location: .wiki-meta/.failed-sources.tsv
+    format: tsv
+    columns: [source_path, reason, ts]
+    cleared_on: "full-success ingest batch"
+    semantics: "Path-level retry manifest for partial-fail multi-source ingest. SessionStart hook reads alongside .pending-scan; per-source retry survives across sessions."
+  retry_counter:
+    location: .wiki-meta/.pending-scan-retry-count
+    format: "<window_epoch>:<count>"
+    threshold: 3       # consecutive all-workers-fail batches before ingest-fail emit
+    cleared_on: "any successful batch (full or partial; partial relies on .failed-sources.tsv for per-source retry)"
+    semantics: "All-workers-fail counter for 3-strike ingest-fail trigger. Counter resets on success; on threshold emit ingest-fail + promote .pending-scan window."
+  pending_scan:
+    location: .wiki-meta/.pending-scan
+    format: "ISO 8601 UTC (YYYY-MM-DDTHH:MM:SSZ)"
+    semantics: "Oldest detection-window awaiting ingest promotion. Written by SessionStart hook on first detection (never overwritten if valid — H1 regression guard from ultrareview bug_006). Promoted to .last-scan on successful ingest. Stale-recovery covered by wiki-lint Step 11/12."
+  last_scan:
+    location: .wiki-meta/.last-scan
+    format: "ISO 8601 UTC (YYYY-MM-DDTHH:MM:SSZ)"
+    invariant: "Monotonic — never regresses (v1.1.4 promotion regression guard enforced)."
+    semantics: "Last committed scan window. SessionStart hook uses this as the lower bound for new-file detection."
 
 auto_lint:
   trigger_after:         # Auto-lint runs after these operations

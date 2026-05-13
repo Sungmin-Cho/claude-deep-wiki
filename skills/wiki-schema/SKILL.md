@@ -1,7 +1,6 @@
 ---
 name: wiki-schema
-description: This skill defines the core schema and rules for managing a deep-wiki knowledge base. It should be activated whenever any wiki operation is performed — ingesting sources, querying pages, linting, rebuilding indexes, or validating page structure. Covers frontmatter requirements, kebab-case naming, markdown link conventions, source provenance files, index.json catalog, log.jsonl event log, concurrency locking, and page versioning.
-user-invocable: false
+description: This skill defines the schema, invariants, and lifecycle rules for any deep-wiki knowledge base operation. It should be activated whenever wiki pages or metadata are read, created, modified, or validated — specifically during /wiki-ingest source ingestion, /wiki-query searches and auto-filing of cross-page synthesis, /wiki-lint health checks, /wiki-rebuild index regeneration, /wiki-setup initialization, page frontmatter validation, source provenance tracking, or any direct manipulation of pages/, index.json, log.jsonl, sources/, or .versions/ under a wiki root. Covers required frontmatter fields, kebab-case naming, markdown link conventions, source provenance YAML, M3-envelope-wrapped index.json catalog, append-only log.jsonl event log with all 10 lifecycle actions (ingest, ingest-skip, ingest-repair, ingest-fail, update, lint, rebuild, delete, query-filed, setup), mkdir-based concurrency locking, page versioning, and the 4 critical invariants (pages_created exactly-once, .last-scan monotonicity, lock atomicity, source provenance correspondence).
 ---
 
 # Wiki Schema — Core Rules for Wiki Management
@@ -30,17 +29,35 @@ wiki_root: ~/path/to/wiki    # Required
 
 ```
 <wiki_root>/
-├── index.md                  # LLM-written human-readable catalog (wiki artifact)
-├── log.md                    # LLM-written human-readable chronicle (wiki artifact)
-├── .wiki-meta/
-│   ├── index.json            # Machine-readable page catalog (derived, rebuildable)
-│   ├── sources/              # Per-source provenance YAML files
-│   └── .versions/            # Page backups before overwrite
-├── log.jsonl                 # Append-only structured event log (machine-readable)
-└── pages/                    # Wiki pages (flat structure, tag-based classification)
+├── index.md                          # LLM-written human-readable catalog (wiki artifact)
+├── log.md                            # LLM-written human-readable chronicle (wiki artifact)
+├── log.jsonl                         # Append-only structured event log (machine-readable)
+├── pages/                            # Wiki pages (flat, tag-based classification)
+└── .wiki-meta/
+    ├── index.json                    # v1.5.0+: M3-envelope-wrapped page catalog (derived, rebuildable)
+    ├── sources/                      # Per-source provenance YAML files
+    ├── .versions/                    # Page backups before overwrite (keep last 3)
+    ├── .wiki-lock/                   # mkdir-based concurrency lock (transient)
+    ├── .last-scan                    # Last committed scan window (ISO 8601 UTC, monotonic)
+    ├── .pending-scan                 # Oldest detection-window awaiting ingest promotion
+    ├── .failed-sources.tsv           # (v1.3.0+) Path-level partial-fail retry manifest
+    ├── .pending-scan-retry-count     # (v1.3.0+) 3-strike all-workers-fail counter
+    └── .config.json                  # (v1.4.0+) Optional A5 fanout knobs
 ```
 
 `index.md` and `log.md` are **wiki artifacts** — written by the LLM in natural language for human readers. `index.json` and `log.jsonl` are their machine-readable counterparts for programmatic use.
+
+## Invariants
+
+These four invariants MUST NEVER be violated by any wiki operation. They are the foundation of the wiki's audit, recovery, and concurrency guarantees — breaking them causes data loss, ambiguous history, or stuck-state.
+
+1. **`pages_created` exactly-once across log** — Any page filename appears in `pages_created` arrays at most once across the entire `log.jsonl` history (including within a single multi-source batch). `ingest-repair` lines are exempt: they always carry `pages_created: []` because a self-repair restores an existing page's lifecycle rather than creating a new one. The historical `ingest` line is the canonical creation record. Enforced by `commands/wiki-lint.md` Step 6 LOG-INVARIANT scan (with `select(.action != "ingest-repair")` filter) and the v1.2.0+ intra-batch dedup in `commands/wiki-ingest.md`.
+
+2. **`.last-scan` monotonic** — `<wiki>/.wiki-meta/.last-scan` MUST NEVER regress (timestamp can only advance or stay equal). Regression would let the SessionStart hook re-detect already-ingested files OR lose detection of files whose mtime falls between the lowered bound and the prior bound. Enforced by the v1.1.4 promotion regression guard in `commands/wiki-ingest.md`'s promote block. `.pending-scan` has a parallel guarantee — once written with a valid ISO 8601 value it is preserved verbatim until promoted (H1 regression guard from ultrareview bug_006; tested by `tests/pending-scan-recovery.test.js` v1.5.2+).
+
+3. **Lock atomicity** — All write operations MUST acquire `mkdir <wiki>/.wiki-meta/.wiki-lock` before touching any wiki state, and release via `trap 'rmdir' EXIT`. `mkdir` is the single atomic primitive that guarantees mutual exclusion across all filesystems. Enforced at: `commands/wiki-ingest.md` (Step 7.6.C / Step 7.5.M-C), `commands/wiki-rebuild.md` Step 1, `commands/wiki-query.md` (Layer 2). See `references/storage-layout.md` for the full protocol + stale-lock recovery.
+
+4. **Source provenance correspondence** — Every wiki page frontmatter `sources:` slug MUST have a corresponding `<wiki>/.wiki-meta/sources/<slug>.yaml` file on disk. The yaml is the authoritative provenance record (log-based audit reconstruction may be incomplete when log absence triggered `ingest-repair`). Enforced by `commands/wiki-lint.md` Step 7 Source Provenance Check.
 
 ## Page Rules
 
@@ -95,6 +112,14 @@ content_hash: "sha256:abc123..."
 pages_created:
   - llm-wiki-philosophy.md
 pages_updated: []
+# Optional (v1.4.0+) — `partial_fail` sentinel, written by /wiki-ingest
+# Step 7.6.F when any page in an A5 fanout run fails. Removed on
+# repair-on-success (Case ii). Drives Step 1.5 hash-skip override →
+# `partial-fail-recovery` repair_reason on next session.
+# partial_fail:
+#   ts: "2026-05-05T10:30:00Z"
+#   failed_pages: [react-hooks.md]
+#   reason: "synthesizer worker timeout"
 ```
 
 The `content_hash` field stores a hash of the source content at ingest time, enabling future re-ingest detection.
@@ -182,7 +207,20 @@ This file is **derived** — it can always be rebuilt from page frontmatter usin
 {"ts":"2026-04-06T15:00:00Z","action":"ingest","source":"karpathy-llm-wiki","pages_created":["llm-wiki-philosophy.md"],"pages_updated":[]}
 ```
 
-Actions: `ingest`, `update`, `lint`, `rebuild`, `delete`
+### Actions (10 total)
+
+All valid `action` values. The first three (`ingest`, `ingest-skip`, `ingest-repair`) drive `/wiki-ingest`'s self-healing logic; `ingest-fail` is the 3-strike escape hatch. Auto-lint runs after every state-changing action — see `wiki-schema.yaml` `auto_lint.trigger_after`.
+
+- **`ingest`** — Normal processing path. New/updated pages emit. v1.4.0+ adds optional `pages_failed: [<file>...]` field (A5 fanout partial-fail audit); v1.4.2+ adds optional `phase_timing_ms: {stage_1_analysis, stage_2_fanout, stage_3_write, total}` ms-int telemetry. Both fields are schema-additive and ignored by `/wiki-lint` Step 6 LOG-INVARIANT scan.
+- **`ingest-skip`** (v1.2.0+) — Source dropped from batch because `content_hash` unchanged AND wiki-side state intact (no missing pages, no log drift).
+- **`ingest-repair`** (v1.2.0+, expanded v1.2.1+) — `content_hash` unchanged BUT wiki state drift detected → full ingest forced as self-repair. MUST carry `pages_created: []` (the historical `ingest` line is the canonical creation record); all touched pages go to `pages_updated`. Triggered by `missing-page`, `page-missing-slug`, `no-prior-terminal-log`, or `partial-fail-recovery` (v1.4.0+) reasons. Filtered out by `/wiki-lint` Step 6 LOG-INVARIANT scan as defense-in-depth.
+- **`ingest-fail`** (v1.3.0+) — Emitted when the all-workers-fail retry counter reaches 3 consecutive batches on the same `.pending-scan` window. Promotes the window despite failure (releases stuck state) and records affected source paths + 3 prior failure timestamps. Counter resets on any successful batch (full or partial — partial relies on `.failed-sources.tsv` for per-source retry).
+- **`update`** — Direct page edit (out-of-band of `/wiki-ingest`).
+- **`lint`** — `/wiki-lint` execution + auto-fix.
+- **`rebuild`** — `/wiki-rebuild` index regeneration.
+- **`delete`** — Page deletion.
+- **`query-filed`** — `/wiki-query` produced a synthesis that drew from 2+ pages with novel cross-page insight; auto-filed back into the wiki as a `query-synthesis`-tagged page.
+- **`setup`** — `/wiki-setup` initial scaffold (welcome.md seed).
 
 ## Concurrency
 

@@ -6,20 +6,25 @@
 <wiki_root>/
 ├── index.md                       # LLM-written catalog (wiki artifact, human-readable)
 ├── log.md                         # LLM-written chronicle (wiki artifact, human-readable)
-├── .wiki-meta/                    # Internal metadata (hidden from Obsidian graph)
-│   ├── index.json                 # Machine-readable page catalog (derived, rebuildable)
-│   ├── sources/                   # Source provenance files
-│   │   ├── karpathy-llm-wiki.yaml
-│   │   └── deep-work-2026-04-06.yaml
-│   ├── .versions/                 # Page backups before overwrite
-│   │   ├── react-hooks.v1.md
-│   │   └── react-hooks.v2.md
-│   └── .wiki-lock/                # Directory-based lock (transient)
 ├── log.jsonl                      # Append-only structured event log (machine-readable)
-└── pages/                         # Wiki pages (flat, tag-based)
-    ├── welcome.md
-    ├── react-hooks.md
-    └── postgres-indexing.md
+├── pages/                         # Wiki pages (flat, tag-based)
+│   ├── welcome.md
+│   ├── react-hooks.md
+│   └── postgres-indexing.md
+└── .wiki-meta/                    # Internal metadata (hidden from Obsidian graph)
+    ├── index.json                 # v1.5.0+: M3-envelope-wrapped page catalog (derived, rebuildable)
+    ├── sources/                   # Source provenance files
+    │   ├── karpathy-llm-wiki.yaml
+    │   └── deep-work-2026-04-06.yaml
+    ├── .versions/                 # Page backups before overwrite (keep last 3)
+    │   ├── react-hooks.v1.md
+    │   └── react-hooks.v2.md
+    ├── .wiki-lock/                # mkdir-based concurrency lock (transient)
+    ├── .last-scan                 # Last committed scan window (ISO 8601 UTC, monotonic)
+    ├── .pending-scan              # Oldest detection-window awaiting ingest promotion
+    ├── .failed-sources.tsv        # (v1.3.0+) Path-level partial-fail retry manifest (TSV)
+    ├── .pending-scan-retry-count  # (v1.3.0+) 3-strike all-workers-fail counter
+    └── .config.json               # (v1.4.0+) Optional A5 fanout knobs
 ```
 
 ## Why This Structure?

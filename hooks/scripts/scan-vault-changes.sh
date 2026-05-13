@@ -86,7 +86,7 @@ fi
 unset _candidate
 
 # Convert to epoch for comparison
-if command -v gdate &>/dev/null; then
+if command -v gdate >/dev/null 2>&1; then
   LAST_EPOCH=$(gdate -d "$LAST_SCAN" +%s 2>/dev/null || echo 0)
 elif [[ "$(uname)" == "Darwin" ]]; then
   LAST_EPOCH=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$LAST_SCAN" +%s 2>/dev/null || echo 0)
@@ -204,7 +204,7 @@ if [ -n "$HAS_OBS_CLI" ] && [ -n "$WIKI_PREFIX" ]; then
   TIMEOUT_BIN=$(command -v timeout 2>/dev/null || true)
   if [ -n "$TIMEOUT_BIN" ] && ! echo "$TIMEOUT_BIN" | grep -qiE '/windows/system32/timeout(\.exe)?$'; then
     TIMEOUT_CMD="timeout 3"
-  elif command -v gtimeout &>/dev/null; then
+  elif command -v gtimeout >/dev/null 2>&1; then
     TIMEOUT_CMD="gtimeout 3"
   fi
   RECENTS_OUTPUT=$($TIMEOUT_CMD obsidian recents 2>/dev/null || true)

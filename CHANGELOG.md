@@ -2,6 +2,20 @@
 
 All notable changes to deep-wiki are documented here.
 
+## [1.5.3] — 2026-05-13 (metadata — SKILL.md description length)
+
+### Fixed
+
+- `skills/wiki-schema/SKILL.md` frontmatter `description` exceeded the Claude Code 1024-character cap (1077 chars), surfaced as `invalid description: exceeds maximum length of 1024 characters` warning when loading the cached plugin from the deep-suite marketplace. Trimmed verbose phrasing ("This skill defines …" → "Defines …", "It should be activated whenever …" → "Activate whenever …", per-slash-command qualifier prose collapsed) while preserving every trigger keyword (all 5 slash commands, all 10 lifecycle actions, the 4 critical invariants, every storage-layout path). New length: 978 chars.
+
+### Changed
+
+- `.claude-plugin/plugin.json` + `package.json` version: 1.5.2 → 1.5.3.
+
+### Notes
+
+Metadata-only patch. Production code, tests, hooks, agents, commands, and skill body all unchanged. Test count unchanged (126).
+
 ## [1.5.2] — 2026-05-12 (M5.5 #5 pending-scan recovery test)
 
 ### Added — `.pending-scan` recovery integration test

@@ -2,6 +2,20 @@
 
 deep-wiki의 주요 변경사항을 기록합니다.
 
+## [1.5.3] — 2026-05-13 (메타데이터 — SKILL.md description 길이)
+
+### 수정
+
+- `skills/wiki-schema/SKILL.md` frontmatter `description` 이 Claude Code 1024자 제한 (1077자) 초과로, deep-suite 마켓플레이스 캐시에서 플러그인 로드 시 `invalid description: exceeds maximum length of 1024 characters` 경고가 발생. verbose phrasing 을 축약 ("This skill defines …" → "Defines …", "It should be activated whenever …" → "Activate whenever …", slash command 별 부연 산문 압축) 하되 모든 trigger 키워드 (5개 slash command, 10개 lifecycle action, 4개 critical invariant, 모든 storage-layout 경로) 보존. 새 길이: 978자.
+
+### 변경
+
+- `.claude-plugin/plugin.json` + `package.json` version: 1.5.2 → 1.5.3.
+
+### 노트
+
+메타데이터 전용 패치. 프로덕션 코드, 테스트, hook, agent, command, skill body 모두 변경 없음. 테스트 수 동일 (126).
+
 ## [1.5.2] — 2026-05-12 (M5.5 #5 pending-scan 복구 테스트)
 
 ### 추가 — `.pending-scan` 복구 통합 테스트

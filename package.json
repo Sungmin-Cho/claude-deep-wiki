@@ -1,6 +1,6 @@
 {
   "name": "deep-wiki",
-  "version": "1.5.2",
+  "version": "1.5.3",
   "description": "LLM-managed markdown wiki — M3 envelope adoption (deep-wiki plugin: tests + helpers only; plugin manifest at .claude-plugin/plugin.json)",
   "author": {
     "name": "Sungmin-Cho"

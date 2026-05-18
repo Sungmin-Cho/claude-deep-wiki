@@ -2,6 +2,22 @@
 
 All notable changes to deep-wiki are documented here.
 
+## [1.6.2] — 2026-05-18 (Codex-native plugin manifest and AGENTS guide)
+
+### Added
+
+- **`.codex-plugin/plugin.json`** — Codex-native plugin manifest pointing at the same skill and hook surfaces as the Claude Code manifest while preserving the existing `claude-deep-*` repository identity.
+- **`AGENTS.md`** — Codex project guide covering runtime surfaces, verification commands, and the downstream suite marketplace update requirement.
+
+### Changed
+
+- Version bumped 1.6.1 → 1.6.2 across package and plugin manifests for a patch release.
+- README documentation now calls out Codex compatibility alongside the existing Claude Code surface.
+
+### Verification
+
+- Repository validation was run before release; see the PR checklist for the exact command output.
+
 ## [1.6.1] — 2026-05-18 (Codex strict-YAML parse fix for wiki-setup description)
 
 ### Fixed

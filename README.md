@@ -7,6 +7,10 @@ An LLM-managed markdown wiki for persistent knowledge accumulation — a Claude 
 > *"Most people's experience with LLMs and documents looks like RAG: you upload a collection of files, the LLM retrieves relevant chunks at query time, and generates an answer. This works, but the LLM is rediscovering knowledge from scratch on every question. There's no accumulation."*
 > — Andrej Karpathy
 
+## Codex Compatibility
+
+This release includes native Codex plugin metadata in `.codex-plugin/plugin.json` and a Codex project guide in `AGENTS.md`. The Claude Code manifest remains in `.claude-plugin/plugin.json`, and the unchanged `claude-deep-suite` marketplace namespace lets existing installs keep their plugin keys while Codex reads the suite's `.agents/plugins/marketplace.json`.
+
 ### Role in Harness Engineering
 
 deep-wiki serves as the **persistent knowledge layer** in the [Deep Suite](https://github.com/Sungmin-Cho/claude-deep-suite) ecosystem. In the [Harness Engineering](https://martinfowler.com/articles/harness-engineering.html) framework's 2×2 matrix, it operates as an **Inferential Guide** — providing accumulated project knowledge that shapes the agent's understanding during Phase 1 Research, replacing the need for repeated RAG queries with a compounding knowledge base.

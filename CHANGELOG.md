@@ -2,6 +2,21 @@
 
 All notable changes to deep-wiki are documented here.
 
+## [1.6.1] — 2026-05-18 (Codex strict-YAML parse fix for wiki-setup description)
+
+### Fixed
+
+- **`skills/wiki-setup/SKILL.md` frontmatter description** — wrapped in double quotes + escaped internal `"` characters + rewrote `(A: inside an Obsidian vault, B: standalone directory)` to `(option A — inside an Obsidian vault, option B — standalone directory)` to remove the `A: ` / `B: ` colon-space hazard that broke Codex's strict YAML parser. Codex was emitting `⚠ invalid YAML: mapping values are not allowed in this context at line 2 column 524` and silently dropping the wiki-setup skill at load time. Claude Code's lenient YAML parser accepted the unquoted form; Codex's strict parser did not. Description content unchanged; only YAML quoting + the inner `A:/B:` colon-space pattern restructured.
+
+### Why this matters
+
+- The v1.6.0 conversion preserved the original `commands/wiki-setup.md` description as an unquoted plain YAML scalar. Plain scalars containing `: ` (colon-space) are ambiguous in YAML 1.1 — strict parsers (yaml-rust, used by Codex) reject them as "mapping values not allowed in this context"; lenient parsers (PyYAML, used by some Claude tooling) accept them. The fix matches the convention already used by the 24 deep-work v6.7.0 entry skills (always-quoted descriptions) and restores Codex cross-platform parity.
+- Defensive scan across all 6 deep-suite plugins confirmed wiki-setup was the sole skill with this hazard.
+
+### Version sync
+
+- `.claude-plugin/plugin.json` + `package.json` bumped 1.6.0 → 1.6.1 (2-way sync).
+
 ## [1.6.0] — 2026-05-18 (5 commands → user-invocable skills: cross-platform)
 
 ### Changed

@@ -1,6 +1,6 @@
 ---
 name: wiki-setup
-description: Use when the user wants to initialize the deep-wiki knowledge base for first use — creating the wiki root directory, the config file at `~/.claude/deep-wiki-config.yaml`, the initial directory structure (`pages/`, `.wiki-meta/`), and a seed `welcome.md` page. Triggers on `/wiki-setup`, "init wiki", "set up wiki", "scaffold wiki", "create wiki", "wiki bootstrap", "위키 초기화", "위키 셋업", "위키 설정", "위키 만들기", "위키 시작". Accepts an optional `<wiki_root_path>` argument; otherwise prompts the user via AskUserQuestion (A: inside an Obsidian vault, B: standalone directory). Windows users must supply a POSIX form path (`/c/...` or `/mnt/c/...`).
+description: "Use when the user wants to initialize the deep-wiki knowledge base for first use — creating the wiki root directory, the config file at `~/.claude/deep-wiki-config.yaml`, the initial directory structure (`pages/`, `.wiki-meta/`), and a seed `welcome.md` page. Triggers on `/wiki-setup`, \"init wiki\", \"set up wiki\", \"scaffold wiki\", \"create wiki\", \"wiki bootstrap\", \"위키 초기화\", \"위키 셋업\", \"위키 설정\", \"위키 만들기\", \"위키 시작\". Accepts an optional `<wiki_root_path>` argument; otherwise prompts the user via AskUserQuestion (option A — inside an Obsidian vault, option B — standalone directory). Windows users must supply a POSIX form path (`/c/...` or `/mnt/c/...`)."
 user-invocable: true
 ---
 

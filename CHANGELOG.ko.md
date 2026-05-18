@@ -2,6 +2,21 @@
 
 deep-wiki의 주요 변경사항을 기록합니다.
 
+## [1.6.1] — 2026-05-18 (Codex strict-YAML 파서를 위한 wiki-setup description 수정)
+
+### Fixed
+
+- **`skills/wiki-setup/SKILL.md` frontmatter description** — double quote 로 감싸고 내부 `"` 문자 escape + `(A: inside an Obsidian vault, B: standalone directory)` 를 `(option A — inside an Obsidian vault, option B — standalone directory)` 로 재작성하여 Codex 의 strict YAML 파서를 깨뜨리던 `A: ` / `B: ` 콜론-스페이스 패턴 제거. Codex 가 `⚠ invalid YAML: mapping values are not allowed in this context at line 2 column 524` 경고와 함께 wiki-setup skill 을 silent drop. Claude Code 의 관대한 YAML 파서는 unquoted 형식을 수용했으나 Codex 의 strict 파서는 거부. description 내용은 그대로; YAML 인용 부호 + 내부 `A:/B:` 콜론-스페이스 패턴만 재구조화.
+
+### 왜 중요한가
+
+- v1.6.0 conversion 은 기존 `commands/wiki-setup.md` description 을 unquoted plain YAML scalar 로 보존. `: ` (콜론-스페이스) 를 포함한 plain scalar 는 YAML 1.1 에서 ambiguous — strict 파서 (yaml-rust, Codex 사용) 는 "mapping values not allowed in this context" 로 거부; lenient 파서 (PyYAML, 일부 Claude tooling 사용) 는 수용. 본 fix 는 24 개 deep-work v6.7.0 entry skill 이 이미 사용 중인 convention (항상 quoted description) 과 일치시켜 Codex cross-platform parity 복원.
+- 6 개 deep-suite plugin 전체 defensive scan 결과 wiki-setup 만이 이 hazard 를 보유.
+
+### Version sync
+
+- `.claude-plugin/plugin.json` + `package.json` 1.6.0 → 1.6.1 (2-way sync).
+
 ## [1.6.0] — 2026-05-18 (5 슬래시 커맨드 → user-invocable skill: cross-platform)
 
 ### 변경

@@ -27,7 +27,7 @@ For detailed change history see [`CHANGELOG.md`](CHANGELOG.md) / [`CHANGELOG.ko.
 
 Update the following files in `/Users/sungmin/Dev/claude-plugins/deep-suite/`:
 
-- **`.claude-plugin/marketplace.json`** — under the `deep-wiki` entry:
+- **`.claude-plugin/marketplace.json`** and **`.agents/plugins/marketplace.json`** — under the `deep-wiki` entry:
   - `sha`: full 40-character merge commit hash on the new `main` (`git rev-parse HEAD`)
   - `description`: a one-line summary of the headline feature for the new version
 - **`README.md`** — the `deep-wiki` row in the Plugins table (version + description)
@@ -37,7 +37,7 @@ Update the following files in `/Users/sungmin/Dev/claude-plugins/deep-suite/`:
 After editing the deep-suite repo:
 ```bash
 cd /Users/sungmin/Dev/claude-plugins/deep-suite
-git add .claude-plugin/marketplace.json README.md README.ko.md
+git add .claude-plugin/marketplace.json .agents/plugins/marketplace.json README.md README.ko.md
 git commit -m "chore: bump deep-wiki to vX.Y.Z — <one-line summary>"
 git push
 ```
@@ -45,7 +45,7 @@ git push
 ### 2. Update deep-wiki CHANGELOG (both languages, required)
 
 - Add a new version entry to both `CHANGELOG.md` and `CHANGELOG.ko.md`
-- Bump the version in `.claude-plugin/plugin.json` and `package.json`
+- Bump the version in `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`, and `package.json`
 
 **Do NOT inline release notes in this CLAUDE.md** — CHANGELOG is the single source of truth. Only update the schema-coupled sections below (Storage layout, Lifecycle actions, Critical invariants) when the schema itself changes.
 
@@ -69,7 +69,8 @@ Skipping any of these causes the next Claude session to work from stale informat
 
 ```
 deep-wiki/
-├── .claude-plugin/plugin.json     # plugin manifest (version, name, description)
+├── .claude-plugin/plugin.json
+├── .codex-plugin/plugin.json     # plugin manifest (version, name, description)
 ├── agents/                         # subagent definitions
 │   ├── wiki-synthesizer-analysis.md   # Stage 1 single-source A5 analysis (Write absent)
 │   ├── wiki-synthesizer-worker.md     # multi-source A4 worker + 2nd-pass merge (Write absent)

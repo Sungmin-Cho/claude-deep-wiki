@@ -1,0 +1,39 @@
+{
+  "name": "deep-wiki",
+  "version": "1.6.2",
+  "description": "LLM-managed markdown wiki for persistent knowledge accumulation",
+  "author": {
+    "name": "sungmin"
+  },
+  "repository": "https://github.com/Sungmin-Cho/claude-deep-wiki.git",
+  "license": "MIT",
+  "keywords": [
+    "wiki",
+    "knowledge-management",
+    "obsidian",
+    "markdown",
+    "llm-wiki",
+    "karpathy"
+  ],
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "Deep Wiki",
+    "shortDescription": "Maintain a persistent markdown knowledge base",
+    "longDescription": "Initialize, ingest, query, lint, and rebuild an LLM-managed markdown wiki that accumulates project knowledge across sessions.",
+    "developerName": "sungmin",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "$deep-wiki:wiki-setup",
+      "$deep-wiki:wiki-ingest",
+      "$deep-wiki:wiki-query"
+    ],
+    "brandColor": "#2563EB",
+    "screenshots": []
+  }
+}

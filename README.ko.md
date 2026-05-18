@@ -7,6 +7,10 @@ LLM이 관리하는 마크다운 위키 — [Karpathy의 LLM Wiki](https://gist.
 > *"대부분의 사람들이 LLM과 문서를 사용하는 방식은 RAG입니다. 파일 모음을 업로드하면 LLM이 쿼리 시점에 관련 청크를 검색하고 답변을 생성합니다. 이건 작동하지만, LLM은 매번 질문할 때마다 지식을 처음부터 재발견하고 있습니다. 축적이 없습니다."*
 > — Andrej Karpathy
 
+## Codex 호환성
+
+이번 릴리스는 `.codex-plugin/plugin.json` Codex 네이티브 플러그인 메타데이터와 `AGENTS.md` Codex 프로젝트 가이드를 포함합니다. Claude Code 매니페스트는 `.claude-plugin/plugin.json`에 그대로 유지되며, 기존 `claude-deep-suite` marketplace namespace를 유지해 기존 설치 키를 보존하면서 Codex는 suite의 `.agents/plugins/marketplace.json`을 읽습니다.
+
 ### 하네스 엔지니어링에서의 역할
 
 deep-wiki는 [Deep Suite](https://github.com/Sungmin-Cho/claude-deep-suite) 생태계의 **지속적 지식 레이어**입니다. [Harness Engineering](https://martinfowler.com/articles/harness-engineering.html) 프레임워크의 2×2 매트릭스에서 **Inferential Guide**로 동작 — Phase 1 Research에서 에이전트의 이해를 형성하는 축적된 프로젝트 지식을 제공하며, 반복적인 RAG 쿼리를 복리로 쌓이는 지식 베이스로 대체합니다.

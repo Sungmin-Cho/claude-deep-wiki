@@ -5,8 +5,8 @@
  * wrap-index-envelope.js — CLI to wrap a deep-wiki index payload in the M3
  * cross-plugin envelope (cf. claude-deep-suite/docs/envelope-migration.md §1).
  *
- * Designed to be called from markdown command prompts (commands/wiki-rebuild.md,
- * commands/wiki-ingest.md, commands/wiki-setup.md) via the Bash tool. The
+ * Designed to be called from markdown command prompts (skills/wiki-rebuild/SKILL.md,
+ * skills/wiki-ingest/SKILL.md, skills/wiki-setup/SKILL.md) via the Bash tool. The
  * command writes the domain payload (pages catalog) to a temp file, then
  * invokes this helper to produce the final envelope-wrapped artifact at
  * <wiki_root>/.wiki-meta/index.json.

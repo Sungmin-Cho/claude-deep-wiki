@@ -888,7 +888,7 @@ describe('envelope-chain — markdown bash snippet portability (BSD/GNU find —
     fs.mkdirSync(path.join(dir, 'pages'));
     const want = ['alpha.md', 'beta.md', 'gamma.md'];
     want.forEach((f) => fs.writeFileSync(path.join(dir, 'pages', f), `# ${f}\n`));
-    // Mirror commands/wiki-rebuild.md Step 3.b find form exactly.
+    // Mirror skills/wiki-rebuild/SKILL.md Step 3.b find form exactly.
     const out = execFileSync('bash', ['-c', `cd "${dir}" 2>/dev/null && find pages -maxdepth 1 -name '*.md' -type f 2>/dev/null | sort`], {
       encoding: 'utf8',
     });
@@ -901,7 +901,7 @@ describe('envelope-chain — markdown bash snippet portability (BSD/GNU find —
     fs.mkdirSync(path.join(dir, 'pages'));
     fs.writeFileSync(path.join(dir, 'pages', 'a.md'), '# a\n');
     fs.writeFileSync(path.join(dir, 'pages', 'b.md'), '# b\n');
-    // Mirror commands/wiki-lint.md Step 10 find form exactly.
+    // Mirror skills/wiki-lint/SKILL.md Step 10 find form exactly.
     const out = execFileSync(
       'bash',
       ['-c', `cd "${dir}/pages" 2>/dev/null && find . -maxdepth 1 -name '*.md' -type f 2>/dev/null | sed 's|^\\./||' | sort`],

@@ -1,14 +1,33 @@
 ---
-allowed-tools: Read, Write, Bash, Glob, Grep
-description: Regenerate derived wiki files (index.json) from page frontmatter. Use when the index is out of sync or corrupted.
-argument-hint:
+name: wiki-rebuild
+description: Use when the user wants to regenerate derived wiki artifacts (M3-envelope-wrapped `.wiki-meta/index.json`) from the source-of-truth page frontmatter — used when the index is suspected stale, corrupted, or drifted relative to actual page files. Triggers on `/wiki-rebuild`, "rebuild wiki index", "regenerate index", "rebuild wiki", "wiki reindex", "wiki rebuild", "위키 인덱스 재생성", "위키 재빌드", "위키 인덱스 복구", "wiki 재구성". Takes no arguments; always acquires the wiki lock and emits a `rebuild` lifecycle event to `log.jsonl`.
+user-invocable: true
 ---
 
-# /wiki-rebuild — Regenerate Wiki Index
+# wiki-rebuild — Regenerate Wiki Index
 
 Rebuild derived artifacts from the source-of-truth page files.
 
+## Invocation
+
+이 스킬은 두 가지 경로로 호출됩니다 — 어느 쪽이든 본 SKILL §"Prerequisites" / §"Steps" 절차를 그대로 실행합니다:
+
+1. **Claude Code 슬래시** — 사용자가 `/wiki-rebuild` 입력 (skill 의 `user-invocable: true` 가 슬래시 진입을 허용).
+2. **타 에이전트 / Codex / Copilot CLI / Gemini CLI / SDK** — `Skill({ skill: "deep-wiki:wiki-rebuild", args: "" })` 형태로 명시 invoke (cross-platform 표준 경로).
+
+두 경로 모두 args 는 비어 있으며, 동일한 본문 Steps 가 실행됩니다.
+
+## Inputs (skill args)
+
+| 인자 | 의미 |
+|---|---|
+| (없음) | rebuild 만 수행 — 모든 페이지의 frontmatter 를 스캔하여 `.wiki-meta/index.json` 을 M3 envelope-wrapped 형태로 재생성 |
+
 ## Prerequisites
+
+이 entry skill 은 `wiki-schema` sibling skill (4 critical invariants + 10 log actions + storage layout 규칙) 을 동작 전제로 합니다. 또한 4 개 sibling entry skill 과 wiki_root 를 공유합니다 — `wiki-setup` 으로 wiki_root 가 사전 초기화되어 있어야 하며, rebuild 는 `wiki-ingest` / `wiki-query` 가 작성한 페이지를 재스캔해 index 의 truth 와 일치시킵니다. 이후 `wiki-lint` 가 index/페이지 drift 검사를 idempotent 하게 수행할 수 있습니다.
+
+**Cross-platform self-containment**: Claude Code 에서는 sibling skill (`wiki-schema`) 이 description 매칭으로 자동 로드되고, `hooks/scripts/wrap-index-envelope.js` 가 Bash 로 invoke 됩니다. 다만 Codex / Copilot CLI / Gemini CLI 등 타 플랫폼에서 `Skill()` 호출 시 sibling skill 의 auto-load 보장이 약할 수 있으므로, 본 SKILL §"Steps" 본문은 **의도적으로 self-contained** — mkdir-based lock acquisition, find-form page scan, M3 envelope wrap CLI 인터페이스, `rebuild` lifecycle action 의 `log.jsonl` entry 형식을 인라인으로 보존합니다.
 
 Read `~/.claude/deep-wiki-config.yaml` to get `wiki_root`. If missing, tell the user to run `/wiki-setup` first.
 

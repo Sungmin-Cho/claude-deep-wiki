@@ -75,15 +75,15 @@ deep-wiki/
 │   ├── wiki-synthesizer-worker.md     # multi-source A4 worker + 2nd-pass merge (Write absent)
 │   ├── wiki-synthesizer-inline.md     # DORMANT — frozen v1.3.0 contract for restoration
 │   └── wiki-page-writer.md            # A5 page-body generator (tools: [])
-├── commands/                       # slash commands (auto-discovered — not listed in plugin.json)
-│   ├── wiki-setup.md              # /wiki-setup — initialization
-│   ├── wiki-ingest.md             # /wiki-ingest — read sources, create/update pages
-│   ├── wiki-query.md              # /wiki-query — search the wiki + grounded answers
-│   ├── wiki-lint.md               # /wiki-lint — health check (schema, orphans, links)
-│   └── wiki-rebuild.md            # /wiki-rebuild — regenerate the index
-├── skills/wiki-schema/             # wiki schema definition + validation rules
-│   ├── SKILL.md
-│   └── wiki-schema.yaml           # machine-readable schema
+├── skills/                         # 5 entry skills (user-invocable) + 1 reference skill (auto-discovered)
+│   ├── wiki-setup/SKILL.md         # /wiki-setup — initialization (also: Skill({skill:"deep-wiki:wiki-setup"}))
+│   ├── wiki-ingest/SKILL.md        # /wiki-ingest — read sources, create/update pages
+│   ├── wiki-query/SKILL.md         # /wiki-query — search the wiki + grounded answers
+│   ├── wiki-lint/SKILL.md          # /wiki-lint — health check (schema, orphans, links)
+│   ├── wiki-rebuild/SKILL.md       # /wiki-rebuild — regenerate the index
+│   └── wiki-schema/                # reference skill (validation rules — not user-invocable)
+│       ├── SKILL.md
+│       └── wiki-schema.yaml        # machine-readable schema
 ├── hooks/
 │   ├── hooks.json                 # SessionStart hook registration
 │   └── scripts/
@@ -235,7 +235,7 @@ To check the current version: `jq -r .version .claude-plugin/plugin.json`
 
 | Question | Answer |
 |---|---|
-| How do I add a new command? | Drop a new `.md` into `commands/` — it's auto-discovered (no `plugin.json` change needed) |
+| How do I add a new entry skill? | Drop a new `skills/<name>/SKILL.md` with `user-invocable: true` frontmatter — it's auto-discovered for both Claude Code slash (`/<name>`) and cross-platform `Skill({ skill: "deep-wiki:<name>" })` |
 | How do I change the schema? | Edit `skills/wiki-schema/wiki-schema.yaml` (machine) AND `SKILL.md` (LLM-readable) |
 | How do I add a new hook trigger? | `hooks/hooks.json` + a new script under `hooks/scripts/<new>.sh` (must finish within the 15-second timeout) |
 | How do I add a subagent? | New `agents/<name>.md` (frontmatter + prompt). Dispatch with the qualified namespace `deep-wiki:<name>` |

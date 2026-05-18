@@ -30,7 +30,7 @@ source:
   optional_fields:
     - content_hash   # SHA-256 hash of source content at ingest time
     - partial_fail   # v1.4.0+: {ts, failed_pages, reason} sentinel written by
-                     # commands/wiki-ingest.md Step 7.6.F when any page in an
+                     # skills/wiki-ingest/SKILL.md Step 7.6.F when any page in an
                      # A5 fanout run fails. Drives Step 1.5 hash-skip override
                      # → `partial-fail-recovery` repair_reason on next session.
                      # Removed on repair-on-success (Case ii).
@@ -88,7 +88,7 @@ log:
     - delete
     - query-filed      # Auto-filed query synthesis (cross-page synthesis from /wiki-query)
     - setup            # v1.0.0+: emitted by /wiki-setup on initial scaffold (welcome.md seed)
-  repair_reasons:      # Valid `ingest-repair` reason values — see commands/wiki-ingest.md Step 1.5
+  repair_reasons:      # Valid `ingest-repair` reason values — see skills/wiki-ingest/SKILL.md Step 1.5
     - missing-page             # page in log but not on disk
     - page-missing-slug        # page exists but its slug not in any provenance yaml
     - no-prior-terminal-log    # v1.2.1+ R3W2: log.jsonl absence OR non-terminal last log

@@ -52,7 +52,7 @@ Raw Sources  →  Wiki (markdown pages)  →  Schema (management rules)
 4. Google Drive mounted volumes (e.g. `G:\내 드라이브\...`) work in Git Bash as `/g/내 드라이브/...`. Prefer offline-mirrored mode to avoid placeholder-file mtime quirks.
 5. Enable long-path support on Windows 10 1607+ if your wiki path approaches 260 characters (required for `.wiki-meta/.versions/<long-name>.vN.md` depth).
 
-> Known Windows-only limitations: NTFS is case-insensitive (kebab-case naming enforced by the schema avoids conflicts); some Unix-only commands in command docs (`which`, `mkdir -p`) require bash.
+> Known Windows-only limitations: NTFS is case-insensitive (kebab-case naming enforced by the schema avoids conflicts); some Unix-only commands in entry-skill docs (`which`, `mkdir -p`) require bash.
 
 ### Upgrading from 1.0.x / 1.1.0 → 1.1.1
 

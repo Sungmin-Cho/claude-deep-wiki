@@ -1,14 +1,38 @@
 ---
-allowed-tools: Read, Write, Edit, Bash, Glob, Grep, WebFetch, Agent
-description: Ingest a source into the wiki — reads the source, creates or updates wiki pages, and tracks provenance. Accepts file paths, URLs, pasted text, or deep-work session folders.
-argument-hint: "<source_path_or_url> [--synthesize]"
+name: wiki-ingest
+description: Use when the user wants to ingest a source (file path, URL, pasted text, or deep-work session folder) into the deep-wiki — reading the source, creating or updating wiki pages with full source provenance, and self-healing the lifecycle log on drift. Triggers on `/wiki-ingest`, "ingest into wiki", "add to wiki", "store in wiki", "merge into wiki", "wiki ingest", "위키 인제스트", "위키에 반영", "위키에 추가", "위키에 저장", "vault 자동 ingest", "vault 변경 반영". Also runs from the SessionStart hook when `scan-vault-changes.sh` detects modified files in the user's Obsidian vault.
+user-invocable: true
 ---
 
-# /wiki-ingest — Add Knowledge to the Wiki
+# wiki-ingest — Add Knowledge to the Wiki
 
 Read a source, extract knowledge, and create or update wiki pages.
 
+## Invocation
+
+이 스킬은 두 가지 경로로 호출됩니다 — 어느 쪽이든 본 SKILL §"Prerequisites" / §"Steps" 절차를 그대로 실행합니다:
+
+1. **Claude Code 슬래시 또는 SessionStart hook** — 사용자가 `/wiki-ingest <source> [--synthesize]` 를 직접 입력하거나, `hooks/scripts/scan-vault-changes.sh` 가 vault 변경을 감지해 자동 트리거 (skill 의 `user-invocable: true` 가 슬래시/hook 진입을 허용).
+2. **타 에이전트 / Codex / Copilot CLI / Gemini CLI / SDK** — `Skill({ skill: "deep-wiki:wiki-ingest", args: "<source> [--synthesize]" })` 형태로 명시 invoke (cross-platform 표준 경로).
+
+두 경로 모두 args 는 동일한 토큰 문자열로 전달되며, 본문의 source-parse 분기 (single-source vs multi-source batch) 가 동일하게 처리합니다.
+
+## Inputs (skill args)
+
+| 인자 | 의미 |
+|---|---|
+| `<source_path>` | 로컬 파일 (markdown / txt / pdf / etc) 또는 deep-work session 폴더 |
+| `<url>` | http(s) URL — WebFetch 로 본문 fetch |
+| `<source1> <source2> …` (newline 또는 공백 구분) | A4 multi-source batch ingest 분기 — SessionStart hook 이 vault 변경분을 한 번에 전달하는 형태와 동일 |
+| `--synthesize` | Backward-compat hint flag — v1.4.x+ 에서는 no-op (cross-source synthesis 는 multi-source batch 분기에서 자동 수행). 본문 "Agent Delegation" 섹션 참고. |
+
+빈 args / 인식되지 않는 토큰 → 사용자에게 source 입력을 요청.
+
 ## Prerequisites
+
+이 entry skill 은 `wiki-schema` sibling skill (4 critical invariants + 10 log actions + storage layout 규칙) 을 동작 전제로 합니다. 또한 4 개 sibling entry skill 과 wiki_root 를 공유합니다 — `wiki-setup` 으로 wiki_root 가 사전 초기화되어 있어야 하며, ingest 완료 후 `wiki-lint` (read-only check 는 idempotent; `--fix` 는 invariant 복원 시 mutate), `wiki-query`, `wiki-rebuild` 가 본 ingest 가 생성·갱신한 페이지 상태 위에서 동작합니다.
+
+**Cross-platform self-containment**: Claude Code 에서는 sibling skill (`wiki-schema`) 이 description 매칭으로 자동 로드되고, `agents/wiki-synthesizer-{analysis,worker}` 가 Agent tool 로 dispatch 됩니다. 다만 Codex / Copilot CLI / Gemini CLI 등 타 플랫폼에서 `Skill()` 호출 시 sibling skill 의 auto-load 보장이 약할 수 있으므로, 본 SKILL §"Steps" 본문은 **의도적으로 self-contained** — A5 page-fanout 분기, Stage 1/2/3 dispatch 규약, `log.jsonl` 의 10 lifecycle action 형식, mkdir-based lock 의 atomicity 보장 구문, `.pending-scan → .last-scan` promotion regression guard 를 인라인으로 보존합니다.
 
 Read `~/.claude/deep-wiki-config.yaml` to get `wiki_root`. If it does not exist, tell the user to run `/wiki-setup` first.
 
@@ -386,7 +410,7 @@ After filtering: if `SOURCES` is now empty (entirely skip-eligible — note: a `
 {"ts":"<iso>","action":"ingest-skip","source":"<slug>","pages_created":[],"pages_updated":[],"skip_reason":"content_hash unchanged"}
 ```
 
-Use the same UTC ISO 8601 `Z` timestamp for every line in the batch (matches multi-source ingest emission rule from `commands/wiki-ingest.md` Step 10). Then run the v1.1.4 `.pending-scan → .last-scan` promotion block (same block that runs at the end of a normal ingest), release the lock, and report "All N sources skipped — bytes unchanged since last ingest". Content processing (Steps 2–13) is bypassed; only lock acquisition, skip-log append, and scan-window promotion are observed so:
+Use the same UTC ISO 8601 `Z` timestamp for every line in the batch (matches multi-source ingest emission rule from `skills/wiki-ingest/SKILL.md` Step 10). Then run the v1.1.4 `.pending-scan → .last-scan` promotion block (same block that runs at the end of a normal ingest), release the lock, and report "All N sources skipped — bytes unchanged since last ingest". Content processing (Steps 2–13) is bypassed; only lock acquisition, skip-log append, and scan-window promotion are observed so:
 
 - concurrent writers cannot race on `log.jsonl`,
 - `.pending-scan` does not become permanently stale (which would cause the next hook to redetect the same N files and skip-log them again indefinitely),
@@ -1911,7 +1935,7 @@ For entries in `created` and `updated`, also embed `page_content` (per round-2 C
 > Round-3's Adv-A2 fix introduced a "Step 8 sub-step taxonomy" table asserting
 > Step 8a=version snapshot, 8b=page write, 8c=sources/*.yaml, 8d=log.jsonl,
 > 8e=index.json, 8f=log.md, 8g=index.md, 8h=retention prune. **Round 4 verified
-> this taxonomy is fictional** — `commands/wiki-ingest.md` Step 8 actually has
+> this taxonomy is fictional** — `skills/wiki-ingest/SKILL.md` Step 8 actually has
 > sub-steps 8a-8e covering reconciliation, validation, classification, source_hashes
 > normalization, and per-source provenance. log.jsonl/index.json/human-artifacts/
 > retention are SEPARATE top-level steps (Step 9 / Step 10 / Step 11 / Step 13).
@@ -1920,7 +1944,7 @@ For entries in `created` and `updated`, also embed `page_content` (per round-2 C
 > skip.** In v1.3.0:
 > - Synthesizer agent's **Phase 2 (backup)** + **Phase 3 (page write)** own the
 >   page-write side effects.
-> - `commands/wiki-ingest.md` Steps 8-13 are PURELY metadata pipelines (run AFTER
+> - `skills/wiki-ingest/SKILL.md` Steps 8-13 are PURELY metadata pipelines (run AFTER
 >   the agent has already written pages).
 >
 > A5 path mirrors this exactly:
@@ -1930,13 +1954,13 @@ For entries in `created` and `updated`, also embed `page_content` (per round-2 C
 >   never write pages in any code path.
 >
 > The round-3 Adv-A2 concern ("double version snapshot") was based on misreading
-> `commands/wiki-ingest.md:625-628` — that paragraph is a v1.3.0 A4 multi-source
+> `skills/wiki-ingest/SKILL.md:625-628` — that paragraph is a v1.3.0 A4 multi-source
 > narrative summary describing what happens AFTER Phase 3 ends (i.e., Steps 8
 > through 13 in narrative form), NOT a sub-step listing of Step 8. v1.3.0 already
 > structures Steps 8+ as metadata-only by virtue of the synthesizer-vs-command
 > split — A5 inherits this property automatically.
 
-After Step 7.6.D's manifest conversion, run `commands/wiki-ingest.md` Steps 8 through 11 UNDER THE LOCK acquired in Step 7.6.C:
+After Step 7.6.D's manifest conversion, run `skills/wiki-ingest/SKILL.md` Steps 8 through 11 UNDER THE LOCK acquired in Step 7.6.C:
 
 - **Step 8** (reconcile + classify + sources/*.yaml). Specifically:
   - **8a** (Reconcile against disk) — `test -f` check that 7.6.C's writes landed.
@@ -2353,7 +2377,7 @@ do_ingest_skip_terminal_under_lock() {
       url|text)
         # C2 fix — reuse Step 8d normalization (single source of truth for
         # url/text hashing). Implementer note: `step_8d_normalize_url_or_text_hash`
-        # is markdown-spec shorthand — read commands/wiki-ingest.md Step 8d
+        # is markdown-spec shorthand — read skills/wiki-ingest/SKILL.md Step 8d
         # block (curl/text-inbox + shasum logic) and inline the equivalent here.
         current_hash=$(step_8d_normalize_url_or_text_hash "<source.origin>" "<source.type>" 2>/dev/null)
         # If normalization fails (e.g., network down for url) keep sentinel.

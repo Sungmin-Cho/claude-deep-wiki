@@ -1,12 +1,34 @@
 ---
-allowed-tools: Read, Write, Bash, Glob, Grep, AskUserQuestion
-description: Initialize deep-wiki configuration and scaffold an empty wiki. Run once to set up the wiki root path and create the initial directory structure.
-argument-hint: "[wiki_root_path]"
+name: wiki-setup
+description: Use when the user wants to initialize the deep-wiki knowledge base for first use — creating the wiki root directory, the config file at `~/.claude/deep-wiki-config.yaml`, the initial directory structure (`pages/`, `.wiki-meta/`), and a seed `welcome.md` page. Triggers on `/wiki-setup`, "init wiki", "set up wiki", "scaffold wiki", "create wiki", "wiki bootstrap", "위키 초기화", "위키 셋업", "위키 설정", "위키 만들기", "위키 시작". Accepts an optional `<wiki_root_path>` argument; otherwise prompts the user via AskUserQuestion (A: inside an Obsidian vault, B: standalone directory). Windows users must supply a POSIX form path (`/c/...` or `/mnt/c/...`).
+user-invocable: true
 ---
 
-# /wiki-setup — Initialize Deep-Wiki
+# wiki-setup — Initialize Deep-Wiki
 
 Set up the deep-wiki knowledge base for first use.
+
+## Invocation
+
+이 스킬은 두 가지 경로로 호출됩니다 — 어느 쪽이든 본 SKILL §"Steps" 절차를 그대로 실행합니다:
+
+1. **Claude Code 슬래시** — 사용자가 `/wiki-setup [wiki_root_path]` 입력 (skill 의 `user-invocable: true` 가 슬래시 진입을 허용).
+2. **타 에이전트 / Codex / Copilot CLI / Gemini CLI / SDK** — `Skill({ skill: "deep-wiki:wiki-setup", args: "[wiki_root_path]" })` 형태로 명시 invoke (cross-platform 표준 경로).
+
+두 경로 모두 args 는 동일한 토큰 문자열로 전달되며, Step 1 의 분기가 동일하게 처리합니다.
+
+## Inputs (skill args)
+
+| 인자 | 의미 |
+|---|---|
+| (없음) | Step 1 의 AskUserQuestion 분기로 진입 — A) Obsidian vault 안 / B) 독립 디렉토리 선택 |
+| `<wiki_root_path>` | wiki_root 로 직접 사용 (절대 경로 또는 `~`-prefix 허용; POSIX form 필수, Windows 사용자는 `/c/Users/...` 또는 `/mnt/c/Users/...`) |
+
+## Prerequisites
+
+이 entry skill 은 `wiki-schema` sibling skill (4 critical invariants + 10 log actions + storage layout 규칙) 과 함께 동작합니다 — setup 은 wiki 디렉토리 구조만 생성하며, 이후 `/wiki-ingest` / `/wiki-lint` / `/wiki-query` / `/wiki-rebuild` 4 개 sibling entry skill 이 본 skill 이 생성한 wiki_root 와 schema 를 공유합니다.
+
+**Cross-platform self-containment**: Claude Code 에서는 sibling skill (`wiki-schema`) 이 description 매칭으로 자동 로드됩니다. 다만 Codex / Copilot CLI / Gemini CLI 등 타 플랫폼에서 `Skill()` 호출 시 sibling skill 의 auto-load 보장이 약할 수 있으므로, 본 SKILL §"Steps" 본문은 **의도적으로 self-contained** — 디렉토리 트리, config 스키마(`wiki_root` 키), 초기 시드 페이지(`welcome.md`) 본문, lifecycle action `setup` 의 `log.jsonl` entry 형식을 인라인으로 보존합니다.
 
 ## Steps
 

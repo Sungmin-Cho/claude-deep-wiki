@@ -2,6 +2,37 @@
 
 All notable changes to deep-wiki are documented here.
 
+## [1.6.0] — 2026-05-18 (5 commands → user-invocable skills: cross-platform)
+
+### Changed
+
+- All 5 `/wiki-*` slash commands promoted to `user-invocable: true` skills under `skills/wiki-{ingest,lint,query,rebuild,setup}/SKILL.md`. The `commands/` directory is removed.
+- Each entry skill gains 3 new head sections — `## Invocation` (Claude Code slash + cross-platform `Skill({ skill: "deep-wiki:wiki-<verb>", args: "..." })`), `## Inputs (skill args)` (token matrix per command), and `## Prerequisites` (sibling skill relationship + cross-platform self-containment note + the original `~/.claude/deep-wiki-config.yaml` / `wiki-schema` load step).
+- Frontmatter `allowed-tools:` keys removed (skills do not declare tool whitelists); replaced by `name:` + bilingual `description:` (Korean + English trigger phrases, third-person voice) + `user-invocable: true`. No `version:` field on SKILL.md (mirrors deep-docs / deep-evolve pilot pattern).
+- Body content for each entry skill is byte-equivalent to the prior `commands/wiki-*.md` (mechanical copy via `cp`, then in-place `sed` retargeting of `commands/wiki-*.md` cross-references to `skills/wiki-*/SKILL.md`). Step / Gate / Section headers and bash blocks preserved verbatim — no semantic changes to the ingest / lint / query / rebuild / setup procedures.
+- Cross-reference updates outside `commands/` (≈20 spots) — `agents/wiki-synthesizer-{analysis,inline}.md`, `hooks/scripts/{scan-vault-changes.sh, wrap-index-envelope.js}` comment headers, `skills/wiki-schema/{SKILL.md, wiki-schema.yaml}` enforcement-spot text, `tests/envelope-chain.test.js` mirror comments, `CLAUDE.md` directory tree + FAQ. `scripts/v0-probe/*` and historical `CHANGELOG` entries deliberately left as-is (line-pinned historical references).
+- `.claude-plugin/plugin.json` + `package.json` version: 1.5.3 → 1.6.0; both descriptions augmented with "5 skill-based entry surfaces (cross-platform)".
+
+### Rationale
+
+Slash commands are Claude Code only. Skills are portable across Codex CLI, Copilot CLI, Gemini CLI, and the Agent SDK via `Skill({ skill: "deep-wiki:<verb>", args: "..." })`. This is the third installment of the suite-wide command-to-skill migration after deep-docs v1.3.0 (1 command, pilot) and deep-evolve v3.4.0 (1 command, second installment). deep-wiki is the largest single conversion in the suite — 5 entry surfaces simultaneously (4,062 lines total; `wiki-ingest` alone is 2,841 lines), all converted atomically because the 5 commands cross-reference each other (ingest recommends lint, query auto-files a new page as a side effect of ingest semantics, lint enforces the same `pages_created` exactly-once invariant the others emit, etc.) — partial conversion would leave some surfaces callable cross-platform and others Claude-Code-only.
+
+### Migration
+
+- Claude Code users: no change. `/wiki-setup`, `/wiki-ingest`, `/wiki-lint`, `/wiki-query`, `/wiki-rebuild` continue to work — Claude Code auto-discovers `user-invocable: true` skills as slash commands. The SessionStart auto-ingest hook (`scan-vault-changes.sh`) also continues working unchanged (it never invoked the slash command by name; it just emits a system-reminder advising `/wiki-ingest`, which the model now resolves to the skill).
+- Codex / Copilot CLI / Gemini CLI / Agent SDK users: invoke as `Skill({ skill: "deep-wiki:wiki-ingest", args: "<source>" })` etc. The argument syntax is identical (no `$ARGUMENTS` placeholder existed; arguments were already taken as natural-language prose by each command).
+- The `wiki-schema` reference skill at `skills/wiki-schema/` is unchanged and still loaded by description-matching auto-discovery; the 4 critical invariants enforcement text now points at `skills/wiki-*/SKILL.md` paths instead of `commands/wiki-*.md`.
+
+### Tests
+
+`npm test`: 126/126 pass. No production-code changes; node:test files (`envelope-emit`, `envelope-chain`, `auto-ingest-golden`, `pending-scan-recovery`) only had comment-level `// Mirror commands/wiki-…md …` retargeting to `// Mirror skills/wiki-…/SKILL.md …`. Assertion logic unchanged.
+
+### Notes
+
+- No `version:` field on entry-skill frontmatter (per deep-docs / deep-evolve pattern; skill-reviewer prefers minimal frontmatter).
+- Body byte-equivalence for `wiki-ingest` was the riskiest preservation surface (2841 lines, many spec-pinned Step / Gate / phase-timing telemetry references). The `cp` + `sed` + targeted `Edit` approach kept the 6 internal self-references at lines 389 / 1914 / 1923 / 1933 / 1939 / 2356 mechanically retargeted only.
+- `scripts/v0-probe/` historical probe docs deliberately keep `commands/wiki-ingest.md:1088-1099`-style line-pinned references — those documents are time-stamped artifacts of v1.4.x.
+
 ## [1.5.3] — 2026-05-13 (metadata — SKILL.md description length)
 
 ### Fixed

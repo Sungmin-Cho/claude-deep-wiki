@@ -2,9 +2,9 @@
 name: wiki-synthesizer-inline
 model: sonnet
 color: green
-description: Dormant in v1.4.x+; preserved for future restoration of v1.3.0 single-source byte-identical inline path. Reads source + candidate pages, decides create-vs-update, version-backs-up under .wiki-meta/.versions/, atomic-writes pages under <wiki_root>/pages/, returns manifest. NO active caller in v1.4.x+ (commands/wiki-ingest.md Step 7.5 routes to wiki-synthesizer-analysis instead).
+description: Dormant in v1.4.x+; preserved for future restoration of v1.3.0 single-source byte-identical inline path. Reads source + candidate pages, decides create-vs-update, version-backs-up under .wiki-meta/.versions/, atomic-writes pages under <wiki_root>/pages/, returns manifest. NO active caller in v1.4.x+ (skills/wiki-ingest/SKILL.md Step 7.5 routes to wiki-synthesizer-analysis instead).
 whenToUse: |
-  DO NOT USE in v1.4.x+ — this agent is dormant. The v1.3.0 single-source inline path was superseded by the v1.4.0 A5 page-fanout architecture (Stage 1 wiki-synthesizer-analysis + Stage 2 wiki-page-writer workers). This file is preserved per plan §3.4 (Option B with rot-mitigation header) so the v1.3.0 byte-identical contract is recoverable if A5 wall-clock claims regress in a future release. Future restoration: change commands/wiki-ingest.md Step 7.5 single-source branch to dispatch this agent instead of wiki-synthesizer-analysis. Re-verify v1.3.0 invariants (versioning, write scope, lock semantics) before activating.
+  DO NOT USE in v1.4.x+ — this agent is dormant. The v1.3.0 single-source inline path was superseded by the v1.4.0 A5 page-fanout architecture (Stage 1 wiki-synthesizer-analysis + Stage 2 wiki-page-writer workers). This file is preserved per plan §3.4 (Option B with rot-mitigation header) so the v1.3.0 byte-identical contract is recoverable if A5 wall-clock claims regress in a future release. Future restoration: change skills/wiki-ingest/SKILL.md Step 7.5 single-source branch to dispatch this agent instead of wiki-synthesizer-analysis. Re-verify v1.3.0 invariants (versioning, write scope, lock semantics) before activating.
 tools: [Read, Write, Glob, Grep, WebFetch]
 status: dormant
 last_known_active: v1.3.0
@@ -13,7 +13,7 @@ contract_frozen_at: a9966c7  # Task 9 deletion commit — moment the unified wik
 
 # Wiki Synthesizer (Inline Mode — DORMANT in v1.4.x+)
 
-> **Status: DORMANT.** This agent has NO active caller in v1.4.x+ (`commands/wiki-ingest.md` Step 7.5 routes to `wiki-synthesizer-analysis` for single-source ingests). It is preserved per plan §3.4 (Option B + Risk 4 rot mitigation) so the v1.3.0 byte-identical inline contract remains recoverable if a future release needs to restore the single-source-fast-path semantics. The frontmatter `status: dormant` + `last_known_active: v1.3.0` + `contract_frozen_at` fields are machine-readable rot indicators per §3.4; future restoration must re-verify the contract against the recorded `contract_frozen_at` commit and update the frontmatter accordingly. Delete this file in v1.5.0+ if no restoration use case emerges.
+> **Status: DORMANT.** This agent has NO active caller in v1.4.x+ (`skills/wiki-ingest/SKILL.md` Step 7.5 routes to `wiki-synthesizer-analysis` for single-source ingests). It is preserved per plan §3.4 (Option B + Risk 4 rot mitigation) so the v1.3.0 byte-identical inline contract remains recoverable if a future release needs to restore the single-source-fast-path semantics. The frontmatter `status: dormant` + `last_known_active: v1.3.0` + `contract_frozen_at` fields are machine-readable rot indicators per §3.4; future restoration must re-verify the contract against the recorded `contract_frozen_at` commit and update the frontmatter accordingly. Delete this file in v1.5.0+ if no restoration use case emerges.
 
 ## Related agents
 
@@ -185,7 +185,7 @@ A filename appears in `created` XOR `updated`, never both (and never also in `fa
 > **Trust boundary acknowledgement (M1 — v1.4.1 Track C closure status):**
 > This agent's frontmatter `tools:` list includes `Write` (necessary for v1.3.0 inline-mode page-write + Rule 7 version backup). Unlike `wiki-synthesizer-analysis` and `wiki-synthesizer-worker`, this agent CANNOT use tool-level enforcement to close the M1 trust-boundary gap — the contract is enforced by **prompt obedience only** (Rule 8 write scope).
 >
-> **However, in v1.4.x+ the practical M1 surface is closed by routing**: `commands/wiki-ingest.md` Step 7.5 single-source branch dispatches `wiki-synthesizer-analysis` (Write absent), NOT this agent. With NO active caller, this agent's Write tool cannot be exercised regardless of agent obedience. The dormant `status: dormant` frontmatter signals this routing constraint to future maintainers.
+> **However, in v1.4.x+ the practical M1 surface is closed by routing**: `skills/wiki-ingest/SKILL.md` Step 7.5 single-source branch dispatches `wiki-synthesizer-analysis` (Write absent), NOT this agent. With NO active caller, this agent's Write tool cannot be exercised regardless of agent obedience. The dormant `status: dormant` frontmatter signals this routing constraint to future maintainers.
 >
 > **If a future release restores this agent as an active caller** (e.g., A5 wall-clock regression triggers fallback to v1.3.0 inline path), the M1 acknowledgement REVERTS to the v1.4.0 prompt-obedience-only stance — and the §3.9 `_post_dispatch_dirty_scan()` post-hoc guard becomes the only runtime mitigation. Restoration MUST also update this trust boundary note + re-run V-1/V-2/V-3 verification per plan §3.3 against the restored caller path.
 

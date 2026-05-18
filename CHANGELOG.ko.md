@@ -2,6 +2,37 @@
 
 deep-wiki의 주요 변경사항을 기록합니다.
 
+## [1.6.0] — 2026-05-18 (5 슬래시 커맨드 → user-invocable skill: cross-platform)
+
+### 변경
+
+- 5 개 `/wiki-*` 슬래시 커맨드를 모두 `skills/wiki-{ingest,lint,query,rebuild,setup}/SKILL.md` 의 `user-invocable: true` 스킬로 승격. `commands/` 디렉토리는 제거된다.
+- 각 entry skill 에 3 개의 새 head section 을 추가 — `## Invocation` (Claude Code 슬래시 + cross-platform `Skill({ skill: "deep-wiki:wiki-<verb>", args: "..." })`), `## Inputs (skill args)` (커맨드별 토큰 매트릭스), `## Prerequisites` (sibling skill 관계 + cross-platform self-containment 노트 + 기존 `~/.claude/deep-wiki-config.yaml` / `wiki-schema` 로드 단계).
+- frontmatter 의 `allowed-tools:` 키 제거 (skill 은 도구 화이트리스트를 선언하지 않는다); 대신 `name:` + 이중 언어 `description:` (한+영 트리거 문구, 3인칭) + `user-invocable: true` 로 교체. SKILL.md 에는 `version:` 필드를 두지 않는다 (deep-docs / deep-evolve 파일럿 패턴 미러).
+- 각 entry skill 의 본문은 기존 `commands/wiki-*.md` 와 byte-equivalent (`cp` 로 mechanical copy 후 in-place `sed` 로 `commands/wiki-*.md` 의 cross-reference 를 `skills/wiki-*/SKILL.md` 로 retarget). Step / Gate / Section 헤더와 bash 블록은 verbatim 유지 — ingest / lint / query / rebuild / setup 절차의 의미 변경 없음.
+- `commands/` 외 cross-reference 갱신 (약 20 곳) — `agents/wiki-synthesizer-{analysis,inline}.md`, `hooks/scripts/{scan-vault-changes.sh, wrap-index-envelope.js}` 의 주석 헤더, `skills/wiki-schema/{SKILL.md, wiki-schema.yaml}` 의 enforcement 절 텍스트, `tests/envelope-chain.test.js` 의 mirror 주석, `CLAUDE.md` 디렉토리 트리 + FAQ. `scripts/v0-probe/*` 와 과거 `CHANGELOG` 항목은 의도적으로 그대로 유지 (line-pinned 역사 참조).
+- `.claude-plugin/plugin.json` + `package.json` version: 1.5.3 → 1.6.0; 양쪽 description 에 "5 skill-based entry surfaces (cross-platform)" 추가.
+
+### Rationale
+
+슬래시 커맨드는 Claude Code 전용이다. 스킬은 Codex CLI / Copilot CLI / Gemini CLI / Agent SDK 모두에서 `Skill({ skill: "deep-wiki:<verb>", args: "..." })` 형태로 portable 하다. 본 변경은 suite 전체 command→skill 마이그레이션의 세 번째 installment 이며 (deep-docs v1.3.0 — 1 command, 파일럿; deep-evolve v3.4.0 — 1 command, 두 번째), deep-wiki 는 suite 내 최대 규모 단일 변환이다 — 동시에 5 entry surface 전환 (총 4,062 lines; `wiki-ingest` 단독 2,841 lines). 5 커맨드가 서로 cross-reference 하기 때문에 (ingest 가 lint 권유, query 가 새 페이지 auto-file, lint 가 다른 entry 가 emit 하는 `pages_created` exactly-once 불변식 검증 등) 일부만 변환하면 일부 entry 는 cross-platform 호출 가능 / 나머지는 Claude Code 전용으로 남는 inconsistent state 가 되어 atomic 변환이 필수.
+
+### Migration
+
+- Claude Code 사용자: 변경 없음. `/wiki-setup`, `/wiki-ingest`, `/wiki-lint`, `/wiki-query`, `/wiki-rebuild` 는 계속 작동 — Claude Code 가 `user-invocable: true` 스킬을 슬래시로 auto-discover. SessionStart auto-ingest hook (`scan-vault-changes.sh`) 도 변경 없이 작동 (hook 은 슬래시 커맨드 이름을 직접 호출한 적이 없고, `/wiki-ingest` 를 권유하는 system-reminder 만 emit; 모델이 이를 새 skill 로 resolve).
+- Codex / Copilot CLI / Gemini CLI / Agent SDK 사용자: `Skill({ skill: "deep-wiki:wiki-ingest", args: "<source>" })` 형태로 호출. 인자 문법 동일 (`$ARGUMENTS` placeholder 가 본문에 부재했고, 인자는 이미 자연어 prose 로 처리되고 있었음).
+- `skills/wiki-schema/` 의 reference skill 은 변경 없음 — description 매칭 auto-discovery 로 계속 로드되며, 4 critical invariants enforcement 텍스트만 `commands/wiki-*.md` 대신 `skills/wiki-*/SKILL.md` 경로를 가리키도록 갱신.
+
+### 테스트
+
+`npm test`: 126/126 통과. 프로덕션 코드 변경 없음; node:test 파일 (`envelope-emit`, `envelope-chain`, `auto-ingest-golden`, `pending-scan-recovery`) 은 주석 수준의 `// Mirror commands/wiki-…md …` → `// Mirror skills/wiki-…/SKILL.md …` 갱신만 수행. assertion 로직 변경 없음.
+
+### 노트
+
+- entry skill frontmatter 에 `version:` 필드 없음 (deep-docs / deep-evolve 패턴; skill-reviewer 가 minimal frontmatter 선호).
+- `wiki-ingest` 의 본문 byte-equivalence 가 가장 위험한 보존 표면 (2841 lines, 다수의 spec-pinned Step / Gate / phase-timing telemetry 참조). `cp` + `sed` + 한정된 `Edit` 접근으로 6 개 내부 self-reference (lines 389 / 1914 / 1923 / 1933 / 1939 / 2356) 만 mechanical retarget.
+- `scripts/v0-probe/` 역사적 probe 문서는 의도적으로 `commands/wiki-ingest.md:1088-1099` 식 line-pinned 참조를 그대로 유지 — v1.4.x 시점의 time-stamped 산출물.
+
 ## [1.5.3] — 2026-05-13 (메타데이터 — SKILL.md description 길이)
 
 ### 수정

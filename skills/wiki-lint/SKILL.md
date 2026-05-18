@@ -1,14 +1,34 @@
 ---
-allowed-tools: Read, Bash, Glob, Grep
-description: Check wiki health — find contradictions, orphan pages, broken links, schema violations, and stale content. Includes a status dashboard.
-argument-hint: "[--fix]"
+name: wiki-lint
+description: Use when the user wants to inspect the deep-wiki for health issues — orphan pages, broken inter-page links, schema violations, contradictions, stale content, missing source provenance YAML, `pages_created` exactly-once invariant breaks, and `.last-scan` monotonicity violations. Triggers on `/wiki-lint`, "lint wiki", "check wiki health", "wiki status", "wiki audit", "wiki diagnose", "wiki dashboard", "위키 린트", "위키 점검", "위키 상태", "위키 헬스체크", "위키 무결성". Accepts an optional `--fix` flag that auto-repairs the auto-fixable subset (broken links, orphan removal, sources/ slug normalization) while leaving audit-only items in the dashboard.
+user-invocable: true
 ---
 
-# /wiki-lint — Wiki Health Check
+# wiki-lint — Wiki Health Check
 
 Inspect the wiki for structural issues, inconsistencies, and schema violations.
 
+## Invocation
+
+이 스킬은 두 가지 경로로 호출됩니다 — 어느 쪽이든 본 SKILL §"Prerequisites" / §"Steps" 절차를 그대로 실행합니다:
+
+1. **Claude Code 슬래시** — 사용자가 `/wiki-lint [--fix]` 입력 (skill 의 `user-invocable: true` 가 슬래시 진입을 허용).
+2. **타 에이전트 / Codex / Copilot CLI / Gemini CLI / SDK** — `Skill({ skill: "deep-wiki:wiki-lint", args: "[--fix]" })` 형태로 명시 invoke (cross-platform 표준 경로).
+
+두 경로 모두 args 는 동일한 토큰 문자열로 전달되며, 본문의 fix-mode 분기가 동일하게 처리합니다.
+
+## Inputs (skill args)
+
+| 인자 | 의미 |
+|---|---|
+| (없음) | dry-run — 모든 lint 항목을 dashboard 로 보고, 변경 없음 |
+| `--fix` | auto-fixable 항목 (broken links, orphan removal, source provenance YAML 정규화) 자동 수정; audit-only 항목은 보고만 |
+
 ## Prerequisites
+
+이 entry skill 은 `wiki-schema` sibling skill (4 critical invariants + 10 log actions + storage layout 규칙) 의 validation 규칙을 동작 전제로 합니다. 또한 4 개 sibling entry skill 과 wiki_root 를 공유합니다 — `wiki-setup` 으로 wiki_root 가 사전 초기화되어 있어야 하며, lint 의 auto-fix 는 `wiki-ingest` / `wiki-query` / `wiki-rebuild` 가 이후 idempotent 하게 동작하도록 invariants 를 복원합니다.
+
+**Cross-platform self-containment**: Claude Code 에서는 sibling skill (`wiki-schema`) 이 description 매칭으로 자동 로드됩니다. 다만 Codex / Copilot CLI / Gemini CLI 등 타 플랫폼에서 `Skill()` 호출 시 sibling skill 의 auto-load 보장이 약할 수 있으므로, 본 SKILL §"Steps" 본문은 **의도적으로 self-contained** — 6 step lint pipeline (status dashboard / link check / orphan check / schema check / log-invariant scan / source provenance check), `lint` lifecycle action 의 `log.jsonl` entry 형식, `pages_created` exactly-once 불변식의 enforcement 규약을 인라인으로 보존합니다.
 
 Read `~/.claude/deep-wiki-config.yaml` to get `wiki_root`. If missing, tell the user to run `/wiki-setup` first.
 
@@ -290,12 +310,12 @@ jq -r 'select(.action != "ingest-repair") | .pages_created[]? | select(type=="st
   | sort | uniq -c | awk '$1 > 1 { print $2, "appears " $1 " times in pages_created" }'
 ```
 
-> The invariant applies to every log entry that emits `pages_created` — including `setup` (seeds `welcome.md`), `ingest`, `query-filed`, and any future action. **Exception (R3C1 review fix, v1.2.1+):** `ingest-repair` lines are excluded from the duplicate scan because they always emit `pages_created:[]` (per `commands/wiki-ingest.md` Step 10 spec) — a self-repair is a restoration of a previously-created page's lifecycle, not a new creation. The `select(.action != "ingest-repair")` filter is defense-in-depth in case any legacy or out-of-spec entry slips a non-empty `pages_created` into an `ingest-repair` line.
+> The invariant applies to every log entry that emits `pages_created` — including `setup` (seeds `welcome.md`), `ingest`, `query-filed`, and any future action. **Exception (R3C1 review fix, v1.2.1+):** `ingest-repair` lines are excluded from the duplicate scan because they always emit `pages_created:[]` (per `skills/wiki-ingest/SKILL.md` Step 10 spec) — a self-repair is a restoration of a previously-created page's lifecycle, not a new creation. The `select(.action != "ingest-repair")` filter is defense-in-depth in case any legacy or out-of-spec entry slips a non-empty `pages_created` into an `ingest-repair` line.
 
 Report findings as `[LOG-INVARIANT]` — no auto-fix (historical log is append-only). Fix forward in future ingests by respecting the pages_created classification rule.
 
 > **v1.4.0 compatibility note:** A5 fanout ingests may emit an additional
-> top-level `pages_failed` field in `log.jsonl` (per `commands/wiki-ingest.md`
+> top-level `pages_failed` field in `log.jsonl` (per `skills/wiki-ingest/SKILL.md`
 > Step 7.6.E Step 10 + Step 7.6.F sentinel payload). The `jq -r '.pages_created[]?'`
 > operator + `select(type=="string")` filter above ignores the new field
 > correctly — no schema update needed. v1.4.0 also introduces

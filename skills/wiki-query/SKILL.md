@@ -1,14 +1,34 @@
 ---
-allowed-tools: Read, Write, Edit, Bash, Glob, Grep
-description: Search the wiki and generate an answer grounded in wiki content. Ask questions about accumulated knowledge in the wiki.
-argument-hint: "<question>"
+name: wiki-query
+description: Use when the user wants to ask a question against the deep-wiki and get an answer grounded in the accumulated knowledge — searching pages, reading their bodies, and (when the answer is novel cross-page synthesis) auto-filing the answer back into the wiki as a new page via the `query-filed` lifecycle action. Triggers on `/wiki-query`, "ask the wiki", "wiki query", "search the wiki", "ask wiki", "위키 질의", "위키 검색", "위키에서 찾기", "위키에 물어보기", "위키 답변". The question string is passed as the sole argument.
+user-invocable: true
 ---
 
-# /wiki-query — Search and Answer from the Wiki
+# wiki-query — Search and Answer from the Wiki
 
 Search wiki pages and generate an answer grounded in the wiki's accumulated knowledge. When a query produces novel cross-page synthesis, the result is automatically filed back into the wiki.
 
+## Invocation
+
+이 스킬은 두 가지 경로로 호출됩니다 — 어느 쪽이든 본 SKILL §"Prerequisites" / §"Steps" 절차를 그대로 실행합니다:
+
+1. **Claude Code 슬래시** — 사용자가 `/wiki-query <question>` 입력 (skill 의 `user-invocable: true` 가 슬래시 진입을 허용).
+2. **타 에이전트 / Codex / Copilot CLI / Gemini CLI / SDK** — `Skill({ skill: "deep-wiki:wiki-query", args: "<question>" })` 형태로 명시 invoke (cross-platform 표준 경로).
+
+두 경로 모두 args 는 동일한 자연어 질문 문자열로 전달되며, Step 1 의 query parsing 이 동일하게 처리합니다.
+
+## Inputs (skill args)
+
+| 인자 | 의미 |
+|---|---|
+| `<question>` | 자연어 질문 — 검색 쿼리이자 답변의 기반 |
+| (없음) | 사용자에게 무엇을 알고 싶은지 물어봄 |
+
 ## Prerequisites
+
+이 entry skill 은 `wiki-schema` sibling skill (4 critical invariants + 10 log actions + storage layout 규칙) 을 동작 전제로 합니다. 또한 4 개 sibling entry skill 과 wiki_root 를 공유합니다 — `wiki-setup` 으로 wiki_root 가 사전 초기화되어 있고 `wiki-ingest` 로 페이지가 쌓여 있어야 하며, query 가 cross-page synthesis 를 auto-file 할 때는 lock atomicity 와 `pages_created` exactly-once 불변식을 `wiki-lint` / `wiki-rebuild` 와 동일하게 준수합니다.
+
+**Cross-platform self-containment**: Claude Code 에서는 sibling skill (`wiki-schema`) 이 description 매칭으로 자동 로드됩니다. 다만 Codex / Copilot CLI / Gemini CLI 등 타 플랫폼에서 `Skill()` 호출 시 sibling skill 의 auto-load 보장이 약할 수 있으므로, 본 SKILL §"Steps" 본문은 **의도적으로 self-contained** — 2-layer 검색 + 답변 pipeline (Layer 1: 페이지 검색·읽기 / Layer 2: lock 하 cross-page synthesis 의 auto-file), `query-filed` lifecycle action 의 `log.jsonl` entry 형식, 새 페이지 file naming 규약 (kebab-case + 충돌 회피 suffix) 을 인라인으로 보존합니다.
 
 Read `~/.claude/deep-wiki-config.yaml` to get `wiki_root`. If missing, tell the user to run `/wiki-setup` first.
 

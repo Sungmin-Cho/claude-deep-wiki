@@ -117,7 +117,7 @@ deep-wiki/
 
 ```
 <wiki_root>/
-├── index.md                # LLM-written human-readable catalog (artifact)
+├── index.md                # LLM-written human-readable dashboard (artifact)
 ├── log.md                  # LLM-written human-readable chronicle (artifact)
 ├── log.jsonl               # append-only structured event log (machine-readable)
 ├── pages/                  # all wiki pages (flat, kebab-case .md)

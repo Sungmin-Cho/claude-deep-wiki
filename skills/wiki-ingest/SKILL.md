@@ -2746,7 +2746,80 @@ For a single-source ingest this is one line; for multi-source batch it is one li
 
 ### 11. Update Human-Readable Wiki Artifacts
 
-**Index.md** — Rewrite `<wiki_root>/index.md` as an LLM-authored natural language catalog of the wiki. Organize by tag groups, describe what each page covers in one sentence, and note connections between pages. This is a wiki artifact, not machine output.
+**Index.md** — Rewrite `<wiki_root>/index.md` as a lightweight LLM-co-authored **dashboard** (v1.7.0+). Not a full catalog — see CHANGELOG v1.7.0 for the catalog-format deprecation rationale.
+
+**Placement invariant (v1.7.0+):** Dashboard regeneration MUST execute under the same lock-held critical section as Step 9 (Update Index) and Step 10 (Append to Log), as the LAST artifact write before Step 12 (Release Lock). The stats it captures (`pages_count`, `tags_count`, `last_ingest_ts`) reflect the post-Step-9 state and the just-emitted Step 10 log line. Writing the dashboard outside the lock would let two concurrent single-source sessions produce dashboards whose stats disagree with `index.json`.
+
+**Backup invariant (v1.7.0+):** Before overwriting `index.md`, if the existing file does NOT start with the v1.7.0 dashboard signature (first non-blank line is `# <title>`, then a blank line, then a paragraph, then `## At a glance`), `mkdir -p` and copy the existing file once to `<wiki_root>/.wiki-meta/.backups/index.md.pre-1.7.0`. Idempotent — skip if the backup already exists. This protects users who hand-curated their pre-1.7.0 catalog from silent data loss on first 1.7.0 ingest. The backup lives in a NEW directory `<wiki_root>/.wiki-meta/.backups/` (introduced in v1.7.0, mkdir -p'd on demand) — NOT in `.versions/`. The existing `.versions/` directory is constrained to per-page snapshots with `keep: 3` retention, and `wiki-lint`'s `excess_versions` auto-fix would prune our index.md backup as orphan. `.backups/` has no schema constraint and no wiki-lint pruning path.
+
+**Dashboard structure (target shape):**
+
+```markdown
+# <wiki title>
+
+<1-paragraph overview — LLM-generated from stats + tag profile; stable across ingests>
+
+## At a glance
+
+- Pages: <code-filled>
+- Tags: <code-filled>
+- Last ingest: <YYYY-MM-DDTHH:MM:SSZ — code-filled>
+- Last catalog refresh: <YYYY-MM-DDTHH:MM:SSZ — code-filled>
+
+## Recent activity (last 7 days)
+
+- <YYYY-MM-DD> — [[<page-slug>]] — <1-sentence summary>
+- ... (max 10 entries, timestamp-descending; see algorithm below)
+
+## Top tags
+
+- `<tag>` (<page_count>) — <1-sentence description from LLM>
+- ... (top 15 by page_count, descending)
+
+## Featured pages
+
+- [[<page-slug>]] — <code-derived first sentence, max 200 chars>
+- ... (only pages with frontmatter `featured: true`; lex-sorted by slug; cap 30; section omitted if empty)
+
+---
+
+*Wiki dashboard — auto-maintained by deep-wiki. For the full machine-readable catalog see `.wiki-meta/index.json`. For chronological history see `log.jsonl`.*
+```
+
+**Generation algorithm:**
+
+1. **STATS (code-only, post-Step-9 / post-Step-10 state):** `pages_count = count of <wiki_root>/pages/*.md`; `tags_count = unique tag count from frontmatter`; `last_ingest_ts = .ts of the log.jsonl line Step 10 just emitted`; `last_catalog_refresh_ts = $(date -u +"%Y-%m-%dT%H:%M:%SZ")`.
+
+2. **RECENT (code-only):** `log.jsonl` lines do NOT carry a `page_slug` field; they carry `pages_created` and `pages_updated` *arrays*. Expand them — for each event where `action in {ingest, update}` AND `(now - ts) < 7 days`, emit one tuple per page in `(pages_created ∪ pages_updated)` as `{ts, page, source}`. De-dupe by `page` keeping the latest `ts`. Sort by `ts` descending. Take top 10.
+
+3. **TOP_TAGS (code-only):** aggregate frontmatter `tags:` across all pages, sort descending by `page_count`, take top 15.
+
+4. **FEATURED (code-only):** collect pages with frontmatter `featured: true`. Lex-sort by slug. Cap at 30 entries (defense ceiling). For each, extract `summary` from the page body using this fallback chain:
+   - (a) First sentence (regex: `^[^.!?]+[.!?]`) of the first non-empty, non-frontmatter, non-code-block, non-table line — truncate to 200 chars.
+   - (b) If (a) yields empty (e.g. page is frontmatter-only, or first line is a code block / table / heading-only), fall back to `summary = page_title`.
+   - (c) If page title is also missing, `summary = "<page-slug>"`.
+   This is deterministic code — no LLM call per featured page. Preserves the token budget claim below regardless of how many pages carry `featured: true`. Section is omitted entirely if FEATURED is empty.
+
+5. **LLM call (single invocation per ingest):** input includes (a) `stats`, (b) `top_tags` (list of `{tag, page_count}`), (c) `top_sample_titles` (~20 most-recently-modified page titles, for context), (d) `prior_overview_paragraph` (see DECISION below). Output: (a) `overview_paragraph` (1 paragraph, 80-150 words), (b) `per_tag_descriptions` (one 1-sentence description per top-15 tag — what the tag means in this wiki, NOT how many pages). Featured summaries are NOT requested from the LLM — they come from step 4's code-derived extraction.
+
+   `prior_overview_paragraph` DECISION:
+   - If `index.md` exists AND starts with `# <title>` + blank line + paragraph + `## At a glance` (v1.7.0 dashboard signature): extract the paragraph between the title and `## At a glance`.
+   - Else (first ingest after `/wiki-setup` — `index.md` doesn't exist yet; OR first ingest after pre-1.7.0 upgrade — `index.md` is in legacy catalog format): pass empty string AND instruct LLM "this is a cold start, write a fresh overview from stats and titles."
+
+   Prompt guardrails (LLM): "The At a glance stat numbers are authoritative — do not restate them in the overview paragraph. Tag descriptions describe meaning, not counts. Use only page titles from the supplied input — no hallucinated references."
+
+6. **BACKUP (code-only, idempotent):** see Backup invariant above. Performed BEFORE the merge in step 7.
+
+7. **MERGE (code-only):** template-fill the dashboard structure with stats + recent + top_tags + featured + LLM outputs. Atomic write to `<wiki_root>/index.md` via temp + rename (mirror `wrap-index-envelope.js` pattern). Executes under the existing Step 11 critical section — same lock as Step 9 / Step 10.
+
+**Failure path (LLM call fails — timeout, schema mismatch, refusal):**
+- stderr receives `[wiki-ingest] dashboard regeneration skipped: <reason>` (operator-visible diagnostic).
+- Existing `index.md` is preserved (no clobber).
+- Ingest itself is NOT failed — the dashboard is a cosmetic artifact, not a wiki-integrity artifact.
+- `log.jsonl` is NOT modified for this sub-failure (preserves the `wiki-schema.yaml` 10-action set and existing `optional_fields:` whitelist unchanged — schema-additive `dashboard_regen_failed:` field is deferred to a future release).
+- Known limitation: in the SessionStart auto-ingest hook path, stderr is captured by the hook runner and typically discarded after the 15-second timeout — dashboard regen failures are effectively silent. Operators discover stale dashboards organically when opening `index.md` in Obsidian.
+
+**Token budget:** ≈3-5 KB input, ≈3-5 KB output per ingest. Stable across ingests because input shape is bounded (top-15 tags + 20 sample titles + 1 paragraph) regardless of total page count.
 
 **Log.md** — Append a short human-readable entry to `<wiki_root>/log.md` describing what was ingested and what changed, in natural language. Example:
 

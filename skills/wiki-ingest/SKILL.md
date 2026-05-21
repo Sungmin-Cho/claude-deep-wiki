@@ -2767,11 +2767,16 @@ For a single-source ingest this is one line; for multi-source batch it is one li
 
 **Placement invariant (v1.7.0+):** Dashboard regeneration MUST execute under the same lock-held critical section as Step 9 (Update Index) and Step 10 (Append to Log), as the LAST artifact write before Step 12 (Release Lock). The stats it captures (`pages_count`, `tags_count`, `last_ingest_ts`) reflect the post-Step-9 state and the just-emitted Step 10 log line. Writing the dashboard outside the lock would let two concurrent single-source sessions produce dashboards whose stats disagree with `index.json`.
 
-**Backup invariant (v1.7.0+):** Before overwriting `index.md`, if the existing file does NOT start with the v1.7.0 dashboard signature (first non-blank line is `# <title>`, then a blank line, then a paragraph, then `## At a glance`), `mkdir -p` and copy the existing file once to `<wiki_root>/.wiki-meta/.backups/index.md.pre-1.7.0`. Idempotent — skip if the backup already exists. This protects users who hand-curated their pre-1.7.0 catalog from silent data loss on first 1.7.0 ingest. The backup lives in a NEW directory `<wiki_root>/.wiki-meta/.backups/` (introduced in v1.7.0, mkdir -p'd on demand) — NOT in `.versions/`. The existing `.versions/` directory is constrained to per-page snapshots with `keep: 3` retention, and `wiki-lint`'s `excess_versions` auto-fix would prune our index.md backup as orphan. `.backups/` has no schema constraint and no wiki-lint pruning path.
+**Backup invariant (v1.7.0+):** Before overwriting `index.md`, if the existing file does NOT contain the explicit dashboard marker `<!-- deep-wiki-dashboard-v1.7.0 -->` on its first non-blank line, `mkdir -p` and copy the existing file once to `<wiki_root>/.wiki-meta/.backups/index.md.pre-1.7.0`. Idempotent — skip if the backup already exists. This protects users who hand-curated their pre-1.7.0 catalog from silent data loss on first 1.7.0 ingest.
+
+**Why an HTML-comment marker, not a structural pattern (review round 3 / Codex adversarial MEDIUM):** earlier drafts of this spec described the "v1.7.0 dashboard signature" as a structural shape — `# <title>` + blank + paragraph + `## At a glance`. A hand-curated pre-1.7.0 catalog can plausibly carry the same shape, which would skip the backup and silently overwrite the curated catalog. An explicit one-line HTML comment (`<!-- deep-wiki-dashboard-v1.7.0 -->`) is invisible to Obsidian's rendered view but unambiguous to the backup guard. Pages that ever contained the marker are by definition v1.7.0+ dashboard outputs; pages without the marker are treated as unknown legacy content and backed up unconditionally.
+
+The backup lives in `<wiki_root>/.wiki-meta/.backups/` (introduced in v1.7.0, `mkdir -p`'d on demand) — NOT in `.versions/`. The existing `.versions/` directory is constrained to per-page snapshots with `keep: 3` retention, and `wiki-lint`'s `excess_versions` auto-fix would prune our index.md backup as orphan. `.backups/` has no schema constraint and no wiki-lint pruning path.
 
 **Dashboard structure (target shape):**
 
 ```markdown
+<!-- deep-wiki-dashboard-v1.7.0 -->
 # <wiki title>
 
 <1-paragraph overview — LLM-generated from stats + tag profile; stable across ingests>
@@ -2820,8 +2825,8 @@ For a single-source ingest this is one line; for multi-source batch it is one li
 5. **LLM call (single invocation per ingest):** input includes (a) `stats`, (b) `top_tags` (list of `{tag, page_count}`), (c) `top_sample_titles` (~20 most-recently-modified page titles, for context), (d) `prior_overview_paragraph` (see DECISION below). Output: (a) `overview_paragraph` (1 paragraph, 80-150 words), (b) `per_tag_descriptions` (one 1-sentence description per top-15 tag — what the tag means in this wiki, NOT how many pages). Featured summaries are NOT requested from the LLM — they come from step 4's code-derived extraction.
 
    `prior_overview_paragraph` DECISION:
-   - If `index.md` exists AND starts with `# <title>` + blank line + paragraph + `## At a glance` (v1.7.0 dashboard signature): extract the paragraph between the title and `## At a glance`.
-   - Else (first ingest after `/wiki-setup` — `index.md` doesn't exist yet; OR first ingest after pre-1.7.0 upgrade — `index.md` is in legacy catalog format): pass empty string AND instruct LLM "this is a cold start, write a fresh overview from stats and titles."
+   - If `index.md` exists AND its first non-blank line is `<!-- deep-wiki-dashboard-v1.7.0 -->` (explicit dashboard marker): extract the paragraph between the title line and `## At a glance`.
+   - Else (first ingest after `/wiki-setup` — `index.md` doesn't exist yet; OR first ingest after pre-1.7.0 upgrade — `index.md` is in legacy catalog format and lacks the marker): pass empty string AND instruct LLM "this is a cold start, write a fresh overview from stats and titles."
 
    Prompt guardrails (LLM): "The At a glance stat numbers are authoritative — do not restate them in the overview paragraph. Tag descriptions describe meaning, not counts. Use only page titles from the supplied input — no hallucinated references."
 

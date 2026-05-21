@@ -2,6 +2,43 @@
 
 deep-wiki의 주요 변경사항을 기록합니다.
 
+## [1.7.0] — 2026-05-22 (대규모 위키 reader race 수정 + index.md dashboard 재정의 + inbox stale 정리)
+
+### 수정
+
+- **`hooks/scripts/read-index-envelope.js` stdout truncation race** — `process.stdout.write()` 호출 직후 `process.exit(0)` 가 호출되면 OS pipe buffer 가 drain 되기 전에 프로세스가 종료될 수 있다 (Node.js 문서화된 동작 — stdout 이 pipe 로 redirect 된 경우 비동기). 401 페이지 wiki (~250KB envelope payload) 에서 reader stdout 의 비결정적 truncation 으로 재현됨. reader 는 `wiki-ingest` Step 2 / Step 9, `wiki-rebuild` / `wiki-query` / `wiki-lint` 에서 호출되므로 truncation 시 duplicate page 생성 (overlap pre-filter 부정확) 또는 index merge 시 silent page loss 위험. 수정: `process.stdout.write(..., cb)` 콜백 형태로 변경해 flush 완료 후에만 `process.exit(0)` 호출. 작은 wiki 에서는 콜백이 동기적으로 즉시 실행되어 동작 변화 없음. 401-page wiki dogfood 에서 발견.
+
+### 변경 (spec)
+
+- **`skills/wiki-ingest/SKILL.md` Step 11 — `index.md` dashboard 재정의.** 기존 명세는 매 ingest 마다 LLM 으로 전체 페이지 catalog 재작성을 요구 — 100 페이지 이상에서 50K+ output tokens 가 필요해 실제로는 SKIP 되어 stale 상태로 유지됨. v1.7.0 부터 `index.md` 는 가벼운 dashboard 로 재정의: wiki 1-paragraph overview, At a glance stats (pages/tags/last ingest/last catalog refresh), Recent activity (`log.jsonl` 의 `pages_created`/`pages_updated` array 를 expand 해 최근 7일치 top 10), Top tags (top 15 + 1-sentence description), Featured pages (frontmatter `featured: true` opt-in, lex-sort, cap 30, code-derived first-sentence summary). 전체 machine-readable catalog 는 그대로 `.wiki-meta/index.json` 에, 시계열 기록은 `log.jsonl` 에 남는다. ingest 당 token 예산 ~3-5 KB input / ~3-5 KB output 으로 page 수와 무관하게 안정. 첫 1.7.0 ingest 시 pre-existing `index.md` 를 `<wiki_root>/.wiki-meta/.backups/index.md.pre-1.7.0` 으로 자동 backup (idempotent) — 손수 편집한 사용자 catalog 보호. `.backups/` 는 v1.7.0 에서 신설된 디렉토리로 `.versions/` 의 wiki-lint `excess_versions` auto-fix (keep: 3 pruning) 영향을 받지 않음.
+- **`CLAUDE.md` Storage layout** — `index.md` 설명을 "LLM-written human-readable catalog" 에서 "LLM-written human-readable dashboard" 로 갱신. Lifecycle actions / Critical invariants 등 schema 절은 변경 없음.
+
+### 추가
+
+- **`skills/wiki-ingest/SKILL.md` Step 0.5 — inbox stale cleanup + `partial_fail` 보호.** Prerequisites 블록 (`WIKI_ROOT` 설정) 과 Step 1 (Identify Sources) 사이에 삽입. wiki lock 미보유 상태에서 실행 — 안전성은 7일 mtime threshold + `<wiki_root>/.wiki-meta/sources/*.yaml` 의 미해결 `partial_fail:` sentinel 참조 파일 명시적 제외로 확보. Step 12 의 "self-session files only, no wildcard" 정책은 그대로 유지. Bash 3.2 portable: GNU `stat -c %Y` 우선 + BSD `stat -f %m` fallback + numeric guard (Linux 의 `stat -f` 는 filesystem info 를 exit 0 으로 반환하므로 단순 `||` 체인은 깨짐).
+- **`hooks/scripts/read-index-envelope.test.js`** — F1 회귀 테스트. 500-page envelope 합성 (`envelope.js` 의 ULID `run_id` 포함), `spawnSync` 로 reader 실행해 piped stdout code path 트리거, 캡처한 stdout 의 `pages.length === 500` 검증. 수정 후 항상 통과 (5회 반복 dogfood 검증).
+- **`tests/inbox-cleanup.test.js`** — F3 회귀 테스트 3종: 8일 이상 파일 삭제 / 1일 이내 파일 보존 / `partial_fail` 참조 파일은 8일 이상이어도 보존. bash body 는 `execSync('bash', { input, env: { WIKI_ROOT } })` 로 stdin + env 전달 (outer-shell expansion 회피).
+- **`package.json` `scripts.test`** — 명시적 file enumeration 에서 bare `node --test` (Node 20+ default recursive discovery) 로 전환. cwd 부터 `**/*.test.js` 를 스캔하며 `node_modules/` 는 자동 제외. 미래에 추가되는 `*.test.js` 가 즉시 포함됨.
+
+### 왜 중요한가
+
+세 finding 모두 큰 위키에서만 노출 (이번 followup 은 401-page dogfood 가 발견 계기) — 작은 위키에서는 (a) reader stdout 이 OS pipe buffer 안에 들어가고, (b) `index.md` rewrite 가 합리적 token 안에 끝나며, (c) inbox 파일이 누적되어 가시화되기 전이라 안 보였다. Karpathy 의 "wiki as the artifact" 비전에 맞춰 deep-wiki 채택이 늘어날수록 v1.7.0 의 세 수정은 장기 운용 위키의 건강성에 prerequisite.
+
+### 검증
+
+- `npm test` 통과 — 130 tests (bare-discovery 로 새 회귀 테스트 4개 자동 포함; F1 1 + F3 3).
+- `node scripts/validate-envelope-emit.js tests/fixtures/sample-index.json` clean.
+
+### 알려진 제한
+
+- "실제 401+ 페이지 위키에서 ingest 후 `read-index-envelope.js | jq '.pages | length'` 가 일관된 카운트를 반환하는지, `index.md` 가 5 섹션을 갖춘 dashboard 로 재생성되는지, `.wiki-meta/.inbox/` 에 7일 이상 파일이 없는지 확인" 항목은 CI 에 존재하지 않는 대규모 위키 환경이 필요해 release-blocking 검증이 아니라 post-release dogfood 체크리스트로 분류.
+- SessionStart auto-ingest hook path 의 dashboard regeneration 실패는 stderr-only 이며 hook runner 의 15초 timeout 이후 사실상 silent. 운영자는 Obsidian 에서 `index.md` 를 열 때 자연스럽게 stale 을 감지. schema-additive `dashboard_regen_failed:` 필드는 차기 release 로 보류.
+
+### 버전 동기화
+
+- `.claude-plugin/plugin.json` + `.codex-plugin/plugin.json` + `package.json` 1.6.2 → 1.7.0.
+- deep-suite marketplace `sha` + `description` 은 merge 후 별도 commit 으로 갱신 (CLAUDE.md "CRITICAL — Plugin Update Workflow" 참조).
+
 ## [1.6.2] — 2026-05-18 (Codex-native plugin manifest and AGENTS guide)
 
 ### 추가

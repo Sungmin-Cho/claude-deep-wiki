@@ -2,6 +2,43 @@
 
 All notable changes to deep-wiki are documented here.
 
+## [1.7.0] — 2026-05-22 (large-wiki reader race fix + index.md dashboard redefinition + inbox stale cleanup)
+
+### Fixed
+
+- **`hooks/scripts/read-index-envelope.js` stdout truncation race** — `process.stdout.write()` followed by `process.exit(0)` could exit before the OS pipe buffer drained (Node.js documented behavior when stdout is piped). On 401-page wikis (~250KB envelope payload), this caused nondeterministic truncation of the reader's stdout. The reader is called from `wiki-ingest` Step 2 / Step 9 and from `wiki-rebuild` / `wiki-query` / `wiki-lint`, so truncation could trigger duplicate-page creation (overlap pre-filter wrong) or silent page-loss on index merge. Fix: pass a callback to `process.stdout.write(..., cb)` and call `process.exit(0)` only after the callback fires (flush complete). Small wikis behave identically because the callback fires synchronously when the buffer is empty. Discovered during a 401-page wiki dogfood ingest.
+
+### Changed (spec)
+
+- **`skills/wiki-ingest/SKILL.md` Step 11 — `index.md` redefined as a dashboard.** The previous contract required a full LLM-authored catalog rewrite every ingest, infeasible above ~100 pages (50K+ output tokens) and silently SKIPped in practice, leaving `index.md` chronically stale. The new contract treats `index.md` as a lightweight, always-fresh dashboard: 1-paragraph wiki overview, At-a-glance stats (pages / tags / last ingest / last catalog refresh), Recent activity (last 7 days from `log.jsonl`, expanded from `pages_created`/`pages_updated` arrays), Top 15 tags with 1-sentence descriptions, and an opt-in Featured pages section (frontmatter `featured: true`, lex-sorted, capped at 30, code-derived first-sentence summary). The full machine-readable catalog continues to live in `.wiki-meta/index.json`; chronological history continues to live in `log.jsonl`. Token budget per ingest: ~3-5 KB input / ~3-5 KB output, stable regardless of wiki size. On the first 1.7.0 ingest, the pre-existing `index.md` is auto-backed-up to `<wiki_root>/.wiki-meta/.backups/index.md.pre-1.7.0` (idempotent) before being overwritten — protects users who hand-curated their legacy catalog. `.backups/` is new in v1.7.0 and is NOT subject to `wiki-lint`'s `excess_versions` auto-fix (which prunes `.versions/` to `keep: 3`).
+- **`CLAUDE.md` Storage layout** — `index.md` description updated from "LLM-written human-readable catalog" to "LLM-written human-readable dashboard". Lifecycle actions, Critical invariants, and other schema sections unchanged.
+
+### Added
+
+- **`skills/wiki-ingest/SKILL.md` Step 0.5 — inbox stale cleanup with `partial_fail` protection.** Inserted between the Prerequisites block (which sets `WIKI_ROOT`) and Step 1 (Identify Sources). Runs **without the wiki lock held** — safety via a 7-day mtime threshold AND explicit exclusion of inbox files referenced by an unresolved `partial_fail:` sentinel in `<wiki_root>/.wiki-meta/sources/*.yaml`. Step 12's "self-session files only, no wildcard" policy is preserved; Step 0.5 is the safety net for the crashed-session case Step 12 cannot cover, while honoring text-source partial-fail retry state regardless of operator absence. Bash 3.2 portable: GNU `stat -c %Y` first + BSD `stat -f %m` fallback + numeric guard against the Linux gotcha where `stat -f` returns filesystem metadata with exit 0.
+- **`hooks/scripts/read-index-envelope.test.js`** — F1 regression. Synthesizes a 500-page envelope (with a valid ULID `run_id` via `envelope.js`), runs the reader via `spawnSync` (triggers piped-stdout code path), parses captured stdout, asserts `pages.length === 500`. Post-fix: always passes.
+- **`tests/inbox-cleanup.test.js`** — F3 regression. Three scenarios: 8-day-old file removed, 1-day-old file preserved, 8-day-old file preserved when its `origin:` is referenced by a `partial_fail:` sentinel. Bash body is passed via `execSync('bash', { input, env: { WIKI_ROOT } })` (stdin + env), avoiding the outer `/bin/sh -c` parameter-expansion trap.
+- **`package.json` `scripts.test`** — switched from explicit file enumeration to **bare `node --test`** (Node 20+ default recursive discovery from cwd, auto-skips `node_modules/`). Future `*.test.js` files anywhere in the repo are picked up automatically.
+
+### Why this matters
+
+All three findings only surface on wikis at scale (this followup was driven by a 401-page dogfood) — small wikis never hit them because (a) reader stdout stays under the OS pipe buffer, (b) `index.md` rewrite stays within feasible token budgets, and (c) inbox files don't accumulate enough generations to be visible. As deep-wiki adoption grows toward Karpathy's "wiki as the artifact" vision, the v1.7.0 fixes are prerequisite for healthy long-running wikis.
+
+### Verification
+
+- `npm test` passes — 130 tests (127 pre-change + 3 new in `tests/inbox-cleanup.test.js`; F1 regression added 1 to `hooks/scripts/`).
+- `node scripts/validate-envelope-emit.js tests/fixtures/sample-index.json` clean.
+
+### Known limitations
+
+- Large-wiki acceptance test ("trigger an ingest on a real 401+ page wiki, confirm `read-index-envelope.js | jq '.pages | length'` returns correct count repeatedly, `index.md` regenerates as a dashboard with all sections present, `.wiki-meta/.inbox/` contains no files older than 7 days") requires a 401-page wiki environment not present in CI and not reproducible by every developer. Treated as a post-release dogfood checklist rather than a release-blocking verification step.
+- Dashboard regeneration failures in the SessionStart auto-ingest hook path are stderr-only and effectively silent (hook runner discards stderr after the 15-second timeout). Operators discover stale dashboards organically when opening `index.md` in Obsidian. Schema-additive `dashboard_regen_failed:` field is deferred to a future release.
+
+### Version sync
+
+- `.claude-plugin/plugin.json` + `.codex-plugin/plugin.json` + `package.json` bumped 1.6.2 → 1.7.0.
+- deep-suite marketplace `sha` and `description` updated post-merge per CLAUDE.md "CRITICAL — Plugin Update Workflow".
+
 ## [1.6.2] — 2026-05-18 (Codex-native plugin manifest and AGENTS guide)
 
 ### Added

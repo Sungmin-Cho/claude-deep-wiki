@@ -118,6 +118,80 @@ fi
 > (deferred to v1.4.x) will record actual per-worker durations to inform
 > whether to lobby for a runtime timeout knob.
 
+## Step 0.5 — Inbox stale cleanup (quarantine, mtime > 7 days, partial_fail-protected)
+
+Crashed sessions cannot fire their cleanup trap (the trap is registered at lock acquisition, so any crash before that point leaves inbox files orphaned). Step 12's "self-session files only, no wildcard" policy is preserved — this step touches files only older than 7 days AND not referenced by an unresolved `partial_fail:` sentinel.
+
+**Quarantine, not delete (review round 3 / Codex adversarial HIGH):** there is an inherent race window between Step 6.5 (pasted text materialized as inbox file) and Step 7.6.F (`partial_fail` sentinel written). If the process crashes inside that window, the inbox file is the ONLY persisted copy of the user's pasted source and there is no sentinel yet to protect it. After 7 days a destructive `rm -f` would silently destroy that recovery state. v1.7.0 therefore **moves** stale files to `<wiki_root>/.wiki-meta/.inbox/.quarantine/<basename>.<epoch>` (idempotent — preserves multiple generations under epoch-suffixed names) instead of deleting them. Operators can recover or hand-prune quarantine contents at their leisure; the directory is opaque to all other wiki-ingest steps.
+
+Runs **without the wiki lock held** (no lock has been acquired yet at this point in the flow) — safety comes from the 7-day threshold + the sentinel exclusion + the non-destructive quarantine policy below.
+
+Caller contract: `WIKI_ROOT` is set by the Prerequisites block (config read at the top of this skill).
+
+```bash
+set +e
+INBOX_DIR="${WIKI_ROOT}/.wiki-meta/.inbox"
+SOURCES_DIR="${WIKI_ROOT}/.wiki-meta/sources"
+QUARANTINE_DIR="${INBOX_DIR}/.quarantine"
+
+# Collect inbox paths referenced by unresolved partial_fail sentinels.
+# Step 7.6.F re-emits `origin:` whenever it writes a partial_fail block,
+# so this scan is guaranteed to find the origin field when the sentinel
+# exists. The sed handles both double-quoted and single-quoted forms
+# (review round 3 / C1 — the Step 1.5 origin parser accepts both, so the
+# protection scan must too, or a single-quoted yaml will fall through and
+# its inbox file get quarantined despite the sentinel).
+PROTECTED_INBOX=""
+if [ -d "$SOURCES_DIR" ]; then
+  for y in "$SOURCES_DIR"/*.yaml; do
+    [ -f "$y" ] || continue
+    grep -q '^partial_fail:' "$y" 2>/dev/null || continue
+    origin=$(grep -E '^origin:' "$y" 2>/dev/null | sed -E "s/^origin: *['\"]?([^'\"]*)['\"]?\$/\1/" | head -1)
+    case "$origin" in
+      "$INBOX_DIR"/*) PROTECTED_INBOX="${PROTECTED_INBOX}${origin}"$'\n' ;;
+    esac
+  done
+fi
+
+if [ -d "$INBOX_DIR" ]; then
+  NOW_EPOCH=$(date +%s)
+  for f in "$INBOX_DIR"/*.txt; do
+    [ -f "$f" ] || continue
+    # Age-independent protection for partial_fail-referenced files.
+    if printf '%s' "$PROTECTED_INBOX" | grep -Fxq "$f"; then
+      continue
+    fi
+    # GNU stat -c %Y first, BSD stat -f %m fallback (on Linux `stat -f %m`
+    # returns filesystem metadata with exit 0, so a BSD-first order would
+    # receive non-numeric input). Numeric guard rejects the filesystem-info
+    # case if it somehow leaks through (e.g. exotic stat builds).
+    FILE_EPOCH=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null)
+    case "$FILE_EPOCH" in
+      ''|*[!0-9]*) continue ;;
+    esac
+    AGE_SEC=$(( NOW_EPOCH - FILE_EPOCH ))
+    if [ "$AGE_SEC" -gt 604800 ]; then
+      # Quarantine instead of hard delete — the file may be the only copy
+      # of pasted-text source state from a crashed session BEFORE the
+      # partial_fail sentinel had a chance to land. Epoch suffix avoids
+      # filename collisions across multiple stale-cleanup runs.
+      mkdir -p "$QUARANTINE_DIR" 2>/dev/null
+      mv "$f" "$QUARANTINE_DIR/$(basename "$f").$(date +%s)" 2>/dev/null
+      echo "[wiki-ingest] quarantined stale inbox file: $(basename "$f") (age: ${AGE_SEC}s) → .quarantine/" >&2
+    fi
+  done
+fi
+set -e
+```
+
+**Why 7 days:** concurrent dev/CI session realistic max lock duration is minutes to hours; 7 days is conservative and guarantees we never quarantine a fresh file from another live session. Configurable via a future `.wiki-meta/.config.json` knob if 7 days proves too long.
+
+**Why quarantine instead of delete:** see the Codex adversarial review round 3 hazard noted above — destructive delete loses user pasted text irrecoverably in the crash window. Quarantine preserves recovery surface.
+
+**Why `set +e` ... `set -e`:** the surrounding skill body runs under `set -euo pipefail`. Cleanup failures (e.g. permission denied on a removed FUSE mount) must not abort the entire ingest — the worst that happens is one extra stale file persists to the next run.
+
+**Quarantine hygiene:** `<INBOX_DIR>/.quarantine/` is not auto-pruned by this step (no second-level age threshold in v1.7.0). The directory is opaque to all other wiki-ingest steps because (a) the file extension after quarantine is `<basename>.txt.<epoch>` — not `.txt` — so the `for f in "$INBOX_DIR"/*.txt` glob in this step and in `wiki-lint`'s inbox scan does not match it; (b) the `.quarantine/` subdir itself is not iterated by `wiki-lint`. Operators may hand-prune (or set up an out-of-band cron) when comfortable that the pasted text is no longer recoverable.
+
 ## Steps
 
 ### 1. Identify Source Type
@@ -2689,7 +2763,85 @@ For a single-source ingest this is one line; for multi-source batch it is one li
 
 ### 11. Update Human-Readable Wiki Artifacts
 
-**Index.md** — Rewrite `<wiki_root>/index.md` as an LLM-authored natural language catalog of the wiki. Organize by tag groups, describe what each page covers in one sentence, and note connections between pages. This is a wiki artifact, not machine output.
+**Index.md** — Rewrite `<wiki_root>/index.md` as a lightweight LLM-co-authored **dashboard** (v1.7.0+). Not a full catalog — see CHANGELOG v1.7.0 for the catalog-format deprecation rationale.
+
+**Placement invariant (v1.7.0+):** Dashboard regeneration MUST execute under the same lock-held critical section as Step 9 (Update Index) and Step 10 (Append to Log), as the LAST artifact write before Step 12 (Release Lock). The stats it captures (`pages_count`, `tags_count`, `last_ingest_ts`) reflect the post-Step-9 state and the just-emitted Step 10 log line. Writing the dashboard outside the lock would let two concurrent single-source sessions produce dashboards whose stats disagree with `index.json`.
+
+**Backup invariant (v1.7.0+):** Before overwriting `index.md`, if the existing file does NOT contain the explicit dashboard marker `<!-- deep-wiki-dashboard-v1.7.0 -->` on its first non-blank line, `mkdir -p` and copy the existing file once to `<wiki_root>/.wiki-meta/.backups/index.md.pre-1.7.0`. Idempotent — skip if the backup already exists. This protects users who hand-curated their pre-1.7.0 catalog from silent data loss on first 1.7.0 ingest.
+
+**Why an HTML-comment marker, not a structural pattern (review round 3 / Codex adversarial MEDIUM):** earlier drafts of this spec described the "v1.7.0 dashboard signature" as a structural shape — `# <title>` + blank + paragraph + `## At a glance`. A hand-curated pre-1.7.0 catalog can plausibly carry the same shape, which would skip the backup and silently overwrite the curated catalog. An explicit one-line HTML comment (`<!-- deep-wiki-dashboard-v1.7.0 -->`) is invisible to Obsidian's rendered view but unambiguous to the backup guard. Pages that ever contained the marker are by definition v1.7.0+ dashboard outputs; pages without the marker are treated as unknown legacy content and backed up unconditionally.
+
+The backup lives in `<wiki_root>/.wiki-meta/.backups/` (introduced in v1.7.0, `mkdir -p`'d on demand) — NOT in `.versions/`. The existing `.versions/` directory is constrained to per-page snapshots with `keep: 3` retention, and `wiki-lint`'s `excess_versions` auto-fix would prune our index.md backup as orphan. `.backups/` has no schema constraint and no wiki-lint pruning path.
+
+**Dashboard structure (target shape):**
+
+```markdown
+<!-- deep-wiki-dashboard-v1.7.0 -->
+# <wiki title>
+
+<1-paragraph overview — LLM-generated from stats + tag profile; stable across ingests>
+
+## At a glance
+
+- Pages: <code-filled>
+- Tags: <code-filled>
+- Last ingest: <YYYY-MM-DDTHH:MM:SSZ — code-filled>
+- Last catalog refresh: <YYYY-MM-DDTHH:MM:SSZ — code-filled>
+
+## Recent activity (last 7 days)
+
+- <YYYY-MM-DD> — [[<page-slug>]] — <1-sentence summary>
+- ... (max 10 entries, timestamp-descending; see algorithm below)
+
+## Top tags
+
+- `<tag>` (<page_count>) — <1-sentence description from LLM>
+- ... (top 15 by page_count, descending)
+
+## Featured pages
+
+- [[<page-slug>]] — <code-derived first sentence, max 200 chars>
+- ... (only pages with frontmatter `featured: true`; lex-sorted by slug; cap 30; section omitted if empty)
+
+---
+
+*Wiki dashboard — auto-maintained by deep-wiki. For the full machine-readable catalog see `.wiki-meta/index.json`. For chronological history see `log.jsonl`.*
+```
+
+**Generation algorithm:**
+
+1. **STATS (code-only, post-Step-9 / post-Step-10 state):** `pages_count = count of <wiki_root>/pages/*.md`; `tags_count = unique tag count from frontmatter`; `last_ingest_ts = .ts of the log.jsonl line Step 10 just emitted`; `last_catalog_refresh_ts = $(date -u +"%Y-%m-%dT%H:%M:%SZ")`.
+
+2. **RECENT (code-only):** `log.jsonl` lines do NOT carry a `page_slug` field; they carry `pages_created` and `pages_updated` *arrays*. Expand them — for each event where `action in {ingest, update}` AND `(now - ts) < 7 days`, emit one tuple per page in `(pages_created ∪ pages_updated)` as `{ts, page, source}`. De-dupe by `page` keeping the latest `ts`. Sort by `ts` descending. Take top 10.
+
+3. **TOP_TAGS (code-only):** aggregate frontmatter `tags:` across all pages, sort descending by `page_count`, take top 15.
+
+4. **FEATURED (code-only):** collect pages with frontmatter `featured: true`. Lex-sort by slug. Cap at 30 entries (defense ceiling). For each, extract `summary` from the page body using this fallback chain:
+   - (a) First sentence (regex: `^[^.!?]+[.!?]`) of the first non-empty, non-frontmatter, non-code-block, non-table line — truncate to 200 chars.
+   - (b) If (a) yields empty (e.g. page is frontmatter-only, or first line is a code block / table / heading-only), fall back to `summary = page_title`.
+   - (c) If page title is also missing, `summary = "<page-slug>"`.
+   This is deterministic code — no LLM call per featured page. Preserves the token budget claim below regardless of how many pages carry `featured: true`. Section is omitted entirely if FEATURED is empty.
+
+5. **LLM call (single invocation per ingest):** input includes (a) `stats`, (b) `top_tags` (list of `{tag, page_count}`), (c) `top_sample_titles` (~20 most-recently-modified page titles, for context), (d) `prior_overview_paragraph` (see DECISION below). Output: (a) `overview_paragraph` (1 paragraph, 80-150 words), (b) `per_tag_descriptions` (one 1-sentence description per top-15 tag — what the tag means in this wiki, NOT how many pages). Featured summaries are NOT requested from the LLM — they come from step 4's code-derived extraction.
+
+   `prior_overview_paragraph` DECISION:
+   - If `index.md` exists AND its first non-blank line is `<!-- deep-wiki-dashboard-v1.7.0 -->` (explicit dashboard marker): extract the paragraph between the title line and `## At a glance`.
+   - Else (first ingest after `/wiki-setup` — `index.md` doesn't exist yet; OR first ingest after pre-1.7.0 upgrade — `index.md` is in legacy catalog format and lacks the marker): pass empty string AND instruct LLM "this is a cold start, write a fresh overview from stats and titles."
+
+   Prompt guardrails (LLM): "The At a glance stat numbers are authoritative — do not restate them in the overview paragraph. Tag descriptions describe meaning, not counts. Use only page titles from the supplied input — no hallucinated references."
+
+6. **BACKUP (code-only, idempotent):** see Backup invariant above. Performed BEFORE the merge in step 7.
+
+7. **MERGE (code-only):** template-fill the dashboard structure with stats + recent + top_tags + featured + LLM outputs. Atomic write to `<wiki_root>/index.md` via temp + rename (mirror `wrap-index-envelope.js` pattern). Executes under the existing Step 11 critical section — same lock as Step 9 / Step 10.
+
+**Failure path (LLM call fails — timeout, schema mismatch, refusal):**
+- stderr receives `[wiki-ingest] dashboard regeneration skipped: <reason>` (operator-visible diagnostic).
+- Existing `index.md` is preserved (no clobber).
+- Ingest itself is NOT failed — the dashboard is a cosmetic artifact, not a wiki-integrity artifact.
+- `log.jsonl` is NOT modified for this sub-failure (preserves the `wiki-schema.yaml` 10-action set and existing `optional_fields:` whitelist unchanged — schema-additive `dashboard_regen_failed:` field is deferred to a future release).
+- Known limitation: in the SessionStart auto-ingest hook path, stderr is captured by the hook runner and typically discarded after the 15-second timeout — dashboard regen failures are effectively silent. Operators discover stale dashboards organically when opening `index.md` in Obsidian.
+
+**Token budget:** ≈3-5 KB input, ≈3-5 KB output per ingest. Stable across ingests because input shape is bounded (top-15 tags + 20 sample titles + 1 paragraph) regardless of total page count.
 
 **Log.md** — Append a short human-readable entry to `<wiki_root>/log.md` describing what was ingested and what changed, in natural language. Example:
 

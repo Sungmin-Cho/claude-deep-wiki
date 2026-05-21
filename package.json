@@ -1,6 +1,6 @@
 {
   "name": "deep-wiki",
-  "version": "1.6.2",
+  "version": "1.7.0",
   "description": "LLM-managed markdown wiki — 5 skill-based entry surfaces (cross-platform). Deep-wiki plugin: tests + helpers only; plugin manifest at .claude-plugin/plugin.json.",
   "author": {
     "name": "Sungmin-Cho"
@@ -17,7 +17,7 @@
     "karpathy"
   ],
   "scripts": {
-    "test": "node --test tests/envelope-emit.test.js tests/envelope-chain.test.js tests/auto-ingest-golden.test.js tests/pending-scan-recovery.test.js",
+    "test": "node --test",
     "validate-fixture": "node scripts/validate-envelope-emit.js tests/fixtures/sample-index.json"
   }
 }

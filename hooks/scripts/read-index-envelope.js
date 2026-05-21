@@ -84,8 +84,13 @@ function main() {
   // shapes where the original happens to fail downstream consumer expectations:
   // we still emit unchanged — consumers are responsible for their own legacy
   // pass-through handling (e.g. legacy index.json had `pages` array at root).
-  process.stdout.write(JSON.stringify(unwrapped, null, 2) + '\n');
-  process.exit(0);
+  process.stdout.write(JSON.stringify(unwrapped, null, 2) + '\n', (err) => {
+    if (err) {
+      process.stderr.write(`error: stdout write failed: ${err.message}\n`);
+      process.exit(2);
+    }
+    process.exit(0);
+  });
 }
 
 if (require.main === module) {

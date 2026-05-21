@@ -118,9 +118,13 @@ fi
 > (deferred to v1.4.x) will record actual per-worker durations to inform
 > whether to lobby for a runtime timeout knob.
 
-## Step 0.5 — Inbox stale cleanup (mtime > 7 days, partial_fail-protected)
+## Step 0.5 — Inbox stale cleanup (quarantine, mtime > 7 days, partial_fail-protected)
 
-Crashed sessions cannot fire their cleanup trap (the trap is registered in Step 3 at lock acquisition, so any crash before Step 3 leaves inbox files orphaned), so their inbox files accumulate indefinitely. Step 12's "self-session files only, no wildcard" policy is preserved — this step only touches files older than 7 days AND not referenced by an unresolved `partial_fail:` sentinel. Runs **without the wiki lock held** (no lock has been acquired yet at this point in the flow) — safety comes from the 7-day threshold and the sentinel exclusion below.
+Crashed sessions cannot fire their cleanup trap (the trap is registered at lock acquisition, so any crash before that point leaves inbox files orphaned). Step 12's "self-session files only, no wildcard" policy is preserved — this step touches files only older than 7 days AND not referenced by an unresolved `partial_fail:` sentinel.
+
+**Quarantine, not delete (review round 3 / Codex adversarial HIGH):** there is an inherent race window between Step 6.5 (pasted text materialized as inbox file) and Step 7.6.F (`partial_fail` sentinel written). If the process crashes inside that window, the inbox file is the ONLY persisted copy of the user's pasted source and there is no sentinel yet to protect it. After 7 days a destructive `rm -f` would silently destroy that recovery state. v1.7.0 therefore **moves** stale files to `<wiki_root>/.wiki-meta/.inbox/.quarantine/<basename>.<epoch>` (idempotent — preserves multiple generations under epoch-suffixed names) instead of deleting them. Operators can recover or hand-prune quarantine contents at their leisure; the directory is opaque to all other wiki-ingest steps.
+
+Runs **without the wiki lock held** (no lock has been acquired yet at this point in the flow) — safety comes from the 7-day threshold + the sentinel exclusion + the non-destructive quarantine policy below.
 
 Caller contract: `WIKI_ROOT` is set by the Prerequisites block (config read at the top of this skill).
 
@@ -128,17 +132,21 @@ Caller contract: `WIKI_ROOT` is set by the Prerequisites block (config read at t
 set +e
 INBOX_DIR="${WIKI_ROOT}/.wiki-meta/.inbox"
 SOURCES_DIR="${WIKI_ROOT}/.wiki-meta/sources"
+QUARANTINE_DIR="${INBOX_DIR}/.quarantine"
 
 # Collect inbox paths referenced by unresolved partial_fail sentinels.
 # Step 7.6.F re-emits `origin:` whenever it writes a partial_fail block,
 # so this scan is guaranteed to find the origin field when the sentinel
-# exists.
+# exists. The sed handles both double-quoted and single-quoted forms
+# (review round 3 / C1 — the Step 1.5 origin parser accepts both, so the
+# protection scan must too, or a single-quoted yaml will fall through and
+# its inbox file get quarantined despite the sentinel).
 PROTECTED_INBOX=""
 if [ -d "$SOURCES_DIR" ]; then
   for y in "$SOURCES_DIR"/*.yaml; do
     [ -f "$y" ] || continue
     grep -q '^partial_fail:' "$y" 2>/dev/null || continue
-    origin=$(grep -E '^origin:' "$y" 2>/dev/null | sed -E 's/^origin: *"?([^"]*)"?$/\1/' | head -1)
+    origin=$(grep -E '^origin:' "$y" 2>/dev/null | sed -E "s/^origin: *['\"]?([^'\"]*)['\"]?\$/\1/" | head -1)
     case "$origin" in
       "$INBOX_DIR"/*) PROTECTED_INBOX="${PROTECTED_INBOX}${origin}"$'\n' ;;
     esac
@@ -163,17 +171,26 @@ if [ -d "$INBOX_DIR" ]; then
     esac
     AGE_SEC=$(( NOW_EPOCH - FILE_EPOCH ))
     if [ "$AGE_SEC" -gt 604800 ]; then
-      rm -f "$f"
-      echo "[wiki-ingest] cleaned stale inbox file: $(basename "$f") (age: ${AGE_SEC}s)" >&2
+      # Quarantine instead of hard delete — the file may be the only copy
+      # of pasted-text source state from a crashed session BEFORE the
+      # partial_fail sentinel had a chance to land. Epoch suffix avoids
+      # filename collisions across multiple stale-cleanup runs.
+      mkdir -p "$QUARANTINE_DIR" 2>/dev/null
+      mv "$f" "$QUARANTINE_DIR/$(basename "$f").$(date +%s)" 2>/dev/null
+      echo "[wiki-ingest] quarantined stale inbox file: $(basename "$f") (age: ${AGE_SEC}s) → .quarantine/" >&2
     fi
   done
 fi
 set -e
 ```
 
-**Why 7 days:** concurrent dev/CI session realistic max lock duration is minutes to hours; 7 days is conservative and guarantees we never delete a fresh file from another live session. Configurable via a future `.wiki-meta/.config.json` knob if 7 days proves too long.
+**Why 7 days:** concurrent dev/CI session realistic max lock duration is minutes to hours; 7 days is conservative and guarantees we never quarantine a fresh file from another live session. Configurable via a future `.wiki-meta/.config.json` knob if 7 days proves too long.
+
+**Why quarantine instead of delete:** see the Codex adversarial review round 3 hazard noted above — destructive delete loses user pasted text irrecoverably in the crash window. Quarantine preserves recovery surface.
 
 **Why `set +e` ... `set -e`:** the surrounding skill body runs under `set -euo pipefail`. Cleanup failures (e.g. permission denied on a removed FUSE mount) must not abort the entire ingest — the worst that happens is one extra stale file persists to the next run.
+
+**Quarantine hygiene:** `<INBOX_DIR>/.quarantine/` is not auto-pruned by this step (no second-level age threshold in v1.7.0). The directory is opaque to all other wiki-ingest steps because (a) the file extension after quarantine is `<basename>.txt.<epoch>` — not `.txt` — so the `for f in "$INBOX_DIR"/*.txt` glob in this step and in `wiki-lint`'s inbox scan does not match it; (b) the `.quarantine/` subdir itself is not iterated by `wiki-lint`. Operators may hand-prune (or set up an out-of-band cron) when comfortable that the pasted text is no longer recoverable.
 
 ## Steps
 

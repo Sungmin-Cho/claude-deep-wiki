@@ -113,17 +113,35 @@ fi
 
 Create the initial human-readable wiki artifacts:
 
-**`<wiki_root>/index.md`** — LLM-written catalog:
+**`<wiki_root>/index.md`** — v1.7.0+ dashboard seed (matches the dashboard shape emitted by `/wiki-ingest` Step 11 so the first ingest does not treat this seed as a pre-1.7.0 catalog needing backup):
 
 ```markdown
-# Wiki Index
+<!-- deep-wiki-dashboard-v1.7.0 -->
+# Wiki Dashboard
 
-This wiki is newly created and has no knowledge pages yet. Run `/wiki-ingest` to start building knowledge.
+This wiki was just initialized and has no knowledge pages yet. Run `/wiki-ingest` to start building knowledge — the first ingest will replace this seed with an auto-generated dashboard reflecting the new pages.
 
-## Pages
+## At a glance
 
-- **Welcome** — Introduction to the wiki ([welcome.md](pages/welcome.md))
+- Pages: 1
+- Tags: 0
+- Last ingest: (none — newly created)
+- Last catalog refresh: (initial setup)
+
+## Recent activity (last 7 days)
+
+- (none — wiki newly created)
+
+## Top tags
+
+- (none — no tagged pages yet)
+
+---
+
+*Wiki dashboard — auto-maintained by deep-wiki. For the full machine-readable catalog see `.wiki-meta/index.json`. For chronological history see `log.jsonl`.*
 ```
+
+The leading `<!-- deep-wiki-dashboard-v1.7.0 -->` marker tells `/wiki-ingest` Step 11's backup guard that this file is already in the v1.7.0 dashboard shape, so the first ingest overwrites it directly without copying it to `.wiki-meta/.backups/index.md.pre-1.7.0`. The seed is intentionally sparse — every section is regenerated from real wiki state on the first ingest.
 
 **`<wiki_root>/log.md`** — LLM-written chronicle:
 

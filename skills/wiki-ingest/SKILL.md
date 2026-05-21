@@ -118,6 +118,63 @@ fi
 > (deferred to v1.4.x) will record actual per-worker durations to inform
 > whether to lobby for a runtime timeout knob.
 
+## Step 0.5 — Inbox stale cleanup (mtime > 7 days, partial_fail-protected)
+
+Crashed sessions cannot fire their cleanup trap (the trap is registered in Step 3 at lock acquisition, so any crash before Step 3 leaves inbox files orphaned), so their inbox files accumulate indefinitely. Step 12's "self-session files only, no wildcard" policy is preserved — this step only touches files older than 7 days AND not referenced by an unresolved `partial_fail:` sentinel. Runs **without the wiki lock held** (no lock has been acquired yet at this point in the flow) — safety comes from the 7-day threshold and the sentinel exclusion below.
+
+Caller contract: `WIKI_ROOT` is set by the Prerequisites block (config read at the top of this skill).
+
+```bash
+set +e
+INBOX_DIR="${WIKI_ROOT}/.wiki-meta/.inbox"
+SOURCES_DIR="${WIKI_ROOT}/.wiki-meta/sources"
+
+# Collect inbox paths referenced by unresolved partial_fail sentinels.
+# Step 7.6.F re-emits `origin:` whenever it writes a partial_fail block,
+# so this scan is guaranteed to find the origin field when the sentinel
+# exists.
+PROTECTED_INBOX=""
+if [ -d "$SOURCES_DIR" ]; then
+  for y in "$SOURCES_DIR"/*.yaml; do
+    [ -f "$y" ] || continue
+    grep -q '^partial_fail:' "$y" 2>/dev/null || continue
+    origin=$(grep -E '^origin:' "$y" 2>/dev/null | sed -E 's/^origin: *"?([^"]*)"?$/\1/' | head -1)
+    case "$origin" in
+      "$INBOX_DIR"/*) PROTECTED_INBOX="${PROTECTED_INBOX}${origin}"$'\n' ;;
+    esac
+  done
+fi
+
+if [ -d "$INBOX_DIR" ]; then
+  NOW_EPOCH=$(date +%s)
+  for f in "$INBOX_DIR"/*.txt; do
+    [ -f "$f" ] || continue
+    # Age-independent protection for partial_fail-referenced files.
+    if printf '%s' "$PROTECTED_INBOX" | grep -Fxq "$f"; then
+      continue
+    fi
+    # GNU stat -c %Y first, BSD stat -f %m fallback (on Linux `stat -f %m`
+    # returns filesystem metadata with exit 0, so a BSD-first order would
+    # receive non-numeric input). Numeric guard rejects the filesystem-info
+    # case if it somehow leaks through (e.g. exotic stat builds).
+    FILE_EPOCH=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null)
+    case "$FILE_EPOCH" in
+      ''|*[!0-9]*) continue ;;
+    esac
+    AGE_SEC=$(( NOW_EPOCH - FILE_EPOCH ))
+    if [ "$AGE_SEC" -gt 604800 ]; then
+      rm -f "$f"
+      echo "[wiki-ingest] cleaned stale inbox file: $(basename "$f") (age: ${AGE_SEC}s)" >&2
+    fi
+  done
+fi
+set -e
+```
+
+**Why 7 days:** concurrent dev/CI session realistic max lock duration is minutes to hours; 7 days is conservative and guarantees we never delete a fresh file from another live session. Configurable via a future `.wiki-meta/.config.json` knob if 7 days proves too long.
+
+**Why `set +e` ... `set -e`:** the surrounding skill body runs under `set -euo pipefail`. Cleanup failures (e.g. permission denied on a removed FUSE mount) must not abort the entire ingest — the worst that happens is one extra stale file persists to the next run.
+
 ## Steps
 
 ### 1. Identify Source Type

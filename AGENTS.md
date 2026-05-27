@@ -4,7 +4,7 @@ LLM-managed markdown wiki for persistent knowledge accumulation. The plugin
 keeps the Claude Code slash-command surface and exposes Codex-native skills and
 manifest metadata.
 
-Current version: 1.6.2.
+To check the current version: `jq -r .version .codex-plugin/plugin.json`.
 
 ## Runtime Surfaces
 
@@ -28,3 +28,7 @@ npm run validate-fixture
 
 After a release, update both suite marketplace manifests in
 `/Users/sungmin/Dev/claude-plugins/deep-suite/`.
+
+---
+
+📄 Documentation in this repo follows `docs/DOCS_RULE.md` (local maintainer guide — single-source-of-truth rules for README / CHANGELOG / this file).

@@ -1,25 +1,21 @@
+**English** | [한국어](./README.ko.md)
+
 # deep-wiki
 
-**[한국어](README.ko.md)**
+![version](https://img.shields.io/github/package-json/v/Sungmin-Cho/claude-deep-wiki?label=version)
+![license](https://img.shields.io/github/license/Sungmin-Cho/claude-deep-wiki)
+[![part of deep-suite](https://img.shields.io/badge/part%20of-deep--suite-5b8def)](https://github.com/Sungmin-Cho/claude-deep-suite)
 
-An LLM-managed markdown wiki for persistent knowledge accumulation — a Claude Code plugin implementation of [Karpathy's LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) philosophy.
+An LLM-managed markdown wiki for persistent knowledge accumulation — a plugin implementation of [Karpathy's LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) philosophy for Claude Code and Codex.
 
 > *"Most people's experience with LLMs and documents looks like RAG: you upload a collection of files, the LLM retrieves relevant chunks at query time, and generates an answer. This works, but the LLM is rediscovering knowledge from scratch on every question. There's no accumulation."*
 > — Andrej Karpathy
 
-## Codex Compatibility
+Instead of re-discovering knowledge each time (RAG), deep-wiki **incrementally builds and maintains a persistent wiki** — a structured, interlinked collection of markdown files. When you add a new source, the LLM reads it, extracts key information, and integrates it into the existing wiki. The cross-references are already there; the contradictions have already been flagged; the synthesis already reflects everything you've read. The knowledge is compiled once and kept current, not re-derived on every query.
 
-This release includes native Codex plugin metadata in `.codex-plugin/plugin.json` and a Codex project guide in `AGENTS.md`. The Claude Code manifest remains in `.claude-plugin/plugin.json`, and the unchanged `claude-deep-suite` marketplace namespace lets existing installs keep their plugin keys while Codex reads the suite's `.agents/plugins/marketplace.json`.
+## Role in deep-suite
 
-### Role in Harness Engineering
-
-deep-wiki serves as the **persistent knowledge layer** in the [Deep Suite](https://github.com/Sungmin-Cho/claude-deep-suite) ecosystem. In the [Harness Engineering](https://martinfowler.com/articles/harness-engineering.html) framework's 2×2 matrix, it operates as an **Inferential Guide** — providing accumulated project knowledge that shapes the agent's understanding during Phase 1 Research, replacing the need for repeated RAG queries with a compounding knowledge base.
-
-## The Idea
-
-Instead of re-discovering knowledge each time (RAG), Claude Code **incrementally builds and maintains a persistent wiki** — a structured, interlinked collection of markdown files. When you add a new source, the LLM reads it, extracts key information, and integrates it into the existing wiki. The knowledge is compiled once and kept current, not re-derived on every query.
-
-**The wiki is a persistent, compounding artifact.** The cross-references are already there. The contradictions have already been flagged. The synthesis already reflects everything you've read.
+deep-wiki is the **persistent knowledge layer** of the [deep-suite](https://github.com/Sungmin-Cho/claude-deep-suite). In the [Harness Engineering](https://martinfowler.com/articles/harness-engineering.html) 2×2 matrix it acts as an **Inferential Guide** — accumulated project knowledge that shapes the agent's understanding, replacing repeated RAG queries with a compounding knowledge base. The 5 `/wiki-*` entry points are skills, so they run natively from Claude Code (slash commands) and from Codex / Copilot CLI / Gemini CLI / the Agent SDK via `Skill({ skill: "deep-wiki:wiki-<verb>" })`.
 
 ## Architecture
 
@@ -37,124 +33,82 @@ Raw Sources  →  Wiki (markdown pages)  →  Schema (management rules)
 | **Wiki** | LLM-generated markdown pages with cross-references | LLM writes, you read |
 | **Schema** | Rules governing how the wiki is structured and maintained | Co-evolved |
 
-## Platform Support
+## Install
 
-| OS | Status | Notes |
-|---|---|---|
-| macOS | ✅ Primary | Developed and tested on Darwin 25+. |
-| Linux | ✅ Supported | Requires bash 4+, GNU coreutils. |
-| Windows | ⚠️ Experimental | Requires **Git Bash** or **WSL2**. Native `cmd.exe` / PowerShell not supported for the SessionStart hook. See "Windows Setup" below. |
-
-### Windows Setup (Git Bash or WSL2)
-
-1. Install Git for Windows (includes Git Bash) or enable WSL2.
-2. Set `wiki_root` using POSIX paths — **never** Windows-native form:
-   - ✅ `/c/Users/name/Obsidian/MyVault/wiki` (Git Bash)
-   - ✅ `/mnt/c/Users/name/Obsidian/MyVault/wiki` (WSL2)
-   - ❌ `C:\Users\name\Obsidian\MyVault\wiki` (rejected by the hook)
-3. If Obsidian CLI is installed, ensure `obsidian version` succeeds in Git Bash (you may need to add the Obsidian install directory, typically under `%LOCALAPPDATA%\Programs\Obsidian\`, to `PATH`).
-4. Google Drive mounted volumes (e.g. `G:\내 드라이브\...`) work in Git Bash as `/g/내 드라이브/...`. Prefer offline-mirrored mode to avoid placeholder-file mtime quirks.
-5. Enable long-path support on Windows 10 1607+ if your wiki path approaches 260 characters (required for `.wiki-meta/.versions/<long-name>.vN.md` depth).
-
-> Known Windows-only limitations: NTFS is case-insensitive (kebab-case naming enforced by the schema avoids conflicts); some Unix-only commands in entry-skill docs (`which`, `mkdir -p`) require bash.
-
-### Upgrading from 1.0.x / 1.1.0 → 1.1.1
-
-1. **Re-run `/wiki-setup`** if you did not do so after installing Obsidian CLI — v1.1.0's CLI integration requires an `obsidian_cli` block in `~/.claude/deep-wiki-config.yaml` that setup writes automatically.
-2. **If you cloned on Windows before 1.1.1** (i.e. before `.gitattributes` was added), your shell scripts may have been CRLF-converted. Re-normalize from a **clean working tree**:
-   ```bash
-   # Ensure nothing is uncommitted first:
-   git status                    # must show no changes
-   # If you have in-progress work, stash it:
-   git stash --include-untracked
-   # Re-normalize:
-   git add --renormalize .
-   git commit -m "chore: normalize line endings"
-   # Restore in-progress work:
-   git stash pop
-   ```
-   > ⚠️ Do **not** use `git rm --cached -r . && git reset --hard` — it destroys all uncommitted changes in the worktree.
-
-## Installation
-
-### Prerequisites
-
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI installed and configured
-
-### Via Deep Suite marketplace (recommended)
+### Via the deep-suite marketplace (recommended)
 
 ```bash
-# 1. Add the marketplace
+# Claude Code
 /plugin marketplace add Sungmin-Cho/claude-deep-suite
-
-# 2. Install the plugin
 /plugin install deep-wiki@Sungmin-Cho-claude-deep-suite
+
+# Codex
+codex plugin install deep-wiki
 ```
 
 ### Standalone
 
 ```bash
-# 1. Add this repo as a marketplace
 /plugin marketplace add Sungmin-Cho/claude-deep-wiki
-
-# 2. Install
 /plugin install deep-wiki@Sungmin-Cho-claude-deep-wiki
 ```
 
-## Quick Start
+Prerequisite: the [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI (or Codex) installed and configured.
+
+## Quick start
 
 ```bash
 # 1. Initialize the wiki
-/deep-wiki:wiki-setup ~/Obsidian/MyVault/wiki
+/wiki-setup ~/Obsidian/MyVault/wiki
 
 # 2. Ingest sources into the wiki
-/deep-wiki:wiki-ingest https://example.com/article
-/deep-wiki:wiki-ingest ./document.pdf
-/deep-wiki:wiki-ingest  # paste text directly
+/wiki-ingest https://example.com/article
+/wiki-ingest ./document.pdf
+/wiki-ingest                       # paste text directly
 
 # 3. Query the wiki
-/deep-wiki:wiki-query What are the rules of React hooks?
+/wiki-query What are the rules of React hooks?
 
 # 4. Health check
-/deep-wiki:wiki-lint
+/wiki-lint
 ```
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `/wiki-setup` | Initialize wiki and create directory structure |
-| `/wiki-ingest` | Read a source (URL, file, text) and create/update wiki pages |
+| `/wiki-setup` | Initialize the wiki and create the directory structure |
+| `/wiki-ingest` | Read a source (URL, file, text, deep-work report) and create/update wiki pages |
 | `/wiki-query` | Search the wiki and generate grounded answers; auto-files cross-page syntheses back into the wiki |
 | `/wiki-lint` | Health check — schema violations, orphan pages, broken links, contradictions (also runs automatically after ingest/rebuild) |
-| `/wiki-rebuild` | Regenerate index.json from page frontmatter |
+| `/wiki-rebuild` | Regenerate the machine-readable index from page frontmatter |
 
-### Operations in Detail
+### Operations in detail
 
-**Ingest** — Drop a new source and tell the LLM to process it. The LLM reads the source, writes summary pages, updates the index, updates relevant pages across the wiki, and appends to the log. A single source might touch multiple wiki pages. New information is merged with existing content — pages grow richer with each ingest. **Auto-lint runs after every ingest** to keep the wiki healthy.
+**Ingest** — Drop a new source and the LLM reads it, writes summary pages, updates the index, updates relevant pages across the wiki, and appends to the log. A single source might touch multiple pages. New information is merged with existing content — pages grow richer with each ingest. **Auto-lint runs after every ingest.**
 
-**Query** — Ask questions against the wiki. The LLM searches for relevant pages using a three-layer strategy (index scan → content search → candidate reading) and synthesizes an answer grounded in wiki content, with citations. **When a query synthesizes insights across 2+ pages, the result is automatically filed back into the wiki** — the knowledge compounds.
+**Query** — Ask questions against the wiki. The LLM searches for relevant pages using a three-layer strategy (index scan → content search → candidate reading) and synthesizes a grounded answer with citations. **When a query synthesizes insights across 2+ pages, the result is automatically filed back into the wiki** — the knowledge compounds.
 
-**Lint** — Health-check the wiki. Looks for: schema violations, contradictions between pages, orphan pages with no inbound links, broken links, stale versions, and index drift. Optionally auto-fixes structural issues with `--fix`. **Runs automatically after ingest and rebuild** — you only need to invoke it manually for deep inspections.
+**Lint** — Health-check the wiki: schema violations, contradictions, orphan pages, broken links, stale versions, and index drift. `--fix` auto-repairs structural issues. **Runs automatically after ingest and rebuild** — invoke it manually for deep inspections.
 
-**Rebuild** — Regenerate `index.json` from page frontmatter. Use when the index is out of sync or corrupted. Auto-lint runs after rebuild.
+**Rebuild** — Regenerate `index.json` from page frontmatter. Use when the index is out of sync or corrupted. Auto-lint runs afterward.
 
-## Storage Structure
+## Storage structure
 
 ```
 <wiki_root>/
-├── index.md                  # LLM-written catalog (human-readable)
+├── index.md                  # LLM-written dashboard (human-readable)
 ├── log.md                    # LLM-written chronicle (human-readable)
-├── .wiki-meta/
-│   ├── index.json            # Machine-readable page catalog (derived; v1.5.0+ M3 envelope-wrapped — see CHANGELOG)
-│   ├── sources/              # Per-source provenance YAML files
-│   └── .versions/            # Page backups before overwrite (last 3)
 ├── log.jsonl                 # Append-only structured event log
-└── pages/                    # Wiki pages (flat, tag-based classification)
+├── pages/                    # Wiki pages (flat, tag-based classification)
+└── .wiki-meta/
+    ├── index.json            # Machine-readable page catalog (derived; M3 envelope-wrapped)
+    ├── sources/              # Per-source provenance YAML files
+    └── .versions/            # Page backups before overwrite (last 3)
 ```
 
 Key design decisions:
-- **Flat pages directory** — no subdirectories. Tags replace categories (more flexible, no broken links from moves).
+- **Flat `pages/` directory** — no subdirectories. Tags replace categories (more flexible, no broken links from moves).
 - **Dual artifacts** — `index.md`/`log.md` are LLM-written for humans; `index.json`/`log.jsonl` are machine-readable counterparts.
 - **`.wiki-meta/` is hidden** — invisible in Obsidian's graph view and file explorer.
 
@@ -173,44 +127,9 @@ obsidian_cli:
   wiki_prefix: "wiki"
 ```
 
-### Cloud-Backed `wiki_root` and the Mirror-and-Sync Workflow (v1.2.0+)
+### Auto-ingest scope (`auto_ingest`)
 
-If your Obsidian vault — and therefore `wiki_root` — lives on iCloud Drive, Google Drive, Dropbox, or a similar sync-daemon-mounted path, every wiki write wakes the sync client and incurs hundreds of milliseconds of latency per `Read`/`Write`. For a typical 5-10 page ingest this can add 15-30s of pure I/O wait on top of LLM inference time.
-
-**Recommended workflow for cloud-backed vaults:**
-
-1. **Run the wiki on local disk.** Choose a non-synced path, e.g. `~/deep-wiki-local/`, and point `wiki_root` there in `~/.claude/deep-wiki-config.yaml`.
-
-   > **Note (R3W3, v1.2.1+):** when `wiki_root` is set to a non-vault local path like `~/deep-wiki-local/`, the SessionStart hook computes `VAULT_ROOT=$(dirname "$WIKI_ROOT")` and watches *that* directory — i.e. `$HOME` — rather than your Obsidian vault. This produces noisy, irrelevant auto-ingest candidates. In the local-mirror configuration the auto-ingest hook should be either disabled (in `~/.claude/settings.json`) or short-circuited via `auto_ingest.ignore_globs: ['**']`. The reverse-rsync from the vault into local replaces hook-driven detection in this mode. A future v1.3.0+ `vault_root:` config knob will let the hook target the vault path explicitly while `wiki_root` stays local.
-2. **Mirror to the vault on a schedule.** Use `rsync` from launchd (macOS) or cron to push the local wiki into the vault every 10-30 minutes. **Use additive sync only — `--delete` is INTENTIONALLY OMITTED**:
-   ```bash
-   # Additive only. The plugin currently has no external-edit conflict
-   # detection (W5 review finding); --delete would silently destroy edits
-   # made on other devices (phone Obsidian, another computer) before the
-   # next ingest sees them. cache_local automation in v1.3.0+ will add
-   # explicit conflict detection — until then, additive is the only safe default.
-   rsync -a --backup --backup-dir="$HOME/.deep-wiki-rsync-backups/$(date +%Y%m%d-%H%M%S)" \
-     ~/deep-wiki-local/ \
-     "$HOME/Library/CloudStorage/GoogleDrive-.../내 드라이브/Obsidian/Personal Vault/deep-wiki/"
-   ```
-3. **Multi-device editing requires manual reverse-sync first** — there is **no automated conflict detection** in v1.2.0. If you edit pages in Obsidian on a phone or another computer, run reverse-rsync to bring those edits into local *before* the next scheduled push:
-   ```bash
-   rsync -a "$HOME/Library/CloudStorage/.../deep-wiki/" ~/deep-wiki-local/
-   ```
-   Or pause auto-ingest temporarily — removing the `auto_ingest:` block in `~/.claude/deep-wiki-config.yaml` does **not** pause it (that returns to v1.1.x whole-vault detection, which is *more* aggressive). Instead, either:
-   - Add the following block to `~/.claude/deep-wiki-config.yaml` (v1.3.0+: the hook parser accepts block, inline, and dotted forms — see [§Config syntax — three accepted forms](#config-syntax--three-accepted-forms) for examples):
-     ```yaml
-     auto_ingest:
-       ignore_globs:
-         - "**"
-     ```
-   - OR disable the deep-wiki SessionStart hook in `~/.claude/settings.json`.
-
-**Why not automate this in the plugin?** The `cache_local` config option that does this transparently is planned for v1.3.0+. The trade-off (race window between local edit and rsync push) deserves a deliberate config knob rather than implicit behavior. v1.2.0 documents the manual workflow and ships only the latency-related observations.
-
-## Config syntax — three accepted forms
-
-Since v1.3.0, the SessionStart hook parser accepts `auto_ingest.ignore_globs` in any of these YAML forms — pick whichever fits your YAML style:
+The SessionStart hook accepts an optional `auto_ingest` block to filter what it scans, in any of three YAML forms (all equivalent; when both block and dotted forms appear, the entries are unioned):
 
 ```yaml
 # Block form
@@ -218,6 +137,7 @@ auto_ingest:
   ignore_globs:
     - "**/archive-*.md"
     - "**/draft-*.md"
+  require_tag: project        # only ingest files whose frontmatter carries this tag
 
 # Inline form
 auto_ingest:
@@ -227,90 +147,112 @@ auto_ingest:
 auto_ingest.ignore_globs: ["**/archive-*.md"]
 ```
 
-All three produce identical behavior. When both block and dotted forms appear in the same config, the entries are unioned (both contribute).
+### Cloud-backed `wiki_root` (iCloud / Google Drive / Dropbox)
 
-## Recommended Tools
+If your Obsidian vault lives on a sync-daemon-mounted path, every wiki write wakes the sync client and adds hundreds of milliseconds of latency per `Read`/`Write` — a typical 5–10 page ingest can add 15–30s of pure I/O wait. Recommended workflow:
 
-Tools referenced in [Karpathy's LLM Wiki gist](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) that enhance the wiki workflow.
+1. **Run the wiki on local disk.** Point `wiki_root` at a non-synced path, e.g. `~/deep-wiki-local/`.
 
-### CLI Tools
+   > When `wiki_root` is a non-vault local path, the SessionStart hook watches its parent directory (`dirname "$WIKI_ROOT"`, i.e. `$HOME`), producing noisy auto-ingest candidates. In this mode either disable the hook in `~/.claude/settings.json` or set `auto_ingest.ignore_globs: ['**']`, and rely on reverse-rsync from the vault instead of hook-driven detection.
 
-| Tool | Purpose | Install |
-|------|---------|---------|
-| **qmd** | Local markdown search engine with BM25/vector search and LLM re-ranking. Also works as an MCP server. | `npm install -g @tobilu/qmd` |
-| **marp** | Generate slide presentations (HTML/PDF/PPTX) from markdown wiki pages. | `npm install -g @marp-team/marp-cli` |
-| **obsidian** | Obsidian CLI — search, backlinks, tags, properties via running Obsidian app. Auto-detected by `/wiki-setup`. | [Obsidian CLI](https://github.com/anthropics/obsidian-cli) |
+2. **Mirror to the vault on a schedule** with `rsync` from launchd (macOS) or cron. Use **additive sync only — `--delete` is intentionally omitted**, since the plugin has no external-edit conflict detection and `--delete` could silently destroy edits made on other devices:
+   ```bash
+   rsync -a --backup --backup-dir="$HOME/.deep-wiki-rsync-backups/$(date +%Y%m%d-%H%M%S)" \
+     ~/deep-wiki-local/ \
+     "$HOME/Library/CloudStorage/GoogleDrive-.../Obsidian/Personal Vault/deep-wiki/"
+   ```
 
-```bash
-# Index your wiki with qmd
-qmd collection add ~/Obsidian/MyVault/wiki/pages
+3. **Multi-device editing requires manual reverse-sync first.** If you edit pages in Obsidian on another device, bring those edits into local *before* the next scheduled push:
+   ```bash
+   rsync -a "$HOME/Library/CloudStorage/.../deep-wiki/" ~/deep-wiki-local/
+   ```
+   Removing the `auto_ingest:` block does **not** pause auto-ingest (it reverts to whole-vault detection, which is *more* aggressive); instead set `ignore_globs: ['**']` or disable the SessionStart hook.
 
-# Generate slides from a wiki page
-marp wiki-page.md -o slides.html
+## Auto-ingest (SessionStart hook)
 
-# Run qmd as MCP server for agent integration
-qmd mcp --http
-```
+The plugin ships a SessionStart hook that **automatically detects new or modified files** in the Obsidian vault each time a Claude Code session starts — write notes as usual and the wiki stays up to date.
 
-> `/wiki-setup` automatically checks whether these tools are installed and shows install commands for any that are missing.
+1. On session start, the hook scans the vault for `.md` files modified since the last scan.
+2. If the Obsidian CLI is available, `obsidian recents` supplements the scan (union + dedupe, with mtime verification).
+3. If new files are found, Claude is instructed to auto-ingest them.
+4. Files are grouped by topic and batch-processed; auto-lint runs afterward.
 
-## Obsidian Compatibility
+Excluded from scanning: to-do files, VPN passwords, `.obsidian/` internals, and the wiki itself.
 
-- Create the wiki inside an Obsidian vault to leverage graph view, backlinks, and search
-- Works as a pure markdown directory without Obsidian
-- `.wiki-meta/` is automatically hidden from Obsidian
-- Standard markdown links (not wikilinks) ensure portability
+## Obsidian compatibility
 
-When `/wiki-setup` detects that the wiki is inside an Obsidian vault, it automatically checks for recommended plugins and reports their status. If the Obsidian CLI is installed and the app is running, it also enables enhanced features:
+- Create the wiki inside an Obsidian vault to leverage graph view, backlinks, and search — or use it as a plain markdown directory without Obsidian.
+- `.wiki-meta/` is automatically hidden from Obsidian.
+- Standard markdown links (not wikilinks) ensure portability.
 
-### Obsidian CLI Integration
+When `/wiki-setup` detects an Obsidian vault, it checks for recommended plugins and reports their status. If the Obsidian CLI is installed and the app is running, wiki operations use it for richer results (with filesystem fallback when it is not):
 
-When detected by `/wiki-setup`, the Obsidian CLI enhances wiki operations:
-
-| Feature | CLI Command | Fallback |
-|---------|------------|----------|
+| Feature | CLI command | Fallback |
+|---------|-------------|----------|
 | Content search | `obsidian search:context` | Grep |
 | Orphan detection | `obsidian orphans` | Regex link scan |
 | Broken link detection | `obsidian unresolved` | File existence check |
 | Backlink analysis | `obsidian backlinks` | Not available |
 | Tag statistics | `obsidian tags counts` | Frontmatter parsing |
 
-All vault-wide CLI results are filtered to the wiki boundary. The CLI is optional — all commands work without it via filesystem fallback.
+**Recommended Obsidian plugins:** Graph view (see hubs and orphans), Dataview (query page frontmatter), Marp Slides (render slide decks), and the [Obsidian Web Clipper](https://obsidian.md/clipper) (clip web articles for quick ingest).
 
-**Recommended Obsidian plugins:**
-- **Graph view** — see the shape of your wiki, hubs, and orphans
-- **Dataview** — query page frontmatter (tags, sources) for dynamic tables
-- **Marp Slides** — render Marp slide decks directly in Obsidian
-- **Obsidian Web Clipper** — browser extension to clip web articles as markdown for quick ingest (install from https://obsidian.md/clipper)
+## Recommended tools
 
-## Auto-Ingest (SessionStart Hook)
+Tools referenced in [Karpathy's LLM Wiki gist](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) that enhance the workflow. `/wiki-setup` checks whether each is installed and shows install commands for any that are missing.
 
-The plugin includes a SessionStart hook that **automatically detects new or modified files** in the Obsidian vault every time a Claude Code session starts. No manual action needed — just write notes as usual, and the wiki stays up to date.
+| Tool | Purpose | Install |
+|------|---------|---------|
+| **qmd** | Local markdown search engine with BM25/vector search and LLM re-ranking. Also works as an MCP server. | `npm install -g @tobilu/qmd` |
+| **marp** | Generate slide presentations (HTML/PDF/PPTX) from markdown wiki pages. | `npm install -g @marp-team/marp-cli` |
+| **obsidian** | Obsidian CLI — search, backlinks, tags, properties via the running Obsidian app. Auto-detected by `/wiki-setup`. | [Obsidian CLI](https://github.com/anthropics/obsidian-cli) |
 
-**How it works:**
-1. On session start, the hook scans the vault for `.md` files modified since the last scan
-2. If Obsidian CLI is available, `obsidian recents` supplements the scan (union + deduplicate, with mtime verification)
-3. If new files are found, Claude is instructed to auto-ingest them
-4. Files are grouped by topic and batch-processed
-5. The wiki is updated with new knowledge, and auto-lint runs afterward
+```bash
+qmd collection add ~/Obsidian/MyVault/wiki/pages   # index your wiki with qmd
+marp wiki-page.md -o slides.html                   # generate slides from a wiki page
+qmd mcp --http                                     # run qmd as an MCP server
+```
 
-**Excluded from scanning:** To-do files, VPN passwords, `.obsidian/` internals, the wiki itself.
-
-## deep-work Integration
+## deep-work integration
 
 Ingest deep-work session reports into the wiki:
 
 ```bash
-/deep-wiki:wiki-ingest /path/to/deep-work/session/report.md
+/wiki-ingest /path/to/deep-work/session/report.md
 ```
+
+## Platform support
+
+| OS | Status | Notes |
+|---|---|---|
+| macOS | Primary | Developed and tested on Darwin 25+. |
+| Linux | Supported | Requires bash 4+, GNU coreutils. |
+| Windows | Experimental | Requires **Git Bash** or **WSL2**. Native `cmd.exe` / PowerShell is not supported for the SessionStart hook. |
+
+**Windows setup (Git Bash or WSL2):**
+
+1. Install Git for Windows (includes Git Bash) or enable WSL2.
+2. Set `wiki_root` using POSIX paths — never the Windows-native form:
+   - `/c/Users/name/Obsidian/MyVault/wiki` (Git Bash) or `/mnt/c/Users/name/Obsidian/MyVault/wiki` (WSL2)
+   - `C:\Users\name\...` is rejected by the hook.
+3. If the Obsidian CLI is installed, ensure `obsidian version` succeeds in Git Bash (you may need to add the Obsidian install directory, typically `%LOCALAPPDATA%\Programs\Obsidian\`, to `PATH`).
+4. Google Drive mounted volumes (`G:\...`) appear in Git Bash as `/g/...`. Prefer offline-mirrored mode to avoid placeholder-file mtime quirks.
+5. Enable long-path support on Windows 10 1607+ if your wiki path approaches 260 characters.
+
+> NTFS is case-insensitive; the schema's kebab-case naming avoids conflicts. Some Unix-only commands in the skill docs (`which`, `mkdir -p`) require bash.
 
 ## Philosophy
 
-This plugin implements the pattern described in Karpathy's [LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f):
-
 > *"The tedious part of maintaining a knowledge base is not the reading or the thinking — it's the bookkeeping. Updating cross-references, keeping summaries current, noting when new data contradicts old claims, maintaining consistency across dozens of pages. Humans abandon wikis because the maintenance burden grows faster than the value. LLMs don't get bored, don't forget to update a cross-reference, and can touch 15 files in one pass."*
+> — Andrej Karpathy
 
 The human's job is to curate sources, direct the analysis, ask good questions, and think about what it all means. The LLM's job is everything else.
+
+## Links
+
+- [CHANGELOG](CHANGELOG.md) — release history
+- [deep-suite](https://github.com/Sungmin-Cho/claude-deep-suite) — the marketplace and the other plugins
+- [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 
 ## License
 

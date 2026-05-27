@@ -4,6 +4,8 @@ This file is **auto-loaded at the start of every new Claude session**. It contai
 
 For detailed change history see [`CHANGELOG.md`](CHANGELOG.md) / [`CHANGELOG.ko.md`](CHANGELOG.ko.md). This file is intentionally kept short — it carries only the project overview plus drift-resistant structural and schema information. Version-by-version release notes are deliberately excluded.
 
+> 📄 Documentation in this repo follows `docs/DOCS_RULE.md` (local maintainer guide — single-source-of-truth rules for README / CHANGELOG / this file).
+
 ---
 
 ## Project Overview

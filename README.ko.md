@@ -1,162 +1,116 @@
+[English](./README.md) | **한국어**
+
 # deep-wiki
 
-**[English](README.md)**
+![version](https://img.shields.io/github/package-json/v/Sungmin-Cho/claude-deep-wiki?label=version)
+![license](https://img.shields.io/github/license/Sungmin-Cho/claude-deep-wiki)
+[![part of deep-suite](https://img.shields.io/badge/part%20of-deep--suite-5b8def)](https://github.com/Sungmin-Cho/claude-deep-suite)
 
-LLM이 관리하는 마크다운 위키 — [Karpathy의 LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) 철학을 구현한 Claude Code 플러그인.
+LLM이 관리하는 마크다운 위키 — [Karpathy의 LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) 철학을 Claude Code와 Codex에서 구현한 플러그인입니다.
 
 > *"대부분의 사람들이 LLM과 문서를 사용하는 방식은 RAG입니다. 파일 모음을 업로드하면 LLM이 쿼리 시점에 관련 청크를 검색하고 답변을 생성합니다. 이건 작동하지만, LLM은 매번 질문할 때마다 지식을 처음부터 재발견하고 있습니다. 축적이 없습니다."*
 > — Andrej Karpathy
 
-## Codex 호환성
+매번 지식을 재발견하는 RAG 대신, deep-wiki는 **점진적으로 영구 위키를 구축하고 유지**합니다 — 구조화되고 상호 연결된 마크다운 파일 모음입니다. 새 소스를 추가하면 LLM이 읽고, 핵심 정보를 추출하고, 기존 위키에 통합합니다. 상호 참조는 이미 거기 있고, 모순은 이미 표시되어 있으며, 종합은 이미 읽은 모든 내용을 반영합니다. 지식은 한 번 컴파일되고 최신 상태로 유지되며, 매 쿼리마다 다시 도출되지 않습니다.
 
-이번 릴리스는 `.codex-plugin/plugin.json` Codex 네이티브 플러그인 메타데이터와 `AGENTS.md` Codex 프로젝트 가이드를 포함합니다. Claude Code 매니페스트는 `.claude-plugin/plugin.json`에 그대로 유지되며, 기존 `claude-deep-suite` marketplace namespace를 유지해 기존 설치 키를 보존하면서 Codex는 suite의 `.agents/plugins/marketplace.json`을 읽습니다.
+## deep-suite에서의 역할
 
-### 하네스 엔지니어링에서의 역할
-
-deep-wiki는 [Deep Suite](https://github.com/Sungmin-Cho/claude-deep-suite) 생태계의 **지속적 지식 레이어**입니다. [Harness Engineering](https://martinfowler.com/articles/harness-engineering.html) 프레임워크의 2×2 매트릭스에서 **Inferential Guide**로 동작 — Phase 1 Research에서 에이전트의 이해를 형성하는 축적된 프로젝트 지식을 제공하며, 반복적인 RAG 쿼리를 복리로 쌓이는 지식 베이스로 대체합니다.
-
-## 핵심 아이디어
-
-매번 지식을 재발견하는 RAG 대신, Claude Code가 **점진적으로 영구 위키를 구축하고 유지**합니다 — 구조화되고 상호 연결된 마크다운 파일 모음입니다. 새 소스를 추가하면 LLM이 읽고, 핵심 정보를 추출하고, 기존 위키에 통합합니다. 지식은 한 번 컴파일되고 최신 상태로 유지되며, 매 쿼리마다 다시 도출되지 않습니다.
-
-**위키는 영구적이고 복리로 쌓이는 산출물입니다.** 교차 참조는 이미 되어 있고, 모순은 이미 표시되어 있고, 합성은 이미 읽은 모든 것을 반영합니다.
+deep-wiki는 [deep-suite](https://github.com/Sungmin-Cho/claude-deep-suite)의 **지속적 지식 레이어**입니다. [Harness Engineering](https://martinfowler.com/articles/harness-engineering.html) 2×2 매트릭스에서 **Inferential Guide**로 동작 — 에이전트의 이해를 형성하는 축적된 프로젝트 지식을 제공하며, 반복적인 RAG 쿼리를 복리로 쌓이는 지식 베이스로 대체합니다. 5개의 `/wiki-*` 진입점은 스킬이므로 Claude Code(슬래시 커맨드)에서, 그리고 Codex / Copilot CLI / Gemini CLI / Agent SDK에서 `Skill({ skill: "deep-wiki:wiki-<verb>" })` 형태로 네이티브로 실행됩니다.
 
 ## 아키텍처
 
 Karpathy의 3계층 모델 기반:
 
 ```
-Raw Sources  →  Wiki (마크다운 페이지)  →  Schema (관리 규칙)
-    ↑                   ↑                       ↑
- wiki-ingest        pages/              wiki-schema skill
+Raw Sources  →  Wiki (markdown pages)  →  Schema (management rules)
+    ↑                   ↑                        ↑
+ wiki-ingest        pages/               wiki-schema skill
 ```
 
 | 계층 | 설명 | 소유자 |
-|------|------|--------|
-| **Raw Sources** | 변경 불가 입력 — 파일, URL, 텍스트, 리포트 | 사용자가 큐레이션 |
-| **Wiki** | LLM이 생성한 교차 참조 마크다운 페이지 | LLM이 작성, 사용자가 읽음 |
-| **Schema** | 위키 구조와 유지 방법을 규정하는 규칙 | 함께 발전 |
-
-## 플랫폼 지원
-
-| OS | 상태 | 비고 |
-|---|---|---|
-| macOS | ✅ 기본 지원 | Darwin 25+에서 개발·검증. |
-| Linux | ✅ 지원 | bash 4+ 와 GNU coreutils 필요. |
-| Windows | ⚠️ 실험 단계 | **Git Bash** 또는 **WSL2** 필요. 네이티브 `cmd.exe` / PowerShell은 SessionStart hook 실행 불가. 아래 "Windows 설정" 참고. |
-
-### Windows 설정 (Git Bash 또는 WSL2)
-
-1. Git for Windows (Git Bash 포함) 설치 또는 WSL2 활성화.
-2. `wiki_root`는 반드시 POSIX 형식으로 지정 — Windows 네이티브 경로는 **거부됨**:
-   - ✅ `/c/Users/name/Obsidian/MyVault/wiki` (Git Bash)
-   - ✅ `/mnt/c/Users/name/Obsidian/MyVault/wiki` (WSL2)
-   - ❌ `C:\Users\name\Obsidian\MyVault\wiki` (hook이 거부)
-3. Obsidian CLI 설치 시 Git Bash에서 `obsidian version`이 성공하는지 확인 (필요 시 `%LOCALAPPDATA%\Programs\Obsidian\`을 `PATH`에 추가).
-4. Google Drive 마운트 볼륨(`G:\내 드라이브\...`)은 Git Bash에서 `/g/내 드라이브/...`로 접근. placeholder 파일 mtime 이슈 회피를 위해 **오프라인 미러 모드** 권장.
-5. Windows 10 1607+에서 long-path 지원 활성화 (`.wiki-meta/.versions/<long-name>.vN.md` 깊이가 260자에 근접할 때 필요).
-
-> Windows 한정 제약: NTFS는 대소문자 구분 없음(스키마의 kebab-case 소문자 규칙 덕에 실제 충돌 위험 낮음). 커맨드 문서의 일부 Unix 전용 명령(`which`, `mkdir -p`)은 bash 환경 필요.
-
-### 1.0.x / 1.1.0 → 1.1.1 업그레이드
-
-1. **`/wiki-setup` 재실행** — Obsidian CLI 설치 후 `/wiki-setup`을 다시 실행하지 않았다면 지금 재실행하세요. v1.1.0 CLI 통합 기능은 `~/.claude/deep-wiki-config.yaml`에 `obsidian_cli` 블록이 있어야 활성화되며, setup이 자동으로 기록합니다.
-2. **Windows에서 1.1.1 이전 clone을 사용 중이라면** (즉 `.gitattributes` 추가 이전) shell script가 CRLF로 변환되어 있을 수 있습니다. **clean working tree 상태**에서 재정규화하세요:
-   ```bash
-   # 먼저 커밋 안 된 변경이 없는지 확인
-   git status                    # 변경 없음 상태여야 함
-   # 진행 중 작업이 있으면 stash
-   git stash --include-untracked
-   # 재정규화
-   git add --renormalize .
-   git commit -m "chore: normalize line endings"
-   # 진행 중 작업 복원
-   git stash pop
-   ```
-   > ⚠️ `git rm --cached -r . && git reset --hard`는 사용하지 마세요 — worktree의 모든 커밋되지 않은 변경을 파괴합니다.
+|-------|-------------|-------|
+| **Raw Sources** | 불변 입력 — 파일, URL, 텍스트, 리포트 | 사용자가 큐레이션 |
+| **Wiki** | 상호 참조가 있는 LLM 생성 마크다운 페이지 | LLM이 작성, 사용자가 읽음 |
+| **Schema** | 위키 구조화·유지 방식을 규정하는 규칙 | 함께 진화 |
 
 ## 설치
 
-### 사전 요구사항
-
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI 설치 및 설정 완료
-
-### Deep Suite 마켓플레이스 (권장)
+### deep-suite 마켓플레이스 경유 (권장)
 
 ```bash
-# 1. 마켓플레이스 추가
+# Claude Code
 /plugin marketplace add Sungmin-Cho/claude-deep-suite
-
-# 2. 플러그인 설치
 /plugin install deep-wiki@Sungmin-Cho-claude-deep-suite
+
+# Codex
+codex plugin install deep-wiki
 ```
 
 ### 단독 설치
 
 ```bash
-# 1. 이 레포를 마켓플레이스로 추가
 /plugin marketplace add Sungmin-Cho/claude-deep-wiki
-
-# 2. 설치
 /plugin install deep-wiki@Sungmin-Cho-claude-deep-wiki
 ```
 
-## 시작하기
+전제 조건: [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI(또는 Codex)가 설치·구성되어 있어야 합니다.
+
+## 빠른 시작
 
 ```bash
 # 1. 위키 초기화
-/deep-wiki:wiki-setup ~/Obsidian/MyVault/wiki
+/wiki-setup ~/Obsidian/MyVault/wiki
 
-# 2. 소스를 위키에 추가
-/deep-wiki:wiki-ingest https://example.com/article
-/deep-wiki:wiki-ingest ./document.pdf
-/deep-wiki:wiki-ingest  # 텍스트를 직접 붙여넣기
+# 2. 소스를 위키로 ingest
+/wiki-ingest https://example.com/article
+/wiki-ingest ./document.pdf
+/wiki-ingest                       # 텍스트를 직접 붙여넣기
 
-# 3. 위키에서 질문
-/deep-wiki:wiki-query React hooks의 규칙은?
+# 3. 위키 질의
+/wiki-query React hooks의 규칙이 뭐야?
 
-# 4. 건강 점검
-/deep-wiki:wiki-lint
+# 4. 헬스 체크
+/wiki-lint
 ```
 
-## 명령어
+## 커맨드
 
-| 명령어 | 설명 |
-|--------|------|
+| 커맨드 | 설명 |
+|---------|-------------|
 | `/wiki-setup` | 위키 초기화 및 디렉토리 구조 생성 |
-| `/wiki-ingest` | 소스(URL, 파일, 텍스트)를 읽어 위키 페이지 생성/업데이트 |
-| `/wiki-query` | 위키에서 검색하고 근거 있는 답변 생성; 교차 페이지 합성 결과를 자동으로 위키에 환류 |
-| `/wiki-lint` | 건강 점검 — 스키마 위반, 고아 페이지, 깨진 링크, 모순 탐지 (ingest/rebuild 후 자동 실행) |
-| `/wiki-rebuild` | index.json을 페이지 frontmatter에서 재생성 |
+| `/wiki-ingest` | 소스(URL, 파일, 텍스트, deep-work 리포트)를 읽어 위키 페이지 생성/갱신 |
+| `/wiki-query` | 위키 검색 후 근거 기반 답변 생성; 페이지 간 종합은 위키에 자동 파일링 |
+| `/wiki-lint` | 헬스 체크 — 스키마 위반, orphan 페이지, broken link, 모순 (ingest/rebuild 후 자동 실행) |
+| `/wiki-rebuild` | 페이지 frontmatter로부터 machine-readable 인덱스 재생성 |
 
-### 연산 상세
+### 동작 상세
 
-**Ingest** — 새 소스를 추가하면 LLM이 처리합니다. 소스를 읽고, 요약 페이지를 작성하고, 인덱스를 업데이트하고, 위키 전반의 관련 페이지를 갱신하고, 로그에 기록합니다. 하나의 소스가 여러 위키 페이지에 영향을 줄 수 있습니다. 새 정보는 기존 콘텐츠와 병합됩니다 — 페이지는 ingest할수록 풍부해집니다. **매 ingest 후 자동 lint가 실행**되어 위키를 건강하게 유지합니다.
+**Ingest** — 새 소스를 넣으면 LLM이 읽고, 요약 페이지를 작성하고, 인덱스를 갱신하고, 위키 전반의 관련 페이지를 갱신하고, 로그에 추가합니다. 하나의 소스가 여러 페이지를 건드릴 수 있습니다. 새 정보는 기존 내용과 병합되어 페이지가 ingest마다 풍부해집니다. **ingest 후 auto-lint가 실행됩니다.**
 
-**Query** — 위키에 질문합니다. LLM이 3계층 전략(인덱스 스캔 → 콘텐츠 검색 → 후보 읽기)으로 관련 페이지를 찾고, 위키 콘텐츠에 근거한 답변을 인용과 함께 합성합니다. **2개 이상의 페이지에서 교차 합성된 인사이트는 자동으로 위키에 환류**됩니다 — 지식이 복리로 쌓입니다.
+**Query** — 위키에 질문합니다. LLM이 3계층 전략(인덱스 스캔 → 콘텐츠 검색 → 후보 읽기)으로 관련 페이지를 찾아 인용과 함께 근거 기반 답변을 종합합니다. **하나의 쿼리가 2개 이상 페이지에 걸친 인사이트를 종합하면 그 결과가 위키에 자동 파일링됩니다** — 지식이 복리로 쌓입니다.
 
-**Lint** — 위키 건강 점검. 스키마 위반, 페이지 간 모순, 인바운드 링크 없는 고아 페이지, 깨진 링크, 오래된 버전, 인덱스 불일치를 탐지합니다. `--fix` 플래그로 구조적 문제를 자동 수정할 수 있습니다. **ingest와 rebuild 후 자동 실행** — 수동 실행은 깊은 점검이 필요할 때만 사용합니다.
+**Lint** — 위키 헬스 체크: 스키마 위반, 페이지 간 모순, orphan 페이지, broken link, stale 버전, 인덱스 drift. `--fix`로 구조적 문제를 자동 복구합니다. **ingest와 rebuild 후 자동 실행** — 깊은 점검 시에만 수동 호출하면 됩니다.
 
-**Rebuild** — 페이지 frontmatter에서 `index.json`을 재생성합니다. 인덱스가 동기화되지 않거나 손상되었을 때 사용합니다. rebuild 후 자동 lint가 실행됩니다.
+**Rebuild** — 페이지 frontmatter로부터 `index.json`을 재생성합니다. 인덱스가 동기화에서 벗어났거나 손상되었을 때 사용합니다. 이후 auto-lint가 실행됩니다.
 
 ## 저장 구조
 
 ```
 <wiki_root>/
-├── index.md                  # LLM이 작성한 카탈로그 (사람이 읽는 용도)
-├── log.md                    # LLM이 작성한 연대기 (사람이 읽는 용도)
-├── .wiki-meta/
-│   ├── index.json            # 머신 리더블 페이지 카탈로그 (파생; v1.5.0+ M3 envelope-wrapped — CHANGELOG 참조)
-│   ├── sources/              # 소스별 출처 추적 YAML 파일
-│   └── .versions/            # 덮어쓰기 전 페이지 백업 (최근 3개)
-├── log.jsonl                 # append-only 구조화 이벤트 로그
-└── pages/                    # 위키 페이지 (flat 구조, 태그 기반 분류)
+├── index.md                  # LLM이 작성하는 dashboard (사람이 읽음)
+├── log.md                    # LLM이 작성하는 chronicle (사람이 읽음)
+├── log.jsonl                 # Append-only 구조화 이벤트 로그
+├── pages/                    # 위키 페이지 (flat, 태그 기반 분류)
+└── .wiki-meta/
+    ├── index.json            # Machine-readable 페이지 catalog (파생; M3 envelope-wrapped)
+    ├── sources/              # 소스별 provenance YAML 파일
+    └── .versions/            # 덮어쓰기 전 페이지 백업 (최근 3개)
 ```
 
-주요 설계 결정:
-- **Flat pages 디렉토리** — 하위 디렉토리 없음. 태그가 카테고리를 대체 (더 유연하고, 이동 시 링크 깨짐 없음)
-- **이중 아티팩트** — `index.md`/`log.md`는 LLM이 사람을 위해 작성; `index.json`/`log.jsonl`은 머신 리더블 대응물
-- **`.wiki-meta/`는 숨김** — Obsidian 그래프 뷰와 파일 탐색기에서 보이지 않음
+핵심 설계 결정:
+- **Flat `pages/` 디렉토리** — 하위 디렉토리 없음. 태그가 카테고리를 대체 (더 유연하고 이동으로 인한 broken link 없음).
+- **Dual artifacts** — `index.md`/`log.md`는 사람을 위해 LLM이 작성; `index.json`/`log.jsonl`은 machine-readable 대응물.
+- **`.wiki-meta/`는 숨김** — Obsidian의 그래프 뷰와 파일 탐색기에서 보이지 않음.
 
 ## 설정
 
@@ -165,7 +119,7 @@ Raw Sources  →  Wiki (마크다운 페이지)  →  Schema (관리 규칙)
 ```yaml
 wiki_root: ~/Obsidian/MyVault/wiki
 
-# Obsidian CLI 사용 가능 시 /wiki-setup이 자동 감지 (선택 사항)
+# Obsidian CLI가 있으면 /wiki-setup이 자동 감지 (선택)
 obsidian_cli:
   available: true
   vault_name: "My Vault"
@@ -173,144 +127,132 @@ obsidian_cli:
   wiki_prefix: "wiki"
 ```
 
-### 클라우드 백엔드 `wiki_root` + Mirror-and-Sync 워크플로우 (v1.2.0+)
+### Auto-ingest 범위 (`auto_ingest`)
 
-Obsidian 볼트 — 따라서 `wiki_root` — 가 iCloud Drive, Google Drive, Dropbox 또는 유사한 sync daemon이 마운트한 경로에 있다면, 위키에 쓰기 작업을 할 때마다 sync 클라이언트가 깨어나 `Read`/`Write` 당 수백 밀리초의 지연이 발생합니다. 일반적인 5-10 페이지 ingest에서 LLM 추론 시간에 더해 순수 I/O 대기만으로 15-30초가 추가될 수 있습니다.
-
-**클라우드 백엔드 볼트를 위한 권장 워크플로우:**
-
-1. **위키를 로컬 디스크에서 실행하세요.** 동기화되지 않는 경로(예: `~/deep-wiki-local/`)를 선택하고, `~/.claude/deep-wiki-config.yaml`의 `wiki_root`를 해당 경로로 지정합니다.
-
-   > **참고 (R3W3, v1.2.1+):** `wiki_root`가 `~/deep-wiki-local/`처럼 볼트 외부 로컬 경로로 지정되면, SessionStart hook은 `VAULT_ROOT=$(dirname "$WIKI_ROOT")`을 계산하여 *그 경로*(즉, `$HOME`)를 감시합니다 — Obsidian 볼트가 아닙니다. 그 결과 무관한 auto-ingest 후보가 다수 발생합니다. 로컬 미러 구성에서는 auto-ingest hook을 비활성화하거나(`~/.claude/settings.json`에서) `auto_ingest.ignore_globs: ['**']`로 단락시켜야 합니다. 이 모드에서는 볼트→로컬 역방향 rsync가 hook 기반 감지를 대체합니다. 미래 v1.3.0+에 `vault_root:` 설정 키가 추가되면 `wiki_root`는 로컬에 두면서 hook은 볼트 경로를 명시적으로 감시할 수 있습니다.
-2. **스케줄에 따라 볼트로 미러링하세요.** launchd (macOS) 또는 cron을 통해 `rsync`를 사용하여 10-30분마다 로컬 위키를 볼트로 푸시합니다. **추가 sync만 사용하세요 — `--delete`는 의도적으로 제외됩니다**:
-   ```bash
-   # Additive only. The plugin currently has no external-edit conflict
-   # detection (W5 review finding); --delete would silently destroy edits
-   # made on other devices (phone Obsidian, another computer) before the
-   # next ingest sees them. cache_local automation in v1.3.0+ will add
-   # explicit conflict detection — until then, additive is the only safe default.
-   rsync -a --backup --backup-dir="$HOME/.deep-wiki-rsync-backups/$(date +%Y%m%d-%H%M%S)" \
-     ~/deep-wiki-local/ \
-     "$HOME/Library/CloudStorage/GoogleDrive-.../내 드라이브/Obsidian/Personal Vault/deep-wiki/"
-   ```
-3. **멀티 디바이스 편집 시에는 먼저 수동 역방향 sync가 필요합니다** — v1.2.0에는 **자동 충돌 감지가 없습니다**. 다른 기기(휴대폰 Obsidian, 다른 컴퓨터)에서 페이지를 편집한 경우, 다음 예약된 푸시 *이전에* 역방향 rsync로 해당 편집 내용을 로컬로 가져오세요:
-   ```bash
-   rsync -a "$HOME/Library/CloudStorage/.../deep-wiki/" ~/deep-wiki-local/
-   ```
-   auto-ingest를 일시 중지하고 싶다면 주의: `~/.claude/deep-wiki-config.yaml`에서 `auto_ingest:` 블록을 제거하는 것은 일시 중지가 **아닙니다** (v1.1.x 기본 동작인 전체 볼트 감지로 회귀하므로 오히려 *더* 공격적입니다). 올바른 방법은 다음 중 하나입니다:
-   - `~/.claude/deep-wiki-config.yaml`에 다음 블록을 추가하세요 (v1.3.0+: 훅 파서는 block, inline, dotted 세 가지 form을 모두 수용 — 예시는 [§설정 문법 — 세 가지 수용 form](#설정-문법--세-가지-수용-form) 참조):
-     ```yaml
-     auto_ingest:
-       ignore_globs:
-         - "**"
-     ```
-   - 또는 `~/.claude/settings.json`에서 deep-wiki SessionStart hook을 비활성화하세요.
-
-**왜 플러그인에서 자동화하지 않나요?** 이를 투명하게 처리하는 `cache_local` 설정 옵션은 v1.3.0+에서 계획되어 있습니다. 로컬 편집과 rsync 푸시 사이의 경쟁 창(race window) 트레이드오프는 암묵적 동작보다 명시적 설정 옵션이 적합합니다. v1.2.0은 수동 워크플로우를 문서화하고 지연 관련 관찰 사항만 제공합니다.
-
-## 설정 문법 — 세 가지 수용 form
-
-v1.3.0부터 SessionStart hook 파서는 `auto_ingest.ignore_globs`를 다음 세 가지 YAML form 중 어떤 것으로도 받습니다 — 선호하는 YAML 스타일에 맞춰 선택하세요:
+SessionStart hook은 스캔 대상을 필터링하는 선택적 `auto_ingest` 블록을 세 가지 YAML 형식으로 받습니다 (모두 동일; block 형식과 dotted 형식이 함께 있으면 항목이 union됩니다):
 
 ```yaml
-# Block form
+# Block 형식
 auto_ingest:
   ignore_globs:
     - "**/archive-*.md"
     - "**/draft-*.md"
+  require_tag: project        # frontmatter에 이 태그가 있는 파일만 ingest
 
-# Inline form
+# Inline 형식
 auto_ingest:
   ignore_globs: ["**/archive-*.md", "**/draft-*.md"]
 
-# Dotted form
+# Dotted 형식
 auto_ingest.ignore_globs: ["**/archive-*.md"]
 ```
 
-세 form 모두 동일한 동작을 합니다. block form과 dotted form이 같은 설정 파일에 동시에 존재하면 두 entry가 union되어(둘 다 반영) 처리됩니다.
+### 클라우드 백업 `wiki_root` (iCloud / Google Drive / Dropbox)
 
-## 추천 도구
+Obsidian vault가 sync-daemon이 마운트한 경로에 있으면 위키 write마다 sync 클라이언트가 깨어나 `Read`/`Write`당 수백 ms의 지연이 붙습니다 — 일반적인 5–10 페이지 ingest에서 순수 I/O 대기만 15–30초가 추가될 수 있습니다. 권장 워크플로우:
 
-[Karpathy의 LLM Wiki 글](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)에서 언급된 위키 워크플로우 향상 도구들입니다.
+1. **위키를 로컬 디스크에서 실행.** `wiki_root`를 동기화되지 않는 경로(예: `~/deep-wiki-local/`)로 지정합니다.
 
-### CLI 도구
+   > `wiki_root`가 vault가 아닌 로컬 경로일 때 SessionStart hook은 그 부모 디렉토리(`dirname "$WIKI_ROOT"`, 즉 `$HOME`)를 감시하여 noisy한 auto-ingest 후보를 만듭니다. 이 모드에서는 `~/.claude/settings.json`에서 hook을 비활성화하거나 `auto_ingest.ignore_globs: ['**']`를 설정하고, hook 기반 감지 대신 vault에서의 reverse-rsync에 의존하세요.
 
-| 도구 | 용도 | 설치 |
-|------|------|------|
-| **qmd** | BM25/벡터 검색 및 LLM 리랭킹을 지원하는 로컬 마크다운 검색 엔진. MCP 서버로도 사용 가능. | `npm install -g @tobilu/qmd` |
-| **marp** | 마크다운 위키 페이지에서 슬라이드 프레젠테이션(HTML/PDF/PPTX) 생성. | `npm install -g @marp-team/marp-cli` |
-| **obsidian** | Obsidian CLI — 실행 중인 Obsidian 앱을 통해 검색, 백링크, 태그, 속성 조작. `/wiki-setup`이 자동 감지. | [Obsidian CLI](https://github.com/anthropics/obsidian-cli) |
+2. **vault로 스케줄 미러링** — launchd(macOS)나 cron에서 `rsync`. 플러그인에 외부 편집 충돌 감지가 없으므로 **additive sync만 사용 — `--delete`는 의도적으로 생략**합니다 (`--delete`는 다른 기기에서 한 편집을 조용히 파괴할 수 있음):
+   ```bash
+   rsync -a --backup --backup-dir="$HOME/.deep-wiki-rsync-backups/$(date +%Y%m%d-%H%M%S)" \
+     ~/deep-wiki-local/ \
+     "$HOME/Library/CloudStorage/GoogleDrive-.../Obsidian/Personal Vault/deep-wiki/"
+   ```
 
-```bash
-# qmd로 위키 인덱싱
-qmd collection add ~/Obsidian/MyVault/wiki/pages
+3. **다중 기기 편집은 먼저 수동 reverse-sync가 필요.** 다른 기기의 Obsidian에서 페이지를 편집했다면, 다음 스케줄 push *전에* 그 편집을 로컬로 가져옵니다:
+   ```bash
+   rsync -a "$HOME/Library/CloudStorage/.../deep-wiki/" ~/deep-wiki-local/
+   ```
+   `auto_ingest:` 블록을 제거해도 auto-ingest는 **중단되지 않습니다** (whole-vault 감지로 되돌아가 *더* 공격적). 대신 `ignore_globs: ['**']`를 설정하거나 SessionStart hook을 비활성화하세요.
 
-# 위키 페이지에서 슬라이드 생성
-marp wiki-page.md -o slides.html
+## Auto-ingest (SessionStart hook)
 
-# 에이전트 연동을 위한 MCP 서버 실행
-qmd mcp --http
-```
+플러그인은 Claude Code 세션 시작마다 Obsidian vault의 **새/수정된 파일을 자동 감지**하는 SessionStart hook을 포함합니다 — 평소처럼 노트를 작성하면 위키가 최신 상태로 유지됩니다.
 
-> `/wiki-setup` 실행 시 이 도구들의 설치 여부를 자동으로 확인하고, 미설치 도구의 설치 명령어를 안내합니다.
+1. 세션 시작 시 hook이 마지막 스캔 이후 수정된 `.md` 파일을 vault에서 스캔합니다.
+2. Obsidian CLI가 있으면 `obsidian recents`가 스캔을 보완합니다 (union + dedupe, mtime 검증).
+3. 새 파일이 발견되면 Claude가 이를 auto-ingest하도록 지시받습니다.
+4. 파일은 주제별로 그룹화되어 배치 처리되며, 이후 auto-lint가 실행됩니다.
+
+스캔 제외: 할 일 파일, VPN 비밀번호, `.obsidian/` 내부, 위키 자체.
 
 ## Obsidian 호환성
 
-- Obsidian 볼트 안에 위키를 생성하면 그래프 뷰, 백링크, 검색을 활용할 수 있습니다
-- Obsidian 없이도 순수 마크다운 디렉토리로 동작합니다
-- `.wiki-meta/` 디렉토리는 Obsidian에서 자동으로 숨겨집니다
-- 표준 마크다운 링크 사용 (wikilink 아님)으로 이식성 보장
+- Obsidian vault 안에 위키를 만들면 그래프 뷰, backlink, 검색을 활용할 수 있습니다 — 또는 Obsidian 없이 순수 마크다운 디렉토리로 사용할 수 있습니다.
+- `.wiki-meta/`는 Obsidian에서 자동으로 숨겨집니다.
+- 표준 마크다운 링크(wikilink 아님)로 이식성을 보장합니다.
 
-`/wiki-setup`이 위키가 Obsidian 볼트 내부에 있음을 감지하면, 추천 플러그인의 설치 여부를 자동으로 확인하고 상태를 보고합니다. Obsidian CLI가 설치되어 있고 앱이 실행 중이면 향상된 기능도 활성화합니다:
+`/wiki-setup`이 Obsidian vault를 감지하면 권장 플러그인을 확인하고 상태를 보고합니다. Obsidian CLI가 설치되고 앱이 실행 중이면 위키 동작이 이를 사용해 더 풍부한 결과를 냅니다 (없으면 파일시스템 fallback):
 
-### Obsidian CLI 통합
-
-`/wiki-setup`에서 감지되면 Obsidian CLI가 위키 작업을 향상합니다:
-
-| 기능 | CLI 명령 | 폴백 |
-|------|----------|------|
+| 기능 | CLI 커맨드 | Fallback |
+|---------|-------------|----------|
 | 콘텐츠 검색 | `obsidian search:context` | Grep |
-| 고아 페이지 감지 | `obsidian orphans` | 정규식 링크 스캔 |
-| 깨진 링크 감지 | `obsidian unresolved` | 파일 존재 확인 |
-| 백링크 분석 | `obsidian backlinks` | 사용 불가 |
-| 태그 통계 | `obsidian tags counts` | frontmatter 파싱 |
+| Orphan 감지 | `obsidian orphans` | 정규식 link 스캔 |
+| Broken link 감지 | `obsidian unresolved` | 파일 존재 확인 |
+| Backlink 분석 | `obsidian backlinks` | 불가 |
+| 태그 통계 | `obsidian tags counts` | Frontmatter 파싱 |
 
-모든 vault-wide CLI 결과는 위키 경계로 필터링됩니다. CLI는 선택 사항이며 — 모든 명령어는 CLI 없이도 파일시스템 폴백으로 동작합니다.
+**권장 Obsidian 플러그인:** Graph view(hub와 orphan 확인), Dataview(페이지 frontmatter 질의), Marp Slides(슬라이드 덱 렌더링), [Obsidian Web Clipper](https://obsidian.md/clipper)(웹 글을 빠른 ingest용으로 클리핑).
 
-**추천 Obsidian 플러그인:**
-- **Graph view** — 위키의 형태, 허브, 고아 페이지를 시각적으로 확인
-- **Dataview** — 페이지 frontmatter(태그, 소스)를 쿼리하여 동적 테이블 생성
-- **Marp Slides** — Obsidian 내에서 Marp 슬라이드 덱을 직접 렌더링
-- **Obsidian Web Clipper** — 웹 기사를 마크다운으로 클리핑하는 브라우저 확장 프로그램, 빠른 ingest에 유용 (https://obsidian.md/clipper 에서 설치)
+## 권장 도구
 
-## 자동 Ingest (SessionStart Hook)
+[Karpathy의 LLM Wiki gist](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)에서 언급된, 워크플로우를 향상시키는 도구들입니다. `/wiki-setup`이 각 도구의 설치 여부를 확인하고 누락된 것의 설치 명령을 보여줍니다.
 
-플러그인에 포함된 SessionStart hook이 Claude Code 세션이 시작될 때마다 Obsidian vault에서 **새로운/수정된 파일을 자동으로 감지**합니다. 수동 작업 없이 평소대로 노트를 작성하면 위키가 자동으로 최신 상태를 유지합니다.
+| 도구 | 용도 | 설치 |
+|------|---------|---------|
+| **qmd** | BM25/벡터 검색 + LLM 재정렬을 갖춘 로컬 마크다운 검색 엔진. MCP 서버로도 동작. | `npm install -g @tobilu/qmd` |
+| **marp** | 마크다운 위키 페이지로부터 슬라이드(HTML/PDF/PPTX) 생성. | `npm install -g @marp-team/marp-cli` |
+| **obsidian** | Obsidian CLI — 실행 중인 Obsidian 앱을 통한 검색, backlink, 태그, 속성. `/wiki-setup`이 자동 감지. | [Obsidian CLI](https://github.com/anthropics/obsidian-cli) |
 
-**동작 방식:**
-1. 세션 시작 시, 마지막 스캔 이후 수정된 `.md` 파일을 vault에서 탐색
-2. Obsidian CLI 사용 가능 시, `obsidian recents`가 스캔을 보충 (합집합 + 중복 제거, mtime 검증 포함)
-3. 새 파일이 발견되면 Claude에게 자동 ingest를 지시
-4. 파일을 주제별로 그룹화하여 일괄 처리
-5. 위키에 새 지식이 반영되고, 자동 lint 실행
-
-**스캔 제외 대상:** To-do 파일, VPN 비밀번호, `.obsidian/` 내부, 위키 자체.
+```bash
+qmd collection add ~/Obsidian/MyVault/wiki/pages   # qmd로 위키 인덱싱
+marp wiki-page.md -o slides.html                   # 위키 페이지로부터 슬라이드 생성
+qmd mcp --http                                     # qmd를 MCP 서버로 실행
+```
 
 ## deep-work 연동
 
-deep-work 세션 리포트를 위키에 추가:
+deep-work 세션 리포트를 위키로 ingest:
 
 ```bash
-/deep-wiki:wiki-ingest /path/to/deep-work/session/report.md
+/wiki-ingest /path/to/deep-work/session/report.md
 ```
+
+## 플랫폼 지원
+
+| OS | 상태 | 비고 |
+|---|---|---|
+| macOS | Primary | Darwin 25+에서 개발·테스트. |
+| Linux | Supported | bash 4+, GNU coreutils 필요. |
+| Windows | Experimental | **Git Bash** 또는 **WSL2** 필요. SessionStart hook은 네이티브 `cmd.exe` / PowerShell 미지원. |
+
+**Windows 설정 (Git Bash 또는 WSL2):**
+
+1. Git for Windows(Git Bash 포함)를 설치하거나 WSL2를 활성화합니다.
+2. `wiki_root`를 POSIX 경로로 설정 — Windows 네이티브 형식 금지:
+   - `/c/Users/name/Obsidian/MyVault/wiki` (Git Bash) 또는 `/mnt/c/Users/name/Obsidian/MyVault/wiki` (WSL2)
+   - `C:\Users\name\...`는 hook이 거부합니다.
+3. Obsidian CLI가 설치되어 있으면 Git Bash에서 `obsidian version`이 성공하는지 확인하세요 (Obsidian 설치 디렉토리, 보통 `%LOCALAPPDATA%\Programs\Obsidian\`을 `PATH`에 추가해야 할 수 있음).
+4. Google Drive 마운트 볼륨(`G:\...`)은 Git Bash에서 `/g/...`로 나타납니다. placeholder 파일 mtime 문제를 피하려면 offline-mirrored 모드를 선호하세요.
+5. 위키 경로가 260자에 근접하면 Windows 10 1607+에서 long-path 지원을 활성화하세요.
+
+> NTFS는 대소문자 구분이 없습니다; 스키마의 kebab-case 네이밍이 충돌을 방지합니다. skill 문서의 일부 Unix 전용 명령(`which`, `mkdir -p`)은 bash가 필요합니다.
 
 ## 철학
 
-이 플러그인은 Karpathy의 [LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)에서 설명한 패턴을 구현합니다:
+> *"지식 베이스 유지에서 지루한 부분은 읽기나 사고가 아니라 bookkeeping입니다. 상호 참조 갱신, 요약 최신화, 새 데이터가 기존 주장과 모순될 때 표시하기, 수십 페이지 간 일관성 유지. 인간은 유지 부담이 가치보다 빠르게 커지기 때문에 위키를 포기합니다. LLM은 지루해하지 않고, 상호 참조 갱신을 잊지 않으며, 한 번에 15개 파일을 건드릴 수 있습니다."*
+> — Andrej Karpathy
 
-> *"지식 베이스 유지의 지루한 부분은 읽기나 사고가 아닙니다 — 기록 관리입니다. 교차 참조 업데이트, 요약을 최신 상태로 유지, 새 데이터가 기존 주장과 모순될 때 기록, 수십 페이지에 걸친 일관성 유지. 사람은 유지 보수 부담이 가치보다 빠르게 증가하기 때문에 위키를 포기합니다. LLM은 지루해하지 않고, 교차 참조 업데이트를 잊지 않으며, 한 번에 15개 파일을 수정할 수 있습니다."*
+사람의 역할은 소스를 큐레이션하고, 분석을 지휘하고, 좋은 질문을 하고, 그것이 무엇을 의미하는지 사고하는 것입니다. LLM의 역할은 나머지 전부입니다.
 
-사람의 역할은 소스를 큐레이션하고, 분석을 지시하고, 좋은 질문을 하고, 그 모든 것이 의미하는 바를 생각하는 것입니다. LLM의 역할은 나머지 전부입니다.
+## 링크
+
+- [CHANGELOG](CHANGELOG.ko.md) — 릴리스 이력
+- [deep-suite](https://github.com/Sungmin-Cho/claude-deep-suite) — 마켓플레이스와 나머지 플러그인
+- [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 
 ## 라이선스
 

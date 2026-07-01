@@ -40,7 +40,7 @@ Raw Sources  →  Wiki (markdown pages)  →  Schema (management rules)
 ```bash
 # Claude Code
 /plugin marketplace add Sungmin-Cho/claude-deep-suite
-/plugin install deep-wiki@Sungmin-Cho-claude-deep-suite
+/plugin install deep-wiki@claude-deep-suite
 
 # Codex
 codex plugin install deep-wiki

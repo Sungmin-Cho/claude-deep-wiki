@@ -516,3 +516,59 @@ test('F3-c: counter reaching 3 makes the guarded promotion reachable (e2e)', () 
     fs.rmSync(f.tmp, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Review fix (impl R4) #6 — the F1 single-source path writes the retry counter
+// as `<.pending-scan ISO string>:<count>`, but the multi-source Step 7.5.M-D
+// contract defined the SAME file as `<window_epoch>:<count>`. Two paths sharing
+// .pending-scan-retry-count with different key formats reset each other's
+// counter, delaying/blocking the 3-strike escape. Fix: the multi-source
+// contract adopts the same verbatim-`.pending-scan` key + colon-safe parse.
+// ---------------------------------------------------------------------------
+
+// Slice the multi-source counter contract prose (Counter file format → clear).
+function extractMultiSourceCounterContract(md) {
+  const sIdx = md.indexOf('**Counter file format**');
+  assert.notEqual(sIdx, -1, 'multi-source counter contract start not found');
+  const eIdx = md.indexOf('**Counter clear**', sIdx);
+  assert.notEqual(eIdx, -1, 'multi-source counter contract end not found');
+  return md.slice(sIdx, eIdx);
+}
+
+// F6-a — doc-assertion (RED-able): the multi-source contract uses the verbatim
+// .pending-scan ISO string as the window key (string equality + colon-safe
+// parse), NOT an epoch. RED before the fix (`<window_epoch>:<count>`), GREEN
+// after.
+test('F6-a: multi-source retry-counter contract shares the F1 ISO-string key format', () => {
+  const md = fs.readFileSync(SKILL_MD, 'utf8');
+  const region = extractMultiSourceCounterContract(md);
+  assert.doesNotMatch(
+    region,
+    /<window_epoch>:<count>/,
+    'multi-source contract must not define the counter file as <window_epoch>:<count>',
+  );
+  assert.match(region, /\.pending-scan/, 'the window key must be the .pending-scan value');
+  assert.match(region, /\$\{saved%:\*\}/, 'the contract must specify the colon-safe parse (${saved%:*})');
+  assert.match(region, /string equality|verbatim/i, 'window comparison must be full-string (not epoch)');
+});
+
+// F6-b — cross-path interop (behavioral): a counter written in the unified
+// format (a colon-bearing ISO window) by one path is read + incremented by the
+// F1 path to reach 3 (would trigger the shared 3-strike escape).
+test('F6-b: a counter in the unified ISO format is continued (2 -> 3) across paths', () => {
+  const md = fs.readFileSync(SKILL_MD, 'utf8');
+  const counterBash = extractRetryCounterBash(md);
+  const f = setupFixture();
+  const window = '2026-06-01T00:00:00Z';
+  fs.writeFileSync(f.pending, window + '\n');
+  // The "other path" wrote the counter in the unified format: <ISO window>:<count>.
+  fs.writeFileSync(path.join(f.meta, '.pending-scan-retry-count'), `${window}:2`);
+  try {
+    execSync('bash', { input: counterBash, env: { ...process.env, WIKI_ROOT: f.tmp }, stdio: ['pipe', 'pipe', 'pipe'] });
+    const written = fs.readFileSync(path.join(f.meta, '.pending-scan-retry-count'), 'utf8').trim();
+    assert.equal(written.slice(written.lastIndexOf(':') + 1), '3', 'the F1 path must continue the shared counter (2 -> 3), reaching the 3-strike threshold');
+    assert.equal(written.slice(0, written.lastIndexOf(':')), window, 'the window key round-trips as the full ISO timestamp');
+  } finally {
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  }
+});

@@ -1593,25 +1593,36 @@ Plan #2.1 C2S-1 manifest + C2-W5 counter edge cases.)
   window — W3 fix + Plan #2.1 Cycle-2 C2-W5 edge-case semantics):**
   maintain a counter at `<wiki>/.wiki-meta/.pending-scan-retry-count`.
 
-  **Counter file format** (Plan #2.1, single line):
+  **Counter file format** (single line — **unified with the F1 single-source
+  path** so both read/write `.pending-scan-retry-count` without resetting each
+  other, impl R4):
   ```
-  <window_epoch>:<count>
+  <window>:<count>
   ```
-  Example: `1735738200:2` (window epoch 1735738200, fail count 2).
+  where `<window>` is the **verbatim `.pending-scan` value** (the UTC ISO-8601
+  scan-window timestamp — which itself contains colons) and `<count>` is the
+  consecutive-failure count. Example: `2026-06-01T00:00:00Z:2` (window
+  `2026-06-01T00:00:00Z`, fail count 2). Parse **colon-safely**: the window is
+  `${saved%:*}` (strip from the LAST colon → keep the whole timestamp) and the
+  count is `${saved##*:}` (field after the last colon), integer-validated.
+  NEVER `${saved%%:*}` — it truncates the timestamp at its first colon. (Why
+  the timestamp, not an epoch: `.pending-scan` stores the ISO string, and a
+  bash-3.2 / BSD-`date` portable ISO→epoch conversion is not available, so both
+  paths compare the ISO string directly.)
 
   **Read semantics** (start of every all-workers-fail handling):
-  - File missing or unreadable → treat as `<current_window_epoch>:0`
+  - File missing or unreadable → treat as `<current .pending-scan>:0`
     (initialize on first failure).
-  - Stored window_epoch ≠ current `.pending-scan` epoch → **reset count
-    to 0** (different window; previous failures don't carry over to a
-    new scan window). Write `<current>:0` (now becomes :1 after this
-    increment).
-  - Corrupt content (no colon, non-integer) → log warning, treat as
-    `<current_window_epoch>:0`, overwrite cleanly on next write.
+  - Stored `<window>` ≠ current `.pending-scan` value (**string equality** on
+    the full timestamp) → **reset count to 0** (different window; previous
+    failures don't carry over to a new scan window). Write `<current>:0` (now
+    becomes :1 after this increment).
+  - Corrupt content (no colon, non-integer count) → log warning, treat as
+    `<current .pending-scan>:0`, overwrite cleanly on next write.
 
   **Write semantics** (after each all-workers-fail event):
   - Increment count by 1.
-  - Write `<current_window_epoch>:<count>` (overwrites stored).
+  - Write `<current .pending-scan value>:<count>` (overwrites stored).
   - Atomic write (write to temp file, mv to final — same pattern as
     v1.2.1 lock + atomic ops).
 
@@ -1642,9 +1653,9 @@ Plan #2.1 C2S-1 manifest + C2-W5 counter edge cases.)
        NC2 canonical-shape rule (Step 1.5), every action MUST preserve
        `{ts, action, source, pages_created, pages_updated}`. Concrete
        schema (Cycle-3 W-N2 + P3 fix — note: counter file format
-       `<window_epoch>:<count>` does NOT store prior timestamps; use
-       only the current trigger ts + window_epoch + retry_count to
-       characterize the failure):
+       `<window>:<count>` (window = the `.pending-scan` timestamp) does NOT
+       store prior timestamps; use only the current trigger ts + window_epoch +
+       retry_count to characterize the failure):
 
        ```jsonc
        {

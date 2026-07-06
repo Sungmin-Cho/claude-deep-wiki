@@ -258,15 +258,27 @@ test('T1-d: reader rejects empty .last-scan and falls through to .pending-scan',
 // block in skills/wiki-ingest/SKILL.md do_all_failed_under_lock 3-strike path.
 const F1_PROMOTE_BASH = `
 current_window=$(cat "\${WIKI_ROOT}/.wiki-meta/.pending-scan" 2>/dev/null || echo "")
+RETRY_FILE="\${WIKI_ROOT}/.wiki-meta/.pending-scan-retry-count"
 if [ -n "$current_window" ]; then
   TS_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
   LAST_FILE="\${WIKI_ROOT}/.wiki-meta/.last-scan"
   CURRENT_LAST=$(cat "$LAST_FILE" 2>/dev/null || echo "")
   if [[ "$current_window" =~ $TS_RE ]] && { [[ -z "$CURRENT_LAST" ]] || ! [[ "$CURRENT_LAST" =~ $TS_RE ]] || [[ "$current_window" > "$CURRENT_LAST" ]]; }; then
     _LS_TMP="\${LAST_FILE}.tmp.$$.$(date +%s)"
-    printf '%s\\n' "$current_window" > "$_LS_TMP" && mv "$_LS_TMP" "$LAST_FILE"
+    if printf '%s\\n' "$current_window" > "$_LS_TMP" && mv "$_LS_TMP" "$LAST_FILE"; then
+      rm -f "\${WIKI_ROOT}/.wiki-meta/.pending-scan"
+      rm -f "$RETRY_FILE"
+    else
+      rm -f "$_LS_TMP" 2>/dev/null || true
+      echo "FATAL: F1 3-strike could not advance .last-scan (rename failed); .pending-scan and retry counter preserved." >&2
+      exit 1
+    fi
+  else
+    rm -f "\${WIKI_ROOT}/.wiki-meta/.pending-scan"
+    rm -f "$RETRY_FILE"
   fi
-  rm -f "\${WIKI_ROOT}/.wiki-meta/.pending-scan"
+else
+  rm -f "$RETRY_FILE"
 fi
 `;
 
@@ -353,4 +365,69 @@ test('F2-d: F1 3-strike drops a malformed window and leaves .last-scan intact', 
   } finally {
     fs.rmSync(f.tmp, { recursive: true, force: true });
   }
+});
+
+// F2-e — impl R2 fix: the valid+newer advance clears the stuck state
+// (.pending-scan + retry counter) ONLY after a CONFIRMED rename. If the rename
+// fails (ENOSPC/EACCES/network FS), .last-scan stays stale, so both the window
+// and the counter must be preserved for the next hook cycle. RED before the fix
+// (the pre-R2 form dropped .pending-scan + counter unconditionally on failure).
+test('F2-e: F1 3-strike preserves .pending-scan + retry counter when the rename fails', () => {
+  const f = setupFixture();
+  const window = '2026-06-01T00:00:00Z';
+  const priorLast = '2026-05-01T00:00:00Z';           // older → advance attempted
+  fs.writeFileSync(f.pending, window + '\n');
+  fs.writeFileSync(f.last, priorLast + '\n');
+  const retryFile = path.join(f.meta, '.pending-scan-retry-count');
+  const retryContent = '1748736000:3';                // window_epoch:count (3-strike armed)
+  fs.writeFileSync(retryFile, retryContent);
+
+  // Shadow `mv` with a stub that always fails, so the temp write succeeds but
+  // the rename into `.last-scan` does not.
+  const binDir = path.join(f.tmp, 'stub-bin');
+  fs.mkdirSync(binDir, { recursive: true });
+  const mvStub = path.join(binDir, 'mv');
+  fs.writeFileSync(mvStub, '#!/bin/sh\nexit 1\n');
+  fs.chmodSync(mvStub, 0o755);
+
+  try {
+    let status = 0;
+    try {
+      execSync('bash', {
+        input: F1_PROMOTE_BASH,
+        env: { ...process.env, WIKI_ROOT: f.tmp, PATH: `${binDir}:${process.env.PATH}` },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch (e) {
+      status = e.status || 1;   // the block bails non-zero on rename failure
+    }
+    assert.notEqual(status, 0, 'the promotion must bail non-zero when the rename fails');
+    assert.equal(fs.readFileSync(f.last, 'utf8').trim(), priorLast, '.last-scan must stay at its prior value (advance did not commit)');
+    assert.equal(fs.existsSync(f.pending), true, '.pending-scan must be preserved (the only record of the stuck window)');
+    assert.equal(fs.readFileSync(f.pending, 'utf8').trim(), window, '.pending-scan content unchanged');
+    assert.equal(fs.existsSync(retryFile), true, 'retry counter must be preserved (escape stays armed for the next cycle)');
+    assert.equal(fs.readFileSync(retryFile, 'utf8'), retryContent, 'retry counter content unchanged');
+    assert.equal(
+      fs.readdirSync(f.meta).filter((n) => n.startsWith('.last-scan.tmp.')).length,
+      0,
+      'the failed temp file must be cleaned up (no stray tmp)',
+    );
+  } finally {
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  }
+});
+
+// F2-f — shipped-procedure guard (RED-able) for impl R2: the real SKILL.md
+// 3-strike region must clear the stuck state ONLY inside a rename-success gate,
+// and a failed rename must surface a fatal error + bail (lock released).
+test('F2-f: F1 3-strike gates .pending-scan/counter cleanup on a confirmed rename (impl R2)', () => {
+  const md = fs.readFileSync(SKILL_MD, 'utf8');
+  const region = extractF1ThreeStrike(md);
+  assert.match(
+    region,
+    /if\s+printf[^\n]*&&\s*mv[^\n]*;\s*then/,
+    'the .last-scan advance must be success-gated (if printf … && mv …; then)',
+  );
+  assert.match(region, /FATAL/, 'a failed rename must surface a fatal error (not silently drop state)');
+  assert.match(region, /return 1/, 'a failed rename must bail (return 1) after releasing the lock');
 });

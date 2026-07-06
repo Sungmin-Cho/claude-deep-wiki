@@ -1160,22 +1160,45 @@ PFAIL_EOF
     # .last-scan`, which regressed or corrupted .last-scan (invariant #2) when
     # the stuck window was stale (older than .last-scan) or malformed. Advance
     # .last-scan ONLY when the window is a valid TS strictly newer than the
-    # current .last-scan; EITHER way drop .pending-scan so the stuck window is
-    # released (the whole point of the 3-strike escape).
+    # current .last-scan; the stuck state (.pending-scan + retry counter) is
+    # cleared ONLY AFTER a confirmed write+rename (impl R2 fix). The invalid /
+    # stale branch drops .pending-scan unconditionally — no .last-scan write is
+    # at risk there, so it always releases the stuck window.
     if [ -n "$current_window" ]; then
       TS_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
       LAST_FILE="<wiki>/.wiki-meta/.last-scan"
       CURRENT_LAST=$(cat "$LAST_FILE" 2>/dev/null || echo "")
       if [[ "$current_window" =~ $TS_RE ]] \
          && { [[ -z "$CURRENT_LAST" ]] || ! [[ "$CURRENT_LAST" =~ $TS_RE ]] || [[ "$current_window" > "$CURRENT_LAST" ]]; }; then
-        # Atomic advance (temp + rename) — runs under .wiki-lock so tmp cannot collide.
+        # Valid + newer: advance .last-scan atomically (temp + rename) — runs
+        # under .wiki-lock so tmp cannot collide. Clear the stuck state ONLY on
+        # a CONFIRMED rename. If the write/rename fails (ENOSPC / EACCES /
+        # network FS), .last-scan is still stale, so dropping .pending-scan +
+        # the retry counter here would lose the only record of the window
+        # (silent window loss or duplicate re-detection). Preserve both, surface
+        # a fatal error, release the lock, and bail — the next hook cycle
+        # re-detects the window and re-attempts the escape.
         _LS_TMP="${LAST_FILE}.tmp.$$.$(date +%s)"
-        printf '%s\n' "$current_window" > "$_LS_TMP" && mv "$_LS_TMP" "$LAST_FILE"
+        if printf '%s\n' "$current_window" > "$_LS_TMP" && mv "$_LS_TMP" "$LAST_FILE"; then
+          rm -f "<wiki>/.wiki-meta/.pending-scan"
+          rm -f "$RETRY_FILE"
+        else
+          rm -f "$_LS_TMP" 2>/dev/null || true
+          echo "FATAL: F1 3-strike could not advance .last-scan (rename failed) for $slug — .pending-scan and retry counter PRESERVED; next session re-detects and retries. Check disk space / permissions on <wiki>/.wiki-meta/." >&2
+          rmdir "<wiki>/.wiki-meta/.wiki-lock" 2>/dev/null || true
+          trap - EXIT
+          return 1
+        fi
+      else
+        # Invalid / stale window: no .last-scan write. Drop .pending-scan to
+        # release the stuck window (invariant #2 preserved) + clear the counter.
+        rm -f "<wiki>/.wiki-meta/.pending-scan"
+        rm -f "$RETRY_FILE"
       fi
-      rm -f "<wiki>/.wiki-meta/.pending-scan"
+    else
+      # No pending window recorded — nothing to promote; clear the counter.
+      rm -f "$RETRY_FILE"
     fi
-    # Clear retry counter.
-    rm -f "$RETRY_FILE"
     echo "ERROR: F1 all-dropped path hit 3-strike escape for $slug. .pending-scan promoted; manual investigation required." >&2
   else
     # Normal retry-required emit — action `ingest` with pages_failed.

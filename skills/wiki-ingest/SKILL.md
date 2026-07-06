@@ -3040,18 +3040,20 @@ obsidian backlinks path="<wiki_prefix>/pages/<page>.md" format=json
 
 > **Wiki boundary filtering is mandatory.** `obsidian orphans` and `obsidian unresolved` return vault-wide results. Always post-filter against `<wiki_prefix>/pages/` to avoid reporting unrelated vault notes as wiki issues.
 
-**Auto-fix** what can be fixed without human judgment. v1.5.0+: index
-mutations MUST go through the envelope-wrap helper to preserve the
-envelope wrapper (round-2 Codex review P2-B). Recommended form is to
-delegate to `/wiki-rebuild` (regenerates the full envelope-wrapped index
-from page frontmatter — the source of truth per
-`skills/wiki-schema/SKILL.md`); an in-place patch path follows the same
-read-merge-write pattern as Step 9 above.
+**Auto-fixable issues are NOT mutated here** (invariant #3 — this post-ingest
+auto-lint runs POST-LOCK and holds no lock, so it must not write wiki state).
+Delegate them to `/wiki-lint --fix`, which mutates ONLY under the lock: its §13
+Auto-Fix Phase A self-acquires `.wiki-lock` for the retention prune, and its
+Phase B delegates `index.json` repair to `/wiki-rebuild` (the single lock owner,
+envelope-preserving). Never prune `.versions/` or patch `index.json` unlocked
+from this step:
 
-- Add missing pages to `index.json` (via envelope helpers — delegate to
-  `/wiki-rebuild` or apply the Step 9 read-merge-write pattern)
-- Remove ghost entries from `index.json` (same)
-- Prune excess page versions (keep last 3)
+- Missing / ghost `index.json` entries → `/wiki-lint --fix` (Phase B → `/wiki-rebuild`)
+- Excess page versions (keep last 3) → `/wiki-lint --fix` (Phase A retention prune)
+
+`index.json` is already kept in sync under the lock by Step 9 during the ingest
+transaction; this post-lock step only reports drift and defers any repair to the
+locked `/wiki-lint --fix` path above.
 
 **Report issues** that require human judgment (only if found):
 - Schema violations (missing frontmatter)

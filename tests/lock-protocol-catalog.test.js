@@ -155,6 +155,30 @@ test('F5-a: Step 7.6.G post-lock auto-lint is read-only; prune deferred to a loc
 });
 
 // ---------------------------------------------------------------------------
+// Review fix (impl R5) #7 — R4 corrected Step 7.6.G's comment but left the
+// Step 13 SECTION body ("### 13. Auto-Lint") still instructing an unlocked
+// "**Auto-fix**" (add/remove index.json entries, prune excess versions). An
+// agent following that section post-release mutates state without the lock
+// (invariant #3). The fix makes the section read-only + delegates the
+// auto-fixable mutations to `/wiki-lint --fix` (self-locking §13 Phase A / B).
+// ---------------------------------------------------------------------------
+test('F7-a: Step 13 Auto-Lint section performs no unlocked mutation (delegates auto-fix)', () => {
+  const md = fs.readFileSync(INGEST, 'utf8');
+  // Anchor on the real markdown heading (leading newline), not the 7.6.G comment
+  // that quotes "### 13. Auto-Lint".
+  const sIdx = md.indexOf('\n### 13. Auto-Lint');
+  assert.notEqual(sIdx, -1, 'Step 13 section not found');
+  const section = md.slice(sIdx, md.indexOf('\n### 14.', sIdx));
+  assert.doesNotMatch(
+    section,
+    /\*\*Auto-fix\*\* what can be fixed/,
+    'Step 13 must not carry an unlocked auto-fix mutation directive',
+  );
+  assert.match(section, /\/wiki-lint --fix/, 'Step 13 must delegate auto-fixable mutations to /wiki-lint --fix');
+  assert.match(section, /read-only/i, 'Step 13 must state it is read-only');
+});
+
+// ---------------------------------------------------------------------------
 // Review fix (impl R5) #8 — Pattern 2 (the 7.6.C conversion) holds the lock
 // across 7.6.C -> 7.6.D -> 7.6.E -> 7.6.F -> 7.6.G, but only 7.6.C registered a
 // failure-only trap. A general command failure in an intermediate block

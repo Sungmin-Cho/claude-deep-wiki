@@ -98,6 +98,36 @@ trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
 rmdir "$LOCK_DIR"
 ```
 
+### Trap patterns (catalog)
+
+Invariant #3 requires acquire-before-write and release-before-end-of-critical-
+section, but the **trap form** depends on whether the lock lives in one Bash
+block or spans several. The Claude Code Bash tool spawns a **fresh shell per
+```bash``` block**, so an `EXIT` trap registered in an acquisition block fires
+the instant that block ends — releasing the lock before the next block runs.
+Three patterns cover every skill; pick by lock span, not by habit.
+
+- **Pattern 1 — single-block, unconditional-release trap.** Acquire, register
+  `trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT`, mutate, and let the block
+  end all in ONE `bash` block. Block exit releases the lock. Use when the whole
+  critical section fits in one block. On contention, either hard `exit 1` or
+  soft-skip (pattern 3) if the caller still emits a user-facing report.
+  Examples: `wiki-ingest` Step 7.6.C, `wiki-query` Layer 2, `wiki-lint` §13
+  Auto-Fix Phase A.
+
+- **Pattern 2 — multi-block, failure-only trap + explicit success release.**
+  When the lock must span several blocks, the acquisition block registers **no**
+  `EXIT` trap (it would release too early). Instead the mutation block registers
+  a trap that releases ONLY on failure (`rc != 0`), and a later block releases
+  explicitly (`rmdir` + `trap - EXIT`) on success. Examples: `wiki-rebuild`
+  Step 1 + Step 3/6, `wiki-query` Step 5a + Step 5d/5e.
+
+- **Pattern 3 — contention soft-fail (WARN / return).** When a hard `exit 1` on
+  a busy lock would terminate the whole script before a user-facing message or
+  diagnostic sentinel is emitted, WARN to stderr and `return` non-zero instead
+  of exiting. Use in function-context paths that own later cleanup. Example:
+  `wiki-ingest` F1 `do_all_failed_under_lock`.
+
 ### Stale Lock Recovery
 
 If a process crashes without releasing the lock, the directory remains. To detect stale locks:

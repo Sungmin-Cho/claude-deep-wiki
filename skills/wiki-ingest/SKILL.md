@@ -2330,12 +2330,20 @@ fi  # End if/elif (Case ii / Case i). Case (iii) PARTIAL_FAIL=false AND no yaml 
 rmdir "<wiki>/.wiki-meta/.wiki-lock"
 trap - EXIT
 
-# Step 13 (Auto-Lint, includes retention prune `last-3 .versions per page`)
-# — runs POST-LOCK. Read-mostly + idempotent; safe outside the transaction.
-# Retention prune retains the newest .versions/v<N+1>.md created by 7.6.C
-# and prunes from the oldest end — no risk of pruning the just-created
-# backup.
-run_step_13_auto_lint
+# Step 13 (Auto-Lint) — runs POST-LOCK, READ-ONLY ONLY. The Step 13 checks
+# (schema compliance, broken links, index drift, orphan detection — see
+# "### 13. Auto-Lint" below) never mutate state, so they are safe to run once
+# this ingest transaction has released the lock.
+#
+# Invariant #3 (every write acquires the lock): the retention prune
+# (`keep last-3 .versions per page`) is a MUTATION and MUST NOT run unlocked
+# here. It is performed ONLY through wiki-lint §13 Auto-Fix Phase A
+# (skills/wiki-lint/SKILL.md), whose block self-acquires `.wiki-lock`
+# (mkdir + unconditional-release trap, pattern 1) before pruning and soft-skips
+# on contention. Pruning unlocked right after this Step 12 rmdir would let a
+# concurrent ingest that grabs the freed lock race the prune against its own
+# fresh `.versions/` backups + index repair.
+run_step_13_auto_lint   # read-only diagnostics only; retention prune runs under the lock via wiki-lint §13 Phase A
 ```
 
 Surface result to user (Step 14 final report unchanged from v1.3.0).
@@ -2961,6 +2969,8 @@ The same two operations (inbox cleanup + rmdir) must also run on any error exit 
 
 Run an automatic health check after the ingest completes. This ensures the wiki stays healthy without the user needing to manually invoke `/wiki-lint`.
 
+> **Read-only (invariant #3):** this post-ingest auto-lint runs POST-LOCK and performs **diagnostics only** — it never mutates wiki state. The retention prune (`keep last-3 .versions per page`) is a mutation and is performed under the wiki lock via wiki-lint §13 Auto-Fix Phase A (`skills/wiki-lint/SKILL.md`), which self-acquires `.wiki-lock` — never unlocked here.
+
 Perform these lint checks silently:
 
 1. **Schema compliance** — verify all affected pages have required frontmatter
@@ -3111,5 +3121,5 @@ In this case:
   - Legacy `created`/`updated`/`versioned`/`failed` shape applies ONLY to the Step 8 manifest AFTER main reconciles drafts/page_plans (i.e., post-aggregation, NOT raw split-agent output). Step 8a's manifest construction generates this shape from per-agent outputs; Step 8b+ validation operates on this constructed manifest, not on the raw agent JSON.
 - Always release the lock in case of errors (use trap in bash operations)
 - **Inbox cleanup (type: text)**: The trap that releases the lock also deletes each file in `INBOX_FILES` (populated in Step 6.5). Never use `.inbox/*.txt` wildcards — stale inbox files from a prior crashed session belong to that session and may still be needed for recovery. This cleanup runs on success AND failure so pasted text never lingers on disk
-- **Orphan versions**: If any `failed` entry carries an `orphan_version`, surface it in the Step 14 report so the user knows a backup exists for a page that did NOT get overwritten. Auto-lint's retention prune (Step 13) handles actual cleanup — no special action here
+- **Orphan versions**: If any `failed` entry carries an `orphan_version`, surface it in the Step 14 report so the user knows a backup exists for a page that did NOT get overwritten. The retention prune (wiki-lint §13 Auto-Fix Phase A, under the wiki lock) handles actual cleanup — no special action here
 - If the agent returns `failed` entries (partial success): proceed with metadata updates for the succeeded pages and include the failures in the Step 14 report. **Do NOT promote `.pending-scan` on any partial or full failure** — the next session's hook will re-detect and re-process the window (no data loss). This matches the original "process all files successfully before promoting" semantics

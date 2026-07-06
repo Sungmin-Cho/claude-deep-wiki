@@ -126,3 +126,28 @@ test('F1-c: storage-layout.md lists wiki-ingest 7.6.C under Pattern 2, not Patte
   assert.doesNotMatch(p1, /7\.6\.C/, 'Pattern 1 must no longer list wiki-ingest Step 7.6.C');
   assert.match(p2, /7\.6\.C/, 'Pattern 2 must list wiki-ingest Step 7.6.C (multi-block critical section)');
 });
+
+// ---------------------------------------------------------------------------
+// Review fix (impl R4) #5 — Step 7.6.G released the lock (rmdir + trap -) and
+// then ran `run_step_13_auto_lint`, whose comment claimed it "includes
+// retention prune last-3 .versions per page" and was "safe outside the
+// transaction". A retention prune is a MUTATION, so running it unlocked breaks
+// invariant #3 (every write acquires the lock) — a concurrent ingest that grabs
+// the freed lock races the prune against its own fresh .versions backups. The
+// fix: the post-lock auto-lint is read-only diagnostics; the prune is performed
+// only through wiki-lint §13 Auto-Fix Phase A, which self-acquires the lock.
+// ---------------------------------------------------------------------------
+test('F5-a: Step 7.6.G post-lock auto-lint is read-only; prune deferred to a locked path', () => {
+  const md = fs.readFileSync(INGEST, 'utf8');
+  const gIdx = md.indexOf('#### Step 7.6.G');
+  assert.notEqual(gIdx, -1, 'Step 7.6.G heading not found');
+  const gBlock = md.slice(gIdx, md.indexOf('\n#### ', gIdx + 10));
+  assert.doesNotMatch(
+    gBlock,
+    /safe outside the transaction/i,
+    '7.6.G must not claim the post-lock prune is safe outside the lock transaction',
+  );
+  assert.match(gBlock, /read-only/i, '7.6.G must state the post-lock auto-lint is read-only');
+  assert.match(gBlock, /Phase A/, '7.6.G must route the retention prune through wiki-lint §13 Phase A (self-locked)');
+  assert.match(gBlock, /invariant #3/i, '7.6.G must tie the prune-under-lock rule to invariant #3');
+});

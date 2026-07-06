@@ -21,6 +21,7 @@ const assert = require('node:assert/strict');
 const S = (...p) => path.resolve(__dirname, '..', 'skills', ...p);
 const STORAGE = S('wiki-schema', 'references', 'storage-layout.md');
 const SCHEMA = S('wiki-schema', 'SKILL.md');
+const SCHEMA_YAML = S('wiki-schema', 'wiki-schema.yaml');
 
 // T3-a — the 3-pattern catalog exists in storage-layout.md (RED-able).
 test('T3-a: storage-layout.md documents all three lock patterns', () => {
@@ -299,4 +300,30 @@ test('F10-c: wiki-rebuild Step 5 auto-fix prunes under the held lock', () => {
     /under the .*lock|invariant #3/i,
     'wiki-rebuild auto-fix (prune) must state it runs under the held lock',
   );
+});
+
+// ---------------------------------------------------------------------------
+// Review fix (impl R7) #12 — the canonical wiki-schema still promised
+// `auto_lint.auto_fix: "Fix silently without user action"` (index drift, excess
+// versions, stale pending), contradicting the read-only-delegation model. The
+// yaml and the wiki-schema/SKILL.md prose must both state that post-ingest
+// auto-lint is read-only and auto-repair is delegated to the self-locking
+// `/wiki-lint --fix` path. This sync guard fails if either side drifts back.
+// ---------------------------------------------------------------------------
+test('F12-a: auto_lint contract is read-only + delegated (no "Fix silently") in schema.yaml and SKILL.md', () => {
+  const yaml = fs.readFileSync(SCHEMA_YAML, 'utf8');
+  const skill = fs.readFileSync(SCHEMA, 'utf8');
+
+  // wiki-schema.yaml auto_lint block — no silent-auto-fix promise; delegates.
+  const al = yaml.slice(yaml.indexOf('auto_lint:'), yaml.indexOf('\n\n', yaml.indexOf('auto_lint:')) + 1 || yaml.length);
+  assert.notEqual(al.length, 0, 'auto_lint block not found in wiki-schema.yaml');
+  assert.doesNotMatch(al, /Fix silently without user action/, 'auto_lint must not promise a silent unlocked auto-fix');
+  assert.match(al, /read-only|\/wiki-lint --fix|delegat/i, 'auto_lint must state read-only diagnostics + delegation to /wiki-lint --fix');
+
+  // wiki-schema/SKILL.md Auto-Lint section — same read-only + delegation.
+  const alIdx = skill.indexOf('## Auto-Lint');
+  assert.notEqual(alIdx, -1, '## Auto-Lint section not found in wiki-schema/SKILL.md');
+  const section = skill.slice(alIdx, skill.indexOf('\n## ', alIdx + 4));
+  assert.doesNotMatch(section, /auto-fixes structural issues.*silently/i, 'SKILL.md must not claim the post-ingest lint auto-fixes silently');
+  assert.match(section, /read-only|\/wiki-lint --fix|delegat/i, 'SKILL.md Auto-Lint section must state read-only diagnostics + delegation');
 });

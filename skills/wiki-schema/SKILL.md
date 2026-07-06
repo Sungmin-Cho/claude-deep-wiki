@@ -232,9 +232,9 @@ Before overwriting an existing page, copy the current version to `.wiki-meta/.ve
 
 ## Auto-Lint
 
-Lint runs **automatically** after every write operation (`wiki-ingest`, `wiki-rebuild`, and `wiki-query` auto-filing). Users do not need to invoke `/wiki-lint` manually — it is only needed for on-demand deep inspection or `--fix` on legacy issues.
+Lint runs **automatically** after every write operation (`wiki-ingest`, `wiki-rebuild`, and `wiki-query` auto-filing). Users do not need to invoke `/wiki-lint` manually for the diagnostics — it is only needed for on-demand deep inspection or `--fix` repairs.
 
-Auto-lint checks: schema compliance, broken links, index drift, orphan detection. It auto-fixes structural issues (index drift, excess versions) silently and only reports issues requiring human judgment.
+The post-ingest auto-lint is **read-only** (invariant #3 — every write acquires the lock): it runs the diagnostics (schema compliance, broken links, index drift, orphan detection) and reports issues, but it does NOT mutate wiki state. Auto-repairable issues (index drift, excess versions, stale `.pending-scan`) are **delegated to `/wiki-lint --fix`**, which mutates only under the wiki lock (§13 Auto-Fix Phase A self-acquires `.wiki-lock`; Phase B delegates index repair to `/wiki-rebuild`). Issues requiring human judgment are reported only.
 
 ## Query Auto-Filing
 

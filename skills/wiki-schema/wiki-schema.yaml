@@ -136,20 +136,24 @@ failure_state:         # v1.3.0+: partial-fail retry artifacts under .wiki-meta/
     semantics: "Last committed scan window. SessionStart hook uses this as the lower bound for new-file detection."
 
 auto_lint:
-  trigger_after:         # Auto-lint runs after these operations
+  trigger_after:         # Post-ingest auto-lint runs after these operations
     - ingest
     - rebuild
     - query-filed
+  mode: read-only-diagnostics   # v1.7.1+: the post-ingest/rebuild auto-lint NEVER mutates wiki state (invariant #3 — every write acquires the lock). Diagnostics only.
   checks:
     - schema_compliance
     - broken_links
     - index_drift
     - orphan_detection
     - scan_window_invariant   # v1.2.0+
-  auto_fix:              # Fix silently without user action
-    - index_drift
-    - excess_versions
-    - stale_pending_scan      # v1.2.0+ (drops .pending-scan when older than .last-scan)
+  auto_repair:           # v1.7.1+: NOT fixed silently here — delegated to the self-locking `/wiki-lint --fix` path (§13 Auto-Fix Phase A self-acquires .wiki-lock; Phase B → /wiki-rebuild). The post-ingest lint only reports drift; it does not mutate.
+    delegated_to: "/wiki-lint --fix"
+    under_lock: true
+    items:
+      - index_drift
+      - excess_versions
+      - stale_pending_scan      # v1.2.0+ (drops .pending-scan when older than .last-scan)
   report_only:           # Only report if issues found (no noise)
     - schema_violations
     - broken_links

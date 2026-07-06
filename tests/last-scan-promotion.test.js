@@ -245,3 +245,112 @@ test('T1-d: reader rejects empty .last-scan and falls through to .pending-scan',
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Review fix (impl R1) #2 — the F1 all-dropped 3-strike escape promoted the
+// stuck window with a raw `mv "<wiki>/…/.pending-scan" "<wiki>/…/.last-scan"`,
+// with NO TS_RE validation and NO monotonicity check. A stale window (older
+// than .last-scan) would regress .last-scan, and a malformed one would corrupt
+// it — both invariant #2 (.last-scan monotonicity) breaks. The fix reuses the
+// Step 11 promotion guard: advance .last-scan ONLY when the window is a valid
+// TS strictly newer than .last-scan; either way drop .pending-scan so the stuck
+// window is still released. F1_PROMOTE_BASH must stay in sync with the guarded
+// block in skills/wiki-ingest/SKILL.md do_all_failed_under_lock 3-strike path.
+const F1_PROMOTE_BASH = `
+current_window=$(cat "\${WIKI_ROOT}/.wiki-meta/.pending-scan" 2>/dev/null || echo "")
+if [ -n "$current_window" ]; then
+  TS_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
+  LAST_FILE="\${WIKI_ROOT}/.wiki-meta/.last-scan"
+  CURRENT_LAST=$(cat "$LAST_FILE" 2>/dev/null || echo "")
+  if [[ "$current_window" =~ $TS_RE ]] && { [[ -z "$CURRENT_LAST" ]] || ! [[ "$CURRENT_LAST" =~ $TS_RE ]] || [[ "$current_window" > "$CURRENT_LAST" ]]; }; then
+    _LS_TMP="\${LAST_FILE}.tmp.$$.$(date +%s)"
+    printf '%s\\n' "$current_window" > "$_LS_TMP" && mv "$_LS_TMP" "$LAST_FILE"
+  fi
+  rm -f "\${WIKI_ROOT}/.wiki-meta/.pending-scan"
+fi
+`;
+
+// Slice the F1 3-strike escape sub-block out of the real SKILL.md.
+function extractF1ThreeStrike(md) {
+  const startAnchor = '# 3-strike escape — emit ingest-fail';
+  const sIdx = md.indexOf(startAnchor);
+  assert.notEqual(sIdx, -1, 'F1 3-strike block start anchor not found in SKILL.md');
+  const endAnchor = 'Normal retry-required emit';
+  const eIdx = md.indexOf(endAnchor, sIdx);
+  assert.notEqual(eIdx, -1, 'F1 3-strike block end anchor not found in SKILL.md');
+  return md.slice(sIdx, eIdx);
+}
+
+function runF1Promote(tmp) {
+  execSync('bash', {
+    input: F1_PROMOTE_BASH,
+    env: { ...process.env, WIKI_ROOT: tmp },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+}
+
+// F2-a — shipped-procedure guard (RED-able). The F1 3-strike region must not
+// contain the raw unguarded `mv .pending-scan .last-scan`, and MUST validate
+// via TS_RE + drop .pending-scan.
+test('F2-a: F1 3-strike promotion is guarded (no unguarded mv onto .last-scan)', () => {
+  const md = fs.readFileSync(SKILL_MD, 'utf8');
+  const region = extractF1ThreeStrike(md);
+  assert.doesNotMatch(
+    region,
+    /mv\s+"<wiki>\/\.wiki-meta\/\.pending-scan"\s+"<wiki>\/\.wiki-meta\/\.last-scan"/,
+    'F1 3-strike must not unconditionally mv .pending-scan onto .last-scan (regress/corrupt risk)',
+  );
+  assert.match(region, /TS_RE/, 'F1 3-strike must validate the stuck window against TS_RE before promoting');
+  assert.match(
+    region,
+    /rm -f "<wiki>\/\.wiki-meta\/\.pending-scan"/,
+    'F1 3-strike must drop .pending-scan (release the stuck window) on the non-promote path',
+  );
+});
+
+// F2-b — valid window strictly newer than .last-scan → atomic advance + drop.
+test('F2-b: F1 3-strike promotes a valid window newer than .last-scan (atomic advance)', () => {
+  const f = setupFixture();
+  fs.writeFileSync(f.pending, '2026-06-01T00:00:00Z\n');
+  fs.writeFileSync(f.last, '2026-05-01T00:00:00Z\n');
+  try {
+    runF1Promote(f.tmp);
+    assert.equal(fs.readFileSync(f.last, 'utf8').trim(), '2026-06-01T00:00:00Z', '.last-scan advances to the stuck window');
+    assert.equal(fs.existsSync(f.pending), false, '.pending-scan dropped (stuck window released)');
+    assert.equal(
+      fs.readdirSync(f.meta).filter((n) => n.startsWith('.last-scan.tmp.')).length,
+      0,
+      'no temp remnant on a successful atomic advance',
+    );
+  } finally {
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  }
+});
+
+// F2-c — stale window (older than .last-scan) → no regress, still dropped.
+test('F2-c: F1 3-strike drops a stale window without regressing .last-scan', () => {
+  const f = setupFixture();
+  fs.writeFileSync(f.pending, '2026-04-01T00:00:00Z\n');  // older than last
+  fs.writeFileSync(f.last, '2026-05-01T00:00:00Z\n');
+  try {
+    runF1Promote(f.tmp);
+    assert.equal(fs.readFileSync(f.last, 'utf8').trim(), '2026-05-01T00:00:00Z', '.last-scan must NOT regress (invariant #2)');
+    assert.equal(fs.existsSync(f.pending), false, 'stale .pending-scan dropped (stuck window still released)');
+  } finally {
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  }
+});
+
+// F2-d — malformed window → .last-scan untouched, still dropped.
+test('F2-d: F1 3-strike drops a malformed window and leaves .last-scan intact', () => {
+  const f = setupFixture();
+  fs.writeFileSync(f.pending, 'not-a-timestamp\n');
+  fs.writeFileSync(f.last, '2026-05-01T00:00:00Z\n');
+  try {
+    runF1Promote(f.tmp);
+    assert.equal(fs.readFileSync(f.last, 'utf8').trim(), '2026-05-01T00:00:00Z', 'invalid window must not corrupt .last-scan');
+    assert.equal(fs.existsSync(f.pending), false, 'invalid .pending-scan dropped (stuck window released)');
+  } finally {
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  }
+});

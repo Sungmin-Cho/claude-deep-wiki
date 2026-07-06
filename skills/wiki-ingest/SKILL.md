@@ -1154,9 +1154,25 @@ PFAIL_EOF
                   pages_failed=$pages_failed_json phase_timing_ms=$PHASE_TIMING_JSON \
                   fail_reason="all_f1_dropped_3_strike"
     # Promote .pending-scan despite failure (release stuck state) — same
-    # contract as v1.3.0 Step 7.5.M-D ingest-fail.
+    # contract as v1.3.0 Step 7.5.M-D ingest-fail. GUARDED promotion, SHARED
+    # with the Step 11 "Auto-Ingest" promotion block (validate TS_RE + never
+    # regress .last-scan). The pre-v1.7.1 form did a raw `mv .pending-scan
+    # .last-scan`, which regressed or corrupted .last-scan (invariant #2) when
+    # the stuck window was stale (older than .last-scan) or malformed. Advance
+    # .last-scan ONLY when the window is a valid TS strictly newer than the
+    # current .last-scan; EITHER way drop .pending-scan so the stuck window is
+    # released (the whole point of the 3-strike escape).
     if [ -n "$current_window" ]; then
-      mv "<wiki>/.wiki-meta/.pending-scan" "<wiki>/.wiki-meta/.last-scan"
+      TS_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
+      LAST_FILE="<wiki>/.wiki-meta/.last-scan"
+      CURRENT_LAST=$(cat "$LAST_FILE" 2>/dev/null || echo "")
+      if [[ "$current_window" =~ $TS_RE ]] \
+         && { [[ -z "$CURRENT_LAST" ]] || ! [[ "$CURRENT_LAST" =~ $TS_RE ]] || [[ "$current_window" > "$CURRENT_LAST" ]]; }; then
+        # Atomic advance (temp + rename) — runs under .wiki-lock so tmp cannot collide.
+        _LS_TMP="${LAST_FILE}.tmp.$$.$(date +%s)"
+        printf '%s\n' "$current_window" > "$_LS_TMP" && mv "$_LS_TMP" "$LAST_FILE"
+      fi
+      rm -f "<wiki>/.wiki-meta/.pending-scan"
     fi
     # Clear retry counter.
     rm -f "$RETRY_FILE"
@@ -1582,7 +1598,13 @@ Plan #2.1 C2S-1 manifest + C2-W5 counter edge cases.)
   When count reaches 3:
     1. Promote `.pending-scan → .last-scan` ANYWAY (releases the stuck
        window so the user can move forward; the alternative is an infinite
-       hook-time retry loop on the same files).
+       hook-time retry loop on the same files). Use the **guarded** promotion
+       (shared with the Step 11 "Auto-Ingest" block and the F1 3-strike
+       escape): advance `.last-scan` only when the window is a valid TS
+       strictly newer than the current `.last-scan`, otherwise leave
+       `.last-scan` untouched — but drop `.pending-scan` either way so the
+       stuck window is released. Never a raw `mv .pending-scan .last-scan`
+       (it would regress/corrupt `.last-scan`, invariant #2).
     2. Append a new `ingest-fail` lifecycle event to `log.jsonl`. Per
        NC2 canonical-shape rule (Step 1.5), every action MUST preserve
        `{ts, action, source, pages_created, pages_updated}`. Concrete
@@ -2340,6 +2362,9 @@ if [[ ${#SUCCESS_DRAFTS[@]} -eq 0 ]]; then
   # 4. If counter == 3:
   if [[ retry_counter == 3 ]]; then
     emit_log_line action=ingest-fail
+    # Guarded promotion (shared shorthand — see the Step 11 "Auto-Ingest"
+    # promotion block / F1 3-strike escape): validate TS_RE + advance only when
+    # strictly newer than .last-scan, else drop .pending-scan. Never a raw mv.
     promote_pending_scan_to_last_scan  # break stuck-window loop
     reset_retry_counter
   fi
@@ -2511,6 +2536,9 @@ do_ingest_skip_terminal_under_lock() {
   emit_log_line action=ingest-skip source=<slug> pages_created=[] pages_updated=[]
 
   # 3. Promote .pending-scan → .last-scan (terminal event, source is fully accounted for).
+  # Guarded promotion (shared shorthand — see the Step 11 "Auto-Ingest" promotion
+  # block / F1 3-strike escape): validate TS_RE + advance only when strictly
+  # newer than .last-scan, else drop .pending-scan. Never a raw mv.
   promote_pending_scan_to_last_scan
 
   rmdir "<wiki>/.wiki-meta/.wiki-lock"

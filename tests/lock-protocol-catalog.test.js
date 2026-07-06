@@ -13,6 +13,8 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const os = require('node:os');
+const { execSync } = require('node:child_process');
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
@@ -150,4 +152,71 @@ test('F5-a: Step 7.6.G post-lock auto-lint is read-only; prune deferred to a loc
   assert.match(gBlock, /read-only/i, '7.6.G must state the post-lock auto-lint is read-only');
   assert.match(gBlock, /Phase A/, '7.6.G must route the retention prune through wiki-lint §13 Phase A (self-locked)');
   assert.match(gBlock, /invariant #3/i, '7.6.G must tie the prune-under-lock rule to invariant #3');
+});
+
+// ---------------------------------------------------------------------------
+// Review fix (impl R5) #8 — Pattern 2 (the 7.6.C conversion) holds the lock
+// across 7.6.C -> 7.6.D -> 7.6.E -> 7.6.F -> 7.6.G, but only 7.6.C registered a
+// failure-only trap. A general command failure in an intermediate block
+// (7.6.D/7.6.F) between the 7.6.C success and the 7.6.G release would exit the
+// block non-zero with the lock still held → stranded lock, all writers blocked.
+// The catalog's Pattern 2 definition requires each mutation block to register a
+// release-on-failure trap (wiki-rebuild cleanup_step3 model).
+// ---------------------------------------------------------------------------
+test('F8-a: intermediate lock-holding blocks 7.6.D and 7.6.F register a failure-only trap', () => {
+  const md = fs.readFileSync(INGEST, 'utf8');
+  for (const [name, heading, fn] of [
+    ['7.6.D', '#### Step 7.6.D', 'cleanup_7_6_D'],
+    ['7.6.F', '#### Step 7.6.F', 'cleanup_7_6_F'],
+  ]) {
+    const block = firstBashBlockUnder(md, heading);
+    assert.match(block, new RegExp(`${fn}\\(\\)`), `${name} must define a failure-only cleanup (${fn})`);
+    assert.match(block, /rc.*-ne.*0/, `${name} cleanup must release the lock ONLY on non-zero rc`);
+    assert.match(block, new RegExp(`trap ${fn} EXIT`), `${name} must register the failure-only trap`);
+    assert.doesNotMatch(block, /trap\s+'rmdir[^']*'\s+EXIT/, `${name} must not use an unconditional release trap`);
+  }
+});
+
+test('F8-b: a lock-holding intermediate block releases the lock on failure, keeps it on success', () => {
+  const md = fs.readFileSync(INGEST, 'utf8');
+  const fBlock = firstBashBlockUnder(md, '#### Step 7.6.F');
+  const m = /cleanup_7_6_F\(\)\s*\{[\s\S]*?\}\s*\ntrap cleanup_7_6_F EXIT/.exec(fBlock);
+  assert.notEqual(m, null, 'cleanup_7_6_F function + trap not found in the 7.6.F block');
+  const trapMech = m[0];
+
+  // Failure path: the block exits non-zero with the lock held → trap releases it.
+  let tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'f8-fail-')));
+  try {
+    fs.mkdirSync(path.join(tmp, '.wiki-meta', '.wiki-lock'), { recursive: true });
+    const failScript = trapMech.split('<wiki>').join(tmp) + '\nfalse\n';
+    let status = 0;
+    try {
+      execSync('bash', { input: failScript, stdio: ['pipe', 'pipe', 'pipe'] });
+    } catch (e) {
+      status = e.status || 1;
+    }
+    assert.notEqual(status, 0, 'the block must exit non-zero on a mid-block failure');
+    assert.equal(
+      fs.existsSync(path.join(tmp, '.wiki-meta', '.wiki-lock')),
+      false,
+      'the failure-only trap must release the lock (no strand)',
+    );
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+
+  // Success path: the block exits zero → lock stays held for Step 7.6.G.
+  tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'f8-ok-')));
+  try {
+    fs.mkdirSync(path.join(tmp, '.wiki-meta', '.wiki-lock'), { recursive: true });
+    const okScript = trapMech.split('<wiki>').join(tmp) + '\ntrue\n';
+    execSync('bash', { input: okScript, stdio: ['pipe', 'pipe', 'pipe'] });
+    assert.equal(
+      fs.existsSync(path.join(tmp, '.wiki-meta', '.wiki-lock')),
+      true,
+      'success must keep the lock held for Step 7.6.G',
+    );
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 });

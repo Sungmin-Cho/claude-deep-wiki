@@ -2071,6 +2071,19 @@ done
 Build the manifest for Step 8a-8h consumption:
 
 ```bash
+# Pattern 2 lock discipline (7.6.C conversion): this block runs holding the
+# .wiki-lock acquired at Step 7.6.C, in a fresh shell. Register a FAILURE-ONLY
+# cleanup so a general command failure here releases the lock instead of
+# stranding it (which would block every writer until manual recovery); on
+# success (rc == 0) the lock stays held for Steps 7.6.E-G. No unconditional
+# trap — that would release the lock at this block's end (before 7.6.G).
+cleanup_7_6_D() {
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then rmdir "<wiki>/.wiki-meta/.wiki-lock" 2>/dev/null || true; fi
+  return $rc
+}
+trap cleanup_7_6_D EXIT
+
 manifest = {
   created: [],      # entries from WRITTEN where pe.action == "create" AND PRE_BATCH_PAGES does not contain file
   updated: [],      # entries from WRITTEN where pe.action == "update"
@@ -2175,6 +2188,13 @@ After Step 7.6.D's manifest conversion, run `skills/wiki-ingest/SKILL.md` Steps 
 No sub-step skipping required. Steps 8-11 run end-to-end under the lock; Step 12
 + Step 13 fire from Step 7.6.G AFTER Step 7.6.F's sentinel rewrite is durable.
 
+> **Pattern 2 lock discipline (7.6.C conversion):** Steps 8-11 hold the lock
+> acquired at 7.6.C across their fresh Bash blocks. A failure in any of them is
+> released — not stranded — by Step 7.7.F's `on_metadata_failure`, which writes
+> the partial_fail sentinel and then `rmdir`s the lock (release-on-failure, the
+> same intent as the 7.6.D/7.6.F `cleanup_*` traps). Success keeps the lock held
+> for Step 7.6.G's explicit release.
+
 #### Step 7.6.F — partial_fail sentinel WRITE or REMOVAL-on-success (A1 + C5 + P4)
 
 **Two sub-cases depending on `PARTIAL_FAIL` state and existing yaml content:**
@@ -2189,6 +2209,23 @@ No sub-step skipping required. Steps 8-11 run end-to-end under the lock; Step 12
   (the typical clean ingest case).
 
 ```bash
+# Pattern 2 lock discipline (7.6.C conversion): this block runs holding the
+# .wiki-lock acquired at Step 7.6.C, in a fresh shell. Register a FAILURE-ONLY
+# cleanup so any abort here — an explicit `exit 1` on a sentinel-write failure,
+# OR a general command failure that exits the block non-zero — releases the
+# lock instead of stranding it. On success the lock stays held for Step 7.6.G.
+# No unconditional trap. (The trailing `:` below forces rc=0 on the clean Case
+# (iii) fall-through so this trap only fires on a real abort.)
+cleanup_7_6_F() {
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    rmdir "<wiki>/.wiki-meta/.wiki-lock" 2>/dev/null || true
+    echo "ERROR: Step 7.6.F sentinel block aborted (rc=$rc); lock released to avoid stranding." >&2
+  fi
+  return $rc
+}
+trap cleanup_7_6_F EXIT
+
 yaml="<wiki>/.wiki-meta/sources/<slug>.yaml"
 yaml_has_partial=false
 if grep -q '^partial_fail:' "$yaml" 2>/dev/null; then
@@ -2238,10 +2275,7 @@ if [ "$PARTIAL_FAIL" = "false" ] && [ "$yaml_has_partial" = "true" ]; then
   if ! mv "$tmp" "$yaml"; then
     rm -f "$tmp"
     echo "ERROR: partial_fail removal failed; source stuck in re-ingest loop"
-    # Pattern 2 (7.6.C conversion): the lock is held from Step 7.6.C through
-    # 7.6.G, so a hard exit here would strand it. Release before aborting.
-    rmdir "<wiki>/.wiki-meta/.wiki-lock" 2>/dev/null || true
-    exit 1
+    exit 1   # cleanup_7_6_F EXIT trap releases the held lock (rc != 0)
   fi
 
 elif [ "$PARTIAL_FAIL" = "true" ]; then
@@ -2318,12 +2352,10 @@ EOF
   if ! mv "$tmp" "$yaml"; then
     rm -f "$tmp"
     echo "ERROR: partial_fail sentinel write failed; wiki state at risk"
-    # Pattern 2 (7.6.C conversion): the lock is held from Step 7.6.C through
-    # 7.6.G, so a hard exit here would strand it. Release before aborting.
-    rmdir "<wiki>/.wiki-meta/.wiki-lock" 2>/dev/null || true
-    exit 1
+    exit 1   # cleanup_7_6_F EXIT trap releases the held lock (rc != 0)
   fi
 fi  # End if/elif (Case ii / Case i). Case (iii) PARTIAL_FAIL=false AND no yaml partial_fail → falls past (no-op clean ingest).
+:   # Force rc=0 on the clean/success fall-through so cleanup_7_6_F keeps the lock (only a real abort releases it).
 ```
 
 #### Step 7.6.G — Release lock + post-lock auto-lint + report

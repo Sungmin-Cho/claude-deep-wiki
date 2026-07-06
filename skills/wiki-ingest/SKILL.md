@@ -1159,10 +1159,12 @@ PFAIL_EOF
   pages_failed_json=$(printf '%s\n' "${FAILED_PAGE_FILES[@]}" | jq -R . | jq -s -c .)
 
   if [ "$current_count" -ge 3 ]; then
-    # 3-strike escape — emit ingest-fail, promote .pending-scan, clear counter.
-    emit_log_line action=ingest-fail source=$slug pages_created=[] pages_updated=[] \
-                  pages_failed=$pages_failed_json phase_timing_ms=$PHASE_TIMING_JSON \
-                  fail_reason="all_f1_dropped_3_strike"
+    # 3-strike escape — promote/drop the stuck window FIRST, then emit the
+    # terminal ingest-fail ONLY after the scan-window state is durably advanced
+    # or released (impl R7). The rename-failure branch below bails (return 1)
+    # with .pending-scan + the counter preserved, so it MUST NOT leave a
+    # terminal ingest-fail row — otherwise the next retry cycle re-emits it and
+    # the append-only audit log disagrees with the real scan-window state.
     # Promote .pending-scan despite failure (release stuck state) — same
     # contract as v1.3.0 Step 7.5.M-D ingest-fail. GUARDED promotion, SHARED
     # with the Step 11 "Auto-Ingest" promotion block (validate TS_RE + never
@@ -1209,6 +1211,12 @@ PFAIL_EOF
       # No pending window recorded — nothing to promote; clear the counter.
       rm -f "$RETRY_FILE"
     fi
+    # Scan-window state durably advanced/released above → emit the terminal
+    # ingest-fail NOW (the rename-failure path already returned 1 and skips this,
+    # so a failed escape never leaves a durable terminal row — impl R7).
+    emit_log_line action=ingest-fail source=$slug pages_created=[] pages_updated=[] \
+                  pages_failed=$pages_failed_json phase_timing_ms=$PHASE_TIMING_JSON \
+                  fail_reason="all_f1_dropped_3_strike"
     echo "ERROR: F1 all-dropped path hit 3-strike escape for $slug. .pending-scan promoted; manual investigation required." >&2
   else
     # Normal retry-required emit — action `ingest` with pages_failed.

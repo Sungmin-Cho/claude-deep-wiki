@@ -287,7 +287,7 @@ fi
 
 // Slice the F1 3-strike escape sub-block out of the real SKILL.md.
 function extractF1ThreeStrike(md) {
-  const startAnchor = '# 3-strike escape — emit ingest-fail';
+  const startAnchor = '# 3-strike escape';
   const sIdx = md.indexOf(startAnchor);
   assert.notEqual(sIdx, -1, 'F1 3-strike block start anchor not found in SKILL.md');
   const endAnchor = 'Normal retry-required emit';
@@ -603,4 +603,86 @@ test('F9-a: retry-counter format unified (ISO key) across wiki-schema.yaml and w
   const contract = md.slice(md.indexOf('**Counter file format**'), md.indexOf('**Counter clear**'));
   assert.doesNotMatch(contract, /<window_epoch>:<count>/, 'SKILL.md multi-source contract must not declare the epoch format');
   assert.match(contract, /\.pending-scan/, 'SKILL.md contract must key on the .pending-scan value');
+});
+
+// ---------------------------------------------------------------------------
+// Review fix (impl R7) #11 — the F1 3-strike block emitted the terminal
+// `ingest-fail` log line BEFORE attempting the guarded promotion. On a rename
+// failure the promotion bails (return 1) with `.pending-scan` + the counter
+// preserved (R2), but the append-only log already carries a terminal
+// ingest-fail row — so the next retry cycle emits another, and the audit log
+// disagrees with the real scan-window state. The emit must move AFTER the
+// promotion durably advances/releases the window.
+// ---------------------------------------------------------------------------
+test('F11-a: F1 3-strike emits the terminal ingest-fail only after the promotion durably advances', () => {
+  const md = fs.readFileSync(SKILL_MD, 'utf8');
+  const region = extractF1ThreeStrike(md);
+  const emitIdx = region.indexOf('action=ingest-fail');
+  const gateIdx = region.indexOf('if printf');
+  const bailIdx = region.indexOf('return 1');
+  assert.ok(emitIdx !== -1 && gateIdx !== -1 && bailIdx !== -1, 'emit / promotion gate / bail must all be present in the 3-strike block');
+  assert.ok(emitIdx > gateIdx, 'the terminal ingest-fail emit must come AFTER the promotion write+rename gate');
+  assert.ok(emitIdx > bailIdx, 'the terminal ingest-fail emit must come AFTER the rename-failure bail (a failed rename emits no terminal row)');
+});
+
+// F11-b — behavioral model of the reordered flow: a stub `emit_ingest_fail`
+// runs only after the guarded promotion. A rename failure bails (return 1)
+// before it, so no terminal ingest-fail row is written; success writes one.
+test('F11-b: a failed rename leaves no durable ingest-fail row; success writes one', () => {
+  const MODEL = `
+run() {
+  current_window=$(cat "\${WIKI_ROOT}/.wiki-meta/.pending-scan" 2>/dev/null || echo "")
+  RETRY_FILE="\${WIKI_ROOT}/.wiki-meta/.pending-scan-retry-count"
+  emit_ingest_fail() { printf '{"action":"ingest-fail"}\\n' >> "\${WIKI_ROOT}/.wiki-meta/log.jsonl"; }
+  if [ -n "$current_window" ]; then
+    TS_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
+    LAST_FILE="\${WIKI_ROOT}/.wiki-meta/.last-scan"
+    CURRENT_LAST=$(cat "$LAST_FILE" 2>/dev/null || echo "")
+    if [[ "$current_window" =~ $TS_RE ]] && { [[ -z "$CURRENT_LAST" ]] || ! [[ "$CURRENT_LAST" =~ $TS_RE ]] || [[ "$current_window" > "$CURRENT_LAST" ]]; }; then
+      _LS_TMP="\${LAST_FILE}.tmp.$$.$(date +%s)"
+      if printf '%s\\n' "$current_window" > "$_LS_TMP" && mv "$_LS_TMP" "$LAST_FILE"; then
+        rm -f "\${WIKI_ROOT}/.wiki-meta/.pending-scan"; rm -f "$RETRY_FILE"
+      else
+        rm -f "$_LS_TMP" 2>/dev/null || true; return 1
+      fi
+    else
+      rm -f "\${WIKI_ROOT}/.wiki-meta/.pending-scan"; rm -f "$RETRY_FILE"
+    fi
+  else
+    rm -f "$RETRY_FILE"
+  fi
+  emit_ingest_fail   # terminal row — only reached after a durable advance/release
+}
+run
+`;
+  const logHas = (dir) => fs.existsSync(path.join(dir, '.wiki-meta', 'log.jsonl'))
+    && fs.readFileSync(path.join(dir, '.wiki-meta', 'log.jsonl'), 'utf8').includes('ingest-fail');
+
+  // Failure path: mv stubbed to fail → run returns 1 before emit → no row.
+  const ff = setupFixture();
+  fs.writeFileSync(ff.pending, '2026-06-01T00:00:00Z\n');
+  fs.writeFileSync(ff.last, '2026-05-01T00:00:00Z\n');
+  const binDir = path.join(ff.tmp, 'stub-bin');
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(path.join(binDir, 'mv'), '#!/bin/sh\nexit 1\n');
+  fs.chmodSync(path.join(binDir, 'mv'), 0o755);
+  try {
+    try {
+      execSync('bash', { input: MODEL, env: { ...process.env, WIKI_ROOT: ff.tmp, PATH: `${binDir}:${process.env.PATH}` }, stdio: ['pipe', 'pipe', 'pipe'] });
+    } catch { /* run returns 1 */ }
+    assert.equal(logHas(ff.tmp), false, 'a failed rename must leave no durable terminal ingest-fail row');
+  } finally {
+    fs.rmSync(ff.tmp, { recursive: true, force: true });
+  }
+
+  // Success path: promotion advances → terminal row written.
+  const sf = setupFixture();
+  fs.writeFileSync(sf.pending, '2026-06-01T00:00:00Z\n');
+  fs.writeFileSync(sf.last, '2026-05-01T00:00:00Z\n');
+  try {
+    execSync('bash', { input: MODEL, env: { ...process.env, WIKI_ROOT: sf.tmp }, stdio: ['pipe', 'pipe', 'pipe'] });
+    assert.equal(logHas(sf.tmp), true, 'a durable advance must write the terminal ingest-fail row');
+  } finally {
+    fs.rmSync(sf.tmp, { recursive: true, force: true });
+  }
 });

@@ -5,6 +5,18 @@ All notable changes to deep-wiki are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.1] — 2026-07-07 (wiki-lint --fix lock + atomic .last-scan promotion)
+
+### Fixed
+
+- `/wiki-lint --fix` now acquires the wiki lock before mutating wiki state. Its `.pending-scan` drop and version prune previously ran with no `.wiki-lock`, so a concurrent hook-driven `/wiki-ingest` (holding the lock) could lost-update `index.json`, clobber the scan window, or race the `.versions/` prune — a breach of invariant #3 (lock atomicity). The `--fix` mutations now run inside a single self-contained lock block (acquire → EXIT-trap release → re-read + re-validate under the lock → mutate); on contention they soft-skip while the read-only diagnostics still print. Index-drift repair delegates to `/wiki-rebuild` only after that lock is released (its acquisition is non-reentrant).
+- Made the hook-driven `.last-scan` promotion write atomic (temp file + `mv`), matching the repo's `.pending-scan` and `index.json` writers. The prior direct `echo > .last-scan` redirect could leave the file empty/truncated if interrupted mid-write (e.g. the 15s SessionStart hook budget on network-backed volumes).
+
+### Changed
+
+- Documented the three concurrency-lock trap patterns (single-block unconditional trap / multi-block failure-only trap + explicit release / contention soft-fail) in `storage-layout.md`, and split invariant #3 into *what* (acquire before any write, release before end of critical section) vs *how* (trap form → pattern catalog). Existing skill trap code is unchanged.
+- The `/wiki-lint --fix` version prune now sorts backups by numeric version, so `.v10`/`.v11` are correctly retained over `.v2` (a lexicographic sort would have deleted the newest backups).
+
 ## [1.7.0] — 2026-05-22 (large-wiki reader race fix + index.md dashboard + inbox cleanup)
 
 ### Fixed

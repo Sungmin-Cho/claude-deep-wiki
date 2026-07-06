@@ -5,6 +5,18 @@ deep-wiki의 주요 변경사항을 기록합니다.
 형식은 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)를 따르며,
 이 프로젝트는 [유의적 버전](https://semver.org/spec/v2.0.0.html)을 준수합니다.
 
+## [1.7.1] — 2026-07-07 (wiki-lint --fix lock + .last-scan 승격 원자화)
+
+### 수정
+
+- `/wiki-lint --fix`가 이제 위키 상태를 변경하기 전에 위키 lock을 획득합니다. 기존에는 `.pending-scan` drop과 version prune이 `.wiki-lock` 없이 실행되어, hook 구동 `/wiki-ingest`(lock 보유)와 동시에 돌면 `index.json` lost-update, scan window 훼손, `.versions/` prune 경쟁이 발생할 수 있었습니다 — invariant #3(lock atomicity) 위반. 이제 `--fix` 변경은 자기완결 단일 lock 블록 안에서 실행됩니다(획득 → EXIT trap 해제 → lock 하 재독·재검증 → 변경). 경합 시에는 read-only 진단은 그대로 출력하면서 변경만 soft-skip합니다. index drift 수리는 해당 lock 해제 이후에만 `/wiki-rebuild`에 위임합니다(rebuild의 lock 획득은 비재진입).
+- hook 구동 `.last-scan` 승격 쓰기를 원자화했습니다(임시 파일 + `mv`). 저장소의 `.pending-scan`·`index.json` writer와 동일한 방식입니다. 기존의 직접 `echo > .last-scan` redirect는 쓰기 도중 중단되면(예: 네트워크 볼륨에서 15초 SessionStart hook 예산) 파일이 empty/truncated로 남을 수 있었습니다.
+
+### 변경
+
+- 동시성 lock trap 3패턴(단일 블록 무조건 해제 trap / 다중 블록 실패 전용 trap + 명시적 해제 / 경합 soft-fail)을 `storage-layout.md`에 문서화하고, invariant #3을 *what*(모든 write 전 획득, critical section 종료 전 해제)과 *how*(trap 형태 → 패턴 카탈로그)로 분리했습니다. 기존 스킬 trap 코드는 변경하지 않았습니다.
+- `/wiki-lint --fix` version prune이 이제 백업을 숫자 버전으로 정렬하여 `.v10`/`.v11`이 `.v2`보다 올바르게 유지됩니다(lexicographic 정렬은 최신 백업을 삭제할 수 있었습니다).
+
 ## [1.7.0] — 2026-05-22 (대규모 위키 reader race 수정 + index.md dashboard + inbox 정리)
 
 ### 수정

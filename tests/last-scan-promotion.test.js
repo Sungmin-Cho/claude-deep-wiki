@@ -686,3 +686,23 @@ run
     fs.rmSync(sf.tmp, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Review fix (impl R8) #13 — mirror the R7 log-order fix onto the sibling
+// Step 7.7.B all-workers-fail 3-strike path, which still emitted `ingest-fail`
+// BEFORE the guarded promotion (same duplicate-terminal-row / audit-mismatch
+// failure mode on a rename failure). Shipped-order guard, isomorphic to F11-a.
+// ---------------------------------------------------------------------------
+test('F13: Step 7.7.B all-workers-fail 3-strike emits ingest-fail only after promotion', () => {
+  const md = fs.readFileSync(SKILL_MD, 'utf8');
+  const sIdx = md.indexOf('# 4. If counter == 3');
+  assert.notEqual(sIdx, -1, 'Step 7.7.B 3-strike block not found');
+  const region = md.slice(sIdx, md.indexOf('# else: .pending-scan NOT promoted', sIdx));
+  const promoteIdx = region.indexOf('promote_pending_scan_to_last_scan');
+  const emitIdx = region.indexOf('action=ingest-fail');
+  assert.ok(promoteIdx !== -1 && emitIdx !== -1, 'the guarded promotion + ingest-fail emit must both be present');
+  assert.ok(
+    emitIdx > promoteIdx,
+    'the terminal ingest-fail emit must come AFTER the guarded promotion (mirror of the F1 3-strike fix)',
+  );
+});

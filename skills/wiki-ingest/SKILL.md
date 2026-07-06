@@ -2452,14 +2452,23 @@ if [[ ${#SUCCESS_DRAFTS[@]} -eq 0 ]]; then
   # 3. Increment retry counter (.pending-scan-retry-count).
   increment_retry_counter
 
-  # 4. If counter == 3:
+  # 4. If counter == 3 — 3-strike escape. Mirror the F1 path's log ordering
+  #    (impl R8): promote/release the stuck window FIRST, and emit the terminal
+  #    ingest-fail ONLY after a durable advance/release. The guarded promotion
+  #    preserves .pending-scan + the counter and BAILS on a rename failure (see
+  #    the F1 3-strike escape), so a failed escape leaves no terminal
+  #    ingest-fail row — otherwise the next cycle re-emits it and the append-only
+  #    audit log disagrees with the real scan-window state.
   if [[ retry_counter == 3 ]]; then
-    emit_log_line action=ingest-fail
     # Guarded promotion (shared shorthand — see the Step 11 "Auto-Ingest"
     # promotion block / F1 3-strike escape): validate TS_RE + advance only when
     # strictly newer than .last-scan, else drop .pending-scan. Never a raw mv.
+    # Bails (releasing the lock, preserving .pending-scan + counter) on a rename
+    # failure — skipping the reset + terminal emit below.
     promote_pending_scan_to_last_scan  # break stuck-window loop
     reset_retry_counter
+    # Durable advance/release confirmed → emit the terminal ingest-fail NOW.
+    emit_log_line action=ingest-fail
   fi
   # else: .pending-scan NOT promoted (next session retries the source).
 

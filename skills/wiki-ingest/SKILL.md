@@ -1654,7 +1654,7 @@ Plan #2.1 C2S-1 manifest + C2-W5 counter edge cases.)
        `{ts, action, source, pages_created, pages_updated}`. Concrete
        schema (Cycle-3 W-N2 + P3 fix — note: counter file format
        `<window>:<count>` (window = the `.pending-scan` timestamp) does NOT
-       store prior timestamps; use only the current trigger ts + window_epoch +
+       store prior timestamps; use only the current trigger ts + window +
        retry_count to characterize the failure):
 
        ```jsonc
@@ -1665,13 +1665,14 @@ Plan #2.1 C2S-1 manifest + C2-W5 counter edge cases.)
          "pages_created": [],
          "pages_updated": [],
          "failure_reason": "<worker error / timeout / lock-contention summary>",
-         "window_epoch": <int — the .pending-scan epoch that hit 3 strikes>,
+         "window": "<the .pending-scan ISO-8601 window that hit 3 strikes>",
          "retry_count": 3
        }
        ```
 
        `pages_created` / `pages_updated` are empty (no pages produced by
-       a failure event). The window_epoch + retry_count fields are
+       a failure event). The `window` (the `.pending-scan` ISO string, not an
+       epoch — see impl R4/R6 format unification) + `retry_count` fields are
        v1.3.0+ extensions on top of the canonical NC2 shape, capturing
        enough context to correlate against `.pending-scan` history
        without storing prior timestamps.

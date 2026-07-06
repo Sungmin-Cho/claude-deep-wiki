@@ -30,6 +30,9 @@ const assert = require('node:assert/strict');
 const SKILL_MD = path.resolve(
   __dirname, '..', 'skills', 'wiki-ingest', 'SKILL.md',
 );
+const SCHEMA_YAML = path.resolve(
+  __dirname, '..', 'skills', 'wiki-schema', 'wiki-schema.yaml',
+);
 
 // Promotion bash extract (must stay in sync with skills/wiki-ingest/SKILL.md
 // "Auto-Ingest (SessionStart Hook)" Step 11 promotion block). `<wiki_root>`
@@ -379,7 +382,7 @@ test('F2-e: F1 3-strike preserves .pending-scan + retry counter when the rename 
   fs.writeFileSync(f.pending, window + '\n');
   fs.writeFileSync(f.last, priorLast + '\n');
   const retryFile = path.join(f.meta, '.pending-scan-retry-count');
-  const retryContent = '1748736000:3';                // window_epoch:count (3-strike armed)
+  const retryContent = `${window}:3`;                 // <pending_scan ISO>:count (3-strike armed)
   fs.writeFileSync(retryFile, retryContent);
 
   // Shadow `mv` with a stub that always fails, so the temp write succeeds but
@@ -571,4 +574,33 @@ test('F6-b: a counter in the unified ISO format is continued (2 -> 3) across pat
   } finally {
     fs.rmSync(f.tmp, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Review fix (impl R6 sweep) #9 — the R4 format unification updated the SKILL.md
+// prose but left the machine-readable wiki-schema.yaml `retry_counter.format`
+// (and the ingest-fail action description) declaring the old `<window_epoch>:
+// <count>`. This sync guard pins the schema declaration and the SKILL.md
+// contract to the same ISO key so a one-sided revert goes RED.
+// ---------------------------------------------------------------------------
+test('F9-a: retry-counter format unified (ISO key) across wiki-schema.yaml and wiki-ingest SKILL.md', () => {
+  const schema = fs.readFileSync(SCHEMA_YAML, 'utf8');
+  const md = fs.readFileSync(SKILL_MD, 'utf8');
+
+  // schema.yaml retry_counter.format — the .pending-scan ISO key, never epoch.
+  const rc = schema.slice(schema.indexOf('retry_counter:'), schema.indexOf('pending_scan:'));
+  assert.notEqual(rc.length, 0, 'retry_counter block not found in wiki-schema.yaml');
+  assert.doesNotMatch(rc, /window_epoch/, 'schema retry_counter must not declare the epoch key format');
+  assert.match(rc, /pending_scan_iso|pending-scan/, 'schema retry_counter format must reference the .pending-scan ISO key');
+
+  // schema.yaml ingest-fail action description — no epoch counter format.
+  const ifIdx = schema.indexOf('- ingest-fail');
+  assert.notEqual(ifIdx, -1, 'ingest-fail action not found in wiki-schema.yaml');
+  const ifLine = schema.slice(ifIdx, schema.indexOf('\n', ifIdx));
+  assert.doesNotMatch(ifLine, /<window_epoch>:<count>/, 'ingest-fail action must not cite the epoch counter format');
+
+  // SKILL.md multi-source (7.5.M-D) contract — same ISO key, no epoch.
+  const contract = md.slice(md.indexOf('**Counter file format**'), md.indexOf('**Counter clear**'));
+  assert.doesNotMatch(contract, /<window_epoch>:<count>/, 'SKILL.md multi-source contract must not declare the epoch format');
+  assert.match(contract, /\.pending-scan/, 'SKILL.md contract must key on the .pending-scan value');
 });

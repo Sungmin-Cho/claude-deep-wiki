@@ -81,7 +81,7 @@ log:
     - ingest
     - ingest-skip      # v1.2.0+: source dropped from batch because content_hash unchanged AND wiki-side state intact
     - ingest-repair    # v1.2.1+ (IC1 review fix): hash unchanged but wiki state drift detected (missing page, page-missing-slug, or non-terminal last log) — full ingest forced as self-repair. R3C1 review fix: pages_created MUST be [] (a self-repair restores an existing page's lifecycle, not a new creation; the historical `ingest` line is the canonical pages_created entry). All touched pages go to pages_updated regardless of PRE_BATCH_PAGES classification. wiki-lint Step 6 LOG-INVARIANT scan filters out ingest-repair lines as defense-in-depth.
-    - ingest-fail      # v1.3.0+: emitted when the all-workers-fail retry counter reaches 3 consecutive batches on the same `.pending-scan` window. Promotes window despite failure (releases stuck state); records affected source paths + 3 prior failure timestamps. Counter `.wiki-meta/.pending-scan-retry-count` (format `<window_epoch>:<count>`) resets on any successful batch (full or partial — partial relies on `.failed-sources.tsv` for per-source retry).
+    - ingest-fail      # v1.3.0+: emitted when the all-workers-fail retry counter reaches 3 consecutive batches on the same `.pending-scan` window. Promotes window despite failure (releases stuck state); records affected source paths + 3 prior failure timestamps. Counter `.wiki-meta/.pending-scan-retry-count` (format `<pending_scan_iso>:<count>`) resets on any successful batch (full or partial — partial relies on `.failed-sources.tsv` for per-source retry).
     - update
     - lint
     - rebuild
@@ -121,7 +121,7 @@ failure_state:         # v1.3.0+: partial-fail retry artifacts under .wiki-meta/
     semantics: "Path-level retry manifest for partial-fail multi-source ingest. SessionStart hook reads alongside .pending-scan; per-source retry survives across sessions."
   retry_counter:
     location: .wiki-meta/.pending-scan-retry-count
-    format: "<window_epoch>:<count>"
+    format: "<pending_scan_iso>:<count>"   # window key = verbatim .pending-scan ISO-8601 value (colon-safe parse: window=${saved%:*}, count=${saved##*:}). Shared by single-source (F1) + multi-source (7.5.M-D) paths.
     threshold: 3       # consecutive all-workers-fail batches before ingest-fail emit
     cleared_on: "any successful batch (full or partial; partial relies on .failed-sources.tsv for per-source retry)"
     semantics: "All-workers-fail counter for 3-strike ingest-fail trigger. Counter resets on success; on threshold emit ingest-fail + promote .pending-scan window."

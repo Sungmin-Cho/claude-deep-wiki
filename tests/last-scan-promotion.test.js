@@ -431,3 +431,88 @@ test('F2-f: F1 3-strike gates .pending-scan/counter cleanup on a confirmed renam
   assert.match(region, /FATAL/, 'a failed rename must surface a fatal error (not silently drop state)');
   assert.match(region, /return 1/, 'a failed rename must bail (return 1) after releasing the lock');
 });
+
+// ---------------------------------------------------------------------------
+// Review fix (impl R3) #4 — the F1 all-dropped 3-strike retry counter parsed
+// its window key with `${saved%%:*}` (strip from the FIRST colon). But the key
+// is the `.pending-scan` value — an ISO-8601 timestamp WITH colons
+// (2026-06-01T00:00:00Z) — so `%%:*` truncated it to `2026-06-01T00`, never
+// matched the current window, and reset the count to 1 on every run. The `>= 3`
+// escape (including the guarded promotion above) was therefore unreachable in
+// the real hook flow and `.pending-scan` stuck forever. Fix: `${saved%:*}`
+// (strip from the LAST colon → keep the full timestamp) + integer-validate
+// saved_count. These run the REAL counter block sliced from SKILL.md, so they
+// are RED before the fix and GREEN after.
+// ---------------------------------------------------------------------------
+
+// Slice the retry-counter read+increment block out of the real SKILL.md and
+// render <wiki> as ${WIKI_ROOT} so it runs hermetically.
+function extractRetryCounterBash(md) {
+  const startAnchor = 'RETRY_FILE="<wiki>/.wiki-meta/.pending-scan-retry-count"';
+  const sIdx = md.indexOf(startAnchor);
+  assert.notEqual(sIdx, -1, 'retry-counter block start anchor not found');
+  const endAnchor = 'printf \'%s:%d\' "$current_window" "$current_count" > "$RETRY_FILE"';
+  const eIdx = md.indexOf(endAnchor, sIdx);
+  assert.notEqual(eIdx, -1, 'retry-counter block end anchor not found');
+  return md.slice(sIdx, eIdx + endAnchor.length).split('<wiki>').join('${WIKI_ROOT}');
+}
+
+// F3-a — shipped-procedure guard (RED-able): colon-safe parse + int validation.
+test('F3-a: F1 retry counter parses its timestamp window colon-safely (impl R3)', () => {
+  const md = fs.readFileSync(SKILL_MD, 'utf8');
+  const region = extractRetryCounterBash(md);
+  assert.match(region, /\$\{saved%:\*\}/, 'window must be parsed with ${saved%:*} (strip from LAST colon)');
+  assert.doesNotMatch(
+    region,
+    /\$\{saved%%:\*\}/,
+    'window must NOT use ${saved%%:*} — it truncates the ISO timestamp at its first colon',
+  );
+  assert.match(region, /=~\s*\^\[0-9\]\+\$/, 'saved_count must be integer-validated (=~ ^[0-9]+$)');
+});
+
+// F3-b — behavioral regression (RED-able): a colon-bearing timestamp window
+// matches the saved counter and increments (2 -> 3), not resets to 1.
+test('F3-b: retry counter increments (not resets) for a colon-bearing timestamp window', () => {
+  const md = fs.readFileSync(SKILL_MD, 'utf8');
+  const counterBash = extractRetryCounterBash(md);
+  const f = setupFixture();
+  const window = '2026-06-01T00:00:00Z';
+  fs.writeFileSync(f.pending, window + '\n');
+  fs.writeFileSync(path.join(f.meta, '.pending-scan-retry-count'), `${window}:2`);
+  try {
+    execSync('bash', { input: counterBash, env: { ...process.env, WIKI_ROOT: f.tmp }, stdio: ['pipe', 'pipe', 'pipe'] });
+    const written = fs.readFileSync(path.join(f.meta, '.pending-scan-retry-count'), 'utf8').trim();
+    const count = written.slice(written.lastIndexOf(':') + 1);
+    const storedWindow = written.slice(0, written.lastIndexOf(':'));
+    assert.equal(count, '3', 'a matching timestamp window must carry the count forward (2 -> 3), not reset to 1');
+    assert.equal(storedWindow, window, 'the stored window key must be the full timestamp');
+  } finally {
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  }
+});
+
+// F3-c — end-to-end (RED-able): counter increment -> 3-strike gate -> guarded
+// promotion. Before the parse fix the count resets to 1, the `>= 3` gate never
+// fires, and the stuck window is never released.
+test('F3-c: counter reaching 3 makes the guarded promotion reachable (e2e)', () => {
+  const md = fs.readFileSync(SKILL_MD, 'utf8');
+  const counterBash = extractRetryCounterBash(md);
+  const f = setupFixture();
+  const window = '2026-06-01T00:00:00Z';
+  fs.writeFileSync(f.pending, window + '\n');
+  fs.writeFileSync(f.last, '2026-05-01T00:00:00Z\n');
+  fs.writeFileSync(path.join(f.meta, '.pending-scan-retry-count'), `${window}:2`);
+  const e2e = `${counterBash}\nif [ "$current_count" -ge 3 ]; then\n${F1_PROMOTE_BASH}\nfi\n`;
+  try {
+    execSync('bash', { input: e2e, env: { ...process.env, WIKI_ROOT: f.tmp }, stdio: ['pipe', 'pipe', 'pipe'] });
+    assert.equal(fs.readFileSync(f.last, 'utf8').trim(), window, '3-strike fired → .last-scan advanced to the stuck window');
+    assert.equal(fs.existsSync(f.pending), false, '3-strike fired → .pending-scan dropped (stuck window released)');
+    assert.equal(
+      fs.existsSync(path.join(f.meta, '.pending-scan-retry-count')),
+      false,
+      '3-strike fired → retry counter cleared',
+    );
+  } finally {
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  }
+});

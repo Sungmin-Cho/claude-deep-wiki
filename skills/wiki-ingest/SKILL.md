@@ -1106,8 +1106,10 @@ PFAIL_EOF
 
   # R3.P2.2 fix (3rd-round 2/3 review) — 3-strike retry counter.
   # Mirrors Step 7.5.M-D's pattern (multi-source all-workers-fail).
-  # Counter format: "<window_epoch>:<count>" stored in
-  # <wiki>/.wiki-meta/.pending-scan-retry-count. Without this counter,
+  # Counter format: "<window>:<count>" stored in
+  # <wiki>/.wiki-meta/.pending-scan-retry-count, where <window> is the
+  # .pending-scan value (an ISO-8601 timestamp WITH colons — see the colon-safe
+  # parse below). Without this counter,
   # an auto-ingest scan window with a persistent F1-all-dropped source
   # (e.g., synthesizer keeps hallucinating absent pages) loops
   # indefinitely. Same 3-strike escape as v1.3.0 ingest-fail action:
@@ -1118,8 +1120,16 @@ PFAIL_EOF
   current_count=0
   if [ -n "$current_window" ] && [ -f "$RETRY_FILE" ]; then
     saved=$(cat "$RETRY_FILE" 2>/dev/null || echo ":")
-    saved_window="${saved%%:*}"
+    # Colon-safe parse (impl R3 fix): the window key is the .pending-scan value,
+    # an ISO-8601 timestamp WITH colons (2026-06-01T00:00:00Z). Strip from the
+    # LAST colon (`%:*`) to keep the whole timestamp — `%%:*` would truncate it
+    # at its first colon (→ 2026-06-01T00), never match "$current_window", and
+    # reset the count to 1 every run, making the `>= 3` escape unreachable in the
+    # real hook flow (.pending-scan stuck forever). The count is the field after
+    # the last colon (`##*:`); integer-validate it (corrupt/no-colon → 0).
+    saved_window="${saved%:*}"
     saved_count="${saved##*:}"
+    [[ "$saved_count" =~ ^[0-9]+$ ]] || saved_count=0
     if [ "$saved_window" = "$current_window" ]; then
       current_count="$saved_count"
     fi

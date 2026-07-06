@@ -120,7 +120,7 @@ fi
 
 ## Step 0.5 — Inbox stale cleanup (quarantine, mtime > 7 days, partial_fail-protected)
 
-Crashed sessions cannot fire their cleanup trap (the trap is registered at lock acquisition, so any crash before that point leaves inbox files orphaned). Step 12's "self-session files only, no wildcard" policy is preserved — this step touches files only older than 7 days AND not referenced by an unresolved `partial_fail:` sentinel.
+Crashed sessions cannot fire their cleanup trap (per the lock-pattern catalog the cleanup runs from a mutating block's failure-only trap or the Step 12 explicit release, so any crash before that trap is registered leaves inbox files orphaned). Step 12's "self-session files only, no wildcard" policy is preserved — this step touches files only older than 7 days AND not referenced by an unresolved `partial_fail:` sentinel.
 
 **Quarantine, not delete (review round 3 / Codex adversarial HIGH):** there is an inherent race window between Step 6.5 (pasted text materialized as inbox file) and Step 7.6.F (`partial_fail` sentinel written). If the process crashes inside that window, the inbox file is the ONLY persisted copy of the user's pasted source and there is no sentinel yet to protect it. After 7 days a destructive `rm -f` would silently destroy that recovery state. v1.7.0 therefore **moves** stale files to `<wiki_root>/.wiki-meta/.inbox/.quarantine/<basename>.<epoch>` (idempotent — preserves multiple generations under epoch-suffixed names) instead of deleting them. Operators can recover or hand-prune quarantine contents at their leisure; the directory is opaque to all other wiki-ingest steps.
 
@@ -534,7 +534,7 @@ LOCK_DIR="<wiki_root>/.wiki-meta/.wiki-lock"
 mkdir "$LOCK_DIR" 2>/dev/null || { echo "ERROR: Wiki is locked by another session. Try again later."; exit 1; }
 ```
 
-Set up cleanup: the lock MUST be released when done (success or failure).
+Set up cleanup per the lock-pattern catalog (`skills/wiki-schema/references/storage-layout.md` §Concurrency Lock Protocol): the lock MUST be released when done (success or failure). This is a **multi-block** path (this acquire block → Steps 4-11 mutate → Step 12 release), so do NOT register an unconditional `EXIT` trap in this acquisition block — it would fire at this block's end and release the lock before Steps 4-11 run. Use the Pattern 2 form: a failure-only trap on each mutating block + the explicit success release at Step 12.
 
 ### 4. Pre-filter Overlap Candidates
 
@@ -1106,8 +1106,10 @@ PFAIL_EOF
 
   # R3.P2.2 fix (3rd-round 2/3 review) — 3-strike retry counter.
   # Mirrors Step 7.5.M-D's pattern (multi-source all-workers-fail).
-  # Counter format: "<window_epoch>:<count>" stored in
-  # <wiki>/.wiki-meta/.pending-scan-retry-count. Without this counter,
+  # Counter format: "<window>:<count>" stored in
+  # <wiki>/.wiki-meta/.pending-scan-retry-count, where <window> is the
+  # .pending-scan value (an ISO-8601 timestamp WITH colons — see the colon-safe
+  # parse below). Without this counter,
   # an auto-ingest scan window with a persistent F1-all-dropped source
   # (e.g., synthesizer keeps hallucinating absent pages) loops
   # indefinitely. Same 3-strike escape as v1.3.0 ingest-fail action:
@@ -1118,8 +1120,16 @@ PFAIL_EOF
   current_count=0
   if [ -n "$current_window" ] && [ -f "$RETRY_FILE" ]; then
     saved=$(cat "$RETRY_FILE" 2>/dev/null || echo ":")
-    saved_window="${saved%%:*}"
+    # Colon-safe parse (impl R3 fix): the window key is the .pending-scan value,
+    # an ISO-8601 timestamp WITH colons (2026-06-01T00:00:00Z). Strip from the
+    # LAST colon (`%:*`) to keep the whole timestamp — `%%:*` would truncate it
+    # at its first colon (→ 2026-06-01T00), never match "$current_window", and
+    # reset the count to 1 every run, making the `>= 3` escape unreachable in the
+    # real hook flow (.pending-scan stuck forever). The count is the field after
+    # the last colon (`##*:`); integer-validate it (corrupt/no-colon → 0).
+    saved_window="${saved%:*}"
     saved_count="${saved##*:}"
+    [[ "$saved_count" =~ ^[0-9]+$ ]] || saved_count=0
     if [ "$saved_window" = "$current_window" ]; then
       current_count="$saved_count"
     fi
@@ -1149,17 +1159,79 @@ PFAIL_EOF
   pages_failed_json=$(printf '%s\n' "${FAILED_PAGE_FILES[@]}" | jq -R . | jq -s -c .)
 
   if [ "$current_count" -ge 3 ]; then
-    # 3-strike escape — emit ingest-fail, promote .pending-scan, clear counter.
-    emit_log_line action=ingest-fail source=$slug pages_created=[] pages_updated=[] \
-                  pages_failed=$pages_failed_json phase_timing_ms=$PHASE_TIMING_JSON \
-                  fail_reason="all_f1_dropped_3_strike"
-    # Promote .pending-scan despite failure (release stuck state) — same
-    # contract as v1.3.0 Step 7.5.M-D ingest-fail.
-    if [ -n "$current_window" ]; then
-      mv "<wiki>/.wiki-meta/.pending-scan" "<wiki>/.wiki-meta/.last-scan"
+    # 3-strike escape — idempotent emit-first (impl R9, closing R7 AND R9). R9:
+    # the terminal ingest-fail row must be DURABLE before the window is released
+    # — a promote-first order could release the window then fail to log the
+    # ingest-fail = fail-open (a 3-strike with no audit record). R7: a retry
+    # cycle must not append a SECOND terminal row for the same window. So:
+    #   (1) window-key idempotency — skip the emit if log.jsonl already carries a
+    #       terminal ingest-fail row for THIS window (+slug);
+    #   (2) else emit, and if the emit FAILS do NOT release the window (preserve
+    #       .pending-scan + counter and bail — next session re-attempts, log
+    #       still consistent);
+    #   (3) only after the terminal row is durable, run the guarded promotion
+    #       below (which preserves state + bails on a rename failure; the
+    #       already-emitted row is not duplicated next cycle thanks to (1)).
+    LOG_FILE="<wiki>/.wiki-meta/log.jsonl"
+    if ! { grep -F '"ingest-fail"' "$LOG_FILE" 2>/dev/null | grep -F "$current_window" | grep -Fq "$slug"; }; then
+      if ! emit_log_line action=ingest-fail source=$slug window=$current_window pages_created=[] pages_updated=[] \
+                         pages_failed=$pages_failed_json phase_timing_ms=$PHASE_TIMING_JSON \
+                         fail_reason="all_f1_dropped_3_strike"; then
+        # Terminal row did not land — do NOT release the window. Preserve
+        # .pending-scan + counter and bail; the next session re-attempts the emit.
+        echo "FATAL: F1 3-strike could not durably record ingest-fail for $slug — .pending-scan + counter preserved; next session retries." >&2
+        rmdir "<wiki>/.wiki-meta/.wiki-lock" 2>/dev/null || true
+        trap - EXIT
+        return 1
+      fi
     fi
-    # Clear retry counter.
-    rm -f "$RETRY_FILE"
+    # Terminal ingest-fail row is durable → NOW release the stuck window.
+    # Promote .pending-scan despite failure (release stuck state) — same
+    # contract as v1.3.0 Step 7.5.M-D ingest-fail. GUARDED promotion, SHARED
+    # with the Step 11 "Auto-Ingest" promotion block (validate TS_RE + never
+    # regress .last-scan). The pre-v1.7.1 form did a raw `mv .pending-scan
+    # .last-scan`, which regressed or corrupted .last-scan (invariant #2) when
+    # the stuck window was stale (older than .last-scan) or malformed. Advance
+    # .last-scan ONLY when the window is a valid TS strictly newer than the
+    # current .last-scan; the stuck state (.pending-scan + retry counter) is
+    # cleared ONLY AFTER a confirmed write+rename (impl R2 fix). The invalid /
+    # stale branch drops .pending-scan unconditionally — no .last-scan write is
+    # at risk there, so it always releases the stuck window.
+    if [ -n "$current_window" ]; then
+      TS_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
+      LAST_FILE="<wiki>/.wiki-meta/.last-scan"
+      CURRENT_LAST=$(cat "$LAST_FILE" 2>/dev/null || echo "")
+      if [[ "$current_window" =~ $TS_RE ]] \
+         && { [[ -z "$CURRENT_LAST" ]] || ! [[ "$CURRENT_LAST" =~ $TS_RE ]] || [[ "$current_window" > "$CURRENT_LAST" ]]; }; then
+        # Valid + newer: advance .last-scan atomically (temp + rename) — runs
+        # under .wiki-lock so tmp cannot collide. Clear the stuck state ONLY on
+        # a CONFIRMED rename. If the write/rename fails (ENOSPC / EACCES /
+        # network FS), .last-scan is still stale, so dropping .pending-scan +
+        # the retry counter here would lose the only record of the window
+        # (silent window loss or duplicate re-detection). Preserve both, surface
+        # a fatal error, release the lock, and bail — the next hook cycle
+        # re-detects the window and re-attempts the escape.
+        _LS_TMP="${LAST_FILE}.tmp.$$.$(date +%s)"
+        if printf '%s\n' "$current_window" > "$_LS_TMP" && mv "$_LS_TMP" "$LAST_FILE"; then
+          rm -f "<wiki>/.wiki-meta/.pending-scan"
+          rm -f "$RETRY_FILE"
+        else
+          rm -f "$_LS_TMP" 2>/dev/null || true
+          echo "FATAL: F1 3-strike could not advance .last-scan (rename failed) for $slug — .pending-scan and retry counter PRESERVED; next session re-detects and retries. Check disk space / permissions on <wiki>/.wiki-meta/." >&2
+          rmdir "<wiki>/.wiki-meta/.wiki-lock" 2>/dev/null || true
+          trap - EXIT
+          return 1
+        fi
+      else
+        # Invalid / stale window: no .last-scan write. Drop .pending-scan to
+        # release the stuck window (invariant #2 preserved) + clear the counter.
+        rm -f "<wiki>/.wiki-meta/.pending-scan"
+        rm -f "$RETRY_FILE"
+      fi
+    else
+      # No pending window recorded — nothing to promote; clear the counter.
+      rm -f "$RETRY_FILE"
+    fi
     echo "ERROR: F1 all-dropped path hit 3-strike escape for $slug. .pending-scan promoted; manual investigation required." >&2
   else
     # Normal retry-required emit — action `ingest` with pages_failed.
@@ -1544,25 +1616,36 @@ Plan #2.1 C2S-1 manifest + C2-W5 counter edge cases.)
   window — W3 fix + Plan #2.1 Cycle-2 C2-W5 edge-case semantics):**
   maintain a counter at `<wiki>/.wiki-meta/.pending-scan-retry-count`.
 
-  **Counter file format** (Plan #2.1, single line):
+  **Counter file format** (single line — **unified with the F1 single-source
+  path** so both read/write `.pending-scan-retry-count` without resetting each
+  other, impl R4):
   ```
-  <window_epoch>:<count>
+  <window>:<count>
   ```
-  Example: `1735738200:2` (window epoch 1735738200, fail count 2).
+  where `<window>` is the **verbatim `.pending-scan` value** (the UTC ISO-8601
+  scan-window timestamp — which itself contains colons) and `<count>` is the
+  consecutive-failure count. Example: `2026-06-01T00:00:00Z:2` (window
+  `2026-06-01T00:00:00Z`, fail count 2). Parse **colon-safely**: the window is
+  `${saved%:*}` (strip from the LAST colon → keep the whole timestamp) and the
+  count is `${saved##*:}` (field after the last colon), integer-validated.
+  NEVER `${saved%%:*}` — it truncates the timestamp at its first colon. (Why
+  the timestamp, not an epoch: `.pending-scan` stores the ISO string, and a
+  bash-3.2 / BSD-`date` portable ISO→epoch conversion is not available, so both
+  paths compare the ISO string directly.)
 
   **Read semantics** (start of every all-workers-fail handling):
-  - File missing or unreadable → treat as `<current_window_epoch>:0`
+  - File missing or unreadable → treat as `<current .pending-scan>:0`
     (initialize on first failure).
-  - Stored window_epoch ≠ current `.pending-scan` epoch → **reset count
-    to 0** (different window; previous failures don't carry over to a
-    new scan window). Write `<current>:0` (now becomes :1 after this
-    increment).
-  - Corrupt content (no colon, non-integer) → log warning, treat as
-    `<current_window_epoch>:0`, overwrite cleanly on next write.
+  - Stored `<window>` ≠ current `.pending-scan` value (**string equality** on
+    the full timestamp) → **reset count to 0** (different window; previous
+    failures don't carry over to a new scan window). Write `<current>:0` (now
+    becomes :1 after this increment).
+  - Corrupt content (no colon, non-integer count) → log warning, treat as
+    `<current .pending-scan>:0`, overwrite cleanly on next write.
 
   **Write semantics** (after each all-workers-fail event):
   - Increment count by 1.
-  - Write `<current_window_epoch>:<count>` (overwrites stored).
+  - Write `<current .pending-scan value>:<count>` (overwrites stored).
   - Atomic write (write to temp file, mv to final — same pattern as
     v1.2.1 lock + atomic ops).
 
@@ -1582,14 +1665,20 @@ Plan #2.1 C2S-1 manifest + C2-W5 counter edge cases.)
   When count reaches 3:
     1. Promote `.pending-scan → .last-scan` ANYWAY (releases the stuck
        window so the user can move forward; the alternative is an infinite
-       hook-time retry loop on the same files).
+       hook-time retry loop on the same files). Use the **guarded** promotion
+       (shared with the Step 11 "Auto-Ingest" block and the F1 3-strike
+       escape): advance `.last-scan` only when the window is a valid TS
+       strictly newer than the current `.last-scan`, otherwise leave
+       `.last-scan` untouched — but drop `.pending-scan` either way so the
+       stuck window is released. Never a raw `mv .pending-scan .last-scan`
+       (it would regress/corrupt `.last-scan`, invariant #2).
     2. Append a new `ingest-fail` lifecycle event to `log.jsonl`. Per
        NC2 canonical-shape rule (Step 1.5), every action MUST preserve
        `{ts, action, source, pages_created, pages_updated}`. Concrete
        schema (Cycle-3 W-N2 + P3 fix — note: counter file format
-       `<window_epoch>:<count>` does NOT store prior timestamps; use
-       only the current trigger ts + window_epoch + retry_count to
-       characterize the failure):
+       `<window>:<count>` (window = the `.pending-scan` timestamp) does NOT
+       store prior timestamps; use only the current trigger ts + window +
+       retry_count to characterize the failure):
 
        ```jsonc
        {
@@ -1599,13 +1688,14 @@ Plan #2.1 C2S-1 manifest + C2-W5 counter edge cases.)
          "pages_created": [],
          "pages_updated": [],
          "failure_reason": "<worker error / timeout / lock-contention summary>",
-         "window_epoch": <int — the .pending-scan epoch that hit 3 strikes>,
+         "window": "<the .pending-scan ISO-8601 window that hit 3 strikes>",
          "retry_count": 3
        }
        ```
 
        `pages_created` / `pages_updated` are empty (no pages produced by
-       a failure event). The window_epoch + retry_count fields are
+       a failure event). The `window` (the `.pending-scan` ISO string, not an
+       epoch — see impl R4/R6 format unification) + `retry_count` fields are
        v1.3.0+ extensions on top of the canonical NC2 shape, capturing
        enough context to correlate against `.pending-scan` history
        without storing prior timestamps.
@@ -1864,7 +1954,32 @@ On mismatch: function emits `FATAL: A5-fanout worker mutated wiki_root (pre=...,
 ```bash
 STAGE_3_START_MS=$(_ts_ms)    # B3 v1.4.2 — phase_timing_ms capture (Stage 3 start = lock acquire attempt)
 mkdir "<wiki>/.wiki-meta/.wiki-lock" || { echo "Wiki locked"; exit 1; }
-trap 'rmdir "<wiki>/.wiki-meta/.wiki-lock" 2>/dev/null || true' EXIT
+
+# Pattern 2 lock (storage-layout.md §Concurrency Lock Protocol — same fix as
+# wiki-rebuild round-4 Codex review #1). This .wiki-lock critical section spans
+# Steps 7.6.C → 7.6.D → 7.6.E (Steps 8-11) → 7.6.F → 7.6.G, and each of those
+# runs in a SEPARATE Claude Code Bash tool block (a fresh shell per fenced bash
+# block). An unconditional EXIT trap that rmdirs the lock in this acquisition
+# block would therefore fire the instant THIS block ends — releasing it before Steps
+# D-G run and reopening the concurrent-write window they must be protected from
+# (the very early-release bug wiki-rebuild round-4 fixed). So: NO unconditional
+# release trap here. Instead register a FAILURE-ONLY cleanup (cleanup_step3
+# model): on a hard abort of this write block (rc != 0) release the lock so it
+# never strands; on success (rc == 0 — including the partial-fail break/continue
+# paths, which still complete the block normally) keep the lock held for Step
+# 7.6.F's sentinel write and Step 7.6.G's explicit rmdir release. Inter-block
+# crash between D-G still leaks the lock — pre-existing mkdir-lock behaviour,
+# recovered manually (Stale Lock Recovery) or by Step 7.7.F's on_metadata_failure
+# release; out of scope here.
+cleanup_7_6_C() {
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    rmdir "<wiki>/.wiki-meta/.wiki-lock" 2>/dev/null || true
+    echo "ERROR: Step 7.6.C write block aborted (rc=$rc); lock released to avoid stranding." >&2
+  fi
+  return $rc
+}
+trap cleanup_7_6_C EXIT
 
 PARTIAL_FAIL=false
 
@@ -1980,6 +2095,19 @@ done
 Build the manifest for Step 8a-8h consumption:
 
 ```bash
+# Pattern 2 lock discipline (7.6.C conversion): this block runs holding the
+# .wiki-lock acquired at Step 7.6.C, in a fresh shell. Register a FAILURE-ONLY
+# cleanup so a general command failure here releases the lock instead of
+# stranding it (which would block every writer until manual recovery); on
+# success (rc == 0) the lock stays held for Steps 7.6.E-G. No unconditional
+# trap — that would release the lock at this block's end (before 7.6.G).
+cleanup_7_6_D() {
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then rmdir "<wiki>/.wiki-meta/.wiki-lock" 2>/dev/null || true; fi
+  return $rc
+}
+trap cleanup_7_6_D EXIT
+
 manifest = {
   created: [],      # entries from WRITTEN where pe.action == "create" AND PRE_BATCH_PAGES does not contain file
   updated: [],      # entries from WRITTEN where pe.action == "update"
@@ -2084,6 +2212,13 @@ After Step 7.6.D's manifest conversion, run `skills/wiki-ingest/SKILL.md` Steps 
 No sub-step skipping required. Steps 8-11 run end-to-end under the lock; Step 12
 + Step 13 fire from Step 7.6.G AFTER Step 7.6.F's sentinel rewrite is durable.
 
+> **Pattern 2 lock discipline (7.6.C conversion):** Steps 8-11 hold the lock
+> acquired at 7.6.C across their fresh Bash blocks. A failure in any of them is
+> released — not stranded — by Step 7.7.F's `on_metadata_failure`, which writes
+> the partial_fail sentinel and then `rmdir`s the lock (release-on-failure, the
+> same intent as the 7.6.D/7.6.F `cleanup_*` traps). Success keeps the lock held
+> for Step 7.6.G's explicit release.
+
 #### Step 7.6.F — partial_fail sentinel WRITE or REMOVAL-on-success (A1 + C5 + P4)
 
 **Two sub-cases depending on `PARTIAL_FAIL` state and existing yaml content:**
@@ -2098,6 +2233,23 @@ No sub-step skipping required. Steps 8-11 run end-to-end under the lock; Step 12
   (the typical clean ingest case).
 
 ```bash
+# Pattern 2 lock discipline (7.6.C conversion): this block runs holding the
+# .wiki-lock acquired at Step 7.6.C, in a fresh shell. Register a FAILURE-ONLY
+# cleanup so any abort here — an explicit `exit 1` on a sentinel-write failure,
+# OR a general command failure that exits the block non-zero — releases the
+# lock instead of stranding it. On success the lock stays held for Step 7.6.G.
+# No unconditional trap. (The trailing `:` below forces rc=0 on the clean Case
+# (iii) fall-through so this trap only fires on a real abort.)
+cleanup_7_6_F() {
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    rmdir "<wiki>/.wiki-meta/.wiki-lock" 2>/dev/null || true
+    echo "ERROR: Step 7.6.F sentinel block aborted (rc=$rc); lock released to avoid stranding." >&2
+  fi
+  return $rc
+}
+trap cleanup_7_6_F EXIT
+
 yaml="<wiki>/.wiki-meta/sources/<slug>.yaml"
 yaml_has_partial=false
 if grep -q '^partial_fail:' "$yaml" 2>/dev/null; then
@@ -2147,7 +2299,7 @@ if [ "$PARTIAL_FAIL" = "false" ] && [ "$yaml_has_partial" = "true" ]; then
   if ! mv "$tmp" "$yaml"; then
     rm -f "$tmp"
     echo "ERROR: partial_fail removal failed; source stuck in re-ingest loop"
-    exit 1
+    exit 1   # cleanup_7_6_F EXIT trap releases the held lock (rc != 0)
   fi
 
 elif [ "$PARTIAL_FAIL" = "true" ]; then
@@ -2224,9 +2376,10 @@ EOF
   if ! mv "$tmp" "$yaml"; then
     rm -f "$tmp"
     echo "ERROR: partial_fail sentinel write failed; wiki state at risk"
-    exit 1
+    exit 1   # cleanup_7_6_F EXIT trap releases the held lock (rc != 0)
   fi
 fi  # End if/elif (Case ii / Case i). Case (iii) PARTIAL_FAIL=false AND no yaml partial_fail → falls past (no-op clean ingest).
+:   # Force rc=0 on the clean/success fall-through so cleanup_7_6_F keeps the lock (only a real abort releases it).
 ```
 
 #### Step 7.6.G — Release lock + post-lock auto-lint + report
@@ -2244,12 +2397,20 @@ fi  # End if/elif (Case ii / Case i). Case (iii) PARTIAL_FAIL=false AND no yaml 
 rmdir "<wiki>/.wiki-meta/.wiki-lock"
 trap - EXIT
 
-# Step 13 (Auto-Lint, includes retention prune `last-3 .versions per page`)
-# — runs POST-LOCK. Read-mostly + idempotent; safe outside the transaction.
-# Retention prune retains the newest .versions/v<N+1>.md created by 7.6.C
-# and prunes from the oldest end — no risk of pruning the just-created
-# backup.
-run_step_13_auto_lint
+# Step 13 (Auto-Lint) — runs POST-LOCK, READ-ONLY ONLY. The Step 13 checks
+# (schema compliance, broken links, index drift, orphan detection — see
+# "### 13. Auto-Lint" below) never mutate state, so they are safe to run once
+# this ingest transaction has released the lock.
+#
+# Invariant #3 (every write acquires the lock): the retention prune
+# (`keep last-3 .versions per page`) is a MUTATION and MUST NOT run unlocked
+# here. It is performed ONLY through wiki-lint §13 Auto-Fix Phase A
+# (skills/wiki-lint/SKILL.md), whose block self-acquires `.wiki-lock`
+# (mkdir + unconditional-release trap, pattern 1) before pruning and soft-skips
+# on contention. Pruning unlocked right after this Step 12 rmdir would let a
+# concurrent ingest that grabs the freed lock race the prune against its own
+# fresh `.versions/` backups + index repair.
+run_step_13_auto_lint   # read-only diagnostics only; retention prune runs under the lock via wiki-lint §13 Phase A
 ```
 
 Surface result to user (Step 14 final report unchanged from v1.3.0).
@@ -2306,9 +2467,29 @@ if [[ ${#SUCCESS_DRAFTS[@]} -eq 0 ]]; then
   # 3. Increment retry counter (.pending-scan-retry-count).
   increment_retry_counter
 
-  # 4. If counter == 3:
+  # 4. If counter == 3 — 3-strike escape (idempotent emit-first, impl R9, mirror
+  #    of the F1 path). R9: the terminal ingest-fail row must be durable BEFORE
+  #    the window is released (a promote-first order risks fail-open on a log
+  #    failure). R7: a retry cycle must not append a duplicate terminal row for
+  #    the same window. (1) skip the emit if log.jsonl already carries a terminal
+  #    ingest-fail row for THIS window (+slug); (2) else emit and, on emit
+  #    failure, do NOT promote (preserve .pending-scan + counter, bail); (3) only
+  #    after the row is durable, run the guarded promotion (preserves state +
+  #    bails on a rename failure; idempotency prevents a duplicate row).
   if [[ retry_counter == 3 ]]; then
-    emit_log_line action=ingest-fail
+    # (1)+(2) window-key idempotent emit-first. `ingest_fail_row_exists` greps
+    # log.jsonl for a terminal ingest-fail row carrying THIS window (+slug); the
+    # emit adds `window=<current .pending-scan>` so the idempotency key is present.
+    if ! ingest_fail_row_exists window="<current .pending-scan>" source=$slug; then
+      emit_log_line action=ingest-fail source=$slug window="<current .pending-scan>" \
+        || { echo "FATAL: could not durably record ingest-fail; window preserved" >&2; \
+             rmdir "<wiki>/.wiki-meta/.wiki-lock"; trap - EXIT; exit 1; }
+    fi
+    # (3) Guarded promotion — only AFTER the terminal row is durable (shared
+    # shorthand — see the Step 11 "Auto-Ingest" block / F1 3-strike escape:
+    # validate TS_RE + advance only when strictly newer than .last-scan, else
+    # drop .pending-scan; never a raw mv; bails on a rename failure, preserving
+    # .pending-scan + counter — the durable row is not duplicated next cycle).
     promote_pending_scan_to_last_scan  # break stuck-window loop
     reset_retry_counter
   fi
@@ -2480,6 +2661,9 @@ do_ingest_skip_terminal_under_lock() {
   emit_log_line action=ingest-skip source=<slug> pages_created=[] pages_updated=[]
 
   # 3. Promote .pending-scan → .last-scan (terminal event, source is fully accounted for).
+  # Guarded promotion (shared shorthand — see the Step 11 "Auto-Ingest" promotion
+  # block / F1 3-strike escape): validate TS_RE + advance only when strictly
+  # newer than .last-scan, else drop .pending-scan. Never a raw mv.
   promote_pending_scan_to_last_scan
 
   rmdir "<wiki>/.wiki-meta/.wiki-lock"
@@ -2863,11 +3047,13 @@ for f in "${INBOX_FILES[@]}"; do rm -f "$f"; done
 rmdir "<wiki_root>/.wiki-meta/.wiki-lock" 2>/dev/null
 ```
 
-The same two operations (inbox cleanup + rmdir) must also run on any error exit — register them in a bash `trap` set up at lock-acquisition time. See Error Handling.
+The same two operations (inbox cleanup + rmdir) must also run on any error exit. Use the trap form from the lock-pattern catalog (`skills/wiki-schema/references/storage-layout.md` §Concurrency Lock Protocol), NOT an unconditional `trap` registered at lock-acquisition time: the main single-source ingest is a **multi-block** path (Step 3 acquire → Steps 4-11 mutate → Step 12 release), so an acquisition-time `EXIT` trap would fire at the end of the Step 3 block and release the lock before Steps 4-11 run (the early-release bug Pattern 2 / Step 7.6.C fixed). Instead each mutating block registers a **failure-only** trap that runs the inbox cleanup + `rmdir` on `rc != 0`, and this Step 12 releases explicitly on the success path above. (A single-block ingest — acquire + mutate + release in one Bash block — may use the Pattern 1 unconditional-release trap instead.) See Error Handling.
 
 ### 13. Auto-Lint
 
 Run an automatic health check after the ingest completes. This ensures the wiki stays healthy without the user needing to manually invoke `/wiki-lint`.
+
+> **Read-only (invariant #3):** this post-ingest auto-lint runs POST-LOCK and performs **diagnostics only** — it never mutates wiki state. The retention prune (`keep last-3 .versions per page`) is a mutation and is performed under the wiki lock via wiki-lint §13 Auto-Fix Phase A (`skills/wiki-lint/SKILL.md`), which self-acquires `.wiki-lock` — never unlocked here.
 
 Perform these lint checks silently:
 
@@ -2895,18 +3081,20 @@ obsidian backlinks path="<wiki_prefix>/pages/<page>.md" format=json
 
 > **Wiki boundary filtering is mandatory.** `obsidian orphans` and `obsidian unresolved` return vault-wide results. Always post-filter against `<wiki_prefix>/pages/` to avoid reporting unrelated vault notes as wiki issues.
 
-**Auto-fix** what can be fixed without human judgment. v1.5.0+: index
-mutations MUST go through the envelope-wrap helper to preserve the
-envelope wrapper (round-2 Codex review P2-B). Recommended form is to
-delegate to `/wiki-rebuild` (regenerates the full envelope-wrapped index
-from page frontmatter — the source of truth per
-`skills/wiki-schema/SKILL.md`); an in-place patch path follows the same
-read-merge-write pattern as Step 9 above.
+**Auto-fixable issues are NOT mutated here** (invariant #3 — this post-ingest
+auto-lint runs POST-LOCK and holds no lock, so it must not write wiki state).
+Delegate them to `/wiki-lint --fix`, which mutates ONLY under the lock: its §13
+Auto-Fix Phase A self-acquires `.wiki-lock` for the retention prune, and its
+Phase B delegates `index.json` repair to `/wiki-rebuild` (the single lock owner,
+envelope-preserving). Never prune `.versions/` or patch `index.json` unlocked
+from this step:
 
-- Add missing pages to `index.json` (via envelope helpers — delegate to
-  `/wiki-rebuild` or apply the Step 9 read-merge-write pattern)
-- Remove ghost entries from `index.json` (same)
-- Prune excess page versions (keep last 3)
+- Missing / ghost `index.json` entries → `/wiki-lint --fix` (Phase B → `/wiki-rebuild`)
+- Excess page versions (keep last 3) → `/wiki-lint --fix` (Phase A retention prune)
+
+`index.json` is already kept in sync under the lock by Step 9 during the ingest
+transaction; this post-lock step only reports drift and defers any repair to the
+locked `/wiki-lint --fix` path above.
 
 **Report issues** that require human judgment (only if found):
 - Schema violations (missing frontmatter)
@@ -2968,7 +3156,13 @@ In this case:
        #       CURRENT_LAST > BATCH_PENDING ⇒ do NOT regress LAST. Skip the
        #       advance; Step B will drop the now-obsolete pending.
        if [[ -z "$CURRENT_LAST" ]] || ! [[ "$CURRENT_LAST" =~ $TS_RE ]] || ! [[ "$CURRENT_LAST" > "$BATCH_PENDING" ]]; then
-         echo "$BATCH_PENDING" > "$LAST_FILE"
+         # Atomic write (temp + rename) — repo standard, matching
+         # scan-vault-changes.sh's .pending-scan write and wrap-index-envelope.js.
+         # A direct truncate-then-write redirect could leave .last-scan
+         # empty/truncated if interrupted mid-write; rename swaps it in one step.
+         # This runs under .wiki-lock, so the tmp filename cannot collide.
+         _LS_TMP="${LAST_FILE}.tmp.$$.$(date +%s)"
+         printf '%s\n' "$BATCH_PENDING" > "$_LS_TMP" && mv "$_LS_TMP" "$LAST_FILE"
        fi
        # Step B — drop .pending-scan if its window is already covered by LAST.
        # Re-read LAST since Step A may have just advanced it.
@@ -3011,7 +3205,7 @@ In this case:
   - For `wiki-page-writer`: any worker-output validation failure is handled per Step 7.6.B Gates 1-4 (file basename, status branch, page_content non-empty, frontmatter_meta subfields) — the per-agent contract above is the BEFORE-Gate-1 baseline.
   - Note: invalid-format `source_hashes` *values* (sentinels like `"main-computes"`, empty strings, non-hex) are NOT fatal — Step 8d normalizes them via main-side recompute. Only a missing key for a slug the caller passed in is fatal.
   - Legacy `created`/`updated`/`versioned`/`failed` shape applies ONLY to the Step 8 manifest AFTER main reconciles drafts/page_plans (i.e., post-aggregation, NOT raw split-agent output). Step 8a's manifest construction generates this shape from per-agent outputs; Step 8b+ validation operates on this constructed manifest, not on the raw agent JSON.
-- Always release the lock in case of errors (use trap in bash operations)
+- Always release the lock in case of errors, using the trap form from the lock-pattern catalog (`skills/wiki-schema/references/storage-layout.md` §Concurrency Lock Protocol) — a failure-only trap on each mutating block for multi-block paths (never an unconditional trap at lock-acquisition, which releases early), or a single-block unconditional-release trap when acquire+mutate+release fit one Bash block
 - **Inbox cleanup (type: text)**: The trap that releases the lock also deletes each file in `INBOX_FILES` (populated in Step 6.5). Never use `.inbox/*.txt` wildcards — stale inbox files from a prior crashed session belong to that session and may still be needed for recovery. This cleanup runs on success AND failure so pasted text never lingers on disk
-- **Orphan versions**: If any `failed` entry carries an `orphan_version`, surface it in the Step 14 report so the user knows a backup exists for a page that did NOT get overwritten. Auto-lint's retention prune (Step 13) handles actual cleanup — no special action here
+- **Orphan versions**: If any `failed` entry carries an `orphan_version`, surface it in the Step 14 report so the user knows a backup exists for a page that did NOT get overwritten. The retention prune (wiki-lint §13 Auto-Fix Phase A, under the wiki lock) handles actual cleanup — no special action here
 - If the agent returns `failed` entries (partial success): proceed with metadata updates for the succeeded pages and include the failures in the Step 14 report. **Do NOT promote `.pending-scan` on any partial or full failure** — the next session's hook will re-detect and re-process the window (no data loss). This matches the original "process all files successfully before promoting" semantics

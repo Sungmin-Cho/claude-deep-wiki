@@ -244,7 +244,7 @@ After rebuilding, run an automatic health check (same as wiki-ingest auto-lint):
 
 > Wiki boundary filtering is mandatory for all vault-wide CLI results.
 
-Auto-fix structural issues silently (prune excess versions, remove ghost index entries). Only report issues that need human judgment.
+Auto-fix structural issues silently — under the `.wiki-lock` still held from Step 1 (invariant #3; released only at Step 6) — (prune excess versions, remove ghost index entries). Only report issues that need human judgment.
 
 ### 6. Release Lock and Report
 

@@ -443,49 +443,116 @@ Present a structured report:
 
 ### 13. Auto-Fix (if --fix flag)
 
-If the user passed `--fix`:
+If the user passed `--fix`, the auto-fixable subset performs:
 - Prune excess versions (keep last 3)
-- Add missing pages to index.json (v1.5.0+ — see envelope-aware index mutation below)
+- Add missing pages to index.json (v1.5.0+ — see Phase B below)
 - Remove ghost entries from index.json (v1.5.0+ — same)
 - Do NOT auto-fix content issues (schema violations, orphans, broken links) — these require human judgment
 - Drop stale `.pending-scan` (State B from Step 11 — `PENDING < LAST`)
 - Drop invalid `.pending-scan` content (State A on `.pending-scan`); leave `.last-scan` intact (State A on `.last-scan` requires manual intervention because dropping it would trigger first-run fallback).
 
-**v1.5.0+ envelope-aware index mutation.** When `--fix` adds missing pages
-or removes ghost entries from `index.json`, the write path MUST go through
-the envelope helpers. Direct mutation of the wrapped file drops
-`envelope.run_id` and provenance, breaking subsequent envelope-aware reads
-(round-1 Codex adversarial #2). The simplest safe form delegates to
-`/wiki-rebuild` (which already uses the envelope-wrap helper end-to-end):
+The read-only diagnostics (§1–§12) never mutate state and run without the lock.
+Every mutating fix runs under `.wiki-lock` (invariant #3 — all writes acquire the
+lock first). The mutations split into two phases with **distinct lock owners**, so
+that no single owner ever holds the lock across the `/wiki-rebuild` delegation:
+
+- **Phase A** — lint's own mutations (`.pending-scan` drop + version prune) run
+  inside a single self-contained lock block (pattern 1; see
+  `skills/wiki-schema/references/storage-layout.md` §Concurrency Lock Protocol).
+- **Phase B** — `index.json` drift repair delegates to `/wiki-rebuild`, which
+  acquires the lock itself. It MUST run **after** Phase A has released the lock,
+  because `/wiki-rebuild`'s acquisition is non-reentrant (`mkdir "$LOCK_DIR" ||
+  exit 1`, `skills/wiki-rebuild/SKILL.md` Step 1) and would hard-fail if lint
+  still held the lock.
+
+**Phase A — lint self-mutations under the wiki lock.**
 
 ```bash
 set -euo pipefail
 : "${WIKI_ROOT:?caller must set WIKI_ROOT to the wiki root absolute path}"
+LOCK_DIR="${WIKI_ROOT}/.wiki-meta/.wiki-lock"
 
-# Recommended: delegate index drift fix to /wiki-rebuild — it regenerates
-# index.json from page frontmatter (the source of truth per
-# skills/wiki-schema/SKILL.md) and emits envelope-wrapped output via the
-# same atomic temp+rename helper used by /wiki-ingest. Equivalent semantics
-# to a manual add-missing + remove-ghost cycle, without the envelope
-# preservation foot-gun.
-
-# Alternative — in-place envelope-aware index patch (for callers that
-# explicitly need to scope changes to specific pages without a full
-# rebuild). Same read-merge-write pattern as /wiki-query Step 5d and
-# /wiki-ingest Step 9 — see those steps for the full pattern.
-```
-
-```bash
-# In the --fix path (SCAN-WINDOW auto-fix, v1.2.0+):
-LAST=$(cat "$WIKI_ROOT/.wiki-meta/.last-scan" 2>/dev/null || true)
-PEND=$(cat "$WIKI_ROOT/.wiki-meta/.pending-scan" 2>/dev/null || true)
-TS_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
-
-if [ -s "$WIKI_ROOT/.wiki-meta/.pending-scan" ] && ! [[ "$PEND" =~ $TS_RE ]]; then
-  rm -f "$WIKI_ROOT/.wiki-meta/.pending-scan"
-  echo "  --fix: dropped invalid .pending-scan"
-elif [[ "$LAST" =~ $TS_RE ]] && [[ "$PEND" =~ $TS_RE ]] && [[ "$PEND" < "$LAST" ]]; then
-  rm -f "$WIKI_ROOT/.wiki-meta/.pending-scan"
-  echo "  --fix: dropped stale .pending-scan (older than .last-scan)"
+# Phase A — lint's own --fix mutations under the wiki lock (invariant #3).
+# Pattern 1 (references/storage-layout.md §Concurrency Lock Protocol):
+# self-contained single block → acquire → unconditional-release EXIT trap →
+# re-read + re-validate under the lock (TOCTOU) → mutate → block exit releases
+# the lock. Distinguish contention from real errors: soft-skip the mutations
+# ONLY when the lock dir already exists (another session holds it) — the
+# read-only diagnostics above still stand. A missing .wiki-meta (not a wiki
+# root) or an unwritable lock path is NOT contention → fail loud.
+if [ ! -d "$WIKI_ROOT/.wiki-meta" ]; then
+  echo "ERROR: --fix: $WIKI_ROOT/.wiki-meta missing — not a wiki root (run /wiki-setup)." >&2
+  exit 1
 fi
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  if [ -d "$LOCK_DIR" ]; then
+    echo "  --fix: wiki locked by another session — auto-fix mutations skipped; diagnostics above stand. Re-run /wiki-lint --fix later."
+  else
+    echo "ERROR: --fix: cannot acquire lock at $LOCK_DIR (not contention — check permissions / filesystem)." >&2
+    exit 1
+  fi
+else
+  trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+  TS_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
+  # Re-read UNDER the lock — do NOT trust the pre-lock diagnostic values (TOCTOU).
+  LAST=$(cat "$WIKI_ROOT/.wiki-meta/.last-scan" 2>/dev/null || true)
+  PEND=$(cat "$WIKI_ROOT/.wiki-meta/.pending-scan" 2>/dev/null || true)
+
+  # A.1 — .pending-scan drop (State A: invalid content; State B: older than LAST).
+  if [ -s "$WIKI_ROOT/.wiki-meta/.pending-scan" ] && ! [[ "$PEND" =~ $TS_RE ]]; then
+    rm -f "$WIKI_ROOT/.wiki-meta/.pending-scan"
+    echo "  --fix: dropped invalid .pending-scan"
+  elif [[ "$LAST" =~ $TS_RE ]] && [[ "$PEND" =~ $TS_RE ]] && [[ "$PEND" < "$LAST" ]]; then
+    rm -f "$WIKI_ROOT/.wiki-meta/.pending-scan"
+    echo "  --fix: dropped stale .pending-scan (older than .last-scan)"
+  fi
+
+  # A.2 — version prune: per page stem keep the newest 3
+  # `.versions/<stem>.v<N>.md`, remove the rest. bash-3.2 safe (no associative
+  # arrays / no mapfile). Sort by NUMERIC <N> so v10/v11 outrank v2 —
+  # lexicographic order would delete the newest backups. Files that do not
+  # match <stem>.v<N>.md are left untouched (conservative).
+  VERSIONS_DIR="$WIKI_ROOT/.wiki-meta/.versions"
+  if [ -d "$VERSIONS_DIR" ]; then
+    TAB=$(printf '\t')
+    _prune=$(
+      for vf in "$VERSIONS_DIR"/*.v[0-9]*.md; do
+        [ -f "$vf" ] || continue
+        _b=${vf##*/}
+        _stem=$(printf '%s' "$_b" | sed -E 's/\.v[0-9]+\.md$//')
+        [ "$_stem" != "$_b" ] || continue          # no <stem>.v<N>.md suffix — skip
+        _n=$(printf '%s' "$_b" | sed -E 's/^.*\.v([0-9]+)\.md$/\1/')
+        [[ "$_n" =~ ^[0-9]+$ ]] || continue         # non-numeric version — skip
+        printf '%s%s%s%s%s\n' "$_stem" "$TAB" "$_n" "$TAB" "$vf"
+      done | sort -t"$TAB" -k1,1 -k2,2nr | awk -F"$TAB" '{ c[$1]++; if (c[$1] > 3) print $3 }'
+    ) || _prune=""
+    if [ -n "$_prune" ]; then
+      printf '%s\n' "$_prune" | while IFS= read -r _old; do
+        [ -n "$_old" ] || continue
+        rm -f "$_old" && echo "  --fix: pruned old version ${_old##*/}"
+      done
+    fi
+  fi
+fi
+# Block exit here → EXIT trap fires → .wiki-lock released (invariant iii).
 ```
+
+**Phase B — index drift repair via `/wiki-rebuild` (after Phase A releases the lock).**
+
+Once the Phase A block above has exited (lint now holds no lock), if `--fix` needs
+to add missing pages or remove ghost entries from `index.json`, delegate to
+`/wiki-rebuild` **as a separate step**. It regenerates `index.json` from page
+frontmatter (the source of truth per `skills/wiki-schema/SKILL.md`) and emits
+envelope-wrapped output via the same atomic temp+rename helper used by
+`/wiki-ingest`, acquiring `.wiki-lock` itself as the single owner. In-place
+mutation of the wrapped `index.json` is deliberately NOT used here: it would drop
+`envelope.run_id` / provenance (round-1 Codex adversarial #2) and would require a
+lock lint no longer holds. If `/wiki-rebuild` reports lock contention, do not
+force it — surface "index repair deferred — run /wiki-rebuild later" and leave the
+drift for the next run (the read-only diagnostics already reported what drifted).
+
+**Phase invariants** (§13): (i) lint holds no `.wiki-lock` at the moment it
+delegates to `/wiki-rebuild` — the pattern-1 single block guarantees this (block
+exit = trap release); (ii) every `--fix` mutation runs under a lock whose sole
+owner is either lint (Phase A) or `/wiki-rebuild` (Phase B), never both; (iii)
+lint never holds the lock across a bash-block boundary, so it leaks no stale lock.

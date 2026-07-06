@@ -120,7 +120,7 @@ fi
 
 ## Step 0.5 — Inbox stale cleanup (quarantine, mtime > 7 days, partial_fail-protected)
 
-Crashed sessions cannot fire their cleanup trap (the trap is registered at lock acquisition, so any crash before that point leaves inbox files orphaned). Step 12's "self-session files only, no wildcard" policy is preserved — this step touches files only older than 7 days AND not referenced by an unresolved `partial_fail:` sentinel.
+Crashed sessions cannot fire their cleanup trap (per the lock-pattern catalog the cleanup runs from a mutating block's failure-only trap or the Step 12 explicit release, so any crash before that trap is registered leaves inbox files orphaned). Step 12's "self-session files only, no wildcard" policy is preserved — this step touches files only older than 7 days AND not referenced by an unresolved `partial_fail:` sentinel.
 
 **Quarantine, not delete (review round 3 / Codex adversarial HIGH):** there is an inherent race window between Step 6.5 (pasted text materialized as inbox file) and Step 7.6.F (`partial_fail` sentinel written). If the process crashes inside that window, the inbox file is the ONLY persisted copy of the user's pasted source and there is no sentinel yet to protect it. After 7 days a destructive `rm -f` would silently destroy that recovery state. v1.7.0 therefore **moves** stale files to `<wiki_root>/.wiki-meta/.inbox/.quarantine/<basename>.<epoch>` (idempotent — preserves multiple generations under epoch-suffixed names) instead of deleting them. Operators can recover or hand-prune quarantine contents at their leisure; the directory is opaque to all other wiki-ingest steps.
 
@@ -534,7 +534,7 @@ LOCK_DIR="<wiki_root>/.wiki-meta/.wiki-lock"
 mkdir "$LOCK_DIR" 2>/dev/null || { echo "ERROR: Wiki is locked by another session. Try again later."; exit 1; }
 ```
 
-Set up cleanup: the lock MUST be released when done (success or failure).
+Set up cleanup per the lock-pattern catalog (`skills/wiki-schema/references/storage-layout.md` §Concurrency Lock Protocol): the lock MUST be released when done (success or failure). This is a **multi-block** path (this acquire block → Steps 4-11 mutate → Step 12 release), so do NOT register an unconditional `EXIT` trap in this acquisition block — it would fire at this block's end and release the lock before Steps 4-11 run. Use the Pattern 2 form: a failure-only trap on each mutating block + the explicit success release at Step 12.
 
 ### 4. Pre-filter Overlap Candidates
 
@@ -3006,7 +3006,7 @@ for f in "${INBOX_FILES[@]}"; do rm -f "$f"; done
 rmdir "<wiki_root>/.wiki-meta/.wiki-lock" 2>/dev/null
 ```
 
-The same two operations (inbox cleanup + rmdir) must also run on any error exit — register them in a bash `trap` set up at lock-acquisition time. See Error Handling.
+The same two operations (inbox cleanup + rmdir) must also run on any error exit. Use the trap form from the lock-pattern catalog (`skills/wiki-schema/references/storage-layout.md` §Concurrency Lock Protocol), NOT an unconditional `trap` registered at lock-acquisition time: the main single-source ingest is a **multi-block** path (Step 3 acquire → Steps 4-11 mutate → Step 12 release), so an acquisition-time `EXIT` trap would fire at the end of the Step 3 block and release the lock before Steps 4-11 run (the early-release bug Pattern 2 / Step 7.6.C fixed). Instead each mutating block registers a **failure-only** trap that runs the inbox cleanup + `rmdir` on `rc != 0`, and this Step 12 releases explicitly on the success path above. (A single-block ingest — acquire + mutate + release in one Bash block — may use the Pattern 1 unconditional-release trap instead.) See Error Handling.
 
 ### 13. Auto-Lint
 
@@ -3164,7 +3164,7 @@ In this case:
   - For `wiki-page-writer`: any worker-output validation failure is handled per Step 7.6.B Gates 1-4 (file basename, status branch, page_content non-empty, frontmatter_meta subfields) — the per-agent contract above is the BEFORE-Gate-1 baseline.
   - Note: invalid-format `source_hashes` *values* (sentinels like `"main-computes"`, empty strings, non-hex) are NOT fatal — Step 8d normalizes them via main-side recompute. Only a missing key for a slug the caller passed in is fatal.
   - Legacy `created`/`updated`/`versioned`/`failed` shape applies ONLY to the Step 8 manifest AFTER main reconciles drafts/page_plans (i.e., post-aggregation, NOT raw split-agent output). Step 8a's manifest construction generates this shape from per-agent outputs; Step 8b+ validation operates on this constructed manifest, not on the raw agent JSON.
-- Always release the lock in case of errors (use trap in bash operations)
+- Always release the lock in case of errors, using the trap form from the lock-pattern catalog (`skills/wiki-schema/references/storage-layout.md` §Concurrency Lock Protocol) — a failure-only trap on each mutating block for multi-block paths (never an unconditional trap at lock-acquisition, which releases early), or a single-block unconditional-release trap when acquire+mutate+release fit one Bash block
 - **Inbox cleanup (type: text)**: The trap that releases the lock also deletes each file in `INBOX_FILES` (populated in Step 6.5). Never use `.inbox/*.txt` wildcards — stale inbox files from a prior crashed session belong to that session and may still be needed for recovery. This cleanup runs on success AND failure so pasted text never lingers on disk
 - **Orphan versions**: If any `failed` entry carries an `orphan_version`, surface it in the Step 14 report so the user knows a backup exists for a page that did NOT get overwritten. The retention prune (wiki-lint §13 Auto-Fix Phase A, under the wiki lock) handles actual cleanup — no special action here
 - If the agent returns `failed` entries (partial success): proceed with metadata updates for the succeeded pages and include the failures in the Step 14 report. **Do NOT promote `.pending-scan` on any partial or full failure** — the next session's hook will re-detect and re-process the window (no data loss). This matches the original "process all files successfully before promoting" semantics

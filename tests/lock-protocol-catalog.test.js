@@ -244,3 +244,59 @@ test('F8-b: a lock-holding intermediate block releases the lock on failure, keep
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Review fix (impl R6 sweep) #10 — Step 12's error-exit note prescribed
+// registering the cleanup trap "in a bash `trap` set up at lock-acquisition
+// time". For the multi-block main ingest (Step 3 acquire → Steps 4-11 → Step 12
+// release) an unconditional acquisition-time EXIT trap fires at the end of the
+// Step 3 block, releasing the lock before Steps 4-11 run — the early-release
+// bug Pattern 2 fixed. The note now delegates the trap form to the catalog.
+// ---------------------------------------------------------------------------
+test('F10-a: Step 12 error-exit lock release delegates to the lock-pattern catalog', () => {
+  const md = fs.readFileSync(INGEST, 'utf8');
+  const s12Idx = md.indexOf('### 12. Release Lock');
+  assert.notEqual(s12Idx, -1, 'Step 12 heading not found');
+  const s12 = md.slice(s12Idx, md.indexOf('\n### 13.', s12Idx));
+  assert.doesNotMatch(
+    s12,
+    /trap` set up at lock-acquisition time/,
+    'Step 12 must not prescribe an acquisition-time unconditional trap (multi-block early-release bug)',
+  );
+  assert.match(
+    s12,
+    /storage-layout|Concurrency Lock Protocol|failure-only|pattern catalog/i,
+    'Step 12 must delegate the trap form to the lock-pattern catalog',
+  );
+});
+
+// F10-b — sweep residual: the canonical wiki-schema versioning rule must state
+// that version pruning is a locked mutation (invariant #3), not an unqualified
+// "prune during auto-lint" that reads as a post-lock unlocked sweep.
+test('F10-b: wiki-schema versioning rule prunes under the lock (invariant #3)', () => {
+  const schema = fs.readFileSync(SCHEMA, 'utf8');
+  const vIdx = schema.indexOf('## Versioning');
+  assert.notEqual(vIdx, -1, '## Versioning section not found');
+  const versioning = schema.slice(vIdx, schema.indexOf('\n## ', vIdx + 4));
+  assert.match(versioning, /prun/i, 'versioning section must mention pruning');
+  assert.match(
+    versioning,
+    /under the wiki lock|invariant #3|Phase A/i,
+    'version pruning must be stated as a locked mutation (invariant #3 / §13 Phase A)',
+  );
+});
+
+// F10-c — sweep residual: wiki-rebuild's Step 5 auto-fix (prune excess versions,
+// remove ghost entries) must state it runs under the held lock, not read as a
+// bare unlocked mutation.
+test('F10-c: wiki-rebuild Step 5 auto-fix prunes under the held lock', () => {
+  const md = fs.readFileSync(S('wiki-rebuild', 'SKILL.md'), 'utf8');
+  const fixIdx = md.indexOf('Auto-fix structural issues');
+  assert.notEqual(fixIdx, -1, 'wiki-rebuild auto-fix line not found');
+  const line = md.slice(fixIdx, md.indexOf('\n', fixIdx));
+  assert.match(
+    line,
+    /under the .*lock|invariant #3/i,
+    'wiki-rebuild auto-fix (prune) must state it runs under the held lock',
+  );
+});

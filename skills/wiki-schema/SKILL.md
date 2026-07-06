@@ -228,7 +228,7 @@ Acquire a `mkdir`-based directory lock at `.wiki-meta/.wiki-lock` before any wri
 
 ## Versioning
 
-Before overwriting an existing page, copy the current version to `.wiki-meta/.versions/<page-name>.v<N>.md`. Keep the last 3 versions. Prune older versions during auto-lint. See `references/storage-layout.md` for details.
+Before overwriting an existing page, copy the current version to `.wiki-meta/.versions/<page-name>.v<N>.md`. Keep the last 3 versions. Pruning older versions is a **mutation** and therefore runs **under the wiki lock** (invariant #3) — via `wiki-lint` §13 Auto-Fix Phase A, which self-acquires `.wiki-lock`; never unlocked. See `references/storage-layout.md` for details.
 
 ## Auto-Lint
 

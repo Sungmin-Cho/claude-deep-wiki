@@ -2968,7 +2968,13 @@ In this case:
        #       CURRENT_LAST > BATCH_PENDING ⇒ do NOT regress LAST. Skip the
        #       advance; Step B will drop the now-obsolete pending.
        if [[ -z "$CURRENT_LAST" ]] || ! [[ "$CURRENT_LAST" =~ $TS_RE ]] || ! [[ "$CURRENT_LAST" > "$BATCH_PENDING" ]]; then
-         echo "$BATCH_PENDING" > "$LAST_FILE"
+         # Atomic write (temp + rename) — repo standard, matching
+         # scan-vault-changes.sh's .pending-scan write and wrap-index-envelope.js.
+         # A direct truncate-then-write redirect could leave .last-scan
+         # empty/truncated if interrupted mid-write; rename swaps it in one step.
+         # This runs under .wiki-lock, so the tmp filename cannot collide.
+         _LS_TMP="${LAST_FILE}.tmp.$$.$(date +%s)"
+         printf '%s\n' "$BATCH_PENDING" > "$_LS_TMP" && mv "$_LS_TMP" "$LAST_FILE"
        fi
        # Step B — drop .pending-scan if its window is already covered by LAST.
        # Re-read LAST since Step A may have just advanced it.

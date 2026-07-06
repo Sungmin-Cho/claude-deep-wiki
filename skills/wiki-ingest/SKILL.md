@@ -1864,7 +1864,32 @@ On mismatch: function emits `FATAL: A5-fanout worker mutated wiki_root (pre=...,
 ```bash
 STAGE_3_START_MS=$(_ts_ms)    # B3 v1.4.2 — phase_timing_ms capture (Stage 3 start = lock acquire attempt)
 mkdir "<wiki>/.wiki-meta/.wiki-lock" || { echo "Wiki locked"; exit 1; }
-trap 'rmdir "<wiki>/.wiki-meta/.wiki-lock" 2>/dev/null || true' EXIT
+
+# Pattern 2 lock (storage-layout.md §Concurrency Lock Protocol — same fix as
+# wiki-rebuild round-4 Codex review #1). This .wiki-lock critical section spans
+# Steps 7.6.C → 7.6.D → 7.6.E (Steps 8-11) → 7.6.F → 7.6.G, and each of those
+# runs in a SEPARATE Claude Code Bash tool block (a fresh shell per fenced bash
+# block). An unconditional EXIT trap that rmdirs the lock in this acquisition
+# block would therefore fire the instant THIS block ends — releasing it before Steps
+# D-G run and reopening the concurrent-write window they must be protected from
+# (the very early-release bug wiki-rebuild round-4 fixed). So: NO unconditional
+# release trap here. Instead register a FAILURE-ONLY cleanup (cleanup_step3
+# model): on a hard abort of this write block (rc != 0) release the lock so it
+# never strands; on success (rc == 0 — including the partial-fail break/continue
+# paths, which still complete the block normally) keep the lock held for Step
+# 7.6.F's sentinel write and Step 7.6.G's explicit rmdir release. Inter-block
+# crash between D-G still leaks the lock — pre-existing mkdir-lock behaviour,
+# recovered manually (Stale Lock Recovery) or by Step 7.7.F's on_metadata_failure
+# release; out of scope here.
+cleanup_7_6_C() {
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    rmdir "<wiki>/.wiki-meta/.wiki-lock" 2>/dev/null || true
+    echo "ERROR: Step 7.6.C write block aborted (rc=$rc); lock released to avoid stranding." >&2
+  fi
+  return $rc
+}
+trap cleanup_7_6_C EXIT
 
 PARTIAL_FAIL=false
 
@@ -2147,6 +2172,9 @@ if [ "$PARTIAL_FAIL" = "false" ] && [ "$yaml_has_partial" = "true" ]; then
   if ! mv "$tmp" "$yaml"; then
     rm -f "$tmp"
     echo "ERROR: partial_fail removal failed; source stuck in re-ingest loop"
+    # Pattern 2 (7.6.C conversion): the lock is held from Step 7.6.C through
+    # 7.6.G, so a hard exit here would strand it. Release before aborting.
+    rmdir "<wiki>/.wiki-meta/.wiki-lock" 2>/dev/null || true
     exit 1
   fi
 
@@ -2224,6 +2252,9 @@ EOF
   if ! mv "$tmp" "$yaml"; then
     rm -f "$tmp"
     echo "ERROR: partial_fail sentinel write failed; wiki state at risk"
+    # Pattern 2 (7.6.C conversion): the lock is held from Step 7.6.C through
+    # 7.6.G, so a hard exit here would strand it. Release before aborting.
+    rmdir "<wiki>/.wiki-meta/.wiki-lock" 2>/dev/null || true
     exit 1
   fi
 fi  # End if/elif (Case ii / Case i). Case (iii) PARTIAL_FAIL=false AND no yaml partial_fail → falls past (no-op clean ingest).

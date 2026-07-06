@@ -112,15 +112,17 @@ Three patterns cover every skill; pick by lock span, not by habit.
   end all in ONE `bash` block. Block exit releases the lock. Use when the whole
   critical section fits in one block. On contention, either hard `exit 1` or
   soft-skip (pattern 3) if the caller still emits a user-facing report.
-  Examples: `wiki-ingest` Step 7.6.C, `wiki-query` Layer 2, `wiki-lint` §13
-  Auto-Fix Phase A.
+  Examples: `wiki-query` Layer 2, `wiki-lint` §13 Auto-Fix Phase A.
 
 - **Pattern 2 — multi-block, failure-only trap + explicit success release.**
   When the lock must span several blocks, the acquisition block registers **no**
   `EXIT` trap (it would release too early). Instead the mutation block registers
   a trap that releases ONLY on failure (`rc != 0`), and a later block releases
   explicitly (`rmdir` + `trap - EXIT`) on success. Examples: `wiki-rebuild`
-  Step 1 + Step 3/6, `wiki-query` Step 5a + Step 5d/5e.
+  Step 1 + Step 3/6, `wiki-query` Step 5a + Step 5d/5e, `wiki-ingest`
+  Step 7.6.C-G (acquisition-block `EXIT` trap forbidden — the critical section
+  runs across Steps 7.6.C → 7.6.G in separate Bash blocks; 7.6.C registers a
+  failure-only cleanup and 7.6.G releases explicitly).
 
 - **Pattern 3 — contention soft-fail (WARN / return).** When a hard `exit 1` on
   a busy lock would terminate the whole script before a user-facing message or

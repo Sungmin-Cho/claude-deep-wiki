@@ -606,34 +606,34 @@ test('F9-a: retry-counter format unified (ISO key) across wiki-schema.yaml and w
 });
 
 // ---------------------------------------------------------------------------
-// Review fix (impl R7) #11 — the F1 3-strike block emitted the terminal
-// `ingest-fail` log line BEFORE attempting the guarded promotion. On a rename
-// failure the promotion bails (return 1) with `.pending-scan` + the counter
-// preserved (R2), but the append-only log already carries a terminal
-// ingest-fail row — so the next retry cycle emits another, and the audit log
-// disagrees with the real scan-window state. The emit must move AFTER the
-// promotion durably advances/releases the window.
+// Review fix (impl R9) #14 — terminal-log logging for the 3-strike paths is
+// idempotent emit-first, closing R7 AND R9 together. R9: the terminal
+// ingest-fail row must be DURABLE BEFORE the window is released (a promote-first
+// order could release the window then fail to log = fail-open, a 3-strike with
+// no audit record). R7: a retry cycle must not append a SECOND terminal row for
+// the same window. So each 3-strike path: (1) skips the emit if log.jsonl
+// already carries a terminal ingest-fail row for THIS window (+slug) — window-
+// key idempotency; (2) else emits, and on emit failure does NOT release the
+// window (preserve .pending-scan + counter, bail); (3) only after the row is
+// durable runs the guarded promotion (which itself preserves state + bails on a
+// rename failure — the already-emitted row is not duplicated next cycle).
 // ---------------------------------------------------------------------------
-test('F11-a: F1 3-strike emits the terminal ingest-fail only after the promotion durably advances', () => {
-  const md = fs.readFileSync(SKILL_MD, 'utf8');
-  const region = extractF1ThreeStrike(md);
-  const emitIdx = region.indexOf('action=ingest-fail');
-  const gateIdx = region.indexOf('if printf');
-  const bailIdx = region.indexOf('return 1');
-  assert.ok(emitIdx !== -1 && gateIdx !== -1 && bailIdx !== -1, 'emit / promotion gate / bail must all be present in the 3-strike block');
-  assert.ok(emitIdx > gateIdx, 'the terminal ingest-fail emit must come AFTER the promotion write+rename gate');
-  assert.ok(emitIdx > bailIdx, 'the terminal ingest-fail emit must come AFTER the rename-failure bail (a failed rename emits no terminal row)');
-});
 
-// F11-b — behavioral model of the reordered flow: a stub `emit_ingest_fail`
-// runs only after the guarded promotion. A rename failure bails (return 1)
-// before it, so no terminal ingest-fail row is written; success writes one.
-test('F11-b: a failed rename leaves no durable ingest-fail row; success writes one', () => {
-  const MODEL = `
+// Idempotent emit-first + guarded-promotion model shared by the behavioral
+// cases below (mirrors the shipped F1 / Step 7.7.B structure).
+const IDEMPOTENT_MODEL = `
 run() {
   current_window=$(cat "\${WIKI_ROOT}/.wiki-meta/.pending-scan" 2>/dev/null || echo "")
   RETRY_FILE="\${WIKI_ROOT}/.wiki-meta/.pending-scan-retry-count"
-  emit_ingest_fail() { printf '{"action":"ingest-fail"}\\n' >> "\${WIKI_ROOT}/.wiki-meta/log.jsonl"; }
+  LOG_FILE="\${WIKI_ROOT}/.wiki-meta/log.jsonl"
+  slug="src-a"
+  # (1) window-key idempotent emit-first.
+  if ! { grep -F '"ingest-fail"' "$LOG_FILE" 2>/dev/null | grep -F "$current_window" | grep -Fq "$slug"; }; then
+    if ! printf '{"action":"ingest-fail","source":"%s","window":"%s"}\\n' "$slug" "$current_window" >> "$LOG_FILE"; then
+      echo "FATAL: could not durably record ingest-fail" >&2; return 1
+    fi
+  fi
+  # (3) guarded promotion — only after the terminal row is durable.
   if [ -n "$current_window" ]; then
     TS_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
     LAST_FILE="\${WIKI_ROOT}/.wiki-meta/.last-scan"
@@ -651,14 +651,35 @@ run() {
   else
     rm -f "$RETRY_FILE"
   fi
-  emit_ingest_fail   # terminal row — only reached after a durable advance/release
 }
 run
 `;
-  const logHas = (dir) => fs.existsSync(path.join(dir, '.wiki-meta', 'log.jsonl'))
-    && fs.readFileSync(path.join(dir, '.wiki-meta', 'log.jsonl'), 'utf8').includes('ingest-fail');
 
-  // Failure path: mv stubbed to fail → run returns 1 before emit → no row.
+const countIngestFail = (dir) => {
+  const lp = path.join(dir, '.wiki-meta', 'log.jsonl');
+  if (!fs.existsSync(lp) || fs.statSync(lp).isDirectory()) return 0;
+  return fs.readFileSync(lp, 'utf8').split('\n').filter((l) => l.includes('ingest-fail')).length;
+};
+
+// F11-a — shipped-order guard (RED-able): the terminal ingest-fail emit comes
+// FIRST (before the promotion gate), behind a window-key idempotency guard, and
+// an emit failure bails without promoting.
+test('F11-a: F1 3-strike emits the terminal ingest-fail first (idempotent), before the promotion', () => {
+  const md = fs.readFileSync(SKILL_MD, 'utf8');
+  const region = extractF1ThreeStrike(md);
+  const emitIdx = region.indexOf('action=ingest-fail');
+  const gateIdx = region.indexOf('if printf');
+  assert.ok(emitIdx !== -1 && gateIdx !== -1, 'emit + promotion gate must both be present in the 3-strike block');
+  assert.ok(emitIdx < gateIdx, 'the terminal ingest-fail emit must come BEFORE the promotion write+rename gate (emit-first — log durable before window release)');
+  const idem = /grep -F '"ingest-fail"'/.exec(region);
+  assert.ok(idem, 'a window-key idempotency guard (grep log.jsonl for an existing ingest-fail row) must be present');
+  assert.ok(idem.index < emitIdx, 'the idempotency guard must precede the emit');
+  assert.match(region, /could not durably record ingest-fail/i, 'an emit failure must bail (preserve the window) instead of proceeding to promote');
+});
+
+// F11-b — test (a): emit succeeds + rename fails, re-run leaves exactly ONE
+// terminal row (window-key idempotency) and .pending-scan preserved.
+test('F11-b: rename failure keeps exactly one terminal row across retries + preserves pending', () => {
   const ff = setupFixture();
   fs.writeFileSync(ff.pending, '2026-06-01T00:00:00Z\n');
   fs.writeFileSync(ff.last, '2026-05-01T00:00:00Z\n');
@@ -666,34 +687,45 @@ run
   fs.mkdirSync(binDir, { recursive: true });
   fs.writeFileSync(path.join(binDir, 'mv'), '#!/bin/sh\nexit 1\n');
   fs.chmodSync(path.join(binDir, 'mv'), 0o755);
-  try {
+  const runOnce = () => {
     try {
-      execSync('bash', { input: MODEL, env: { ...process.env, WIKI_ROOT: ff.tmp, PATH: `${binDir}:${process.env.PATH}` }, stdio: ['pipe', 'pipe', 'pipe'] });
-    } catch { /* run returns 1 */ }
-    assert.equal(logHas(ff.tmp), false, 'a failed rename must leave no durable terminal ingest-fail row');
+      execSync('bash', { input: IDEMPOTENT_MODEL, env: { ...process.env, WIKI_ROOT: ff.tmp, PATH: `${binDir}:${process.env.PATH}` }, stdio: ['pipe', 'pipe', 'pipe'] });
+    } catch { /* run returns 1 on rename failure */ }
+  };
+  try {
+    runOnce();  // cycle 1: emit + rename fails + preserve
+    runOnce();  // cycle 2: idempotency skips the emit
+    assert.equal(countIngestFail(ff.tmp), 1, 'exactly one terminal ingest-fail row across both cycles (no duplicate)');
+    assert.equal(fs.existsSync(ff.pending), true, '.pending-scan preserved when the rename keeps failing');
+    assert.equal(fs.readFileSync(ff.last, 'utf8').trim(), '2026-05-01T00:00:00Z', '.last-scan not advanced (rename failed)');
   } finally {
     fs.rmSync(ff.tmp, { recursive: true, force: true });
   }
+});
 
-  // Success path: promotion advances → terminal row written.
-  const sf = setupFixture();
-  fs.writeFileSync(sf.pending, '2026-06-01T00:00:00Z\n');
-  fs.writeFileSync(sf.last, '2026-05-01T00:00:00Z\n');
+// F14-b — test (b): the emit fails → the promotion is not attempted (window
+// preserved). Modeled by making log.jsonl un-appendable (a directory).
+test('F14-b: an emit failure blocks the promotion (window preserved, no fail-open)', () => {
+  const f = setupFixture();
+  fs.writeFileSync(f.pending, '2026-06-01T00:00:00Z\n');
+  fs.writeFileSync(f.last, '2026-05-01T00:00:00Z\n');
+  fs.mkdirSync(path.join(f.meta, 'log.jsonl'));   // append to a directory fails → emit fails
   try {
-    execSync('bash', { input: MODEL, env: { ...process.env, WIKI_ROOT: sf.tmp }, stdio: ['pipe', 'pipe', 'pipe'] });
-    assert.equal(logHas(sf.tmp), true, 'a durable advance must write the terminal ingest-fail row');
+    try {
+      execSync('bash', { input: IDEMPOTENT_MODEL, env: { ...process.env, WIKI_ROOT: f.tmp }, stdio: ['pipe', 'pipe', 'pipe'] });
+    } catch { /* run returns 1 on emit failure */ }
+    assert.equal(fs.readFileSync(f.last, 'utf8').trim(), '2026-05-01T00:00:00Z', '.last-scan must NOT advance when the terminal emit failed');
+    assert.equal(fs.existsSync(f.pending), true, '.pending-scan preserved (no window release without a durable audit row)');
   } finally {
-    fs.rmSync(sf.tmp, { recursive: true, force: true });
+    fs.rmSync(f.tmp, { recursive: true, force: true });
   }
 });
 
-// ---------------------------------------------------------------------------
-// Review fix (impl R8) #13 — mirror the R7 log-order fix onto the sibling
-// Step 7.7.B all-workers-fail 3-strike path, which still emitted `ingest-fail`
-// BEFORE the guarded promotion (same duplicate-terminal-row / audit-mismatch
-// failure mode on a rename failure). Shipped-order guard, isomorphic to F11-a.
-// ---------------------------------------------------------------------------
-test('F13: Step 7.7.B all-workers-fail 3-strike emits ingest-fail only after promotion', () => {
+// F13 — Step 7.7.B all-workers-fail 3-strike mirrors the F1 idempotent
+// emit-first order: the terminal ingest-fail emit comes BEFORE the guarded
+// promotion, behind a window-key idempotency guard. Shipped-order guard,
+// isomorphic to F11-a.
+test('F13: Step 7.7.B all-workers-fail 3-strike emits ingest-fail first (idempotent), before promotion', () => {
   const md = fs.readFileSync(SKILL_MD, 'utf8');
   const sIdx = md.indexOf('# 4. If counter == 3');
   assert.notEqual(sIdx, -1, 'Step 7.7.B 3-strike block not found');
@@ -702,7 +734,12 @@ test('F13: Step 7.7.B all-workers-fail 3-strike emits ingest-fail only after pro
   const emitIdx = region.indexOf('action=ingest-fail');
   assert.ok(promoteIdx !== -1 && emitIdx !== -1, 'the guarded promotion + ingest-fail emit must both be present');
   assert.ok(
-    emitIdx > promoteIdx,
-    'the terminal ingest-fail emit must come AFTER the guarded promotion (mirror of the F1 3-strike fix)',
+    emitIdx < promoteIdx,
+    'the terminal ingest-fail emit must come BEFORE the guarded promotion (emit-first, mirror of the F1 3-strike fix)',
+  );
+  assert.match(
+    region,
+    /already (has|carries) a terminal ingest-fail|idempoten|grep -F '"ingest-fail"'/i,
+    'Step 7.7.B must have a window-key idempotency guard before the emit',
   );
 });

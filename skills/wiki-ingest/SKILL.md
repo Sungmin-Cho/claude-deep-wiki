@@ -1159,12 +1159,33 @@ PFAIL_EOF
   pages_failed_json=$(printf '%s\n' "${FAILED_PAGE_FILES[@]}" | jq -R . | jq -s -c .)
 
   if [ "$current_count" -ge 3 ]; then
-    # 3-strike escape — promote/drop the stuck window FIRST, then emit the
-    # terminal ingest-fail ONLY after the scan-window state is durably advanced
-    # or released (impl R7). The rename-failure branch below bails (return 1)
-    # with .pending-scan + the counter preserved, so it MUST NOT leave a
-    # terminal ingest-fail row — otherwise the next retry cycle re-emits it and
-    # the append-only audit log disagrees with the real scan-window state.
+    # 3-strike escape — idempotent emit-first (impl R9, closing R7 AND R9). R9:
+    # the terminal ingest-fail row must be DURABLE before the window is released
+    # — a promote-first order could release the window then fail to log the
+    # ingest-fail = fail-open (a 3-strike with no audit record). R7: a retry
+    # cycle must not append a SECOND terminal row for the same window. So:
+    #   (1) window-key idempotency — skip the emit if log.jsonl already carries a
+    #       terminal ingest-fail row for THIS window (+slug);
+    #   (2) else emit, and if the emit FAILS do NOT release the window (preserve
+    #       .pending-scan + counter and bail — next session re-attempts, log
+    #       still consistent);
+    #   (3) only after the terminal row is durable, run the guarded promotion
+    #       below (which preserves state + bails on a rename failure; the
+    #       already-emitted row is not duplicated next cycle thanks to (1)).
+    LOG_FILE="<wiki>/.wiki-meta/log.jsonl"
+    if ! { grep -F '"ingest-fail"' "$LOG_FILE" 2>/dev/null | grep -F "$current_window" | grep -Fq "$slug"; }; then
+      if ! emit_log_line action=ingest-fail source=$slug window=$current_window pages_created=[] pages_updated=[] \
+                         pages_failed=$pages_failed_json phase_timing_ms=$PHASE_TIMING_JSON \
+                         fail_reason="all_f1_dropped_3_strike"; then
+        # Terminal row did not land — do NOT release the window. Preserve
+        # .pending-scan + counter and bail; the next session re-attempts the emit.
+        echo "FATAL: F1 3-strike could not durably record ingest-fail for $slug — .pending-scan + counter preserved; next session retries." >&2
+        rmdir "<wiki>/.wiki-meta/.wiki-lock" 2>/dev/null || true
+        trap - EXIT
+        return 1
+      fi
+    fi
+    # Terminal ingest-fail row is durable → NOW release the stuck window.
     # Promote .pending-scan despite failure (release stuck state) — same
     # contract as v1.3.0 Step 7.5.M-D ingest-fail. GUARDED promotion, SHARED
     # with the Step 11 "Auto-Ingest" promotion block (validate TS_RE + never
@@ -1211,12 +1232,6 @@ PFAIL_EOF
       # No pending window recorded — nothing to promote; clear the counter.
       rm -f "$RETRY_FILE"
     fi
-    # Scan-window state durably advanced/released above → emit the terminal
-    # ingest-fail NOW (the rename-failure path already returned 1 and skips this,
-    # so a failed escape never leaves a durable terminal row — impl R7).
-    emit_log_line action=ingest-fail source=$slug pages_created=[] pages_updated=[] \
-                  pages_failed=$pages_failed_json phase_timing_ms=$PHASE_TIMING_JSON \
-                  fail_reason="all_f1_dropped_3_strike"
     echo "ERROR: F1 all-dropped path hit 3-strike escape for $slug. .pending-scan promoted; manual investigation required." >&2
   else
     # Normal retry-required emit — action `ingest` with pages_failed.
@@ -2452,23 +2467,31 @@ if [[ ${#SUCCESS_DRAFTS[@]} -eq 0 ]]; then
   # 3. Increment retry counter (.pending-scan-retry-count).
   increment_retry_counter
 
-  # 4. If counter == 3 — 3-strike escape. Mirror the F1 path's log ordering
-  #    (impl R8): promote/release the stuck window FIRST, and emit the terminal
-  #    ingest-fail ONLY after a durable advance/release. The guarded promotion
-  #    preserves .pending-scan + the counter and BAILS on a rename failure (see
-  #    the F1 3-strike escape), so a failed escape leaves no terminal
-  #    ingest-fail row — otherwise the next cycle re-emits it and the append-only
-  #    audit log disagrees with the real scan-window state.
+  # 4. If counter == 3 — 3-strike escape (idempotent emit-first, impl R9, mirror
+  #    of the F1 path). R9: the terminal ingest-fail row must be durable BEFORE
+  #    the window is released (a promote-first order risks fail-open on a log
+  #    failure). R7: a retry cycle must not append a duplicate terminal row for
+  #    the same window. (1) skip the emit if log.jsonl already carries a terminal
+  #    ingest-fail row for THIS window (+slug); (2) else emit and, on emit
+  #    failure, do NOT promote (preserve .pending-scan + counter, bail); (3) only
+  #    after the row is durable, run the guarded promotion (preserves state +
+  #    bails on a rename failure; idempotency prevents a duplicate row).
   if [[ retry_counter == 3 ]]; then
-    # Guarded promotion (shared shorthand — see the Step 11 "Auto-Ingest"
-    # promotion block / F1 3-strike escape): validate TS_RE + advance only when
-    # strictly newer than .last-scan, else drop .pending-scan. Never a raw mv.
-    # Bails (releasing the lock, preserving .pending-scan + counter) on a rename
-    # failure — skipping the reset + terminal emit below.
+    # (1)+(2) window-key idempotent emit-first. `ingest_fail_row_exists` greps
+    # log.jsonl for a terminal ingest-fail row carrying THIS window (+slug); the
+    # emit adds `window=<current .pending-scan>` so the idempotency key is present.
+    if ! ingest_fail_row_exists window="<current .pending-scan>" source=$slug; then
+      emit_log_line action=ingest-fail source=$slug window="<current .pending-scan>" \
+        || { echo "FATAL: could not durably record ingest-fail; window preserved" >&2; \
+             rmdir "<wiki>/.wiki-meta/.wiki-lock"; trap - EXIT; exit 1; }
+    fi
+    # (3) Guarded promotion — only AFTER the terminal row is durable (shared
+    # shorthand — see the Step 11 "Auto-Ingest" block / F1 3-strike escape:
+    # validate TS_RE + advance only when strictly newer than .last-scan, else
+    # drop .pending-scan; never a raw mv; bails on a rename failure, preserving
+    # .pending-scan + counter — the durable row is not duplicated next cycle).
     promote_pending_scan_to_last_scan  # break stuck-window loop
     reset_retry_counter
-    # Durable advance/release confirmed → emit the terminal ingest-fail NOW.
-    emit_log_line action=ingest-fail
   fi
   # else: .pending-scan NOT promoted (next session retries the source).
 

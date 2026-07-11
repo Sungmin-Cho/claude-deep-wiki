@@ -16,7 +16,6 @@
     "karpathy"
   ],
   "skills": "./skills/",
-  "hooks": "./hooks/hooks.json",
   "interface": {
     "displayName": "Deep Wiki",
     "shortDescription": "Maintain a persistent markdown knowledge base",

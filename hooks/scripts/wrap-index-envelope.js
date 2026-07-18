@@ -47,6 +47,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const env = require('./envelope');
+const { atomicWriteFile } = require('./runtime/fs-safe.js');
 
 function usage(extra) {
   if (extra) process.stderr.write(`error: ${extra}\n`);
@@ -222,6 +223,59 @@ function parseSourceArtifactSpec(spec) {
   return { path: spec };
 }
 
+function normalizeSourceArtifacts(sourcePages, sourceArtifactSpecs) {
+  const result = [];
+  for (const page of sourcePages || []) {
+    if (typeof page === 'string' && page.length > 0) result.push({ path: page });
+  }
+  for (const value of sourceArtifactSpecs || []) {
+    const parsed = typeof value === 'string' ? parseSourceArtifactSpec(value) : { ...value };
+    if (!parsed || typeof parsed.path !== 'string' || parsed.path.length === 0) continue;
+    if (!parsed.run_id) {
+      const absolute = path.isAbsolute(parsed.path)
+        ? parsed.path
+        : path.resolve(process.cwd(), parsed.path);
+      const harvested = tryReadEnvelopeRunId(absolute, { selfConsistent: true });
+      if (harvested) parsed.run_id = harvested;
+    }
+    result.push(parsed);
+  }
+  return result;
+}
+
+function writeIndexEnvelope(options = {}) {
+  const outputPath = options.outputPath;
+  const payload = options.payload;
+  if (typeof outputPath !== 'string' || outputPath.length === 0 || !path.isAbsolute(outputPath)) {
+    throw new TypeError('writeIndexEnvelope requires an absolute outputPath');
+  }
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new TypeError('index payload must be a non-null, non-array object');
+  }
+  if (!Array.isArray(payload.pages)) {
+    throw new TypeError(
+      `index payload does not match deep-wiki/index domain shape: required "pages" array (got ${
+        Object.hasOwn(payload, 'pages') ? typeof payload.pages : 'missing'
+      })`,
+    );
+  }
+  const sourceArtifacts = normalizeSourceArtifacts(options.sourcePages, options.sourceArtifacts);
+  const wikiRoot = path.dirname(path.dirname(outputPath));
+  const now = options.now instanceof Date ? options.now : new Date(options.now || Date.now());
+  const wrapped = env.wrapEnvelope({
+    artifactKind: 'index',
+    payload,
+    parentRunId: options.parentRunId,
+    sessionId: options.sessionId,
+    sourceArtifacts,
+    git: options.git || env.detectGit(wikiRoot),
+    generatedAt: now.toISOString(),
+    runId: options.runId,
+  });
+  atomicWriteFile(outputPath, `${JSON.stringify(wrapped, null, 2)}\n`);
+  return wrapped;
+}
+
 function main() {
   const args = parseArgs(process.argv.slice(2));
   const required = ['payload-file', 'output'];
@@ -241,125 +295,18 @@ function main() {
   const outputPath = path.resolve(process.cwd(), args['output']);
 
   const payload = readJson(payloadPath);
-  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
-    process.stderr.write(
-      `error: payload at ${payloadPath} must be a non-null, non-array object\n`,
-    );
-    process.exit(2);
-  }
-
-  // Round-2 Codex adv HIGH-B (PARTIAL ACCEPT): defense-in-depth payload
-  // shape check at the writer boundary for `index` artifact kind. The
-  // authoritative payload schema replacement lives in claude-deep-suite/
-  // schemas/payload-registry/deep-wiki/index/v1.0.schema.json (Phase 3
-  // batch); plugin-side validation here catches the obvious "wrong-shape
-  // payload accidentally wrapped" case without duplicating Phase 3 scope.
-  // Specifically: an `index` payload MUST have `pages` as an array (legacy
-  // shape pre-1.5.0 + envelope payload shape v1.5.0+ both honor this).
-  if (artifactKind === 'index') {
-    if (!('pages' in payload) || !Array.isArray(payload.pages)) {
-      process.stderr.write(
-        `error: payload at ${payloadPath} does not match deep-wiki/index domain shape: required "pages" array (got ${
-          'pages' in payload ? typeof payload.pages : 'missing'
-        }). Wrapping a non-index payload would corrupt the wiki catalog (round-2 Codex adv HIGH-B defense). Authoritative payload schema is enforced by claude-deep-suite payload-registry in Phase 3.\n`,
-      );
-      process.exit(2);
-    }
-  }
-
-  // Provenance: page paths (path-only — markdown, no envelope detect) +
-  // optional generic --source-artifact entries.
-  const sourceArtifacts = [];
-  const parentRunId = args['parent-run-id'] || undefined;
-
-  // Multi-source aggregator: page paths land in source_artifacts path-only.
-  if (Array.isArray(args['source-page'])) {
-    for (const p of args['source-page']) {
-      if (typeof p === 'string' && p.length > 0) {
-        sourceArtifacts.push({ path: p });
-      }
-    }
-  }
-
-  // Generic --source-artifact (repeatable). Path-only entries get
-  // auto-harvested run_id via self-consistency (handoff §4 deep-evolve
-  // round-1 W4 lesson). Wiki index normally only receives markdown page
-  // paths, but supports envelope-wrapped sources for forward compat (e.g.
-  // a future workflow that derives index from another plugin's artifact).
-  if (Array.isArray(args['source-artifact'])) {
-    for (const spec of args['source-artifact']) {
-      const parsed = parseSourceArtifactSpec(spec);
-      if (!parsed) continue;
-      if (!parsed.run_id) {
-        const abs = path.isAbsolute(parsed.path)
-          ? parsed.path
-          : path.resolve(process.cwd(), parsed.path);
-        const harvested = tryReadEnvelopeRunId(abs, { selfConsistent: true });
-        if (harvested) {
-          parsed.run_id = harvested;
-        }
-      }
-      sourceArtifacts.push(parsed);
-    }
-  }
-
-  // Round-4 Codex review #2 + Codex adv #2 (2-way fix): derive the
-  // intended git context from the artifact's location (the wiki root),
-  // NOT from process.cwd(). The CLI is invoked from agent bash blocks
-  // whose cwd is arbitrary (often the user's home or repo checkout that
-  // is unrelated to the wiki). Without this fix, envelope.git could
-  // record the wrong repo's HEAD/dirty state when the wiki itself is
-  // not a git repo (Obsidian vault). Output path shape is
-  // `<wiki_root>/.wiki-meta/index.json` → wiki_root = dirname(dirname).
-  // If wiki_root is not a git repo, detectGit returns the 0000000
-  // sentinel (envelope-schema-valid; correctly signals "no git context").
-  const wikiRoot = path.dirname(path.dirname(outputPath));
-  const gitContext = env.detectGit(wikiRoot);
-
   let wrapped;
   try {
-    wrapped = env.wrapEnvelope({
-      artifactKind,
+    wrapped = writeIndexEnvelope({
+      outputPath,
       payload,
-      parentRunId,
+      parentRunId: args['parent-run-id'] || undefined,
       sessionId: args['session-id'] || undefined,
-      sourceArtifacts,
-      git: gitContext,
+      sourcePages: args['source-page'],
+      sourceArtifacts: args['source-artifact'],
     });
   } catch (err) {
     process.stderr.write(`error: ${err.message}\n`);
-    process.exit(2);
-  }
-
-  const outDir = path.dirname(outputPath);
-  if (!fs.existsSync(outDir)) {
-    try {
-      fs.mkdirSync(outDir, { recursive: true });
-    } catch (err) {
-      process.stderr.write(`error: cannot mkdir ${outDir}: ${err.message}\n`);
-      process.exit(2);
-    }
-  }
-
-  // C1 (deep-work round 1) — Atomic write: temp + rename. /wiki-rebuild
-  // and /wiki-ingest can both run on the same wiki concurrently (mkdir-lock
-  // prevents true concurrency but a stale-lock-recovery scenario could leave
-  // two writers racing for a brief window); mid-write interruption (Ctrl-C,
-  // OOM, hook timeout) must not leave a truncated index.json that
-  // envelope-aware readers (wiki-query, wiki-lint) parse-fail on.
-  const tmpPath = `${outputPath}.tmp.${process.pid}.${Date.now()}`;
-  try {
-    fs.writeFileSync(tmpPath, JSON.stringify(wrapped, null, 2) + '\n', 'utf8');
-  } catch (err) {
-    try { fs.unlinkSync(tmpPath); } catch (_) { /* ignore */ }
-    process.stderr.write(`error: cannot write ${tmpPath}: ${err.message}\n`);
-    process.exit(2);
-  }
-  try {
-    fs.renameSync(tmpPath, outputPath);
-  } catch (err) {
-    try { fs.unlinkSync(tmpPath); } catch (_) { /* ignore */ }
-    process.stderr.write(`error: cannot rename ${tmpPath} → ${outputPath}: ${err.message}\n`);
     process.exit(2);
   }
 
@@ -372,4 +319,4 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { parseSourceArtifactSpec, tryReadEnvelopeRunId };
+module.exports = { parseSourceArtifactSpec, tryReadEnvelopeRunId, writeIndexEnvelope };

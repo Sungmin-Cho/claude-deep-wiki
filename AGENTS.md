@@ -18,6 +18,23 @@ To check the current version: `jq -r .version .codex-plugin/plugin.json`.
 Keep wiki data and runtime locks out of the plugin repo unless they are
 intentional test fixtures.
 
+## Runtime Safety Boundary
+
+- Mutation is governed by a cooperative current writer contract with complete
+  post-seizure owner and directory checks. Ambiguous locks require stopped-host
+  intervention; a concurrent old version is unsupported.
+- The claim is mounted-filesystem and process-termination durability only.
+- The Node 22 SessionStart hook uses Codex's host-owned `%COMSPEC% /C` boundary
+  on Windows. There is no shipped shell-script runtime.
+- The plugin has no plugin MCP server or native binary and no runtime dependency.
+  CI evidence covers Windows Server 2025 and macOS arm64 and Intel; it is no
+  Windows 11 claim.
+- Installed-Codex evidence uses an unauthenticated local Responses fixture. It is
+  not production OpenAI API, login, model-quality, Windows 11,
+  arbitrary-user-machine, or OS-level no-egress certification.
+- After a 1.8 write, use a backup-only downgrade: stop all hosts, recover with
+  1.8, restore the authenticated pre-upgrade backup, then start 1.7.1.
+
 ## Verification
 
 ```bash

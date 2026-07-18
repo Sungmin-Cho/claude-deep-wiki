@@ -1,0 +1,7 @@
+{
+  "exit_code": 0,
+  "detected_count": 1,
+  "expected_files": ["메모 폴더/space note.md"],
+  "forbidden_files": ["Deep Wiki/pages/excluded.md"],
+  "stdout_contains": "[deep-wiki]"
+}

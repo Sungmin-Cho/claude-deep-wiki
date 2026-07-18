@@ -11,8 +11,9 @@ git clone https://github.com/Sungmin-Cho/claude-deep-wiki.git
 cd claude-deep-wiki
 ```
 
-Node 20+ is required (ESM project). There are no runtime dependencies — the repo ships
-the plugin (skills, hooks, agents) plus a Node test runner and helper scripts.
+Node 22 is required for development and CI. There are no runtime dependencies — the
+repo ships the plugin (skills, hooks, agents) plus CommonJS Node runtime and test
+scripts.
 
 ## Tests
 
@@ -21,9 +22,24 @@ npm test                 # node --test (recursive discovery from cwd)
 npm run validate-fixture # validate the envelope sample fixture
 ```
 
-Hook scripts must stay **Bash 3.2 portable** (macOS ships `/bin/bash` 3.2.57) — see the
-conventions in [`CLAUDE.md`](CLAUDE.md): no `declare -A`, no `mapfile`, no `${var,,}`,
-no `&>/dev/null`.
+Hook scripts must stay portable across Node 22 on macOS, Linux, and native Windows.
+Use `node:` APIs, preserve drive/UNC paths, and launch children with `shell:false`.
+
+## Runtime and evidence boundary
+
+- Preserve the cooperative current writer protocol and complete post-seizure owner
+  and directory checks. Ambiguous locks require stopped-host intervention, and a
+  concurrent old version must never write the same wiki.
+- Claims are limited to mounted-filesystem and process-termination durability.
+- Windows hook launch is host-owned `%COMSPEC% /C`; add no shipped shell-script
+  runtime. The repository must retain no plugin MCP server or native binary and no
+  runtime dependency.
+- CI covers Windows Server 2025 and macOS arm64 and Intel. That is no Windows 11
+  claim. The installed-Codex smoke uses an unauthenticated local Responses fixture;
+  it is not production OpenAI API, login, model-quality, Windows 11,
+  arbitrary-user-machine, or OS-level no-egress certification.
+- A post-1.8 rollback is a backup-only downgrade after all hosts stop and 1.8
+  completes recovery.
 
 ## Conventions
 

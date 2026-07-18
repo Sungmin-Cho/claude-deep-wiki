@@ -1,7 +1,7 @@
 {
   "name": "deep-wiki",
-  "version": "1.7.1",
-  "description": "LLM-managed markdown wiki — 5 skill-based entry surfaces (cross-platform). Deep-wiki plugin: tests + helpers only; plugin manifest at .claude-plugin/plugin.json.",
+  "version": "1.8.0",
+  "description": "LLM-managed markdown wiki — 5 cross-platform skills with a portable Node 22 runtime for Claude Code and Codex.",
   "author": {
     "name": "Sungmin-Cho"
   },
@@ -17,7 +17,12 @@
     "karpathy"
   ],
   "scripts": {
-    "test": "node --test",
-    "validate-fixture": "node scripts/validate-envelope-emit.js tests/fixtures/sample-index.json"
+    "test": "node --test --test-concurrency=1",
+    "validate-fixture": "node scripts/validate-envelope-emit.js tests/fixtures/sample-index.json",
+    "validate-plugin": "node --test tests/plugin-contract.test.js",
+    "lint:hook-command": "node scripts/lib/executable-contract.js --check-hooks",
+    "lint:commands": "node scripts/lib/executable-contract.js --check",
+    "lint:agents": "node scripts/lint-agent-tools.js",
+    "test:codex-windows-release": "node --test --test-concurrency=1 tests/release/codex-plugin-hook-smoke.release.js"
   }
 }

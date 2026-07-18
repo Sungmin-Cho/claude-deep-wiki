@@ -1,6 +1,6 @@
 {
   "name": "deep-wiki",
-  "version": "1.7.1",
+  "version": "1.8.0",
   "description": "LLM-managed markdown wiki for persistent knowledge accumulation",
   "author": {
     "name": "sungmin"
@@ -16,7 +16,6 @@
     "karpathy"
   ],
   "skills": "./skills/",
-  "hooks": "./hooks/hooks.json",
   "interface": {
     "displayName": "Deep Wiki",
     "shortDescription": "Maintain a persistent markdown knowledge base",

@@ -13,19 +13,71 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-24.04
+            arch: x64
+          - os: macos-15
+            arch: arm64
+          - os: macos-15-intel
+            arch: x64
+          - os: windows-2025
+            arch: x64
     runs-on: ${{ matrix.os }}
-    name: tests (${{ matrix.os }})
+    name: tests (${{ matrix.os }}, ${{ matrix.arch }})
+    env:
+      EXPECTED_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.EXPECTED_SHA }}
+          persist-credentials: false
 
-      - name: Set up Node.js
+      - name: Authenticate exact checkout and runner architecture
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: >-
+          node -e "const cp=require('node:child_process');
+          const head=cp.execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim();
+          if(head!==process.env.EXPECTED_SHA)throw new Error('checkout SHA mismatch');
+          if(process.arch!==process.env.EXPECTED_ARCH)throw new Error('runner architecture mismatch');
+          console.log(JSON.stringify({head,arch:process.arch,platform:process.platform}));"
+
+      - name: Set up Node.js 22
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
-      - name: Show bash version (M5.5 #4 — bash 3.2 visibility)
-        run: bash --version
+      - name: Run portable verification
+        run: |
+          npm test
+          npm run validate-fixture
+          npm run lint:commands
+          npm run lint:agents
+          npm run validate-plugin
 
-      - name: Run envelope tests
-        run: npm test
+      - name: Install exact native Codex 0.144.1 vendor binary
+        if: matrix.os == 'windows-2025'
+        shell: pwsh
+        run: |
+          $prefix = Join-Path $env:RUNNER_TEMP 'codex-0.144.1'
+          npm install --ignore-scripts --prefix $prefix '@openai/codex@0.144.1'
+          $cliPackage = Join-Path $prefix 'node_modules/@openai/codex/package.json'
+          $vendorPackage = Join-Path $prefix 'node_modules/@openai/codex-win32-x64/package.json'
+          $codexBin = Join-Path $prefix 'node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe'
+          if (!(Test-Path -LiteralPath $codexBin -PathType Leaf)) { throw 'exact Codex vendor executable missing' }
+          $cliVersion = (Get-Content -LiteralPath $cliPackage -Raw | ConvertFrom-Json).version
+          $vendorVersion = (Get-Content -LiteralPath $vendorPackage -Raw | ConvertFrom-Json).version
+          $reported = (& $codexBin --version | Out-String).Trim()
+          if ($cliVersion -ne '0.144.1' -or $vendorVersion -ne '0.144.1-win32-x64' -or $reported -ne 'codex-cli 0.144.1') {
+            throw 'Codex package or executable version mismatch'
+          }
+          $binarySha256 = (Get-FileHash -LiteralPath $codexBin -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Output (ConvertTo-Json @{ cliVersion=$cliVersion; vendorVersion=$vendorVersion; reported=$reported; binarySha256=$binarySha256 } -Compress)
+          "CODEX_BIN=$codexBin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CODEX_BINARY_SHA256=$binarySha256" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Run secret-free native installed-Codex Windows authority
+        if: matrix.os == 'windows-2025'
+        env:
+          CANDIDATE_SHA: ${{ env.EXPECTED_SHA }}
+        run: npm run test:codex-windows-release

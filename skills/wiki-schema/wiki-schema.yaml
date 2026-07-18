@@ -1,6 +1,25 @@
 # deep-wiki Schema Definition
 # Machine-readable rules for wiki page structure and validation
 
+runtime_authority:
+  executable: scripts/wiki-runtime.js
+  hosts: [claude, codex, windows, macos, linux]
+  lock:
+    acquisition: atomic-directory
+    owner_record: .wiki-meta/.wiki-lock/owner.json
+    credential: owner token
+    recovery_command: lock recover
+    direct_directory_removal: forbidden
+  transaction:
+    journal: .wiki-meta/.transactions/<operation_id>/journal.json
+    receipt: .wiki-meta/.transaction-receipts/<operation_id>.json
+    recovery_command: transaction recover
+    expected_hash_guard: true
+  scan_window:
+    pending: .wiki-meta/.pending-scan
+    committed: .wiki-meta/.last-scan
+    monotonic: true
+
 page:
   frontmatter:
     required:
@@ -81,7 +100,7 @@ log:
     - ingest
     - ingest-skip      # v1.2.0+: source dropped from batch because content_hash unchanged AND wiki-side state intact
     - ingest-repair    # v1.2.1+ (IC1 review fix): hash unchanged but wiki state drift detected (missing page, page-missing-slug, or non-terminal last log) — full ingest forced as self-repair. R3C1 review fix: pages_created MUST be [] (a self-repair restores an existing page's lifecycle, not a new creation; the historical `ingest` line is the canonical pages_created entry). All touched pages go to pages_updated regardless of PRE_BATCH_PAGES classification. wiki-lint Step 6 LOG-INVARIANT scan filters out ingest-repair lines as defense-in-depth.
-    - ingest-fail      # v1.3.0+: emitted when the all-workers-fail retry counter reaches 3 consecutive batches on the same `.pending-scan` window. Promotes window despite failure (releases stuck state); records affected source paths + 3 prior failure timestamps. Counter `.wiki-meta/.pending-scan-retry-count` (format `<pending_scan_iso>:<count>`) resets on any successful batch (full or partial — partial relies on `.failed-sources.tsv` for per-source retry).
+    - ingest-fail      # v1.3.0+: emitted when the all-workers-fail retry counter reaches 3 consecutive batches on the same `.pending-scan` window. Promotes window despite failure (releases stuck state); records one affected source partial-fail record and one terminal event timestamped with that window. Counter `.wiki-meta/.pending-scan-retry-count` (format `<pending_scan_iso>:<count>`) resets on any successful batch (full or partial — partial relies on `.failed-sources.tsv` for per-source retry).
     - update
     - lint
     - rebuild
@@ -101,12 +120,12 @@ versions:
 a5_fanout:             # v1.4.0+: optional <wiki>/.wiki-meta/.config.json knobs
   location: .wiki-meta/.config.json
   optional: true       # absence = defaults; no migration needed
-  loader: "python3 (preferred) or jq (fallback)"
+  loader: "scripts/wiki-runtime.js snapshot"
   knobs:
     a5_fanout_threshold:
       type: integer
       default: 3
-      semantics: "Single-source A5 dispatches wiki-page-writer workers in parallel when len(page_plan) >= this value. Sub-threshold runs use inline_bodies from Stage 1 instead."
+      semantics: "Claude Code may dispatch qualified wiki-page-writer workers when len(page_plan) reaches this value. Codex 1.8.0 always processes every page plan sequentially in its main caller."
     a5_worker_timeout_sec:
       type: integer
       default: 90

@@ -5,6 +5,21 @@ deep-wiki의 주요 변경사항을 기록합니다.
 형식은 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)를 따르며,
 이 프로젝트는 [유의적 버전](https://semver.org/spec/v2.0.0.html)을 준수합니다.
 
+## [1.8.0] — 2026-07-19 (Node 22 runtime, 네이티브 Windows hook, Codex 검증)
+
+### 변경
+
+- 배포 Bash SessionStart scanner와 persistence 경로를 Claude Code와 Codex가 공유하는 이식 가능한 Node 22 runtime으로 교체했습니다. 배포 shell-script runtime 없음: Codex는 `commandWindows`를 선택하고 plugin root를 미리 확장한 뒤 host 소유 `%COMSPEC% /C` 경계로 실행합니다.
+- scan-window, wiki transaction, setup, ingest, lint-fix, rebuild의 상태 변경을 동일한 협력적 현재 writer 프로토콜로 통합했습니다. writer는 변경 전에 완전한 탈취 후 owner와 directory 검사를 인증합니다. 모호한 lock은 host를 중지한 상태의 개입이 필요하며 구버전 동시 실행 금지입니다.
+- 내구성 주장은 마운트된 파일시스템과 프로세스 종료 내구성으로 제한됩니다. 전원 손실, 원격 파일시스템, 적대적 프로세스 보장이 아닙니다. 1.8 write 이후에는 백업 전용 downgrade만 지원합니다.
+
+### 호환성과 증거
+
+- Ubuntu 24.04 x64, macOS arm64와 Intel, Windows Server 2025 x64의 고정 CI authority를 추가했습니다. Windows 11 주장 없음입니다.
+- 정확한 Codex 0.144.1 Windows 설치 smoke가 marketplace 설치/탐색, 설치 byte, model 요청 전 배포 hook effect, 직접 설치 supervisor 출력, untrusted no-effect 경로, `commandWindows` root 확장을 인증합니다.
+- 설치 Codex 테스트는 인증 없는 로컬 Responses fixture를 사용했습니다. 프로덕션 OpenAI API, login, model 품질, Windows 11, 임의 사용자 머신, OS 수준 no-egress 인증이 아니다.
+- 플러그인 MCP 서버나 native binary 없음, runtime dependency 없음, 실행 가능한 shell entrypoint 없음입니다. 세 `scripts/v0-probe/*-record.sh` 파일은 maintainer 전용 과거 probe로만 남습니다.
+
 ## [1.7.1] — 2026-07-07 (wiki-lint --fix lock + .last-scan 승격 원자화)
 
 ### 수정

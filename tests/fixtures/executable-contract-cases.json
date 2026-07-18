@@ -1,0 +1,330 @@
+{
+  "markdown": [
+    {
+      "name": "node-windows-unicode-path",
+      "valid": true,
+      "allowlist": ["commit"],
+      "commandCount": 1,
+      "source": "# Procedure\n<!-- deep-wiki:exec -->\n```deep-wiki-exec\n{\"executable\":\"node\",\"argv\":[\"<plugin_root>/scripts/wiki-runtime.js\",\"commit\",\"--wiki-root\",\"C:\\\\Users\\\\민수\\\\Deep Wiki\"]}\n```\n",
+      "expectedCommand": {
+        "kind": "exec",
+        "executable": "node",
+        "argv": ["<plugin_root>/scripts/wiki-runtime.js", "commit", "--wiki-root", "C:\\Users\\민수\\Deep Wiki"],
+        "timeout_ms": null,
+        "line": 4,
+        "column": 1
+      }
+    },
+    {
+      "name": "obsidian-availability-probe",
+      "valid": true,
+      "file": "skills/wiki-setup/SKILL.md",
+      "allowlist": [],
+      "commandCount": 1,
+      "source": "# Procedure\n<!-- deep-wiki:exec -->\n```deep-wiki-exec\n{\"executable\":\"obsidian\",\"argv\":[\"vault\"],\"timeout_ms\":3000}\n```\n"
+    },
+    {
+      "name": "misplaced-obsidian-probe",
+      "valid": false,
+      "file": "skills/wiki-query/SKILL.md",
+      "allowlist": [],
+      "expectedReason": "OBSIDIAN_PROBE_NOT_ALLOWED",
+      "source": "# Procedure\n<!-- deep-wiki:exec -->\n```deep-wiki-exec\n{\"executable\":\"obsidian\",\"argv\":[\"vault\"],\"timeout_ms\":3000}\n```\n"
+    },
+    {
+      "name": "data-and-prose-are-inert",
+      "valid": true,
+      "allowlist": [],
+      "commandCount": 0,
+      "source": "# Reference\nOrdinary prose may quote bash, sh, $(date), `grep`, >, stat, and curl.\n<!-- deep-wiki:data -->\n```json\n{\"schema\":\"bash | sh; curl > out\"}\n```\n<!-- deep-wiki:data -->\n```text\n$ grep x | sh; $(date) `stat file`\n```\n"
+    },
+    {
+      "name": "unclassified-bash-fence",
+      "valid": false,
+      "expectedReason": "UNCLASSIFIED_EXECUTABLE_FENCE",
+      "source": "# Procedure\n```bash\necho bad\n```\n"
+    },
+    {
+      "name": "unclassified-cmd-fence",
+      "valid": false,
+      "expectedReason": "UNCLASSIFIED_EXECUTABLE_FENCE",
+      "source": "# Procedure\n```cmd\necho bad\n```\n"
+    },
+    {
+      "name": "unclassified-powershell-fence",
+      "valid": false,
+      "expectedReason": "UNCLASSIFIED_EXECUTABLE_FENCE",
+      "source": "# Procedure\n```powershell\nWrite-Output bad\n```\n"
+    },
+    {
+      "name": "unclassified-data-fence",
+      "valid": false,
+      "expectedReason": "UNCLASSIFIED_DATA_FENCE",
+      "source": "# Data\n```json\n{\"looks\":\"inert but is unclassified\"}\n```\n"
+    },
+    {
+      "name": "exec-fence-outside-position",
+      "valid": false,
+      "expectedReason": "EXEC_FENCE_OUTSIDE_POSITION",
+      "source": "# Procedure\n```deep-wiki-exec\n{\"executable\":\"node\",\"argv\":[\"<plugin_root>/scripts/wiki-runtime.js\",\"commit\"]}\n```\n"
+    },
+    {
+      "name": "node-wrong-script",
+      "valid": false,
+      "allowlist": ["commit"],
+      "expectedReason": "NODE_SCRIPT_NOT_ALLOWED",
+      "source": "# Procedure\n<!-- deep-wiki:exec -->\n```deep-wiki-exec\n{\"executable\":\"node\",\"argv\":[\"<plugin_root>/scripts/other.js\",\"commit\"]}\n```\n"
+    },
+    {
+      "name": "node-command-family-not-allowed",
+      "valid": false,
+      "allowlist": ["snapshot"],
+      "expectedReason": "COMMAND_FAMILY_NOT_ALLOWED",
+      "source": "# Procedure\n<!-- deep-wiki:exec -->\n```deep-wiki-exec\n{\"executable\":\"node\",\"argv\":[\"<plugin_root>/scripts/wiki-runtime.js\",\"commit\"]}\n```\n"
+    },
+    {
+      "name": "argv-command-substitution",
+      "valid": false,
+      "allowlist": ["commit"],
+      "expectedReason": "ARGV_OPERATOR",
+      "source": "# Procedure\n<!-- deep-wiki:exec -->\n```deep-wiki-exec\n{\"executable\":\"node\",\"argv\":[\"<plugin_root>/scripts/wiki-runtime.js\",\"commit\",\"$(date)\"]}\n```\n"
+    },
+    {
+      "name": "argv-redirection",
+      "valid": false,
+      "allowlist": ["commit"],
+      "expectedReason": "ARGV_OPERATOR",
+      "source": "# Procedure\n<!-- deep-wiki:exec -->\n```deep-wiki-exec\n{\"executable\":\"node\",\"argv\":[\"<plugin_root>/scripts/wiki-runtime.js\",\"commit\",\">\",\"out\"]}\n```\n"
+    },
+    {
+      "name": "argv-pipeline",
+      "valid": false,
+      "allowlist": ["commit"],
+      "expectedReason": "ARGV_OPERATOR",
+      "source": "# Procedure\n<!-- deep-wiki:exec -->\n```deep-wiki-exec\n{\"executable\":\"node\",\"argv\":[\"<plugin_root>/scripts/wiki-runtime.js\",\"commit\",\"|\",\"grep\"]}\n```\n"
+    },
+    {
+      "name": "argv-separator",
+      "valid": false,
+      "allowlist": ["commit"],
+      "expectedReason": "ARGV_OPERATOR",
+      "source": "# Procedure\n<!-- deep-wiki:exec -->\n```deep-wiki-exec\n{\"executable\":\"node\",\"argv\":[\"<plugin_root>/scripts/wiki-runtime.js\",\"commit\",\";\",\"date\"]}\n```\n"
+    },
+    {
+      "name": "argv-backticks",
+      "valid": false,
+      "allowlist": ["commit"],
+      "expectedReason": "ARGV_OPERATOR",
+      "source": "# Procedure\n<!-- deep-wiki:exec -->\n```deep-wiki-exec\n{\"executable\":\"node\",\"argv\":[\"<plugin_root>/scripts/wiki-runtime.js\",\"commit\",\"`stat file`\"]}\n```\n"
+    },
+    {
+      "name": "direct-grep",
+      "valid": false,
+      "expectedReason": "EXECUTABLE_NOT_ALLOWED",
+      "source": "# Procedure\n<!-- deep-wiki:exec -->\n```deep-wiki-exec\n{\"executable\":\"grep\",\"argv\":[\"x\",\"file\"]}\n```\n"
+    },
+    {
+      "name": "direct-stat",
+      "valid": false,
+      "expectedReason": "EXECUTABLE_NOT_ALLOWED",
+      "source": "# Procedure\n<!-- deep-wiki:exec -->\n```deep-wiki-exec\n{\"executable\":\"stat\",\"argv\":[\"file\"]}\n```\n"
+    },
+    {
+      "name": "direct-date",
+      "valid": false,
+      "expectedReason": "EXECUTABLE_NOT_ALLOWED",
+      "source": "# Procedure\n<!-- deep-wiki:exec -->\n```deep-wiki-exec\n{\"executable\":\"date\",\"argv\":[] }\n```\n"
+    },
+    {
+      "name": "direct-curl",
+      "valid": false,
+      "expectedReason": "EXECUTABLE_NOT_ALLOWED",
+      "source": "# Procedure\n<!-- deep-wiki:exec -->\n```deep-wiki-exec\n{\"executable\":\"curl\",\"argv\":[\"https://example.invalid\"]}\n```\n"
+    },
+    {
+      "name": "unknown-executable",
+      "valid": false,
+      "expectedReason": "EXECUTABLE_NOT_ALLOWED",
+      "source": "# Procedure\n<!-- deep-wiki:exec -->\n```deep-wiki-exec\n{\"executable\":\"mystery\",\"argv\":[] }\n```\n"
+    }
+  ],
+  "hooks": [
+    {
+      "name": "exact-posix-and-windows-scanner",
+      "valid": true,
+      "document": {
+        "description": "fixture",
+        "hooks": {
+          "SessionStart": [
+            {
+              "matcher": "*",
+              "hooks": [
+                {
+                  "type": "command",
+                  "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/scan-vault-changes.js\"",
+                  "commandWindows": "node \"${CLAUDE_PLUGIN_ROOT}\\hooks\\scripts\\scan-vault-changes.js\"",
+                  "timeout": 15
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "expectedCommands": [
+        {
+          "executable": "node",
+          "argv": ["${CLAUDE_PLUGIN_ROOT}/hooks/scripts/scan-vault-changes.js"],
+          "variant": "command"
+        },
+        {
+          "executable": "node",
+          "argv": ["${CLAUDE_PLUGIN_ROOT}\\hooks\\scripts\\scan-vault-changes.js"],
+          "variant": "commandWindows"
+        }
+      ]
+    },
+    {
+      "name": "command-outside-handler",
+      "valid": false,
+      "expectedReason": "HOOK_COMMAND_OUTSIDE_HANDLER",
+      "document": {
+        "metadata": {
+          "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/scan-vault-changes.js\""
+        },
+        "hooks": { "SessionStart": [] }
+      }
+    },
+    {
+      "name": "command-nested-under-handler-extra-key",
+      "valid": false,
+      "expectedReason": "HOOK_COMMAND_OUTSIDE_HANDLER",
+      "document": {
+        "hooks": {
+          "SessionStart": [
+            { "hooks": [
+              {
+                "type": "command",
+                "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/scan-vault-changes.js\"",
+                "timeout": 15,
+                "metadata": {
+                  "command": "node hidden.js"
+                }
+              }
+            ] }
+          ]
+        }
+      }
+    },
+    {
+      "name": "missing-session-start-handler",
+      "valid": false,
+      "expectedReason": "HOOK_SESSION_START_SHAPE",
+      "document": {
+        "hooks": { "SessionStart": [] }
+      }
+    },
+    {
+      "name": "multiple-session-start-handlers",
+      "valid": false,
+      "expectedReason": "HOOK_SESSION_START_SHAPE",
+      "document": {
+        "hooks": {
+          "SessionStart": [
+            {
+              "hooks": [
+                {
+                  "type": "command",
+                  "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/scan-vault-changes.js\"",
+                  "timeout": 15
+                },
+                {
+                  "type": "command",
+                  "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/scan-vault-changes.js\"",
+                  "timeout": 15
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "extra-argv",
+      "valid": false,
+      "expectedReason": "HOOK_EXTRA_ARGV",
+      "document": {
+        "hooks": {
+          "SessionStart": [
+            { "hooks": [
+              {
+                "type": "command",
+                "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/scan-vault-changes.js\" extra",
+                "timeout": 15
+              }
+            ] }
+          ]
+        }
+      }
+    },
+    {
+      "name": "relative-scanner",
+      "valid": false,
+      "expectedReason": "HOOK_SCRIPT_NOT_ALLOWED",
+      "document": {
+        "hooks": {
+          "SessionStart": [
+            { "hooks": [
+              { "type": "command", "command": "node hooks/scripts/scan-vault-changes.js", "timeout": 15 }
+            ] }
+          ]
+        }
+      }
+    },
+    {
+      "name": "shell-wrapper",
+      "valid": false,
+      "expectedReason": "HOOK_EXECUTABLE_NOT_ALLOWED",
+      "document": {
+        "hooks": {
+          "SessionStart": [
+            { "hooks": [
+              { "type": "command", "command": "bash -lc \"node scanner.js\"", "timeout": 15 }
+            ] }
+          ]
+        }
+      }
+    },
+    {
+      "name": "hook-redirection",
+      "valid": false,
+      "expectedReason": "HOOK_OPERATOR",
+      "document": {
+        "hooks": {
+          "SessionStart": [
+            { "hooks": [
+              {
+                "type": "command",
+                "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/scan-vault-changes.js\" > out",
+                "timeout": 15
+              }
+            ] }
+          ]
+        }
+      }
+    },
+    {
+      "name": "non-node-executable",
+      "valid": false,
+      "expectedReason": "HOOK_EXECUTABLE_NOT_ALLOWED",
+      "document": {
+        "hooks": {
+          "SessionStart": [
+            { "hooks": [
+              { "type": "command", "command": "powershell.exe -File scanner.ps1", "timeout": 15 }
+            ] }
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -5,6 +5,21 @@ All notable changes to deep-wiki are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.0] — 2026-07-19 (Node 22 runtime, native Windows hook, and Codex authority)
+
+### Changed
+
+- Replaced the shipped Bash SessionStart scanner and persistence paths with a portable Node 22 runtime shared by Claude Code and Codex. The hook has no shipped shell-script runtime: Codex selects `commandWindows`, pre-expands the plugin root, and uses the host-owned `%COMSPEC% /C` launch boundary.
+- Consolidated scan-window, wiki transaction, setup, ingest, lint-fix, and rebuild state changes behind the same cooperative current writer protocol. Writers authenticate complete post-seizure owner and directory checks before mutation; ambiguous locks require stopped-host intervention, and a concurrent old version is unsupported.
+- The durability claim is limited to mounted-filesystem and process-termination durability. It is not a power-loss, remote-filesystem, or hostile-process guarantee. After any 1.8 write, only a backup-only downgrade is supported.
+
+### Compatibility and evidence
+
+- Added fixed CI authority for Ubuntu 24.04 x64, macOS arm64 and Intel, and Windows Server 2025 x64. This is no Windows 11 claim.
+- Added an exact installed-Codex 0.144.1 Windows smoke that authenticates marketplace install/discovery, installed bytes, the pre-model shipped hook effect, direct installed-supervisor output, the no-effect untrusted path, and `commandWindows` root expansion.
+- The installed-Codex test uses an unauthenticated local Responses fixture. It is not production OpenAI API, login, model-quality, Windows 11, arbitrary-user-machine, or OS-level no-egress certification.
+- The plugin ships no plugin MCP server or native binary, no runtime dependency, and no executable shell entrypoint. The three `scripts/v0-probe/*-record.sh` files remain maintainer-only historical probes.
+
 ## [1.7.1] — 2026-07-07 (wiki-lint --fix lock + atomic .last-scan promotion)
 
 ### Fixed

@@ -1,0 +1,10 @@
+{
+  "description": "CRLF config with Unicode and spaces stays portable",
+  "vault_path": "Vault 폴더",
+  "wiki_path": "Deep Wiki",
+  "vault_tree": {
+    "메모 폴더/space note.md": "---\r\ntags: [project]\r\n---\r\n# 내용\r\n",
+    "Deep Wiki/pages/excluded.md": "# excluded\n"
+  },
+  "config_yaml": "wiki_root: \"${WIKI_ROOT}\"\r\nauto_ingest:\r\n  ignore_globs: []\r\n  require_tag: project\r\n"
+}

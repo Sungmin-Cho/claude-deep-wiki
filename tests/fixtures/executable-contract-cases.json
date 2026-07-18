@@ -18,8 +18,17 @@
     {
       "name": "obsidian-availability-probe",
       "valid": true,
+      "file": "skills/wiki-setup/SKILL.md",
       "allowlist": [],
       "commandCount": 1,
+      "source": "# Procedure\n<!-- deep-wiki:exec -->\n```deep-wiki-exec\n{\"executable\":\"obsidian\",\"argv\":[\"vault\"],\"timeout_ms\":3000}\n```\n"
+    },
+    {
+      "name": "misplaced-obsidian-probe",
+      "valid": false,
+      "file": "skills/wiki-query/SKILL.md",
+      "allowlist": [],
+      "expectedReason": "OBSIDIAN_PROBE_NOT_ALLOWED",
       "source": "# Procedure\n<!-- deep-wiki:exec -->\n```deep-wiki-exec\n{\"executable\":\"obsidian\",\"argv\":[\"vault\"],\"timeout_ms\":3000}\n```\n"
     },
     {
@@ -46,6 +55,12 @@
       "valid": false,
       "expectedReason": "UNCLASSIFIED_EXECUTABLE_FENCE",
       "source": "# Procedure\n```powershell\nWrite-Output bad\n```\n"
+    },
+    {
+      "name": "unclassified-data-fence",
+      "valid": false,
+      "expectedReason": "UNCLASSIFIED_DATA_FENCE",
+      "source": "# Data\n```json\n{\"looks\":\"inert but is unclassified\"}\n```\n"
     },
     {
       "name": "exec-fence-outside-position",

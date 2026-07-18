@@ -136,6 +136,8 @@ function parseMarkdownCommands(markdown) {
       violations.push(violation('EXEC_FENCE_OUTSIDE_POSITION', index + 1));
     } else if (SHELL_FENCES.has(opener.info)) {
       violations.push(violation('UNCLASSIFIED_EXECUTABLE_FENCE', index + 1));
+    } else {
+      violations.push(violation('UNCLASSIFIED_DATA_FENCE', index + 1));
     }
     index = end;
   }
@@ -153,16 +155,32 @@ function isAllowedRuntimeScript(value) {
     || value === '%CLAUDE_PLUGIN_ROOT%\\scripts\\wiki-runtime.js';
 }
 
-function normalizeAllowlist(allowlist) {
-  if (Array.isArray(allowlist)) return new Set(allowlist);
-  if (allowlist && typeof allowlist === 'object') return new Set(Object.keys(allowlist));
-  return new Set();
+function normalizeCommandPolicy(policy) {
+  if (Array.isArray(policy) && policy.every((entry) => typeof entry === 'string')) {
+    return { families: new Set(policy), commands: [] };
+  }
+  const commands = policy && Array.isArray(policy.commands) ? policy.commands : [];
+  return {
+    families: new Set(commands.map((command) => command[0])),
+    commands,
+  };
+}
+
+function matchesCommandContract(argv, contract) {
+  if (!Array.isArray(contract) || argv.length !== contract.length) return false;
+  return contract.every((expected, index) => expected === null
+    ? typeof argv[index] === 'string' && argv[index] !== '' && !argv[index].startsWith('--')
+    : argv[index] === expected);
+}
+
+function isSetupSkill(file) {
+  return String(file).replaceAll('\\', '/').endsWith('/wiki-setup/SKILL.md');
 }
 
 function validateSkillCommands(file, markdown, allowlist) {
   const parsed = parseMarkdownCommands(markdown);
   const violations = [...parsed.violations];
-  const allowedFamilies = normalizeAllowlist(allowlist);
+  const policy = normalizeCommandPolicy(allowlist);
 
   for (const command of parsed.commands) {
     if (command.executable === 'node') {
@@ -174,13 +192,20 @@ function validateSkillCommands(file, markdown, allowlist) {
         violations.push(violation('ARGV_OPERATOR', command.line, command.column));
         continue;
       }
-      if (!allowedFamilies.has(command.argv[1])) {
+      if (!policy.families.has(command.argv[1])) {
         violations.push(violation('COMMAND_FAMILY_NOT_ALLOWED', command.line, command.column));
+      } else if (policy.commands.length > 0
+          && !policy.commands.some((contract) => matchesCommandContract(command.argv.slice(1), contract))) {
+        violations.push(violation('COMMAND_ARGV_NOT_ALLOWED', command.line, command.column));
       }
       continue;
     }
 
     if (command.executable === 'obsidian') {
+      if (!isSetupSkill(file)) {
+        violations.push(violation('OBSIDIAN_PROBE_NOT_ALLOWED', command.line, command.column));
+        continue;
+      }
       const valid = command.argv.length === 1
         && command.argv[0] === 'vault'
         && Number.isInteger(command.timeout_ms)
@@ -265,6 +290,27 @@ function tokenizePosixCommand(command) {
 
 function tokenizeWindowsCommand(command) {
   return tokenizeCommand(command, true);
+}
+
+function modelHookInvocation(command, variant, options = {}) {
+  const pluginRoot = options.pluginRoot || (variant === 'commandWindows'
+    ? 'C:\\Deep Wiki Plugin'
+    : '/opt/deep wiki plugin');
+  if (variant === 'command') {
+    const expanded = String(command).replaceAll('${CLAUDE_PLUGIN_ROOT}', pluginRoot);
+    return { outerExecutable: null, outerArgv: [], command: expanded, argv: tokenizePosixCommand(expanded) };
+  }
+  if (variant === 'commandWindows') {
+    const expanded = String(command).replaceAll('%CLAUDE_PLUGIN_ROOT%', pluginRoot);
+    const comspec = options.comspec || 'C:\\Windows\\System32\\cmd.exe';
+    return {
+      outerExecutable: comspec,
+      outerArgv: ['/D', '/S', '/C', expanded],
+      command: expanded,
+      argv: tokenizeWindowsCommand(expanded),
+    };
+  }
+  throw new CommandSyntaxError('HOOK_VARIANT_INVALID', 'hook variant is invalid');
 }
 
 function collectHandlerObjects(document) {
@@ -373,12 +419,44 @@ function validateHookCommands(document) {
   return { commands, violations };
 }
 
-const SKILL_ALLOWLISTS = {
-  'wiki-setup': ['setup', 'config'],
-  'wiki-ingest': ['config', 'inbox', 'snapshot', 'lock', 'commit', 'scan-window', 'transaction'],
-  'wiki-query': ['index', 'lock', 'commit', 'transaction'],
-  'wiki-lint': ['lint', 'lock'],
-  'wiki-rebuild': ['lock', 'commit', 'transaction', 'lint'],
+const SKILL_COMMAND_CONTRACTS = {
+  'wiki-setup': { commands: [
+    ['config', 'resolve', '--json'],
+    ['setup', '--wiki-root', null, '--config-host', 'claude', '--json'],
+    ['setup', '--wiki-root', null, '--config-host', 'codex', '--json'],
+  ] },
+  'wiki-ingest': { commands: [
+    ['config', 'resolve', '--json'],
+    ['snapshot', '--wiki-root', null, '--json'],
+    ['lock', 'acquire', '--wiki-root', null, '--operation', 'ingest', '--json'],
+    ['inbox', 'cleanup', '--wiki-root', null, '--lock-token', null, '--max-age-days', '7', '--json'],
+    ['commit', '--wiki-root', null, '--lock-token', null, '--manifest-file', null, '--json'],
+    ['transaction', 'recover', '--wiki-root', null, '--lock-token', null, '--operation-id', null, '--json'],
+    ['scan-window', 'promote', '--wiki-root', null, '--lock-token', null, '--expected', null, '--json'],
+    ['scan-window', 'fail', '--wiki-root', null, '--lock-token', null, '--source', null, '--json'],
+    ['lock', 'release', '--wiki-root', null, '--token', null, '--json'],
+  ] },
+  'wiki-query': { commands: [
+    ['index', 'read', '--wiki-root', null, '--json'],
+    ['lock', 'acquire', '--wiki-root', null, '--operation', 'query-filed', '--json'],
+    ['commit', '--wiki-root', null, '--lock-token', null, '--manifest-file', null, '--json'],
+    ['transaction', 'recover', '--wiki-root', null, '--lock-token', null, '--operation-id', null, '--json'],
+    ['lock', 'release', '--wiki-root', null, '--token', null, '--json'],
+  ] },
+  'wiki-lint': { commands: [
+    ['lint', 'inspect', '--wiki-root', null, '--json'],
+    ['lint', 'fix', '--wiki-root', null, '--json'],
+    ['lock', 'status', '--wiki-root', null, '--json'],
+    ['lock', 'recover', '--wiki-root', null, '--stale-ms', null, '--json'],
+  ] },
+  'wiki-rebuild': { commands: [
+    ['lock', 'acquire', '--wiki-root', null, '--operation', 'rebuild', '--json'],
+    ['commit', '--wiki-root', null, '--lock-token', null, '--manifest-file', null, '--json'],
+    ['lock', 'status', '--wiki-root', null, '--json'],
+    ['transaction', 'recover', '--wiki-root', null, '--lock-token', null, '--operation-id', null, '--json'],
+    ['lint', 'inspect', '--wiki-root', null, '--json'],
+    ['lock', 'release', '--wiki-root', null, '--token', null, '--json'],
+  ] },
 };
 
 function printViolations(file, violations) {
@@ -402,7 +480,7 @@ function cli(argv) {
   failures += hookResult.violations.length;
 
   if (mode === '--check') {
-    for (const [skill, allowlist] of Object.entries(SKILL_ALLOWLISTS)) {
+    for (const [skill, allowlist] of Object.entries(SKILL_COMMAND_CONTRACTS)) {
       const relative = `skills/${skill}/SKILL.md`;
       const content = fs.readFileSync(path.join(root, relative), 'utf8');
       const result = validateSkillCommands(relative, content, allowlist);
@@ -419,6 +497,8 @@ module.exports = {
   validateHookCommands,
   tokenizePosixCommand,
   tokenizeWindowsCommand,
+  modelHookInvocation,
+  SKILL_COMMAND_CONTRACTS,
 };
 
 if (require.main === module) process.exitCode = cli(process.argv);

@@ -17,7 +17,27 @@ For detailed change history see [`CHANGELOG.md`](CHANGELOG.md) / [`CHANGELOG.ko.
 2. **Wiki** — LLM-managed markdown pages (the accumulated knowledge)
 3. **Schema** — Wiki maintenance rules (`skills/wiki-schema/`)
 
-**Marketplace presence**: This plugin is one of six in the [claude-deep-suite](https://github.com/Sungmin-Cho/claude-deep-suite) marketplace (`deep-work` / `deep-wiki` / `deep-evolve` / `deep-review` / `deep-docs` / `deep-dashboard`).
+**Marketplace presence**: This plugin is one of nine in the [claude-deep-suite](https://github.com/Sungmin-Cho/claude-deep-suite) marketplace (`deep-work` / `deep-wiki` / `deep-evolve` / `deep-review` / `deep-docs` / `deep-dashboard` / `deep-goal` / `deep-memory` / `deep-loop`).
+
+## Runtime Support and Safety Boundaries
+
+- All mutations follow a cooperative current writer contract with complete
+  post-seizure owner and directory checks. Ambiguous locks require stopped-host
+  intervention, and running a concurrent old version against the wiki is unsupported.
+- The guarantee is mounted-filesystem and process-termination durability, not
+  power-loss, remote-filesystem, or hostile-process durability.
+- The SessionStart hook is Node 22. On Windows, Codex pre-expands the plugin root
+  and uses the host-owned `%COMSPEC% /C` launch boundary. There is no shipped
+  shell-script runtime; the three `scripts/v0-probe/*-record.sh` files are
+  maintainer-only historical probes.
+- The release contains no plugin MCP server or native binary and no runtime package
+  dependency. Fixed evidence covers Windows Server 2025 and macOS arm64 and Intel;
+  this is no Windows 11 claim.
+- Installed-Codex authority uses an unauthenticated local Responses fixture. It is
+  not production OpenAI API, login, model-quality, Windows 11,
+  arbitrary-user-machine, or OS-level no-egress certification.
+- After any 1.8 write, only a backup-only downgrade is supported: stop every host,
+  recover with 1.8, restore the authenticated pre-upgrade backup, then start 1.7.1.
 
 ---
 
@@ -90,13 +110,16 @@ deep-wiki/
 ├── hooks/
 │   ├── hooks.json                 # SessionStart hook registration
 │   └── scripts/
-│       ├── scan-vault-changes.sh         # detect modified .md in vault → trigger /wiki-ingest
+│       ├── scan-vault-changes.js         # fail-soft Node SessionStart supervisor
+│       ├── scan-vault-worker.js          # bounded scanner worker
+│       ├── runtime/                       # shared config/lock/state/persistence runtime
 │       ├── envelope.js                   # M3 envelope shared lib (ULID, wrap/unwrap)
 │       ├── wrap-index-envelope.js        # CLI writer (atomic temp+rename)
 │       ├── read-index-envelope.js        # CLI reader (envelope unwrap + legacy pass-through)
 │       └── test-helpers/run-scan-vault.js  # hermetic test helper
 ├── scripts/                        # plugin-level utility scripts
-│   ├── lint-agent-tools.sh        # frontmatter lint (4-agent manifest, Bash 3.2)
+│   ├── lint-agent-tools.js        # frontmatter and tool-contract lint
+│   ├── wiki-runtime.js            # portable wiki transaction CLI
 │   └── validate-envelope-emit.js  # release-lint, mirrors the suite envelope schema
 ├── tests/                          # `npm test` (Node test runner)
 │   ├── envelope-{emit,chain}.test.js
@@ -159,39 +182,32 @@ deep-wiki/
 
 ## Workflows & Conventions
 
-### Bash 3.2 portability (required)
+### Node 22 portability (required)
 
-macOS ships `/bin/bash` at 3.2.57. All hook scripts and bash pseudocode in specs must avoid:
-
-- `declare -A` (associative arrays — bash 4+)
-- `mapfile` / `readarray`
-- `${var,,}` / `${var^^}` (case modification)
-- `&>/dev/null` (use `>/dev/null 2>&1`)
-- some ERE features inside `[[ =~ ]]`
-
-When using `${arr[@]}` under `set -u`, guard with `[ ${#arr[@]} -gt 0 ]`.
-
-Alternative patterns: newline-delimited strings + `grep -Fxq`, or TSV temp files.
+All shipped runtime entrypoints are CommonJS Node scripts and must remain portable
+across macOS, Linux, and native Windows. Use `node:` standard-library APIs, preserve
+Windows drive/UNC paths without POSIX conversion, launch children with `shell:false`,
+and keep stdout/stderr contracts bounded. Shell is allowed only as CI host
+infrastructure; do not add a shipped `.sh`, `.cmd`, `.bat`, or `.ps1` runtime.
 
 ### UTC ISO 8601 timestamps (required)
 
-All `ts` / `generated_at` / `ingested_at` values use the format `YYYY-MM-DDTHH:MM:SSZ` (Z suffix). Generate with `date -u +"%Y-%m-%dT%H:%M:%SZ"`. Never use a local timezone offset (`+09:00`, etc.) — log.jsonl analysis depends on lexicographic comparison matching numeric chronological order.
+All `ts` / `generated_at` / `ingested_at` values use the format
+`YYYY-MM-DDTHH:MM:SSZ` (Z suffix). Generate from `new Date().toISOString()` and
+remove the millisecond component. Never use a local timezone offset (`+09:00`,
+etc.) — log.jsonl analysis depends on lexicographic comparison matching numeric
+chronological order.
 
 ### Cross-platform date parsing
 
-The tri-branch pattern in `scan-vault-changes.sh`:
-```bash
-if command -v gdate >/dev/null 2>&1; then ...gdate -d... ;
-elif [[ "$(uname)" == "Darwin" ]]; then ...date -j -f... ;
-else ...date -d... ; fi
-```
-
-Reuse this pattern whenever you add new epoch-parsing code.
+Validate the canonical UTC-Z grammar before calling `Date.parse`, reject a
+non-finite result, and keep all comparisons in integer milliseconds. Do not
+delegate parsing to platform-specific `date` executables.
 
 ### Atomic commit hygiene
 
 Each commit must correspond to exactly one task. Never use `git add -A` (risk of leaking sensitive files). For every task:
-1. spec change (markdown / yaml / shell)
+1. spec or runtime change (markdown / yaml / Node)
 2. validate via sandbox scenario
 3. `git add` with explicit file paths
 4. HEREDOC commit message (with the Co-Authored-By trailer)
@@ -240,7 +256,7 @@ To check the current version: `jq -r .version .claude-plugin/plugin.json`
 |---|---|
 | How do I add a new entry skill? | Drop a new `skills/<name>/SKILL.md` with `user-invocable: true` frontmatter — it's auto-discovered for both Claude Code slash (`/<name>`) and cross-platform `Skill({ skill: "deep-wiki:<name>" })` |
 | How do I change the schema? | Edit `skills/wiki-schema/wiki-schema.yaml` (machine) AND `SKILL.md` (LLM-readable) |
-| How do I add a new hook trigger? | `hooks/hooks.json` + a new script under `hooks/scripts/<new>.sh` (must finish within the 15-second timeout) |
+| How do I add a new hook trigger? | `hooks/hooks.json` + a portable Node script under `hooks/scripts/<new>.js` (must finish within the 15-second timeout) |
 | How do I add a subagent? | New `agents/<name>.md` (frontmatter + prompt). Dispatch with the qualified namespace `deep-wiki:<name>` |
 | Wiki schema violation? | Run `/wiki-lint` (`--fix` for auto-fixable items) |
 | User complains ingest is slow? | Recommend the `auto_ingest:` config + `/wiki-lint --fix` |

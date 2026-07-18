@@ -225,21 +225,36 @@ deep-work 세션 리포트를 위키로 ingest:
 
 | OS | 상태 | 비고 |
 |---|---|---|
-| macOS | Primary | Darwin 25+에서 개발·테스트. |
-| Linux | Supported | bash 4+, GNU coreutils 필요. |
-| Windows | Experimental | **Git Bash** 또는 **WSL2** 필요. SessionStart hook은 네이티브 `cmd.exe` / PowerShell 미지원. |
+| macOS | Supported | macOS arm64와 Intel 고정 CI 증거. |
+| Linux | Supported | Ubuntu 24.04 x64 고정 CI 증거. |
+| Windows | Supported | Windows Server 2025 x64의 네이티브 Node 22 hook 증거; Git Bash/WSL2 runtime 불필요. |
 
-**Windows 설정 (Git Bash 또는 WSL2):**
 
-1. Git for Windows(Git Bash 포함)를 설치하거나 WSL2를 활성화합니다.
-2. `wiki_root`를 POSIX 경로로 설정 — Windows 네이티브 형식 금지:
-   - `/c/Users/name/Obsidian/MyVault/wiki` (Git Bash) 또는 `/mnt/c/Users/name/Obsidian/MyVault/wiki` (WSL2)
-   - `C:\Users\name\...`는 hook이 거부합니다.
-3. Obsidian CLI가 설치되어 있으면 Git Bash에서 `obsidian version`이 성공하는지 확인하세요 (Obsidian 설치 디렉토리, 보통 `%LOCALAPPDATA%\Programs\Obsidian\`을 `PATH`에 추가해야 할 수 있음).
-4. Google Drive 마운트 볼륨(`G:\...`)은 Git Bash에서 `/g/...`로 나타납니다. placeholder 파일 mtime 문제를 피하려면 offline-mirrored 모드를 선호하세요.
-5. 위키 경로가 260자에 근접하면 Windows 10 1607+에서 long-path 지원을 활성화하세요.
+## 런타임 지원 및 안전 경계
 
-> NTFS는 대소문자 구분이 없습니다; 스키마의 kebab-case 네이밍이 충돌을 방지합니다. skill 문서의 일부 Unix 전용 명령(`which`, `mkdir -p`)은 bash가 필요합니다.
+- **Writer 프로토콜.** 모든 변경은 협력적 현재 writer 계약을 사용합니다.
+  lock 탈취는 완전한 탈취 후 owner와 directory 검사를 통과해야 합니다.
+  모호한 lock에는 host를 중지한 상태의 개입이 필요하며, 같은 wiki에서
+  구버전 동시 실행 금지입니다.
+- **내구성 범위.** 보장은 마운트된 파일시스템과 프로세스 종료 내구성으로
+  제한됩니다. 전원 손실, 손상된 원격 파일시스템, 같은 directory에 접근하는
+  적대적 process까지 보장하지 않습니다.
+- **Hook 실행.** 배포 hook은 Node 22입니다. Codex는 설치 plugin root를 미리
+  확장하고 선택한 Windows command를 host 소유 `%COMSPEC% /C` 경계에
+  위임합니다. 배포 shell-script runtime 없음이며, 과거
+  `scripts/v0-probe/*-record.sh`는 maintainer probe일 뿐 runtime entrypoint가 아닙니다.
+- **Runtime 표면.** 플러그인 MCP 서버나 native binary 없음이며 runtime package
+  dependency도 없습니다. 위의 선택적 `qmd mcp` 명령은 외부 qmd 도구의 기능이지
+  이 플러그인의 MCP가 아닙니다.
+- **증거 범위.** 고정 job은 Windows Server 2025, Ubuntu 24.04, macOS arm64와
+  Intel을 다룹니다. Windows 11 주장 없음입니다. 설치 Codex 증거는 plugin
+  설치/탐색과 hook을 실행하기 위해 인증 없는 로컬 Responses fixture를
+  사용했습니다. 이는 프로덕션 OpenAI API, login, model 품질, Windows 11,
+  임의 사용자 머신, OS 수준 no-egress 인증이 아니다.
+- **Upgrade와 rollback.** 첫 1.8 작업 전에 모든 host를 중지하고 완전한 인증
+  backup을 만드세요. 1.8이 state를 썼다면 직접 in-place rollback은 지원하지
+  않습니다. 중지 상태에서 1.8로 recovery한 뒤 1.7.1을 시작하기 전에 백업 전용
+  downgrade를 수행해야 합니다.
 
 ## 철학
 

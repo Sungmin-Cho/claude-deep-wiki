@@ -225,21 +225,37 @@ Ingest deep-work session reports into the wiki:
 
 | OS | Status | Notes |
 |---|---|---|
-| macOS | Primary | Developed and tested on Darwin 25+. |
-| Linux | Supported | Requires bash 4+, GNU coreutils. |
-| Windows | Experimental | Requires **Git Bash** or **WSL2**. Native `cmd.exe` / PowerShell is not supported for the SessionStart hook. |
+| macOS | Supported | Fixed CI evidence on macOS arm64 and Intel. |
+| Linux | Supported | Fixed CI evidence on Ubuntu 24.04 x64. |
+| Windows | Supported | Native Node 22 hook evidence on Windows Server 2025 x64; no Git Bash or WSL2 runtime requirement. |
 
-**Windows setup (Git Bash or WSL2):**
 
-1. Install Git for Windows (includes Git Bash) or enable WSL2.
-2. Set `wiki_root` using POSIX paths — never the Windows-native form:
-   - `/c/Users/name/Obsidian/MyVault/wiki` (Git Bash) or `/mnt/c/Users/name/Obsidian/MyVault/wiki` (WSL2)
-   - `C:\Users\name\...` is rejected by the hook.
-3. If the Obsidian CLI is installed, ensure `obsidian version` succeeds in Git Bash (you may need to add the Obsidian install directory, typically `%LOCALAPPDATA%\Programs\Obsidian\`, to `PATH`).
-4. Google Drive mounted volumes (`G:\...`) appear in Git Bash as `/g/...`. Prefer offline-mirrored mode to avoid placeholder-file mtime quirks.
-5. Enable long-path support on Windows 10 1607+ if your wiki path approaches 260 characters.
+## Runtime support and safety boundaries
 
-> NTFS is case-insensitive; the schema's kebab-case naming avoids conflicts. Some Unix-only commands in the skill docs (`which`, `mkdir -p`) require bash.
+- **Writer protocol.** Every mutation uses a cooperative current writer contract.
+  Lock takeover is accepted only after complete post-seizure owner and directory
+  checks. An ambiguous lock requires stopped-host intervention; do not run a
+  concurrent old version against the same wiki.
+- **Durability scope.** The guarantee is mounted-filesystem and process-termination
+  durability. It does not claim survival of power loss, broken remote filesystems,
+  or a hostile process with access to the same directory.
+- **Hook launch.** The shipped hook is Node 22. Codex pre-expands the installed
+  plugin root and delegates the selected Windows command to the host-owned
+  `%COMSPEC% /C` boundary. There is no shipped shell-script runtime; the historical
+  `scripts/v0-probe/*-record.sh` files are maintainer probes, not runtime entrypoints.
+- **Runtime surface.** deep-wiki ships no plugin MCP server or native binary and
+  has no runtime package dependency. The optional `qmd mcp` command above belongs
+  to the external qmd tool, not this plugin.
+- **Evidence scope.** Fixed jobs cover Windows Server 2025, Ubuntu 24.04, and
+  macOS arm64 and Intel. This is no Windows 11 claim. Installed-Codex evidence
+  used an unauthenticated local Responses fixture to exercise plugin
+  install/discovery and hooks; it is not production OpenAI API, login,
+  model-quality, Windows 11, arbitrary-user-machine, or OS-level no-egress
+  certification.
+- **Upgrade and rollback.** Stop every host and take an authenticated complete
+  backup before the first 1.8 operation. If 1.8 has written state, direct in-place
+  rollback is unsupported: recover with 1.8 while stopped, then use a backup-only
+  downgrade before starting 1.7.1.
 
 ## Philosophy
 

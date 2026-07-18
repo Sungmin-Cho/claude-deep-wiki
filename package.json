@@ -1,7 +1,7 @@
 {
   "name": "deep-wiki",
-  "version": "1.7.1",
-  "description": "LLM-managed markdown wiki — 5 skill-based entry surfaces (cross-platform). Deep-wiki plugin: tests + helpers only; plugin manifest at .claude-plugin/plugin.json.",
+  "version": "1.8.0",
+  "description": "LLM-managed markdown wiki — 5 cross-platform skills with a portable Node 22 runtime for Claude Code and Codex.",
   "author": {
     "name": "Sungmin-Cho"
   },

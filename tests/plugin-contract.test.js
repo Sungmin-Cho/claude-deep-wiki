@@ -2,6 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const childProcess = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 
@@ -9,6 +10,10 @@ const ROOT = path.resolve(__dirname, '..');
 
 function readJson(relativePath) {
   return JSON.parse(fs.readFileSync(path.join(ROOT, relativePath), 'utf8'));
+}
+
+function readText(relativePath) {
+  return fs.readFileSync(path.join(ROOT, relativePath), 'utf8');
 }
 
 test('Codex manifest uses default hook discovery and has no MCP surface', () => {
@@ -137,4 +142,91 @@ test('portable npm test cannot discover the native installed-Codex release smoke
   assert.match(smoke, /stdio: \['ignore', 'pipe', 'pipe'\]/);
   assert.match(smoke, /shell: false/);
   assert.match(smoke, /windowsHide: true/);
+});
+
+test('1.8.0 release keeps every package version exact', () => {
+  const packageFiles = [
+    '.claude-plugin/plugin.json',
+    '.codex-plugin/plugin.json',
+    'package.json',
+  ];
+  for (const file of packageFiles) assert.equal(readJson(file).version, '1.8.0', file);
+});
+
+test('1.8.0 release documents the reviewed runtime and evidence boundary', () => {
+  const englishRuntimeDocs = [
+    'README.md', 'CLAUDE.md', 'AGENTS.md', 'CONTRIBUTING.md', 'SECURITY.md',
+  ];
+  const englishBoundary = [
+    /cooperative current writer/i,
+    /post-seizure owner and directory checks/i,
+    /stopped-host intervention/i,
+    /concurrent old version/i,
+    /mounted-filesystem and process-termination durability/i,
+    /%COMSPEC%\s+\/C/,
+    /no shipped shell-script runtime/i,
+    /Windows Server 2025/,
+    /macOS arm64 and Intel/,
+    /no Windows 11 claim/i,
+    /no plugin MCP server or native binary/i,
+    /backup-only downgrade/i,
+    /unauthenticated local Responses fixture/i,
+    /not production OpenAI API, login, model-quality, Windows 11, arbitrary-user-machine, or OS-level no-egress certification/i,
+  ];
+  for (const file of englishRuntimeDocs) {
+    const text = readText(file).replace(/\s+/g, ' ');
+    for (const pattern of englishBoundary) assert.match(text, pattern, `${file}: ${pattern}`);
+  }
+
+  const koreanRuntimeDocs = ['README.ko.md'];
+  const koreanBoundary = [
+    /협력적 현재 writer/,
+    /탈취 후 owner와 directory 검사/,
+    /host를 중지한 상태의 개입/,
+    /구버전 동시 실행 금지/,
+    /마운트된 파일시스템과 프로세스 종료 내구성/,
+    /%COMSPEC%\s+\/C/,
+    /배포 shell-script runtime 없음/,
+    /Windows Server 2025/,
+    /macOS arm64와 Intel/,
+    /Windows 11 주장 없음/,
+    /플러그인 MCP 서버나 native binary 없음/,
+    /백업 전용 downgrade/,
+    /인증 없는 로컬 Responses fixture/,
+    /프로덕션 OpenAI API, login, model 품질, Windows 11, 임의 사용자 머신, OS 수준 no-egress 인증이 아니다/,
+  ];
+  for (const file of koreanRuntimeDocs) {
+    const text = readText(file).replace(/\s+/g, ' ');
+    for (const pattern of koreanBoundary) assert.match(text, pattern, `${file}: ${pattern}`);
+  }
+
+  assert.match(readText('CHANGELOG.md'), /## \[1\.8\.0\] — 2026-07-19/);
+  assert.match(readText('CHANGELOG.md'), /unauthenticated local Responses fixture/i);
+  assert.match(readText('CHANGELOG.ko.md'), /## \[1\.8\.0\] — 2026-07-19/);
+  assert.match(readText('CHANGELOG.ko.md'), /인증 없는 로컬 Responses fixture/);
+});
+
+test('1.8.0 ships no MCP, native binary, runtime dependency, or shell entrypoint', () => {
+  const codexManifest = readJson('.codex-plugin/plugin.json');
+  const claudeManifest = readJson('.claude-plugin/plugin.json');
+  const pkg = readJson('package.json');
+  assert.equal(Object.hasOwn(codexManifest, 'mcpServers'), false);
+  assert.equal(Object.hasOwn(claudeManifest, 'mcpServers'), false);
+  for (const field of ['dependencies', 'optionalDependencies', 'peerDependencies', 'bundledDependencies']) {
+    assert.equal(Object.hasOwn(pkg, field), false, field);
+  }
+
+  const tracked = childProcess.execFileSync('git', ['ls-files', '-z'], {
+    cwd: ROOT,
+    encoding: 'utf8',
+  }).split('\0').filter(Boolean);
+  assert.deepEqual(tracked.filter((file) => /(^|\/)\.mcp\.json$/.test(file)), []);
+  assert.deepEqual(tracked.filter((file) => file.startsWith('native/')), []);
+
+  const shellEntrypoints = tracked.filter((file) => /\.(?:sh|cmd|bat|ps1)$/i.test(file));
+  assert.deepEqual(shellEntrypoints.sort(), [
+    'scripts/v0-probe/v0-record.sh',
+    'scripts/v0-probe/v1-record.sh',
+    'scripts/v0-probe/v2-v3-record.sh',
+  ]);
 });

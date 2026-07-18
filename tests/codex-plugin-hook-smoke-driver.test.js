@@ -238,6 +238,28 @@ test('Codex JSONL receipt requires the exact completed assistant message', () =>
     { code: 'CODEX_TRUSTED_EXEC_FAILED' });
 });
 
+test('Codex trusted failure reports bounded structured evidence without secrets', () => {
+  const failed = result(
+    7,
+    `${JSON.stringify({
+      type: 'turn.failed',
+      error: { message: 'hook command failed before model request' },
+    })}\n`,
+    'Authorization: Bearer private-value OPENAI_API_KEY=sk-private-value',
+  );
+  assert.throws(
+    () => trustedJsonlReceipt(failed, releaseFixture),
+    (error) => {
+      assert.equal(error.code, 'CODEX_TRUSTED_EXEC_FAILED');
+      assert.match(error.message, /"status":7/);
+      assert.match(error.message, /hook command failed before model request/);
+      assert.match(error.message, /<redacted>/);
+      assert.doesNotMatch(error.message, /private-value|sk-private/);
+      return true;
+    },
+  );
+});
+
 test('portable full-phase seam proves trusted pre-model effect, independent direct supervisor, untrusted no-state-effect, and diagnostic-last', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'deep-wiki-full-seam-'));
   const codexBin = path.join(root, 'codex.exe');

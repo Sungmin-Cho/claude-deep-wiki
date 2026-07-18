@@ -480,12 +480,54 @@ function buildProviderArgv(port, project, trusted, fixture) {
   ];
 }
 
+function redactDiagnosticText(value) {
+  return String(value || '')
+    .replace(/\bBearer\s+[^\s"']+/gi, 'Bearer <redacted>')
+    .replace(/\bsk-[A-Za-z0-9_-]+\b/g, '<redacted>')
+    .replace(/\b((?:OPENAI_)?API_KEY|ACCESS_TOKEN)\s*[=:]\s*[^\s"']+/gi, '$1=<redacted>');
+}
+
+function trustedFailureMessage(result, reason, records = []) {
+  const terminalErrors = records.flatMap((record) => {
+    if (record?.type === 'error' && typeof record.message === 'string') return [record.message];
+    if (record?.type === 'turn.failed' && typeof record?.error?.message === 'string') {
+      return [record.error.message];
+    }
+    if (record?.type === 'item.completed' && record?.item?.type === 'error'
+        && typeof record.item.message === 'string') return [record.item.message];
+    return [];
+  }).slice(0, 8).map((message) => redactDiagnosticText(message).slice(0, 1024));
+  const stdout = typeof result?.stdout === 'string' ? result.stdout : '';
+  const stderr = typeof result?.stderr === 'string' ? result.stderr : '';
+  return `CODEX_TRUSTED_EXEC_FAILED ${JSON.stringify({
+    reason,
+    status: result?.status ?? null,
+    signal: result?.signal ?? null,
+    spawn_error_code: result?.error?.code || null,
+    stdout_bytes: Buffer.byteLength(stdout),
+    stderr_bytes: Buffer.byteLength(stderr),
+    stdout_sha256: sha256(stdout),
+    stderr_sha256: sha256(stderr),
+    terminal_errors: terminalErrors,
+    stderr_tail: redactDiagnosticText(stderr).slice(-4096),
+  })}`;
+}
+
 function trustedJsonlReceipt(result, fixture) {
-  if (!result || result.error || result.status !== 0) throw new SmokeError('CODEX_TRUSTED_EXEC_FAILED');
-  const lines = result.stdout.split(/\r?\n/).filter(Boolean);
+  const stdout = typeof result?.stdout === 'string' ? result.stdout : '';
+  const lines = stdout.split(/\r?\n/).filter(Boolean);
   const records = [];
   for (const line of lines) {
-    try { records.push(JSON.parse(line)); } catch { throw new SmokeError('CODEX_TRUSTED_JSONL_INVALID'); }
+    try { records.push(JSON.parse(line)); } catch {
+      if (!result || result.error || result.status !== 0) continue;
+      throw new SmokeError('CODEX_TRUSTED_JSONL_INVALID');
+    }
+  }
+  if (!result || result.error || result.status !== 0) {
+    throw new SmokeError(
+      'CODEX_TRUSTED_EXEC_FAILED',
+      trustedFailureMessage(result, 'process-failed', records),
+    );
   }
   const serialized = JSON.stringify(records);
   const exactAssistantResponse = records.some((record) => (
@@ -494,7 +536,14 @@ function trustedJsonlReceipt(result, fixture) {
       && record.item.text === fixture.response_text
   ));
   if (!exactAssistantResponse || /hook[^\n]{0,40}error/i.test(serialized)) {
-    throw new SmokeError('CODEX_TRUSTED_EXEC_FAILED');
+    throw new SmokeError(
+      'CODEX_TRUSTED_EXEC_FAILED',
+      trustedFailureMessage(
+        result,
+        exactAssistantResponse ? 'hook-error-recorded' : 'exact-assistant-response-missing',
+        records,
+      ),
+    );
   }
   return { lineCount: records.length, sha256: sha256(result.stdout) };
 }

@@ -1,0 +1,1169 @@
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { spawn } = require('node:child_process');
+const { once } = require('node:events');
+
+const repoRoot = path.resolve(__dirname, '..');
+const scanWindowPath = path.join(repoRoot, 'hooks', 'scripts', 'runtime', 'scan-window.js');
+const lockPath = path.join(repoRoot, 'hooks', 'scripts', 'runtime', 'lock.js');
+const deadlinePath = path.join(repoRoot, 'hooks', 'scripts', 'runtime', 'deadline.js');
+const racer = path.join(__dirname, 'fixtures', 'scan-window-racer.js');
+const roots = new Set();
+
+const T0 = '2026-07-11T00:00:00Z';
+const T1 = '2026-07-11T01:00:00Z';
+const T2 = '2026-07-11T02:00:00Z';
+const T3 = '2026-07-11T03:00:00Z';
+
+function modules() {
+  return {
+    ...require(scanWindowPath),
+    ...require(lockPath),
+    ...require(deadlinePath),
+  };
+}
+
+function temporaryWiki(prefix = 'deep wiki scan window path with spaces ') {
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
+  roots.add(root);
+  fs.mkdirSync(path.join(root, '.wiki-meta', '.transactions'), { recursive: true });
+  return root;
+}
+
+test.after(() => {
+  for (const root of roots) fs.rmSync(root, { recursive: true, force: true });
+});
+
+function metaPath(root, name) {
+  return path.join(root, '.wiki-meta', name);
+}
+
+function replaceLiveLockExternallyAtInjectedGuard(root) {
+  fs.rmSync(metaPath(root, '.wiki-lock'), { recursive: true });
+}
+
+function setState(root, { pending, last } = {}) {
+  if (pending === undefined || pending === null) fs.rmSync(metaPath(root, '.pending-scan'), { force: true });
+  else fs.writeFileSync(metaPath(root, '.pending-scan'), pending);
+  if (last === undefined || last === null) fs.rmSync(metaPath(root, '.last-scan'), { force: true });
+  else fs.writeFileSync(metaPath(root, '.last-scan'), last);
+}
+
+function readMaybe(file) {
+  try { return fs.readFileSync(file); } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+}
+
+function state(root) {
+  return {
+    pending: readMaybe(metaPath(root, '.pending-scan')),
+    last: readMaybe(metaPath(root, '.last-scan')),
+  };
+}
+
+function assertState(root, { pending, last }) {
+  const actual = state(root);
+  assert.equal(actual.pending?.toString('utf8') ?? null, pending);
+  assert.equal(actual.last?.toString('utf8') ?? null, last);
+  for (const name of fs.readdirSync(metaPath(root, '.transactions'), { recursive: true })) {
+    assert.doesNotMatch(String(name), /\.tmp\./);
+  }
+}
+
+function withOwner(root, operation, callback) {
+  const { acquireLock, releaseLock } = modules();
+  const owner = acquireLock({ wikiRoot: root, operation, now: new Date(T3) });
+  try { return callback(owner); } finally { releaseLock({ wikiRoot: root, token: owner.token }); }
+}
+
+function promote(root, expected, operationId, extra = {}) {
+  return withOwner(root, 'scan-window-promote', (owner) => modules().promotePendingScan({
+    wikiRoot: root,
+    token: owner.token,
+    expected,
+    operationId,
+    now: new Date(T3),
+    ...extra,
+  }));
+}
+
+function journalFiles(root) {
+  const transactions = metaPath(root, '.transactions');
+  return fs.readdirSync(transactions, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => path.join(transactions, entry.name, 'journal.json'))
+    .filter((file) => fs.existsSync(file));
+}
+
+function snapshotFlatDirectory(directory) {
+  return Object.fromEntries(fs.readdirSync(directory).sort().map((name) => [
+    name,
+    fs.readFileSync(path.join(directory, name)).toString('base64'),
+  ]));
+}
+
+function snapshotTree(directory) {
+  const snapshot = {};
+  const visit = (pathname, relative) => {
+    const stat = fs.lstatSync(pathname);
+    const key = relative || '.';
+    if (stat.isSymbolicLink()) {
+      snapshot[key] = { type: 'symlink', target: fs.readlinkSync(pathname) };
+      return;
+    }
+    if (stat.isDirectory()) {
+      snapshot[key] = { type: 'directory' };
+      for (const name of fs.readdirSync(pathname).sort()) {
+        visit(path.join(pathname, name), relative ? path.join(relative, name) : name);
+      }
+      return;
+    }
+    snapshot[key] = { type: 'file', bytes: fs.readFileSync(pathname).toString('base64') };
+  };
+  visit(directory, '');
+  return snapshot;
+}
+
+function makeClock(initial = 0) {
+  let value = initial;
+  return {
+    nowMs: () => value,
+    advance(amount) { value += amount; },
+  };
+}
+
+test('planScanWindowTransition validates canonical UTC-Z input and preserves the oldest pending window', () => {
+  const { planScanWindowTransition } = modules();
+  const plan = planScanWindowTransition({
+    kind: 'ensure', proposed: T2,
+    pendingBytes: Buffer.from(`${T1}\n`), lastBytes: Buffer.from(`${T0}\n`),
+  });
+  assert.equal(plan.pending.before.toString(), `${T1}\n`);
+  assert.equal(plan.pending.after.toString(), `${T1}\n`);
+  assert.equal(plan.last.before.toString(), `${T0}\n`);
+  assert.equal(plan.last.after.toString(), `${T0}\n`);
+  assert.throws(() => planScanWindowTransition({ kind: 'ensure', proposed: '2026-07-11T02:00:00.000Z' }),
+    (error) => error.code === 'SCAN_WINDOW_INVALID');
+});
+
+test('ensurePendingScan creates one canonical line and a committed transaction', () => {
+  const { ensurePendingScan, createDeadline } = modules();
+  const root = temporaryWiki();
+  const result = ensurePendingScan({
+    wikiRoot: root, proposed: T1, now: new Date(T1), deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.equal(result.status, 'created');
+  assert.match(result.operationId, /^[a-z0-9-]{20,}$/);
+  assertState(root, { pending: `${T1}\n`, last: null });
+  const journals = journalFiles(root);
+  assert.equal(journals.length, 1);
+  const journal = JSON.parse(fs.readFileSync(journals[0]));
+  assert.equal(journal.kind, 'ensure');
+  assert.equal(journal.operation_id, result.operationId);
+  assert.deepEqual(journal.input, {
+    wiki_root: root,
+    kind: 'ensure',
+    proposed: T1,
+    expected: null,
+    repair_pending_after: null,
+    repair_last_after: null,
+  });
+  assert.equal(
+    journal.input_sha256,
+    crypto.createHash('sha256').update(JSON.stringify(journal.input)).digest('hex'),
+  );
+  assert.deepEqual(journal.transitions, [
+    'scan-window-preflighted', 'scan-window-staged', 'pending-scan-written',
+    'scan-window-committed', 'cleaned',
+  ]);
+  assert.equal(new Set(journal.transitions).size, journal.transitions.length);
+});
+
+test('ensurePendingScan preserves a valid oldest pending value byte-identically', () => {
+  const { ensurePendingScan, createDeadline } = modules();
+  const root = temporaryWiki('deep wiki preserve pending ');
+  setState(root, { pending: `${T1}\r\n`, last: `${T0}\n` });
+  const before = readMaybe(metaPath(root, '.pending-scan'));
+  const result = ensurePendingScan({
+    wikiRoot: root, proposed: T2, now: new Date(T2), deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.equal(result.status, 'preserved');
+  assert.deepEqual(readMaybe(metaPath(root, '.pending-scan')), before);
+  assertState(root, { pending: `${T1}\r\n`, last: `${T0}\n` });
+});
+
+test('ensurePendingScan is stale at or before last-scan and repairs corrupt pending only for a newer proposal', () => {
+  const { ensurePendingScan, createDeadline } = modules();
+  const root = temporaryWiki('deep wiki stale ensure ');
+  setState(root, { last: `${T2}\n` });
+  assert.equal(ensurePendingScan({
+    wikiRoot: root, proposed: T2, now: new Date(T2), deadline: createDeadline({ budgetMs: 12_000 }),
+  }).status, 'stale');
+  assertState(root, { pending: null, last: `${T2}\n` });
+  fs.writeFileSync(metaPath(root, '.pending-scan'), Buffer.from([0xff, 0x00]));
+  assert.equal(ensurePendingScan({
+    wikiRoot: root, proposed: T3, now: new Date(T3), deadline: createDeadline({ budgetMs: 12_000 }),
+  }).status, 'created');
+  assertState(root, { pending: `${T3}\n`, last: `${T2}\n` });
+});
+
+test('ensurePendingScan defers quietly on bounded lock contention without a lock-free fallback', () => {
+  const { acquireLock, releaseLock, ensurePendingScan, createDeadline } = modules();
+  const root = temporaryWiki('deep wiki ensure contention ');
+  const owner = acquireLock({ wikiRoot: root, operation: 'held' });
+  try {
+    const result = ensurePendingScan({
+      wikiRoot: root, proposed: T1, now: new Date(T1), deadline: createDeadline({ budgetMs: 25 }),
+    });
+    assert.deepEqual(result, { status: 'deferred', reason: 'LOCK_CONTENDED' });
+    assertState(root, { pending: null, last: null });
+    assert.equal(journalFiles(root).length, 0);
+  } finally {
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+});
+
+for (const linkedParent of ['.wiki-meta', '.transactions', 'operation']) {
+  test(`default transaction adapter rejects a ${linkedParent} directory link before external mutation`, () => {
+    const { acquireLock, releaseLock, promotePendingScan } = modules();
+    const root = temporaryWiki(`deep wiki linked ${linkedParent} transaction parent `);
+    const outside = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), `deep wiki outside ${linkedParent} `)));
+    roots.add(outside);
+    const operationId = `linked-${linkedParent.replace('.', '')}-operation`;
+    const meta = metaPath(root, '');
+    const transactions = path.join(meta, '.transactions');
+    const operation = path.join(transactions, operationId);
+    let linkedPath;
+    let linkedTarget;
+    let externalOperation;
+
+    if (linkedParent === '.wiki-meta') {
+      linkedPath = meta;
+      linkedTarget = outside;
+      externalOperation = path.join(outside, '.transactions', operationId);
+      fs.rmSync(meta, { recursive: true });
+    } else if (linkedParent === '.transactions') {
+      linkedPath = transactions;
+      linkedTarget = outside;
+      externalOperation = path.join(outside, operationId);
+      fs.rmSync(transactions, { recursive: true });
+    } else {
+      linkedPath = operation;
+      linkedTarget = outside;
+      externalOperation = outside;
+    }
+
+    fs.mkdirSync(externalOperation, { recursive: true });
+    fs.writeFileSync(path.join(outside, 'external-sentinel.bin'), Buffer.from([0x00, 0xff, 0x41, 0x0a]));
+    fs.writeFileSync(path.join(externalOperation, 'pending.removed'), 'preserve external tombstone\n');
+    fs.symlinkSync(linkedTarget, linkedPath, process.platform === 'win32' ? 'junction' : 'dir');
+
+    const owner = acquireLock({ wikiRoot: root, operation: `linked-${linkedParent}-owner` });
+    setState(root, { pending: `${T1}\n`, last: `${T0}\n` });
+    const beforeExternal = snapshotTree(outside);
+    const beforeState = state(root);
+    const boundaries = [];
+    let result;
+    let observedError;
+    try {
+      result = promotePendingScan({
+        wikiRoot: root,
+        token: owner.token,
+        expected: T1,
+        operationId,
+        now: new Date(T3),
+        faultInjector(boundary) { boundaries.push(boundary); },
+      });
+    } catch (error) {
+      observedError = error;
+    }
+    const afterExternal = snapshotTree(outside);
+    const afterState = state(root);
+    releaseLock({ wikiRoot: root, token: owner.token });
+
+    assert.equal(observedError?.code, 'SCAN_WINDOW_FILESYSTEM', JSON.stringify({
+      result,
+      error: observedError && { code: observedError.code, message: observedError.message },
+      boundaries,
+    }));
+    assert.deepEqual(boundaries, []);
+    assert.deepEqual(afterExternal, beforeExternal);
+    assert.deepEqual(afterState, beforeState);
+  });
+}
+
+test('ensurePendingScan enforces its persistence deadline at journal, stage, destination, commit, and cleanup boundaries', async (t) => {
+  const boundaries = [
+    'after-journal-created',
+    'after-stage-pending-after',
+    'after-pending-rename',
+    'after-scan-window-committed',
+    'before-cleanup',
+  ];
+  for (const boundary of boundaries) {
+    await t.test(boundary, () => {
+      const { ensurePendingScan, createDeadline } = modules();
+      const root = temporaryWiki(`deep wiki persistence deadline ${boundary} `);
+      const clock = makeClock();
+      let advanced = false;
+      const result = ensurePendingScan({
+        wikiRoot: root,
+        proposed: T1,
+        now: new Date(T1),
+        deadline: createDeadline({ clock, budgetMs: 10 }),
+        faultInjector(stage) {
+          if (stage === boundary && !advanced) {
+            advanced = true;
+            clock.advance(10);
+          }
+        },
+      });
+      assert.equal(advanced, true);
+      assert.deepEqual(result, { status: 'deferred', reason: 'DEADLINE_EXCEEDED' });
+      assert.equal(fs.existsSync(metaPath(root, '.wiki-lock')), false);
+      const journals = journalFiles(root);
+      assert.equal(journals.length, 1);
+      const interrupted = JSON.parse(fs.readFileSync(journals[0], 'utf8'));
+      assert.equal(interrupted.transitions[0], 'scan-window-preflighted');
+      assert.equal(interrupted.transitions.includes('cleaned'), false);
+
+      const retryClock = makeClock();
+      const retry = ensurePendingScan({
+        wikiRoot: root,
+        proposed: T1,
+        now: new Date(T1),
+        deadline: createDeadline({ clock: retryClock, budgetMs: 10 }),
+      });
+      assert.equal(retry.status, 'created');
+      assertState(root, { pending: `${T1}\n`, last: null });
+      const recovered = JSON.parse(fs.readFileSync(journals[0], 'utf8'));
+      assert.equal(recovered.transitions.at(-1), 'cleaned');
+    });
+  }
+});
+
+test('deadline deferral releases only the caller token and preserves a successor takeover', () => {
+  const { ensurePendingScan, createDeadline, recoverLock, acquireLock, assertLockOwner, releaseLock } = modules();
+  const root = temporaryWiki('deep wiki deadline successor takeover ');
+  const clock = makeClock();
+  let successor;
+  const result = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    now: new Date(T1),
+    deadline: createDeadline({ clock, budgetMs: 10 }),
+    faultInjector(stage) {
+      if (stage !== 'after-journal-created') return;
+      clock.advance(10);
+      replaceLiveLockExternallyAtInjectedGuard(root);
+      successor = acquireLock({ wikiRoot: root, operation: 'deadline-successor' });
+    },
+  });
+  assert.deepEqual(result, { status: 'deferred', reason: 'DEADLINE_EXCEEDED' });
+  assert.equal(assertLockOwner({ wikiRoot: root, token: successor.token }).operation, 'deadline-successor');
+  releaseLock({ wikiRoot: root, token: successor.token });
+});
+
+test('non-expired takeover after journal creation fences every later transaction metadata mutation', () => {
+  const {
+    ensurePendingScan, createDeadline, recoverLock, acquireLock, assertLockOwner, releaseLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki token successor after journal ');
+  let successor;
+  let transaction;
+  let atTakeover;
+  const result = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    now: new Date(T1),
+    deadline: createDeadline({ budgetMs: 12_000 }),
+    faultInjector(stage) {
+      if (stage !== 'after-journal-created') return;
+      replaceLiveLockExternallyAtInjectedGuard(root);
+      successor = acquireLock({ wikiRoot: root, operation: 'journal-successor' });
+      transaction = path.dirname(journalFiles(root)[0]);
+      atTakeover = snapshotFlatDirectory(transaction);
+    },
+  });
+  assert.deepEqual(result, { status: 'deferred', reason: 'LOCK_TOKEN_MISMATCH' });
+  assert.deepEqual(snapshotFlatDirectory(transaction), atTakeover);
+  assert.equal(Object.keys(atTakeover).filter((name) => name.startsWith('stage-')).length, 0);
+  assert.deepEqual(JSON.parse(Buffer.from(atTakeover['journal.json'], 'base64')), {
+    ...JSON.parse(Buffer.from(atTakeover['journal.json'], 'base64')),
+    transitions: ['scan-window-preflighted'],
+  });
+  assert.equal(assertLockOwner({ wikiRoot: root, token: successor.token }).operation, 'journal-successor');
+  releaseLock({ wikiRoot: root, token: successor.token });
+});
+
+test('token takeover at every transaction publication and cleanup seam performs zero later metadata mutation', async (t) => {
+  const boundaries = [
+    'before-stage-pending-before-write',
+    'before-stage-pending-after-write',
+    'before-stage-last-before-write',
+    'before-stage-last-after-write',
+    'before-transition-scan-window-staged-write',
+    'before-transition-last-scan-written-write',
+    'before-transition-pending-scan-written-write',
+    'before-transition-scan-window-committed-write',
+    'before-stage-pending-before-remove',
+    'before-stage-pending-after-remove',
+    'before-stage-last-before-remove',
+    'before-stage-last-after-remove',
+    'before-tombstone-cleanup-remove',
+    'before-transition-cleaned-write',
+  ];
+  for (const boundary of boundaries) {
+    await t.test(boundary, () => {
+      const { promotePendingScan, acquireLock, recoverLock, assertLockOwner, releaseLock } = modules();
+      const root = temporaryWiki(`deep wiki transaction token fence ${boundary} `);
+      setState(root, { pending: `${T1}\n`, last: `${T0}\n` });
+      const operationId = `token-fence-${boundary}`;
+      const transaction = metaPath(root, path.join('.transactions', operationId));
+      const owner = acquireLock({ wikiRoot: root, operation: 'old-promoter' });
+      let successor;
+      let atTakeover;
+      let injected = false;
+      assert.throws(() => promotePendingScan({
+        wikiRoot: root,
+        token: owner.token,
+        expected: T1,
+        operationId,
+        faultInjector(stage) {
+          if (injected || stage !== boundary) return;
+          injected = true;
+          replaceLiveLockExternallyAtInjectedGuard(root);
+          successor = acquireLock({ wikiRoot: root, operation: `successor-${boundary}` });
+          atTakeover = snapshotFlatDirectory(transaction);
+        },
+      }), (error) => error.code === 'LOCK_TOKEN_MISMATCH');
+      assert.equal(injected, true);
+      assert.deepEqual(snapshotFlatDirectory(transaction), atTakeover);
+      assert.equal(assertLockOwner({ wikiRoot: root, token: successor.token }).operation, `successor-${boundary}`);
+      releaseLock({ wikiRoot: root, token: successor.token });
+    });
+  }
+});
+
+test('token takeover before default transaction-directory creation performs no directory mutation', () => {
+  const {
+    ensurePendingScan, createDeadline, recoverLock, acquireLock, assertLockOwner, releaseLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki transaction directory fence ');
+  const transactions = metaPath(root, '.transactions');
+  let successor;
+  let injected = false;
+  const result = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    now: new Date(T1),
+    deadline: createDeadline({ budgetMs: 12_000 }),
+    faultInjector(stage) {
+      if (stage !== 'before-transaction-directory-create') return;
+      injected = true;
+      replaceLiveLockExternallyAtInjectedGuard(root);
+      successor = acquireLock({ wikiRoot: root, operation: 'transaction-directory-successor' });
+      assert.deepEqual(fs.readdirSync(transactions), []);
+    },
+  });
+  assert.equal(injected, true);
+  assert.deepEqual(result, { status: 'deferred', reason: 'LOCK_TOKEN_MISMATCH' });
+  assert.deepEqual(fs.readdirSync(transactions), []);
+  assert.equal(assertLockOwner({ wikiRoot: root, token: successor.token }).operation, 'transaction-directory-successor');
+  releaseLock({ wikiRoot: root, token: successor.token });
+});
+
+test('old pending publication cannot overwrite a successor commit after temp identity validation', () => {
+  const {
+    ensurePendingScan, planScanWindowTransition, applyScanWindowTransition,
+    createDeadline, acquireLock, assertLockOwner, releaseLock, recoverLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki pending post-identity takeover ');
+  setState(root, { last: `${T0}\n` });
+  const originalLstat = fs.lstatSync;
+  let injected = false;
+  let successor;
+  fs.lstatSync = function injectedLstat(pathname, options) {
+    if (!injected && String(pathname).includes('.pending-scan.tmp.')) {
+      injected = true;
+      replaceLiveLockExternallyAtInjectedGuard(root);
+      successor = acquireLock({ wikiRoot: root, operation: 'pending-successor' });
+      const plan = planScanWindowTransition({ wikiRoot: root, kind: 'ensure', proposed: T2 });
+      const committed = applyScanWindowTransition({
+        wikiRoot: root,
+        token: successor.token,
+        plan,
+        operationId: 'pending-successor-commit',
+        deadline: createDeadline({ budgetMs: 12_000 }),
+      });
+      assert.equal(committed.status, 'created');
+    }
+    return originalLstat.call(fs, pathname, options);
+  };
+  let result;
+  try {
+    result = ensurePendingScan({
+      wikiRoot: root,
+      proposed: T1,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+  } finally {
+    fs.lstatSync = originalLstat;
+  }
+  assert.equal(injected, true);
+  assert.deepEqual(result, { status: 'deferred', reason: 'LOCK_TOKEN_MISMATCH' });
+  assert.equal(readMaybe(metaPath(root, '.pending-scan')).toString('utf8'), `${T2}\n`);
+  assert.equal(assertLockOwner({ wikiRoot: root, token: successor.token }).operation, 'pending-successor');
+  releaseLock({ wikiRoot: root, token: successor.token });
+});
+
+test('old last-scan publication cannot overwrite a successor repair after temp identity validation', () => {
+  const {
+    promotePendingScan, planScanWindowTransition, applyScanWindowTransition,
+    acquireLock, assertLockOwner, releaseLock, recoverLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki last post-identity takeover ');
+  setState(root, { pending: `${T1}\n`, last: `${T0}\n` });
+  const oldOwner = acquireLock({ wikiRoot: root, operation: 'old-promoter' });
+  const originalLstat = fs.lstatSync;
+  let injected = false;
+  let successor;
+  fs.lstatSync = function injectedLstat(pathname, options) {
+    if (!injected && String(pathname).includes('.last-scan.tmp.')) {
+      injected = true;
+      replaceLiveLockExternallyAtInjectedGuard(root);
+      successor = acquireLock({ wikiRoot: root, operation: 'last-successor' });
+      const pendingBytes = readMaybe(metaPath(root, '.pending-scan'));
+      const plan = planScanWindowTransition({
+        wikiRoot: root,
+        kind: 'repair',
+        pendingAfter: pendingBytes,
+        lastAfter: Buffer.from(`${T2}\n`),
+      });
+      const committed = applyScanWindowTransition({
+        wikiRoot: root,
+        token: successor.token,
+        plan,
+        operationId: 'last-successor-commit',
+      });
+      assert.equal(committed.status, 'repaired');
+    }
+    return originalLstat.call(fs, pathname, options);
+  };
+  try {
+    assert.throws(() => promotePendingScan({
+      wikiRoot: root,
+      token: oldOwner.token,
+      expected: T1,
+      operationId: 'old-promoter-commit',
+    }), (error) => error.code === 'LOCK_TOKEN_MISMATCH');
+  } finally {
+    fs.lstatSync = originalLstat;
+  }
+  assert.equal(injected, true);
+  assert.equal(readMaybe(metaPath(root, '.last-scan')).toString('utf8'), `${T2}\n`);
+  assert.equal(assertLockOwner({ wikiRoot: root, token: successor.token }).operation, 'last-successor');
+  releaseLock({ wikiRoot: root, token: successor.token });
+});
+
+test('promotePendingScan requires the caller token, advances last monotonically, and clears only a full-string match', () => {
+  const { acquireLock, releaseLock, promotePendingScan } = modules();
+  const root = temporaryWiki('deep wiki promotion contract ');
+  setState(root, { pending: `${T2}\n`, last: `${T0}\n` });
+  assert.throws(() => promotePendingScan({
+    wikiRoot: root, token: 'wrong', expected: T1, operationId: 'wrong-owner', now: new Date(T3),
+  }), (error) => error.code === 'LOCK_TOKEN_MISMATCH');
+  const owner = acquireLock({ wikiRoot: root, operation: 'promote' });
+  try {
+    const result = promotePendingScan({
+      wikiRoot: root, token: owner.token, expected: T1, operationId: 'preserve-newer', now: new Date(T3),
+    });
+    assert.equal(result.status, 'promoted');
+    assert.equal(result.pendingPreserved, true);
+  } finally {
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+  assertState(root, { pending: `${T2}\n`, last: `${T1}\n` });
+  promote(root, T2, 'clear-matching');
+  assertState(root, { pending: null, last: `${T2}\n` });
+  setState(root, { pending: `${T1}\n`, last: `${T3}\n` });
+  promote(root, T1, 'never-regress');
+  assertState(root, { pending: null, last: `${T3}\n` });
+});
+
+test('pending removal rechecks token ownership immediately before the destination rename', () => {
+  const { acquireLock, promotePendingScan } = modules();
+  const root = temporaryWiki('deep wiki pending removal takeover ');
+  setState(root, { pending: `${T1}\n`, last: `${T0}\n` });
+  const owner = acquireLock({ wikiRoot: root, operation: 'promote' });
+  const ownerPath = metaPath(root, path.join('.wiki-lock', 'owner.json'));
+  const lockDir = metaPath(root, '.wiki-lock');
+  const replacementToken = 'f'.repeat(64);
+  let takeoverInjected = false;
+  try {
+    assert.throws(() => promotePendingScan({
+      wikiRoot: root,
+      token: owner.token,
+      expected: T1,
+      operationId: 'pending-removal-forced-takeover',
+      now: new Date(T3),
+      faultInjector(stage) {
+        if (stage !== 'before-matching-pending-destination-rename') return;
+        takeoverInjected = true;
+        const replacement = {
+          ...JSON.parse(fs.readFileSync(ownerPath, 'utf8')),
+          token: replacementToken,
+          operation: 'forced-takeover',
+        };
+        fs.writeFileSync(ownerPath, `${JSON.stringify(replacement)}\n`);
+      },
+    }), (error) => error.code === 'LOCK_TOKEN_MISMATCH');
+    assert.equal(takeoverInjected, true);
+  } finally {
+    fs.rmSync(lockDir, { recursive: true, force: true });
+  }
+  assert.equal(fs.readFileSync(metaPath(root, '.pending-scan'), 'utf8'), `${T1}\n`);
+  const journal = JSON.parse(fs.readFileSync(journalFiles(root)[0], 'utf8'));
+  assert.equal(journal.transitions.includes('pending-scan-written'), false);
+  assert.equal(journal.transitions.includes('scan-window-committed'), false);
+});
+
+test('scanner-first then promotion and promotion-first then scanner produce the two serial outcomes', () => {
+  const { ensurePendingScan, createDeadline } = modules();
+  const scannerFirst = temporaryWiki('deep wiki scanner first ');
+  setState(scannerFirst, { pending: `${T1}\n` });
+  const before = readMaybe(metaPath(scannerFirst, '.pending-scan'));
+  ensurePendingScan({
+    wikiRoot: scannerFirst, proposed: T2, now: new Date(T2), deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.deepEqual(readMaybe(metaPath(scannerFirst, '.pending-scan')), before);
+  promote(scannerFirst, T1, 'scanner-first-promote');
+  assertState(scannerFirst, { pending: null, last: `${T1}\n` });
+
+  const promotionFirst = temporaryWiki('deep wiki promotion first ');
+  setState(promotionFirst, { pending: `${T1}\n` });
+  promote(promotionFirst, T1, 'promotion-first-promote');
+  ensurePendingScan({
+    wikiRoot: promotionFirst, proposed: T2, now: new Date(T2), deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assertState(promotionFirst, { pending: `${T2}\n`, last: `${T1}\n` });
+});
+
+async function waitForFiles(files, timeoutMs = 5_000) {
+  const expires = Date.now() + timeoutMs;
+  while (Date.now() < expires) {
+    if (files.every((file) => fs.existsSync(file))) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(`timed out waiting for ${files.join(', ')}`);
+}
+
+function spawnRacer(root, mode, suffix, startFile) {
+  const config = {
+    mode,
+    wikiRoot: root,
+    proposed: mode === 'ensure' ? T2 : undefined,
+    expected: mode === 'promote' ? T1 : undefined,
+    operationId: mode === 'promote' ? `race-promote-${suffix}` : undefined,
+    now: T3,
+    timeoutMs: 10_000,
+    startFile,
+    readyFile: path.join(root, `${mode}-${suffix}.ready.json`),
+    resultFile: path.join(root, `${mode}-${suffix}.result.json`),
+  };
+  const configPath = path.join(root, `${mode}-${suffix}.config.json`);
+  fs.writeFileSync(configPath, `${JSON.stringify(config)}\n`);
+  const child = spawn(process.execPath, [racer, configPath], {
+    cwd: root,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    shell: false,
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (chunk) => { stdout += chunk; });
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+  return { child, config, stdout: () => stdout, stderr: () => stderr };
+}
+
+for (const order of ['ensure-first', 'promote-first']) {
+  test(`real process race is serializable with ${order} spawn order`, async () => {
+    const root = temporaryWiki(`deep wiki process race ${order} `);
+    setState(root, { pending: `${T1}\n` });
+    const start = path.join(root, 'start.barrier');
+    const firstMode = order === 'ensure-first' ? 'ensure' : 'promote';
+    const secondMode = firstMode === 'ensure' ? 'promote' : 'ensure';
+    const first = spawnRacer(root, firstMode, 'first', start);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const second = spawnRacer(root, secondMode, 'second', start);
+    await waitForFiles([first.config.readyFile, second.config.readyFile]);
+    fs.writeFileSync(start, 'go\n');
+    const [[firstCode], [secondCode]] = await Promise.all([once(first.child, 'exit'), once(second.child, 'exit')]);
+    assert.equal(firstCode, 0, `${first.stdout()}\n${first.stderr()}`);
+    assert.equal(secondCode, 0, `${second.stdout()}\n${second.stderr()}`);
+    const firstResult = JSON.parse(fs.readFileSync(first.config.resultFile));
+    const secondResult = JSON.parse(fs.readFileSync(second.config.resultFile));
+    assert.equal(firstResult.ok, true);
+    assert.equal(secondResult.ok, true);
+    assert.notEqual(firstResult.result?.status, 'deferred', JSON.stringify(firstResult));
+    assert.notEqual(secondResult.result?.status, 'deferred', JSON.stringify(secondResult));
+    const final = state(root);
+    const serialOne = final.last?.toString() === `${T1}\n` && final.pending === null;
+    const serialTwo = final.last?.toString() === `${T1}\n` && final.pending?.toString() === `${T2}\n`;
+    assert.equal(serialOne || serialTwo, true, JSON.stringify({
+      last: final.last?.toString(), pending: final.pending?.toString(),
+    }));
+    assert.equal(fs.existsSync(metaPath(root, '.wiki-lock')), false);
+    assert.equal(journalFiles(root).length, 2, JSON.stringify({ firstResult, secondResult }));
+  });
+}
+
+const ensureFaults = [
+  'after-journal-created',
+  'after-stage-pending-before',
+  'after-stage-pending-after',
+  'after-stage-last-before',
+  'after-stage-last-after',
+  'before-pending-rename',
+  'after-pending-rename',
+  'after-scan-window-committed',
+  'before-cleanup',
+];
+
+for (const faultPoint of ensureFaults) {
+  test(`ensure crash/retry converges after ${faultPoint}`, () => {
+    const { ensurePendingScan, createDeadline } = modules();
+    const root = temporaryWiki(`deep wiki ensure fault ${faultPoint} `);
+    const first = ensurePendingScan({
+      wikiRoot: root,
+      proposed: T1,
+      now: new Date(T1),
+      deadline: createDeadline({ budgetMs: 12_000 }),
+      faultInjector(stage) {
+        if (stage === faultPoint) {
+          const error = new Error(`injected ${stage}`);
+          error.code = 'INJECTED_CRASH';
+          throw error;
+        }
+      },
+    });
+    assert.equal(first.status, 'deferred');
+    const retry = ensurePendingScan({
+      wikiRoot: root, proposed: T1, now: new Date(T1), deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+    assert.notEqual(retry.status, 'deferred');
+    assertState(root, { pending: `${T1}\n`, last: null });
+    const journals = journalFiles(root);
+    assert.equal(journals.length, 1);
+    const journal = JSON.parse(fs.readFileSync(journals[0]));
+    assert.equal(journal.transitions.at(-1), 'cleaned');
+    assert.equal(new Set(journal.transitions).size, journal.transitions.length);
+  });
+}
+
+const promoteFaults = [
+  'after-journal-created',
+  'after-stage-pending-before',
+  'after-stage-pending-after',
+  'after-stage-last-before',
+  'after-stage-last-after',
+  'before-last-scan-rename',
+  'after-last-scan-rename',
+  'before-matching-pending-remove',
+  'after-matching-pending-remove',
+  'after-scan-window-committed',
+  'before-cleanup',
+];
+
+for (const faultPoint of promoteFaults) {
+  test(`promotion crash/retry converges after ${faultPoint}`, () => {
+    const { acquireLock, releaseLock, promotePendingScan } = modules();
+    const root = temporaryWiki(`deep wiki promote fault ${faultPoint} `);
+    setState(root, { pending: `${T1}\n`, last: `${T0}\n` });
+    let owner = acquireLock({ wikiRoot: root, operation: 'promote' });
+    try {
+      assert.throws(() => promotePendingScan({
+        wikiRoot: root,
+        token: owner.token,
+        expected: T1,
+        operationId: `promote-fault-${faultPoint}`,
+        now: new Date(T3),
+        faultInjector(stage) {
+          if (stage === faultPoint) {
+            const error = new Error(`injected ${stage}`);
+            error.code = 'INJECTED_CRASH';
+            throw error;
+          }
+        },
+      }), /injected/);
+    } finally {
+      releaseLock({ wikiRoot: root, token: owner.token });
+    }
+    owner = acquireLock({ wikiRoot: root, operation: 'promote-retry' });
+    try {
+      const retry = promotePendingScan({
+        wikiRoot: root, token: owner.token, expected: T1,
+        operationId: `promote-fault-${faultPoint}`, now: new Date(T3),
+      });
+      assert.equal(retry.status, 'promoted');
+    } finally {
+      releaseLock({ wikiRoot: root, token: owner.token });
+    }
+    assertState(root, { pending: null, last: `${T1}\n` });
+    const journal = JSON.parse(fs.readFileSync(journalFiles(root)[0]));
+    assert.equal(journal.transitions.at(-1), 'cleaned');
+    assert.equal(new Set(journal.transitions).size, journal.transitions.length);
+  });
+}
+
+test('same operation retry is byte-identical and an operation-id collision fails before mutation', () => {
+  const root = temporaryWiki('deep wiki operation collision ');
+  setState(root, { pending: `${T1}\n` });
+  promote(root, T1, 'stable-operation');
+  const afterFirst = state(root);
+  const journal = journalFiles(root)[0];
+  const journalAfterFirst = fs.readFileSync(journal);
+  promote(root, T1, 'stable-operation');
+  assert.deepEqual(state(root), afterFirst);
+  assert.deepEqual(fs.readFileSync(journal), journalAfterFirst);
+  setState(root, { pending: `${T2}\n`, last: `${T1}\n` });
+  const beforeCollision = state(root);
+  assert.throws(() => promote(root, T2, 'stable-operation'), (error) => error.code === 'OPERATION_ID_COLLISION');
+  assert.deepEqual(state(root), beforeCollision);
+  assert.equal(journalFiles(root).length, 1);
+});
+
+test('corrupt staged bytes require manual recovery and preserve both scan-window files', () => {
+  const { ensurePendingScan, recoverScanWindowTransaction, createDeadline, acquireLock, releaseLock } = modules();
+  const root = temporaryWiki('deep wiki corrupt stage ');
+  setState(root, { last: `${T0}\n` });
+  const result = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    now: new Date(T1),
+    deadline: createDeadline({ budgetMs: 12_000 }),
+    faultInjector(stage) {
+      if (stage === 'before-pending-rename') {
+        const error = new Error('injected before rename');
+        error.code = 'INJECTED_CRASH';
+        throw error;
+      }
+    },
+  });
+  assert.equal(result.status, 'deferred');
+  const journalPath = journalFiles(root)[0];
+  const journal = JSON.parse(fs.readFileSync(journalPath));
+  const txDir = path.dirname(journalPath);
+  fs.writeFileSync(path.join(txDir, 'stage-pending-after.json'), 'corrupt\n');
+  const before = state(root);
+  const owner = acquireLock({ wikiRoot: root, operation: 'recover' });
+  try {
+    assert.throws(() => recoverScanWindowTransaction({
+      wikiRoot: root, token: owner.token, operationId: journal.operation_id,
+    }), (error) => error.code === 'TRANSACTION_RECOVERY_REQUIRED');
+  } finally {
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+  assert.deepEqual(state(root), before);
+});
+
+test('recovery rejects a forged cleaned journal when recorded after bytes were never published', () => {
+  const { ensurePendingScan, recoverScanWindowTransaction, createDeadline, acquireLock, releaseLock } = modules();
+  const root = temporaryWiki('deep wiki forged cleaned journal ');
+  setState(root, { last: `${T0}\n` });
+  const interrupted = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    now: new Date(T1),
+    deadline: createDeadline({ budgetMs: 12_000 }),
+    faultInjector(stage) {
+      if (stage === 'before-pending-rename') {
+        const error = new Error('injected before pending rename');
+        error.code = 'INJECTED_CRASH';
+        throw error;
+      }
+    },
+  });
+  assert.equal(interrupted.status, 'deferred');
+  const journalPath = journalFiles(root)[0];
+  const journal = JSON.parse(fs.readFileSync(journalPath, 'utf8'));
+  journal.transitions = [
+    'scan-window-preflighted',
+    'scan-window-staged',
+    'pending-scan-written',
+    'scan-window-committed',
+    'cleaned',
+  ];
+  fs.writeFileSync(journalPath, `${JSON.stringify(journal)}\n`);
+  const beforeState = state(root);
+  const transactionDir = path.dirname(journalPath);
+  const beforeTransaction = snapshotFlatDirectory(transactionDir);
+  const owner = acquireLock({ wikiRoot: root, operation: 'recover-forged-cleaned' });
+  try {
+    assert.throws(() => recoverScanWindowTransaction({
+      wikiRoot: root,
+      token: owner.token,
+      operationId: journal.operation_id,
+    }), (error) => error.code === 'TRANSACTION_RECOVERY_REQUIRED');
+  } finally {
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+  assert.deepEqual(state(root), beforeState);
+  assert.deepEqual(snapshotFlatDirectory(transactionDir), beforeTransaction);
+});
+
+test('recovery rejects a diverged unchanged target before writing a changed destination', () => {
+  const { acquireLock, releaseLock, promotePendingScan, recoverScanWindowTransaction } = modules();
+  const root = temporaryWiki('deep wiki diverged unchanged destination ');
+  setState(root, { pending: `${T2}\n`, last: `${T0}\n` });
+  let owner = acquireLock({ wikiRoot: root, operation: 'promote-interrupted' });
+  try {
+    assert.throws(() => promotePendingScan({
+      wikiRoot: root,
+      token: owner.token,
+      expected: T1,
+      operationId: 'diverged-unchanged-target',
+      now: new Date(T3),
+      faultInjector(stage) {
+        if (stage === 'before-last-scan-rename') {
+          const error = new Error('injected before last rename');
+          error.code = 'INJECTED_CRASH';
+          throw error;
+        }
+      },
+    }), /injected before last rename/);
+  } finally {
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+
+  const journalPath = journalFiles(root)[0];
+  const journal = JSON.parse(fs.readFileSync(journalPath, 'utf8'));
+  fs.writeFileSync(metaPath(root, '.pending-scan'), `${T3}\n`);
+  const beforeState = state(root);
+  const transactionDir = path.dirname(journalPath);
+  const beforeTransaction = snapshotFlatDirectory(transactionDir);
+  owner = acquireLock({ wikiRoot: root, operation: 'recover-diverged-unchanged' });
+  try {
+    assert.throws(() => recoverScanWindowTransaction({
+      wikiRoot: root,
+      token: owner.token,
+      operationId: journal.operation_id,
+    }), (error) => error.code === 'TRANSACTION_RECOVERY_REQUIRED');
+  } finally {
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+  assert.deepEqual(state(root), beforeState);
+  assert.deepEqual(snapshotFlatDirectory(transactionDir), beforeTransaction);
+});
+
+test('journal recovery rejects canonical-input, schema, descriptor, hash, and transition mutations without destination writes', async (t) => {
+  const mutations = [
+    ['input hash', (journal) => { journal.input_sha256 = 'f'.repeat(64); }],
+    ['canonical input', (journal) => {
+      journal.input.proposed = T2;
+      journal.input_sha256 = crypto.createHash('sha256').update(JSON.stringify(journal.input)).digest('hex');
+    }],
+    ['kind', (journal) => { journal.kind = 'foreign-kind'; }],
+    ['result status', (journal) => { journal.result_status = 'foreign-status'; }],
+    ['descriptor', (journal) => { journal.states.pending.after.sha256 = '0'.repeat(64); }],
+    ['stage hash', (journal) => { journal.stage_sha256['pending-after'] = '0'.repeat(64); }],
+    ['unknown transition', (journal) => { journal.transitions.push('foreign-transition'); }],
+    ['duplicate transition', (journal) => { journal.transitions.push('scan-window-preflighted'); }],
+    ['out-of-order transitions', (journal) => {
+      journal.transitions = ['scan-window-preflighted', 'scan-window-committed', 'scan-window-staged'];
+    }],
+  ];
+
+  for (const [name, mutate] of mutations) {
+    await t.test(name, () => {
+      const { ensurePendingScan, recoverScanWindowTransaction, createDeadline, acquireLock, releaseLock } = modules();
+      const root = temporaryWiki(`deep wiki journal mutation ${name} `);
+      setState(root, { last: `${T0}\n` });
+      const interrupted = ensurePendingScan({
+        wikiRoot: root,
+        proposed: T1,
+        now: new Date(T1),
+        deadline: createDeadline({ budgetMs: 12_000 }),
+        faultInjector(stage) {
+          if (stage === 'before-pending-rename') {
+            const error = new Error('injected before pending rename');
+            error.code = 'INJECTED_CRASH';
+            throw error;
+          }
+        },
+      });
+      assert.equal(interrupted.status, 'deferred');
+      const journalPath = journalFiles(root)[0];
+      const journal = JSON.parse(fs.readFileSync(journalPath, 'utf8'));
+      journal.input ||= {
+        wiki_root: root,
+        kind: 'ensure',
+        proposed: T1,
+        expected: null,
+        repair_pending_after: null,
+        repair_last_after: null,
+      };
+      mutate(journal);
+      fs.writeFileSync(journalPath, `${JSON.stringify(journal)}\n`);
+      const before = state(root);
+      const owner = acquireLock({ wikiRoot: root, operation: 'recover-mutated-journal' });
+      try {
+        assert.throws(() => recoverScanWindowTransaction({
+          wikiRoot: root,
+          token: owner.token,
+          operationId: journal.operation_id,
+        }), (error) => error.code === 'TRANSACTION_RECOVERY_REQUIRED');
+      } finally {
+        releaseLock({ wikiRoot: root, token: owner.token });
+      }
+      assert.deepEqual(state(root), before);
+    });
+  }
+});
+
+function memoryJournalAdapter() {
+  let journal = null;
+  const stages = new Map();
+  return {
+    readJournal() { return journal ? structuredClone(journal) : null; },
+    writeJournal(value) { journal = structuredClone(value); },
+    readStage(name) { return stages.has(name) ? Buffer.from(stages.get(name)) : null; },
+    writeStage(name, bytes) { stages.set(name, Buffer.from(bytes)); },
+    removeStage(name) { stages.delete(name); },
+    snapshot() { return { journal: structuredClone(journal), stages: new Map(stages) }; },
+  };
+}
+
+for (const scenario of [
+  {
+    name: 'parent creation',
+    boundary: 'before-tombstone-parent-create',
+    seed(tombstone) {
+      assert.equal(fs.existsSync(path.dirname(tombstone)), false);
+    },
+    verify(tombstone) {
+      assert.equal(fs.existsSync(path.dirname(tombstone)), false);
+    },
+  },
+  {
+    name: 'existing-file removal',
+    boundary: 'before-tombstone-prepare-remove',
+    seed(tombstone) {
+      fs.mkdirSync(path.dirname(tombstone), { recursive: true });
+      fs.writeFileSync(tombstone, 'preserve-tombstone\n');
+    },
+    verify(tombstone) {
+      assert.equal(fs.readFileSync(tombstone, 'utf8'), 'preserve-tombstone\n');
+    },
+  },
+]) {
+  test(`caller tombstone ${scenario.name} is token-fenced before filesystem mutation`, () => {
+    const { acquireLock, releaseLock, recoverLock, promotePendingScan, assertLockOwner } = modules();
+    const root = temporaryWiki(`deep wiki ${scenario.name} token fence `);
+    setState(root, { pending: `${T1}\n`, last: `${T0}\n` });
+    const adapter = memoryJournalAdapter();
+    const tombstone = metaPath(root, path.join('.caller-tombstones', scenario.boundary, 'pending.removed'));
+    adapter.tombstonePath = tombstone;
+    scenario.seed(tombstone);
+    const owner = acquireLock({ wikiRoot: root, operation: 'old-tombstone-owner' });
+    let successor;
+    let injected = false;
+    try {
+      assert.throws(() => promotePendingScan({
+        wikiRoot: root,
+        token: owner.token,
+        expected: T1,
+        operationId: `caller-${scenario.boundary}`,
+        journalAdapter: adapter,
+        faultInjector(stage) {
+          if (stage !== scenario.boundary) return;
+          injected = true;
+          replaceLiveLockExternallyAtInjectedGuard(root);
+          successor = acquireLock({ wikiRoot: root, operation: `successor-${scenario.boundary}` });
+          scenario.verify(tombstone);
+        },
+      }), (error) => error.code === 'LOCK_TOKEN_MISMATCH');
+      assert.equal(injected, true);
+      scenario.verify(tombstone);
+      assert.equal(fs.readFileSync(metaPath(root, '.pending-scan'), 'utf8'), `${T1}\n`);
+      assert.equal(assertLockOwner({ wikiRoot: root, token: successor.token }).operation, `successor-${scenario.boundary}`);
+    } finally {
+      if (successor) releaseLock({ wikiRoot: root, token: successor.token });
+      else {
+        try { releaseLock({ wikiRoot: root, token: owner.token }); } catch { /* RED cleanup */ }
+      }
+    }
+  });
+}
+
+test('journalAdapter embeds the same staged bytes and transition vocabulary for a caller-owned transaction', () => {
+  const { acquireLock, releaseLock, promotePendingScan } = modules();
+  const root = temporaryWiki('deep wiki journal adapter ');
+  setState(root, { pending: `${T1}\n`, last: `${T0}\n` });
+  const adapter = memoryJournalAdapter();
+  const owner = acquireLock({ wikiRoot: root, operation: 'outer-commit' });
+  try {
+    promotePendingScan({
+      wikiRoot: root,
+      token: owner.token,
+      expected: T1,
+      operationId: 'outer-commit-operation',
+      journalAdapter: adapter,
+      now: new Date(T3),
+    });
+  } finally {
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+  const snapshot = adapter.snapshot();
+  assert.equal(snapshot.journal.operation_id, 'outer-commit-operation');
+  assert.equal(snapshot.journal.transitions.includes('scan-window-staged'), true);
+  assert.equal(snapshot.journal.transitions.includes('scan-window-committed'), true);
+  assert.equal(snapshot.journal.transitions.at(-1), 'cleaned');
+  assert.equal(snapshot.stages.size, 0);
+  assert.equal(journalFiles(root).length, 0);
+  assertState(root, { pending: null, last: `${T1}\n` });
+});
+
+test('caller-owned journal adapters are token-fenced at write, transition, removal, and cleanup seams', async (t) => {
+  const boundaries = [
+    'before-stage-pending-before-write',
+    'before-transition-scan-window-staged-write',
+    'before-stage-pending-before-remove',
+    'before-tombstone-cleanup-remove',
+    'before-transition-cleaned-write',
+  ];
+  for (const boundary of boundaries) {
+    await t.test(boundary, () => {
+      const { acquireLock, releaseLock, recoverLock, promotePendingScan, assertLockOwner } = modules();
+      const root = temporaryWiki(`deep wiki caller adapter token fence ${boundary} `);
+      setState(root, { pending: `${T1}\n`, last: `${T0}\n` });
+      const adapter = memoryJournalAdapter();
+      const owner = acquireLock({ wikiRoot: root, operation: 'caller-adapter-old-owner' });
+      let successor;
+      let atTakeover;
+      let injected = false;
+      assert.throws(() => promotePendingScan({
+        wikiRoot: root,
+        token: owner.token,
+        expected: T1,
+        operationId: `caller-adapter-${boundary}`,
+        journalAdapter: adapter,
+        faultInjector(stage) {
+          if (injected || stage !== boundary) return;
+          injected = true;
+          replaceLiveLockExternallyAtInjectedGuard(root);
+          successor = acquireLock({ wikiRoot: root, operation: `caller-successor-${boundary}` });
+          atTakeover = adapter.snapshot();
+        },
+      }), (error) => error.code === 'LOCK_TOKEN_MISMATCH');
+      assert.equal(injected, true);
+      assert.deepEqual(adapter.snapshot(), atTakeover);
+      assert.equal(assertLockOwner({ wikiRoot: root, token: successor.token }).operation, `caller-successor-${boundary}`);
+      releaseLock({ wikiRoot: root, token: successor.token });
+    });
+  }
+});

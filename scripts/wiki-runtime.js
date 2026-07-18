@@ -11,6 +11,8 @@ const {
   releaseLock,
   recoverLock,
 } = require(path.join(runtimeRoot, 'lock.js'));
+const wikiState = require(path.join(runtimeRoot, 'wiki-state.js'));
+const { sha256 } = require(path.join(runtimeRoot, 'fs-safe.js'));
 
 const HELP = `deep-wiki portable runtime
 
@@ -20,6 +22,16 @@ Usage:
   node scripts/wiki-runtime.js lock status --wiki-root <absolute> --json
   node scripts/wiki-runtime.js lock release --wiki-root <absolute> --token <token> --json
   node scripts/wiki-runtime.js lock recover --wiki-root <absolute> --stale-ms <integer> [--force] --json
+  node scripts/wiki-runtime.js setup --wiki-root <absolute> --config-host <claude|codex> [--replace-config] --json
+  node scripts/wiki-runtime.js snapshot --wiki-root <absolute> --json
+  node scripts/wiki-runtime.js commit --wiki-root <absolute> --lock-token <token> --manifest-file <absolute-json> --json
+  node scripts/wiki-runtime.js transaction recover --wiki-root <absolute> --lock-token <token> --operation-id <id> --json
+  node scripts/wiki-runtime.js index read --wiki-root <absolute> --json
+  node scripts/wiki-runtime.js scan-window promote --wiki-root <absolute> --lock-token <token> --expected <UTC-Z> --json
+  node scripts/wiki-runtime.js scan-window fail --wiki-root <absolute> --lock-token <token> --source <slug> --json
+  node scripts/wiki-runtime.js inbox cleanup --wiki-root <absolute> --lock-token <token> --max-age-days 7 --json
+  node scripts/wiki-runtime.js lint inspect --wiki-root <absolute> --json
+  node scripts/wiki-runtime.js lint fix --wiki-root <absolute> --json
 
 Recovery safety:
   --force bypasses age only. It never bypasses owner validity, same-host liveness,
@@ -135,12 +147,116 @@ function runLock(argv) {
   throw new UsageError(`unsupported lock command: ${command}`);
 }
 
+function wikiFlags(argv, schema) {
+  const flags = parseFlags(argv, { '--wiki-root': 'value', '--json': 'boolean', ...schema });
+  requireFlag(flags, '--json');
+  requireFlag(flags, '--wiki-root');
+  return flags;
+}
+
+function readManifestFile(file) {
+  if (typeof file !== 'string' || !path.isAbsolute(file)) throw new UsageError('--manifest-file must be absolute');
+  let stat;
+  try { stat = fs.lstatSync(file); }
+  catch (cause) { throw Object.assign(new Error(`manifest file is unavailable: ${cause.message}`), { code: 'MANIFEST_INVALID' }); }
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw Object.assign(new Error('manifest file must be regular and non-symlink'), { code: 'MANIFEST_INVALID' });
+  }
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
+  catch (cause) { throw Object.assign(new Error(`manifest file is invalid JSON: ${cause.message}`), { code: 'MANIFEST_INVALID' }); }
+}
+
+function runSetup(argv) {
+  const flags = wikiFlags(argv, { '--config-host': 'value', '--replace-config': 'boolean' });
+  emit(wikiState.setupWiki({
+    wikiRoot: flags['--wiki-root'],
+    configHost: requireFlag(flags, '--config-host'),
+    replaceConfig: flags['--replace-config'] === true,
+    env: process.env,
+  }));
+}
+
+function runSnapshot(argv) {
+  const flags = wikiFlags(argv, {});
+  emit(wikiState.snapshotWiki({ wikiRoot: flags['--wiki-root'] }));
+}
+
+function runCommit(argv) {
+  const flags = wikiFlags(argv, { '--lock-token': 'value', '--manifest-file': 'value' });
+  const manifestFile = requireFlag(flags, '--manifest-file');
+  const result = wikiState.applyCommit({
+    wikiRoot: flags['--wiki-root'],
+    token: requireFlag(flags, '--lock-token'),
+    manifest: readManifestFile(manifestFile),
+  });
+  emit(result);
+  const runtimeDirectory = path.join(path.resolve(flags['--wiki-root']), '.wiki-meta', '.runtime');
+  const relative = path.relative(runtimeDirectory, path.resolve(manifestFile));
+  if (relative && !relative.startsWith('..') && !path.isAbsolute(relative)) fs.rmSync(manifestFile, { force: true });
+}
+
+function runTransaction(argv) {
+  if (argv[0] !== 'recover') throw new UsageError('transaction requires recover');
+  const flags = wikiFlags(argv.slice(1), { '--lock-token': 'value', '--operation-id': 'value' });
+  emit(wikiState.recoverTransaction({
+    wikiRoot: flags['--wiki-root'], token: requireFlag(flags, '--lock-token'),
+    operationId: requireFlag(flags, '--operation-id'),
+  }));
+}
+
+function runIndex(argv) {
+  if (argv[0] !== 'read') throw new UsageError('index requires read');
+  const flags = wikiFlags(argv.slice(1), {});
+  emit(wikiState.snapshotWiki({ wikiRoot: flags['--wiki-root'] }).index);
+}
+
+function runScanWindow(argv) {
+  const command = argv[0];
+  if (command === 'promote') {
+    const flags = wikiFlags(argv.slice(1), { '--lock-token': 'value', '--expected': 'value' });
+    const expected = requireFlag(flags, '--expected');
+    emit(wikiState.promotePendingScan({
+      wikiRoot: flags['--wiki-root'], token: requireFlag(flags, '--lock-token'), expected,
+      operationId: `scan-window-cli-${sha256(Buffer.from(`${flags['--wiki-root']}\0${expected}`)).slice(0, 40)}`,
+    }));
+    return;
+  }
+  if (command === 'fail') {
+    const flags = wikiFlags(argv.slice(1), { '--lock-token': 'value', '--source': 'value' });
+    emit(wikiState.registerIngestFailure({
+      wikiRoot: flags['--wiki-root'], token: requireFlag(flags, '--lock-token'),
+      source: requireFlag(flags, '--source'),
+    }));
+    return;
+  }
+  throw new UsageError('scan-window requires promote or fail');
+}
+
+function runInbox(argv) {
+  if (argv[0] !== 'cleanup') throw new UsageError('inbox requires cleanup');
+  const flags = wikiFlags(argv.slice(1), { '--lock-token': 'value', '--max-age-days': 'value' });
+  const raw = requireFlag(flags, '--max-age-days');
+  if (!/^\d+$/.test(raw)) throw new UsageError('--max-age-days must be a nonnegative integer');
+  emit(wikiState.cleanupInbox({
+    wikiRoot: flags['--wiki-root'], token: requireFlag(flags, '--lock-token'), maxAgeDays: Number(raw),
+  }));
+}
+
+function runLint(argv) {
+  const command = argv[0];
+  const flags = wikiFlags(argv.slice(1), {});
+  if (command === 'inspect') emit(wikiState.inspectWiki({ wikiRoot: flags['--wiki-root'] }));
+  else if (command === 'fix') emit(wikiState.fixWiki({ wikiRoot: flags['--wiki-root'] }));
+  else throw new UsageError('lint requires inspect or fix');
+}
+
 function exitCode(error) {
   if (error.code === 'USAGE') return 2;
   if (['LOCK_CONTENDED', 'LOCK_TOKEN_MISMATCH'].includes(error.code)) return 3;
   if (error.code === 'CONFIG_CONFLICT' || error.code === 'CONFIG_TARGET_CONFLICT'
       || error.code === 'CONFIG_NOT_FOUND' || error.code === 'CONFIG_INVALID'
-      || error.code === 'LOCK_INVALID') return 4;
+      || error.code === 'LOCK_INVALID' || error.code === 'MANIFEST_INVALID'
+      || error.code === 'EXPECTED_HASH_CONFLICT' || error.code === 'WIKI_STATE_INVALID') return 4;
   return 5;
 }
 
@@ -152,7 +268,15 @@ function main(argv = process.argv.slice(2)) {
   try {
     if (argv[0] === 'config') runConfig(argv.slice(1));
     else if (argv[0] === 'lock') runLock(argv.slice(1));
-    else throw new UsageError('command must be config or lock');
+    else if (argv[0] === 'setup') runSetup(argv.slice(1));
+    else if (argv[0] === 'snapshot') runSnapshot(argv.slice(1));
+    else if (argv[0] === 'commit') runCommit(argv.slice(1));
+    else if (argv[0] === 'transaction') runTransaction(argv.slice(1));
+    else if (argv[0] === 'index') runIndex(argv.slice(1));
+    else if (argv[0] === 'scan-window') runScanWindow(argv.slice(1));
+    else if (argv[0] === 'inbox') runInbox(argv.slice(1));
+    else if (argv[0] === 'lint') runLint(argv.slice(1));
+    else throw new UsageError('unsupported command family');
     return 0;
   } catch (error) {
     process.stderr.write(`${error.code || 'FILESYSTEM'}: ${error.message}\n`);

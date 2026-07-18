@@ -37,6 +37,36 @@ const env = require('./envelope');
 
 const EXPECTED_KIND = 'index';
 
+class IndexReadError extends Error {
+  constructor(exitCode, message) {
+    super(message);
+    this.exitCode = exitCode;
+  }
+}
+
+function readIndexPayload(filePath) {
+  let raw;
+  try {
+    raw = fs.readFileSync(filePath, 'utf8');
+  } catch (error) {
+    throw new IndexReadError(2, `cannot read ${filePath}: ${error.message}`);
+  }
+  let object;
+  try {
+    object = JSON.parse(raw);
+  } catch (error) {
+    throw new IndexReadError(2, `cannot parse ${filePath} as JSON: ${error.message}`);
+  }
+  const unwrapped = env.unwrapEnvelope(object, EXPECTED_KIND);
+  if (unwrapped === null) {
+    throw new IndexReadError(
+      1,
+      `${filePath} is envelope-shaped but failed identity check or has corrupt payload`,
+    );
+  }
+  return unwrapped;
+}
+
 function usage(extra) {
   if (extra) process.stderr.write(`error: ${extra}\n`);
   process.stderr.write('usage: read-index-envelope.js <path-to-index.json>\n');
@@ -50,51 +80,23 @@ function main() {
   if (typeof arg !== 'string' || arg.length === 0) usage('path must be non-empty');
 
   const filePath = path.resolve(process.cwd(), arg);
-  let raw;
   try {
-    raw = fs.readFileSync(filePath, 'utf8');
-  } catch (err) {
-    process.stderr.write(`error: cannot read ${filePath}: ${err.message}\n`);
-    process.exit(2);
+    const unwrapped = readIndexPayload(filePath);
+    process.stdout.write(JSON.stringify(unwrapped, null, 2) + '\n', (err) => {
+      if (err) {
+        process.stderr.write(`error: stdout write failed: ${err.message}\n`);
+        process.exit(2);
+      }
+      process.exit(0);
+    });
+  } catch (error) {
+    process.stderr.write(`error: ${error.message}\n`);
+    process.exit(error.exitCode || 2);
   }
-  let obj;
-  try {
-    obj = JSON.parse(raw);
-  } catch (err) {
-    process.stderr.write(`error: cannot parse ${filePath} as JSON: ${err.message}\n`);
-    process.exit(2);
-  }
-
-  // unwrapEnvelope returns:
-  //   - input unchanged for legacy (non-envelope) shape
-  //   - payload object for envelope with identity match
-  //   - null for envelope-shaped with identity mismatch OR corrupt payload
-  const unwrapped = env.unwrapEnvelope(obj, EXPECTED_KIND);
-
-  if (unwrapped === null) {
-    // identity mismatch or corrupt payload — unwrapEnvelope already logged the
-    // specific reason to stderr.
-    process.stderr.write(
-      `error: ${filePath} is envelope-shaped but failed identity check or has corrupt payload\n`,
-    );
-    process.exit(1);
-  }
-
-  // Defense against unwrapEnvelope returning the original object for legacy
-  // shapes where the original happens to fail downstream consumer expectations:
-  // we still emit unchanged — consumers are responsible for their own legacy
-  // pass-through handling (e.g. legacy index.json had `pages` array at root).
-  process.stdout.write(JSON.stringify(unwrapped, null, 2) + '\n', (err) => {
-    if (err) {
-      process.stderr.write(`error: stdout write failed: ${err.message}\n`);
-      process.exit(2);
-    }
-    process.exit(0);
-  });
 }
 
 if (require.main === module) {
   main();
 }
 
-module.exports = { EXPECTED_KIND };
+module.exports = { EXPECTED_KIND, readIndexPayload };

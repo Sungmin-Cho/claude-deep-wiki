@@ -305,6 +305,15 @@ function planScanWindowTransition(options = {}) {
   const pendingTimestamp = timestampFromBytes(pendingBytes);
   const lastTimestamp = timestampFromBytes(lastBytes);
 
+  if (kind === 'promote') {
+    if (pendingBytes !== null && pendingTimestamp === null) {
+      throw scanError('SCAN_WINDOW_INVALID', '.pending-scan is not a canonical timestamp');
+    }
+    if (lastBytes !== null && lastTimestamp === null) {
+      throw scanError('SCAN_WINDOW_INVALID', '.last-scan is not a canonical timestamp');
+    }
+  }
+
   if (kind === 'ensure') {
     const proposed = canonicalTimestamp(options.proposed, 'proposed');
     if (pendingTimestamp !== null) {
@@ -344,8 +353,14 @@ function planScanWindowTransition(options = {}) {
   if (kind === 'repair') {
     return {
       kind, resultStatus: 'repaired',
-      pending: { before: pendingBytes, after: options.pendingAfter ?? pendingBytes },
-      last: { before: lastBytes, after: options.lastAfter ?? lastBytes },
+      pending: {
+        before: pendingBytes,
+        after: Object.hasOwn(options, 'pendingAfter') ? options.pendingAfter : pendingBytes,
+      },
+      last: {
+        before: lastBytes,
+        after: Object.hasOwn(options, 'lastAfter') ? options.lastAfter : lastBytes,
+      },
     };
   }
   throw scanError('SCAN_WINDOW_INVALID', 'unsupported scan-window transition kind');

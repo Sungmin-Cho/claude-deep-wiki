@@ -661,6 +661,13 @@ function resumePendingRestores({ fs, meta, lockDir }) {
         throw new LockError('LOCK_FILESYSTEM', 'unresolved lock seizure reservation requires recovery');
       }
       if (intent && !sameDirectoryIdentity(fs, reservation, intent.reservationIdentity)) {
+        if (transitionIntentIsLive(intent) && pathIsMissing(fs, reservation)) {
+          throw new LockError(
+            'LOCK_CONTENDED',
+            'wiki lock transition is completing',
+            readOwner(path.join(seized, 'owner.json'), fs),
+          );
+        }
         throw new LockError('LOCK_FILESYSTEM', 'lock transition reservation identity is inconsistent');
       }
       continue;

@@ -1949,6 +1949,99 @@ test('live release completion stays contended when seized disappears after its m
   assert.deepEqual(lockQuarantines(wikiRoot), []);
 });
 
+test('live release completion stays contended when its reservation disappears after intent validation', async () => {
+  const { acquireLock } = runtimeModule('lock.js');
+  const wikiRoot = newWikiRoot('deep wiki live release disappearing reservation ');
+  acquireLock({ wikiRoot, operation: 'live-release-disappearing-reservation-owner' });
+  const readyFile = path.join(wikiRoot, 'intent-owner.ready');
+  const stopFile = path.join(wikiRoot, 'intent-owner.stop');
+  const childScript = String.raw`
+    const fs = require('node:fs');
+    const [readyFile, stopFile] = process.argv.slice(1);
+    const state = new Int32Array(new SharedArrayBuffer(4));
+    fs.writeFileSync(readyFile, 'ready\n');
+    const deadline = Date.now() + 10000;
+    while (!fs.existsSync(stopFile)) {
+      if (Date.now() >= deadline) process.exit(9);
+      Atomics.wait(state, 0, 0, 5);
+    }
+  `;
+  const child = spawn(process.execPath, ['-e', childScript, readyFile, stopFile], {
+    cwd: wikiRoot,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    shell: false,
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (chunk) => { stdout += chunk; });
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+
+  const meta = path.join(wikiRoot, '.wiki-meta');
+  let reservation;
+  let seized;
+  let contenderError;
+  let childError;
+  let removedAtSeizedProbe = false;
+  try {
+    waitForPathSync(readyFile);
+    reservation = path.join(meta, `.wiki-lock.release.${child.pid}.${'f'.repeat(32)}`);
+    seized = path.join(reservation, 'seized');
+    fs.mkdirSync(reservation);
+    fs.renameSync(path.join(meta, '.wiki-lock'), seized);
+    const serializeIdentity = (pathname) => {
+      const stat = fs.lstatSync(pathname, { bigint: true });
+      return {
+        dev: stat.dev.toString(10),
+        ino: stat.ino.toString(10),
+        type: (stat.mode & 0o170000n).toString(10),
+      };
+    };
+    const intent = {
+      contract_version: 1,
+      kind: 'lock-seizure-transition',
+      purpose: 'release',
+      reservation_name: path.basename(reservation),
+      reservation_identity: serializeIdentity(reservation),
+      seized_identity: serializeIdentity(seized),
+      pid: child.pid,
+      hostname: os.hostname(),
+    };
+    fs.writeFileSync(path.join(reservation, 'transition.json'), `${JSON.stringify(intent)}\n`);
+
+    const disappearingFs = new Proxy(fs, {
+      get(target, property) {
+        if (property === 'lstatSync') {
+          return (pathname, options) => {
+            if (pathname === seized && options === undefined && !removedAtSeizedProbe) {
+              removedAtSeizedProbe = true;
+              fs.rmSync(reservation, { recursive: true });
+            }
+            return target.lstatSync(pathname, options);
+          };
+        }
+        const value = Reflect.get(target, property);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    try {
+      acquireLock({ wikiRoot, operation: 'completion-contender', fs: disappearingFs });
+    } catch (error) {
+      contenderError = error;
+    }
+    assert.equal(removedAtSeizedProbe, true);
+    assert.doesNotThrow(() => process.kill(child.pid, 0));
+  } finally {
+    if (reservation) fs.rmSync(reservation, { recursive: true, force: true });
+    fs.writeFileSync(stopFile, 'stop\n');
+    try { await waitForChild(child); } catch (error) { childError = error; }
+  }
+
+  assert.equal(childError, undefined, `${stdout}\n${stderr}`);
+  assert.equal(contenderError?.code, 'LOCK_CONTENDED');
+  assert.doesNotMatch(contenderError.message, /manual|unresolved|recovery/i);
+  assert.deepEqual(lockQuarantines(wikiRoot), []);
+});
+
 test('live release completion rejects a replaced reservation when seized disappears before identity capture', async () => {
   const { acquireLock } = runtimeModule('lock.js');
   const wikiRoot = newWikiRoot('deep wiki live release replaced reservation ');

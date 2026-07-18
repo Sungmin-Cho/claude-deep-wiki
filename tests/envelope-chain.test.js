@@ -11,7 +11,9 @@ const { ULID_RE } = require('../scripts/validate-envelope-emit.js');
 const {
   parseSourceArtifactSpec,
   tryReadEnvelopeRunId,
+  writeIndexEnvelope,
 } = require('../hooks/scripts/wrap-index-envelope.js');
+const { readIndexPayload } = require('../hooks/scripts/read-index-envelope.js');
 const {
   wrapEnvelope,
   generateUlid,
@@ -67,6 +69,40 @@ function runValidate(file) {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 }
+
+describe('envelope-chain — reusable index library', () => {
+  it('readIndexPayload returns legacy and valid envelope payloads', () => {
+    const dir = tmpDir();
+    const legacyFile = path.join(dir, 'legacy.json');
+    const envelopedFile = path.join(dir, 'enveloped.json');
+    const payload = { pages: [], generated_at: '2026-07-11T00:00:00Z' };
+    writeJson(legacyFile, payload);
+    writeJson(envelopedFile, wrapEnvelope({
+      artifactKind: 'index',
+      payload,
+      runId: '01JZ7P9Q6MD7S5PB8H4Y40HJ83',
+      generatedAt: '2026-07-11T00:00:00Z',
+      git: { head: '0000000', branch: 'HEAD', dirty: 'unknown' },
+    }));
+    assert.deepEqual(readIndexPayload(legacyFile), payload);
+    assert.deepEqual(readIndexPayload(envelopedFile), payload);
+  });
+
+  it('writeIndexEnvelope atomically replaces index under a Unicode path', () => {
+    const dir = tmpDir();
+    const output = path.join(dir, '위키 Space', '.wiki-meta', 'index.json');
+    const payload = { pages: [], generated_at: '2026-07-11T00:00:00Z' };
+    const result = writeIndexEnvelope({
+      outputPath: output,
+      payload,
+      now: new Date('2026-07-11T00:00:00Z'),
+      runId: '01JZ7P9Q6MD7S5PB8H4Y40HJ83',
+    });
+    assert.equal(result.envelope.artifact_kind, 'index');
+    assert.deepEqual(readIndexPayload(output), payload);
+    assert.deepEqual(fs.readdirSync(path.dirname(output)).sort(), ['index.json']);
+  });
+});
 
 describe('envelope-chain — index wrapped via wrap-index-envelope.js', () => {
   it('emits a valid envelope and survives the validator', () => {

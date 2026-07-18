@@ -8,7 +8,7 @@ Each scenario is a pair of files:
 Driver: `tests/auto-ingest-golden.test.js` discovers pairs by basename,
 materializes the vault tree inside a tmpdir, writes
 `$HOME/.claude/deep-wiki-config.yaml` from `config_yaml`, spawns
-`scan-vault-changes.sh` via the `runScanVault` helper, and asserts each
+`scan-vault-changes.js` via the `runScanVault` helper, and asserts each
 expected field.
 
 ## `.input.json` schema

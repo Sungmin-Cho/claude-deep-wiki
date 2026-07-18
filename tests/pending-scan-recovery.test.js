@@ -3,14 +3,14 @@
 // tests/pending-scan-recovery.test.js — M5.5 #5 (deep-wiki side).
 //
 // Pins the `.pending-scan` recovery contract of
-// hooks/scripts/scan-vault-changes.sh against artificially-dangled state:
+// hooks/scripts/scan-vault-changes.js against artificially-dangled state:
 // invalid content, stale-vs-fresh timestamp ordering, presence-vs-absence
 // of `.last-scan`. The hook's per-fire decision (overwrite vs preserve)
 // is load-bearing for `/wiki-ingest`'s detection window — a regression
 // that overwrites a valid `.pending-scan` on every hook fire would erase
 // the lower bound and let files detected in an earlier session drop
 // below the next LAST_EPOCH (H1 regression on fresh installs, reported
-// by ultrareview bug_006 — see scan-vault-changes.sh:370-376 comment).
+// by ultrareview bug_006 — now enforced by the cooperative Node runtime).
 //
 // This file is the missing companion to wiki-lint.md Step 11 / 12
 // stale-detection-and-fix protocol: wiki-lint is a markdown protocol
@@ -32,14 +32,14 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
 const SCAN_HOOK = path.resolve(
-  __dirname, '..', 'hooks', 'scripts', 'scan-vault-changes.sh',
+  __dirname, '..', 'hooks', 'scripts', 'scan-vault-changes.js',
 );
 
 if (!fs.existsSync(SCAN_HOOK)) {
-  throw new Error(`scan-vault-changes.sh missing at ${SCAN_HOOK}`);
+  throw new Error(`scan-vault-changes.js missing at ${SCAN_HOOK}`);
 }
 
-// ISO-8601 UTC `YYYY-MM-DDTHH:MM:SSZ` matching scan-vault-changes.sh TS_RE.
+// ISO-8601 UTC `YYYY-MM-DDTHH:MM:SSZ` matching the Node scanner contract.
 function nowMinusHours(hours) {
   const d = new Date(Date.now() - hours * 3600 * 1000);
   return d.toISOString().replace(/\.\d+Z$/, 'Z');
@@ -73,11 +73,12 @@ function runHook(tmpHome) {
   // Critical: HOME override pins config lookup to tmpRoot/.claude/, NOT
   // the developer's real ~/.claude/deep-wiki-config.yaml.
   env.HOME = tmpHome;
-  return spawnSync('bash', [SCAN_HOOK], {
+  return spawnSync(process.execPath, [SCAN_HOOK], {
     cwd: tmpHome,
     env,
     encoding: 'utf8',
     timeout: 20000,
+    shell: false,
   });
 }
 
@@ -91,7 +92,7 @@ function readIfExists(p) {
 
 const TS_RE = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$/;
 
-describe('scan-vault-changes.sh .pending-scan recovery (M5.5 #5)', () => {
+describe('scan-vault-changes.js .pending-scan recovery (M5.5 #5)', () => {
   let setup;
   afterEach(() => {
     if (setup && setup.tmp) {

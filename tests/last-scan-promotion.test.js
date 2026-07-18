@@ -201,16 +201,16 @@ test('T1-c: rename failure leaves prior .last-scan intact + temp remnant (never 
   }
 });
 
-// T1-d — reader defense stays valid: scan-vault-changes.sh rejects a
+// T1-d — reader defense stays valid: scan-vault-changes.js rejects a
 // truncated/empty `.last-scan` and falls through to `.pending-scan`. This pins
 // the downstream half of the defense-in-depth (the atomic write is the
 // upstream half). Complements tests/pending-scan-recovery.test.js, which
 // covers empty `.pending-scan` but not empty `.last-scan`.
 test('T1-d: reader rejects empty .last-scan and falls through to .pending-scan', () => {
   const SCAN_HOOK = path.resolve(
-    __dirname, '..', 'hooks', 'scripts', 'scan-vault-changes.sh',
+    __dirname, '..', 'hooks', 'scripts', 'scan-vault-changes.js',
   );
-  assert.ok(fs.existsSync(SCAN_HOOK), 'scan-vault-changes.sh must exist');
+  assert.ok(fs.existsSync(SCAN_HOOK), 'scan-vault-changes.js must exist');
 
   const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'last-scan-rd-')));
   try {
@@ -233,8 +233,8 @@ test('T1-d: reader rejects empty .last-scan and falls through to .pending-scan',
     const env = { ...process.env, HOME: tmp };
     delete env.DEEP_WIKI_ROOT;
     delete env.CLAUDE_PROJECT_DIR;
-    const r = require('node:child_process').spawnSync('bash', [SCAN_HOOK], {
-      cwd: tmp, env, encoding: 'utf8', timeout: 20000,
+    const r = require('node:child_process').spawnSync(process.execPath, [SCAN_HOOK], {
+      cwd: tmp, env, encoding: 'utf8', timeout: 20000, shell: false,
     });
     assert.equal(r.status, 0, `hook crashed on empty .last-scan: ${r.stderr}`);
     // The valid pending-scan must be preserved (reader used it as the bound,

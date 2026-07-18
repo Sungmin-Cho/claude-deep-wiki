@@ -2,7 +2,7 @@
 
 // tests/auto-ingest-golden.test.js — M5.5 #3 hook golden test (deep-wiki).
 //
-// **Goal**: pin scan-vault-changes.sh's stdout (file list + Korean system
+// **Goal**: pin scan-vault-changes.js's stdout (file list + Korean system
 // message header) + exit code on a fixture corpus so the auto-ingest
 // detection contract (mtime > last-scan, .obsidian/.trash exclusion,
 // auto_ingest.{ignore_globs, require_tag} filters, .pending-scan
@@ -103,7 +103,7 @@ if (CORPUS.length === 0) {
   throw new Error('No golden fixtures discovered under tests/fixtures/golden/');
 }
 
-describe('scan-vault-changes.sh golden fixtures (M5.5 #3)', () => {
+describe('scan-vault-changes.js golden fixtures (M5.5 #3)', () => {
   for (const [name, fixture] of CORPUS) {
     const desc = fixture.input.description || '(no description)';
     it(`${name} — ${desc}`, () => {

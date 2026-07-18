@@ -11,6 +11,31 @@ const {
   runCodexPluginHookSmoke,
 } = require('../scripts/codex-plugin-hook-smoke.js');
 
+const repositoryRoot = path.resolve(__dirname, '..');
+
+test('shipped Windows hook models Codex commandWindows expansion through the outer command processor', () => {
+  const hookDocument = JSON.parse(fs.readFileSync(
+    path.join(repositoryRoot, 'hooks', 'hooks.json'),
+    'utf8',
+  ));
+  const hook = hookDocument.hooks.SessionStart[0].hooks[0];
+  const installedRoot = 'C:\\Users\\Example User\\.codex\\plugins\\deep-wiki';
+  const expanded = hook.commandWindows.replaceAll('%CLAUDE_PLUGIN_ROOT%', installedRoot);
+  const hostLaunch = {
+    file: 'C:\\Windows\\System32\\cmd.exe',
+    args: ['/D', '/S', '/C', expanded],
+  };
+
+  assert.equal(hook.commandWindows, 'node "%CLAUDE_PLUGIN_ROOT%\\hooks\\scripts\\scan-vault-changes.js"');
+  assert.deepEqual(hostLaunch.args.slice(0, 3), ['/D', '/S', '/C']);
+  assert.equal(
+    hostLaunch.args[3],
+    'node "C:\\Users\\Example User\\.codex\\plugins\\deep-wiki\\hooks\\scripts\\scan-vault-changes.js"',
+  );
+  assert.match(hostLaunch.file, /cmd\.exe$/i);
+  assert.doesNotMatch(hostLaunch.args[3], /[|;&<>`\r\n]|\$\(/);
+});
+
 function makeFixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'deep-wiki-smoke-test-'));
   const codexHome = path.join(root, 'Codex Home');

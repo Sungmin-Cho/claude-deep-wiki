@@ -1,8 +1,8 @@
 'use strict';
 
-// Test-isolation helper for scan-vault-changes.sh (deep-wiki SessionStart hook).
+// Test-isolation helper for scan-vault-changes.js (deep-wiki SessionStart hook).
 //
-// **Why this exists** — scan-vault-changes.sh reads its wiki config from
+// **Why this exists** — scan-vault-changes.js resolves its wiki config from
 // `$HOME/.claude/deep-wiki-config.yaml` and walks `$wiki_root`'s parent
 // directory. Without an isolated HOME, a developer's interactive shell or
 // a CI runner would:
@@ -26,14 +26,16 @@ const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const DEFAULT_SCRIPT = path.resolve(__dirname, '..', 'scan-vault-changes.sh');
+const DEFAULT_SCRIPT = path.resolve(__dirname, '..', 'scan-vault-changes.js');
 
-// Verified consumer list (grep hooks/scripts/scan-vault-changes.sh as of
+// Verified consumer list (grep hooks/scripts/scan-vault-changes.js as of
 // v1.5.0). Update this list AND the comment block above when a new consumer
 // of a host-leakable env var is added or removed — a stale list silently
 // weakens isolation.
 const HOST_LEAK_VARS = [
-  'HOME',                  // CONFIG path anchor — line 14 of scan-vault-changes.sh
+  'HOME',                  // config discovery anchor
+  'CODEX_HOME',
+  'DEEP_WIKI_CONFIG',
   'CLAUDE_PROJECT_DIR',    // forward-compat redirect (not consumed yet, scrubbed pre-emptively)
   'DEEP_WIKI_ROOT',        // forward-compat redirect
 ];
@@ -50,19 +52,19 @@ const HOST_LEAK_VARS = [
 function scrubHostEnv(extra = {}) {
   const scrubbed = { ...process.env };
   for (const k of HOST_LEAK_VARS) delete scrubbed[k];
-  // PATH is preserved (we need `find`, `awk`, `stat`, `date`).
+  // PATH is preserved so the test uses the same Node executable environment.
   return { ...scrubbed, ...extra };
 }
 
 /**
- * Spawn scan-vault-changes.sh under hermetic test isolation.
+ * Spawn scan-vault-changes.js under hermetic test isolation.
  *
  * Required setup the helper performs:
  *   1. Materialize `<homeDir>/.claude/deep-wiki-config.yaml` from the
  *      caller-supplied YAML string (only if `configYaml` is provided —
  *      omit to exercise the "no wiki configured" branch).
  *   2. Set HOME=homeDir (so the hook's `$HOME/.claude/...` lookup hits
- *      the tmpdir instead of the developer's real config).
+ *      the tmpdir instead of the developer's real config candidates).
  *   3. Merge any caller-supplied env on top of the scrubbed base.
  *
  * The caller is responsible for materializing the vault tree + setting
@@ -73,7 +75,7 @@ function scrubHostEnv(extra = {}) {
  * @param {string} opts.homeDir         — tmpdir that becomes $HOME for the hook
  * @param {string} [opts.configYaml]    — YAML to write at $HOME/.claude/deep-wiki-config.yaml
  * @param {object} [opts.env]           — extra env vars (merged AFTER scrub)
- * @param {string} [opts.script]        — defaults to scan-vault-changes.sh
+ * @param {string} [opts.script]        — defaults to scan-vault-changes.js
  * @param {number} [opts.timeout]       — defaults to 15000ms (matches hook budget)
  * @returns {{status:number,stdout:string,stderr:string,signal:string|null,error:Error|undefined}}
  */
@@ -88,9 +90,8 @@ function runScanVault({
     throw new Error('runScanVault: homeDir is required (use mkdtempSync output)');
   }
 
-  // Always create $HOME/.claude/ so the hook's `[ ! -f "$CONFIG" ]` check
-  // sees a real dir — even when configYaml is intentionally omitted (to
-  // exercise the silent-skip branch on missing config).
+  // Always create $HOME/.claude/ so config discovery sees a real directory,
+  // even when configYaml is intentionally omitted to exercise silent skip.
   const claudeDir = path.join(homeDir, '.claude');
   fs.mkdirSync(claudeDir, { recursive: true });
 
@@ -107,16 +108,17 @@ function runScanVault({
     ...extraEnv,
   });
 
-  return spawnSync('bash', [script], {
+  return spawnSync(process.execPath, [script], {
     cwd: homeDir,
     env,
     encoding: 'utf8',
     timeout,
+    shell: false,
   });
 }
 
 /**
- * Parse the file list from scan-vault-changes.sh stdout.
+ * Parse the file list from scan-vault-changes.js stdout.
  *
  * Output shape (from script lines 429-436):
  *   [deep-wiki] N개의 새로운/수정된 파일이 Obsidian vault에서 감지되었습니다.
@@ -149,9 +151,8 @@ function parseHookOutput(stdout) {
     result.count = Number(headerMatch[1]);
   }
 
-  // File list lines: `  - <relpath>` — note `echo -e` materializes the `\n`
-  // escapes from the script's FILE_LIST builder. We accept any leading
-  // whitespace defensively (in case the printf shape ever shifts).
+  // File list lines are `  - <relpath>`. Accept any leading whitespace
+  // defensively in case the presentation shape ever shifts.
   const lines = stdout.split('\n');
   for (const line of lines) {
     const m = line.match(/^\s*-\s+(.+?)\s*$/);

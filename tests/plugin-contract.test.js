@@ -45,12 +45,13 @@ test('default SessionStart hook has one supported command entry', () => {
   );
   assert.equal(command.type, 'command');
   assert.equal(command.timeout, 15);
-  assert.equal(typeof command.command, 'string');
-  assert.notEqual(command.command.trim(), '');
-  if (Object.hasOwn(command, 'commandWindows')) {
-    assert.equal(typeof command.commandWindows, 'string');
-    assert.notEqual(command.commandWindows.trim(), '');
+  assert.equal(command.command, 'node "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/scan-vault-changes.js"');
+  assert.equal(command.commandWindows, 'node "%CLAUDE_PLUGIN_ROOT%\\hooks\\scripts\\scan-vault-changes.js"');
+  for (const value of [command.command, command.commandWindows]) {
+    assert.doesNotMatch(value, /[|;&<>`\r\n]|\$\(/);
+    assert.doesNotMatch(value, /\.(?:sh|cmd|bat|ps1)(?:"|\s|$)/i);
   }
+  assert.equal(fs.existsSync(path.join(ROOT, 'hooks', 'scripts', 'scan-vault-changes.sh')), false);
 });
 
 test('portable npm test cannot discover the credentialed release smoke', () => {

@@ -517,7 +517,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const normalize = (value) => process.platform === 'win32' ? path.resolve(value).toLowerCase() : path.resolve(value);
 const result = { variant: process.argv[2], plugin_root: process.env.PLUGIN_ROOT, claude_plugin_root: process.env.CLAUDE_PLUGIN_ROOT };
-result.equal = Boolean(result.plugin_root && result.claude_plugin_root && normalize(result.plugin_root) === normalize(result.claude_plugin_root));
+result.equal = Boolean(result.plugin_root && (!result.claude_plugin_root || normalize(result.plugin_root) === normalize(result.claude_plugin_root)));
 fs.writeFileSync(process.env.DEEP_WIKI_DIAGNOSTIC_MARKER, JSON.stringify(result));
 if (!result.equal) process.exitCode = 42;
 `);
@@ -526,7 +526,7 @@ if (!result.equal) process.exitCode = 42;
     hooks: { SessionStart: [{ matcher: '*', hooks: [{
       type: 'command',
       command: 'node "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/diagnostic.js" command',
-      commandWindows: 'node "%CLAUDE_PLUGIN_ROOT%\\hooks\\scripts\\diagnostic.js" commandWindows',
+      commandWindows: 'node "%PLUGIN_ROOT%\\hooks\\scripts\\diagnostic.js" commandWindows',
       timeout: 15,
     }] }] },
   }, null, 2)}\n`);
@@ -584,9 +584,11 @@ if (!result.equal) process.exitCode = 42;
   if (primaryError) throw primaryError;
   const value = JSON.parse(fs.readFileSync(marker, 'utf8'));
   const expectedVariant = platform === 'win32' ? 'commandWindows' : 'command';
+  const claudeAliasValid = value.claude_plugin_root === undefined
+    || normalizePhysical(value.claude_plugin_root, platform) === normalizePhysical(installed.installedPath, platform);
   if (!value.equal || value.variant !== expectedVariant
       || normalizePhysical(value.plugin_root, platform) !== normalizePhysical(installed.installedPath, platform)
-      || normalizePhysical(value.claude_plugin_root, platform) !== normalizePhysical(installed.installedPath, platform)) {
+      || !claudeAliasValid) {
     throw new SmokeError('CODEX_DIAGNOSTIC_HOOK_NOT_OBSERVED');
   }
   assertNoAuthorityFiles(home);

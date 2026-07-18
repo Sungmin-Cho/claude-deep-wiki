@@ -137,14 +137,17 @@ function directoryIdentity(stat) {
   const dev = identityComponent(stat?.dev);
   const ino = identityComponent(stat?.ino);
   const mode = identityComponent(stat?.mode);
-  if (dev === null || ino === null || mode === null || dev < 0n || ino <= 0n
+  const birthtimeNs = identityComponent(stat?.birthtimeNs);
+  if (dev === null || ino === null || mode === null || birthtimeNs === null
+      || dev < 0n || ino <= 0n || birthtimeNs < 0n
       || (mode & FILE_TYPE_MASK) !== DIRECTORY_TYPE) return null;
-  return { dev, ino, type: mode & FILE_TYPE_MASK };
+  return { dev, ino, type: mode & FILE_TYPE_MASK, birthtimeNs };
 }
 
 function identitiesMatch(actual, expected) {
   return actual !== null && expected !== null
-    && actual.dev === expected.dev && actual.ino === expected.ino && actual.type === expected.type;
+    && actual.dev === expected.dev && actual.ino === expected.ino && actual.type === expected.type
+    && actual.birthtimeNs === expected.birthtimeNs;
 }
 
 function samePhysicalPath(actual, expected) {

@@ -73,8 +73,8 @@ test('quote-aware tokenizers preserve one path argument on both hosts', () => {
     ['node', '${CLAUDE_PLUGIN_ROOT}/hooks/scripts/scan-vault-changes.js'],
   );
   assert.deepEqual(
-    tokenizeWindowsCommand('node "%CLAUDE_PLUGIN_ROOT%\\hooks\\scripts\\scan-vault-changes.js"'),
-    ['node', '%CLAUDE_PLUGIN_ROOT%\\hooks\\scripts\\scan-vault-changes.js'],
+    tokenizeWindowsCommand('node "%PLUGIN_ROOT%\\hooks\\scripts\\scan-vault-changes.js"'),
+    ['node', '%PLUGIN_ROOT%\\hooks\\scripts\\scan-vault-changes.js'],
   );
 });
 
@@ -99,7 +99,7 @@ test('hook host model expands each native variable form and preserves the Window
   assert.equal(posix.outerExecutable, null);
 
   const windows = modelHookInvocation(
-    'node "%CLAUDE_PLUGIN_ROOT%\\hooks\\scripts\\scan-vault-changes.js"',
+    'node "%PLUGIN_ROOT%\\hooks\\scripts\\scan-vault-changes.js"',
     'commandWindows',
     { pluginRoot: 'C:\\Users\\민수\\Deep Wiki', comspec: 'C:\\Windows\\System32\\cmd.exe' },
   );

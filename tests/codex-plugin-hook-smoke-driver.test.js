@@ -114,8 +114,8 @@ test('shipped Windows hook models Codex commandWindows expansion through the out
   const hookDocument = JSON.parse(fs.readFileSync(path.join(repositoryRoot, 'hooks', 'hooks.json'), 'utf8'));
   const hook = hookDocument.hooks.SessionStart[0].hooks[0];
   const installedRoot = 'C:\\Users\\Example User\\.codex\\plugins\\deep-wiki';
-  const expanded = hook.commandWindows.replaceAll('%CLAUDE_PLUGIN_ROOT%', installedRoot);
-  assert.equal(hook.commandWindows, 'node "%CLAUDE_PLUGIN_ROOT%\\hooks\\scripts\\scan-vault-changes.js"');
+  const expanded = hook.commandWindows.replaceAll('%PLUGIN_ROOT%', installedRoot);
+  assert.equal(hook.commandWindows, 'node "%PLUGIN_ROOT%\\hooks\\scripts\\scan-vault-changes.js"');
   assert.equal(expanded, 'node "C:\\Users\\Example User\\.codex\\plugins\\deep-wiki\\hooks\\scripts\\scan-vault-changes.js"');
   assert.doesNotMatch(expanded, /[|;&<>`\r\n]|\$\(/);
 });
@@ -314,7 +314,6 @@ test('portable full-phase seam proves trusted pre-model effect, independent dire
         env: {
           ...options.env,
           PLUGIN_ROOT: installed,
-          CLAUDE_PLUGIN_ROOT: installed,
         },
       }, { phase: 'fake-diagnostic-hook' });
       assert.equal(hook.status, 0);

@@ -22,7 +22,8 @@ const RESTORE_STATE_KEYS = [
   'seized_identity', 'canonical_identity', 'entries',
 ];
 const RESTORE_ENTRY_KEYS = ['name', 'identity'];
-const SERIALIZED_IDENTITY_KEYS = ['dev', 'ino', 'type'];
+const LEGACY_SERIALIZED_IDENTITY_KEYS = ['dev', 'ino', 'type'];
+const SERIALIZED_IDENTITY_KEYS = ['dev', 'ino', 'type', 'birthtime_ns'];
 const TRANSITION_INTENT_KEYS = [
   'contract_version', 'kind', 'purpose', 'reservation_name',
   'reservation_identity', 'seized_identity', 'pid', 'hostname',
@@ -56,8 +57,10 @@ function filesystemIdentity(stat) {
   const dev = identityComponent(stat?.dev);
   const ino = identityComponent(stat?.ino);
   const mode = identityComponent(stat?.mode);
-  if (dev === null || ino === null || mode === null || dev < 0n || ino <= 0n) return null;
-  return { dev, ino, type: mode & FILE_TYPE_MASK };
+  const birthtimeNs = identityComponent(stat?.birthtimeNs);
+  if (dev === null || ino === null || mode === null || birthtimeNs === null
+      || dev < 0n || ino <= 0n || birthtimeNs < 0n) return null;
+  return { dev, ino, type: mode & FILE_TYPE_MASK, birthtimeNs };
 }
 
 function directoryIdentity(stat) {
@@ -76,7 +79,7 @@ function readDirectoryIdentity(fs, directory) {
 function sameDirectoryIdentity(fs, directory, expected) {
   const current = readDirectoryIdentity(fs, directory);
   return current !== null && current.dev === expected.dev && current.ino === expected.ino
-    && current.type === expected.type;
+    && current.type === expected.type && current.birthtimeNs === expected.birthtimeNs;
 }
 
 function assertDirectoryIdentity(fs, directory, expected) {
@@ -96,7 +99,7 @@ function readFilesystemIdentity(fs, pathname) {
 function sameFilesystemIdentity(fs, pathname, expected) {
   const current = readFilesystemIdentity(fs, pathname);
   return current !== null && current.dev === expected.dev && current.ino === expected.ino
-    && current.type === expected.type;
+    && current.type === expected.type && current.birthtimeNs === expected.birthtimeNs;
 }
 
 function assertFilesystemIdentity(fs, pathname, expected) {
@@ -217,38 +220,61 @@ function hasExactKeys(value, expected) {
 }
 
 function serializeIdentity(identity) {
+  if (!identity || typeof identity.birthtimeNs !== 'bigint' || identity.birthtimeNs < 0n) {
+    throw new LockError('LOCK_FILESYSTEM', 'filesystem identity lacks a generation seal');
+  }
   return {
     dev: identity.dev.toString(10),
     ino: identity.ino.toString(10),
     type: identity.type.toString(10),
+    birthtime_ns: identity.birthtimeNs.toString(10),
   };
 }
 
 function deserializeIdentity(value) {
-  if (!hasExactKeys(value, SERIALIZED_IDENTITY_KEYS)) return null;
-  if (![value.dev, value.ino, value.type].every((part) => typeof part === 'string' && /^(?:0|[1-9]\d*)$/.test(part))) {
+  const legacy = hasExactKeys(value, LEGACY_SERIALIZED_IDENTITY_KEYS);
+  if (!legacy && !hasExactKeys(value, SERIALIZED_IDENTITY_KEYS)) return null;
+  const parts = legacy
+    ? [value.dev, value.ino, value.type]
+    : [value.dev, value.ino, value.type, value.birthtime_ns];
+  if (!parts.every((part) => typeof part === 'string' && /^(?:0|[1-9]\d*)$/.test(part))) {
     return null;
   }
   try {
-    const identity = { dev: BigInt(value.dev), ino: BigInt(value.ino), type: BigInt(value.type) };
-    if (identity.dev < 0n || identity.ino <= 0n) return null;
+    const identity = {
+      dev: BigInt(value.dev),
+      ino: BigInt(value.ino),
+      type: BigInt(value.type),
+      birthtimeNs: legacy ? null : BigInt(value.birthtime_ns),
+      legacy,
+    };
+    if (identity.dev < 0n || identity.ino <= 0n || (!legacy && identity.birthtimeNs < 0n)) return null;
     return identity;
   } catch {
     return null;
   }
 }
 
+function identityIsGenerationSealed(identity) {
+  return identity !== null && typeof identity.birthtimeNs === 'bigint' && identity.birthtimeNs >= 0n;
+}
+
 function restoreCompleteName(seizure) {
   const identity = seizure.reservationIdentity;
   const suffix = path.basename(seizure.reservation).slice('.wiki-lock.'.length);
-  return `.wiki-lock.restore-complete.${identity.dev.toString(16)}.${identity.ino.toString(16)}.${suffix}`;
+  return `.wiki-lock.restore-complete.${identity.dev.toString(16)}.${identity.ino.toString(16)}.${identity.birthtimeNs.toString(16)}.${suffix}`;
 }
 
 function parseRestoreCompleteIdentity(name) {
-  const match = name.match(/^\.wiki-lock\.restore-complete\.([a-f0-9]+)\.([a-f0-9]+)\./);
+  const match = name.match(/^\.wiki-lock\.restore-complete\.([a-f0-9]+)\.([a-f0-9]+)\.([a-f0-9]+)\./);
   if (!match) return null;
   try {
-    return { dev: BigInt(`0x${match[1]}`), ino: BigInt(`0x${match[2]}`), type: DIRECTORY_TYPE };
+    return {
+      dev: BigInt(`0x${match[1]}`),
+      ino: BigInt(`0x${match[2]}`),
+      type: DIRECTORY_TYPE,
+      birthtimeNs: BigInt(`0x${match[3]}`),
+    };
   } catch {
     return null;
   }
@@ -285,7 +311,15 @@ function validateRestoreState(value, reservationName) {
     entries.push({ name: entry.name, identity });
   }
   if (entries.map(({ name }) => name).join('\0') !== [...seen].sort().join('\0')) return null;
-  return { ...value, seizedIdentity, canonicalIdentity, entries };
+  return {
+    ...value,
+    seizedIdentity,
+    canonicalIdentity,
+    entries,
+    hasLegacyIdentity: !identityIsGenerationSealed(seizedIdentity)
+      || (canonicalIdentity !== null && !identityIsGenerationSealed(canonicalIdentity))
+      || entries.some(({ identity }) => !identityIsGenerationSealed(identity)),
+  };
 }
 
 function validateTransitionIntent(value, reservationName) {
@@ -304,7 +338,13 @@ function validateTransitionIntent(value, reservationName) {
   const seizedIdentity = deserializeIdentity(value.seized_identity);
   if (!reservationIdentity || reservationIdentity.type !== DIRECTORY_TYPE
       || !seizedIdentity || seizedIdentity.type !== DIRECTORY_TYPE) return null;
-  return { ...value, reservationIdentity, seizedIdentity };
+  return {
+    ...value,
+    reservationIdentity,
+    seizedIdentity,
+    hasLegacyIdentity: !identityIsGenerationSealed(reservationIdentity)
+      || !identityIsGenerationSealed(seizedIdentity),
+  };
 }
 
 function readTransitionIntent(fs, reservation) {
@@ -330,6 +370,9 @@ function readTransitionIntent(fs, reservation) {
   }
   const intent = validateTransitionIntent(value, path.basename(reservation));
   if (!intent) throw new LockError('LOCK_FILESYSTEM', 'lock transition intent is malformed');
+  if (intent.hasLegacyIdentity) {
+    throw new LockError('LOCK_FILESYSTEM', 'legacy lock transition identity lacks a generation seal');
+  }
   if (!sameDirectoryIdentity(fs, reservation, intent.reservationIdentity)
       && !pathIsMissing(fs, reservation)) {
     throw new LockError('LOCK_FILESYSTEM', 'lock transition reservation identity is inconsistent');
@@ -397,7 +440,9 @@ function transitionIntentIsLive(intent) {
 
 function identitiesMatch(actual, expected) {
   return actual !== null && expected !== null
-    && actual.dev === expected.dev && actual.ino === expected.ino && actual.type === expected.type;
+    && identityIsGenerationSealed(actual) && identityIsGenerationSealed(expected)
+    && actual.dev === expected.dev && actual.ino === expected.ino && actual.type === expected.type
+    && actual.birthtimeNs === expected.birthtimeNs;
 }
 
 function observeLiveTransition(fs, reservation, seized, intent, reservationIdentity, seizedIdentity) {
@@ -616,6 +661,9 @@ function resumePendingRestores({ fs, meta, lockDir }) {
     if (!/^\.wiki-lock\.(?:release|recovery)\./.test(name)) continue;
     const reservation = path.join(meta, name);
     const state = readRestoreState(fs, reservation);
+    if (state?.hasLegacyIdentity) {
+      throw new LockError('LOCK_FILESYSTEM', 'legacy lock restore identity lacks a generation seal');
+    }
     const intent = readTransitionIntent(fs, reservation);
     const seized = path.join(reservation, 'seized');
     if (!state) {

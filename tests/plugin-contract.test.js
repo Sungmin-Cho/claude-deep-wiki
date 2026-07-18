@@ -46,7 +46,7 @@ test('default SessionStart hook has one supported command entry', () => {
   assert.equal(command.type, 'command');
   assert.equal(command.timeout, 15);
   assert.equal(command.command, 'node "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/scan-vault-changes.js"');
-  assert.equal(command.commandWindows, 'node "%CLAUDE_PLUGIN_ROOT%\\hooks\\scripts\\scan-vault-changes.js"');
+  assert.equal(command.commandWindows, 'node "%PLUGIN_ROOT%\\hooks\\scripts\\scan-vault-changes.js"');
   for (const value of [command.command, command.commandWindows]) {
     assert.doesNotMatch(value, /[|;&<>`\r\n]|\$\(/);
     assert.doesNotMatch(value, /\.(?:sh|cmd|bat|ps1)(?:"|\s|$)/i);

@@ -17,7 +17,7 @@
 // Reference: claude-deep-work tests/phase-guard-golden.test.js (PR #29).
 // Helper rationale: see hooks/scripts/test-helpers/run-scan-vault.js.
 
-const { describe, it } = require('node:test');
+const { describe, it, test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -26,6 +26,7 @@ const path = require('node:path');
 const {
   runScanVault,
   parseHookOutput,
+  interpolateYamlDoubleQuotedPlaceholder,
 } = require('../hooks/scripts/test-helpers/run-scan-vault');
 
 const FIXTURE_DIR = path.resolve(__dirname, 'fixtures', 'golden');
@@ -103,6 +104,17 @@ if (CORPUS.length === 0) {
   throw new Error('No golden fixtures discovered under tests/fixtures/golden/');
 }
 
+test('Windows config placeholders are escaped as YAML double-quoted scalar fragments', () => {
+  assert.equal(
+    interpolateYamlDoubleQuotedPlaceholder(
+      'wiki_root: "${WIKI_ROOT}"\r\n',
+      '${WIKI_ROOT}',
+      'D:\\a\\민수\\Deep Wiki',
+    ),
+    'wiki_root: "D:\\\\a\\\\민수\\\\Deep Wiki"\r\n',
+  );
+});
+
 describe('scan-vault-changes.js golden fixtures (M5.5 #3)', () => {
   for (const [name, fixture] of CORPUS) {
     const desc = fixture.input.description || '(no description)';
@@ -134,9 +146,12 @@ describe('scan-vault-changes.js golden fixtures (M5.5 #3)', () => {
         // fixture stays portable across tmpdir paths.
         let configYaml = fixture.input.config_yaml;
         if (typeof configYaml === 'string') {
-          configYaml = configYaml
-            .replace(/\$\{VAULT_ROOT\}/g, vaultRoot)
-            .replace(/\$\{WIKI_ROOT\}/g, wikiRoot);
+          configYaml = interpolateYamlDoubleQuotedPlaceholder(
+            configYaml, '${VAULT_ROOT}', vaultRoot,
+          );
+          configYaml = interpolateYamlDoubleQuotedPlaceholder(
+            configYaml, '${WIKI_ROOT}', wikiRoot,
+          );
         }
 
         const result = runScanVault({

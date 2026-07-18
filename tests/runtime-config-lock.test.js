@@ -1102,6 +1102,47 @@ test('atomicWriteFile refuses to publish a foreign same-path temp replacement', 
   assert.equal(fs.readFileSync(temporary, 'utf8'), 'foreign\n');
 });
 
+test('atomicWriteFile rejects a reused dev and inode with a changed birth-time generation', () => {
+  const { atomicWriteFile } = runtimeModule('fs-safe.js');
+  const root = temporaryRoot('deep wiki atomic reused inode generation ');
+  const destination = write(path.join(root, 'destination'), 'original\n');
+  let replaced = false;
+  let temporary;
+  const generationFs = new Proxy(fs, {
+    get(target, property) {
+      if (property === 'fstatSync') {
+        return (descriptor, options) => ({
+          ...target.fstatSync(descriptor, options),
+          dev: 7n,
+          ino: 11n,
+          birthtimeNs: 100n,
+        });
+      }
+      if (property === 'lstatSync') {
+        return (pathname, options) => ({
+          ...target.lstatSync(pathname, options),
+          dev: 7n,
+          ino: 11n,
+          birthtimeNs: replaced ? 200n : 100n,
+        });
+      }
+      const value = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  assert.throws(() => atomicWriteFile(destination, 'owned\n', {
+    fs: generationFs,
+    beforeRename(paths) {
+      temporary = paths.temporary;
+      fs.rmSync(temporary);
+      fs.writeFileSync(temporary, 'foreign\n');
+      replaced = true;
+    },
+  }), /identity|ownership/i);
+  assert.equal(fs.readFileSync(destination, 'utf8'), 'original\n');
+  assert.equal(fs.readFileSync(temporary, 'utf8'), 'foreign\n');
+});
+
 test('atomicWriteFile accepts Windows-style dev zero only with a nonzero inode identity', () => {
   const { atomicWriteFile } = runtimeModule('fs-safe.js');
   const root = temporaryRoot('deep wiki atomic dev zero ');
@@ -1618,6 +1659,14 @@ function opaqueReplacementBytes(kind) {
   return files;
 }
 
+function withoutIdentityGenerations(value) {
+  if (Array.isArray(value)) return value.map(withoutIdentityGenerations);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value)
+    .filter(([key]) => key !== 'birthtime_ns')
+    .map(([key, child]) => [key, withoutIdentityGenerations(child)]));
+}
+
 function installOpaqueLock(lockDir, files) {
   fs.mkdirSync(lockDir);
   for (const [name, bytes] of Object.entries(files)) fs.writeFileSync(path.join(lockDir, name), bytes);
@@ -1900,6 +1949,7 @@ test('live release completion stays contended when seized disappears after its m
         dev: stat.dev.toString(10),
         ino: stat.ino.toString(10),
         type: (stat.mode & 0o170000n).toString(10),
+        birthtime_ns: stat.birthtimeNs.toString(10),
       };
     };
     const intent = {
@@ -1994,6 +2044,7 @@ test('live release completion stays contended when its reservation disappears af
         dev: stat.dev.toString(10),
         ino: stat.ino.toString(10),
         type: (stat.mode & 0o170000n).toString(10),
+        birthtime_ns: stat.birthtimeNs.toString(10),
       };
     };
     const intent = {
@@ -2092,6 +2143,7 @@ test('live release completion rejects a replaced reservation when seized disappe
         dev: stat.dev.toString(10),
         ino: stat.ino.toString(10),
         type: (stat.mode & 0o170000n).toString(10),
+        birthtime_ns: stat.birthtimeNs.toString(10),
       };
     };
     recordedReservationIdentity = serializeIdentity(reservation);
@@ -2566,6 +2618,43 @@ for (const mode of ['release']) {
   }
 }
 
+test('legacy three-field restore identities stop before every recovery mutation', () => {
+  const { acquireLock, releaseLock } = runtimeModule('lock.js');
+  const wikiRoot = newWikiRoot('deep wiki legacy unsealed restore ');
+  const lockDir = path.join(wikiRoot, '.wiki-meta', '.wiki-lock');
+  const oldOwner = acquireLock({
+    wikiRoot,
+    operation: 'old-owner',
+    now: new Date('2026-07-10T00:00:00.000Z'),
+  });
+  const interrupted = interruptedMismatchRestoreFs(
+    wikiRoot,
+    opaqueReplacementBytes('ownerless'),
+    'after-entry-1',
+  );
+  assert.throws(
+    () => releaseLock({ wikiRoot, token: oldOwner.token, fs: interrupted.fs }),
+    (error) => error.code === 'LOCK_TOKEN_MISMATCH',
+  );
+  const reservation = path.join(wikiRoot, '.wiki-meta', lockQuarantines(wikiRoot)[0]);
+  const restorePath = path.join(reservation, 'restore.json');
+  const legacy = withoutIdentityGenerations(JSON.parse(fs.readFileSync(restorePath, 'utf8')));
+  fs.writeFileSync(restorePath, `${JSON.stringify(legacy)}\n`);
+  const beforeRestore = fs.readFileSync(restorePath);
+  const beforeLockEntries = fs.readdirSync(lockDir).sort();
+  const beforeSeizedEntries = fs.readdirSync(path.join(reservation, 'seized')).sort();
+
+  assert.throws(
+    () => acquireLock({ wikiRoot, operation: 'must-not-resume-legacy' }),
+    (error) => error.code === 'LOCK_FILESYSTEM' && /legacy|generation/i.test(error.message),
+  );
+  assert.deepEqual(fs.readFileSync(restorePath), beforeRestore);
+  assert.deepEqual(fs.readdirSync(lockDir).sort(), beforeLockEntries);
+  assert.deepEqual(fs.readdirSync(path.join(reservation, 'seized')).sort(), beforeSeizedEntries);
+  fs.rmSync(lockDir, { recursive: true, force: true });
+  fs.rmSync(reservation, { recursive: true, force: true });
+});
+
 for (const mode of ['release']) {
   test(`${mode} resume leaves a canonical_identity null different-inode empty successor untouched through owner publication`, () => {
     const { acquireLock, assertLockOwner, releaseLock, recoverLock } = runtimeModule('lock.js');
@@ -3039,6 +3128,47 @@ test('owner-construction cleanup preserves a successor that takes over before th
     },
   }), /post-takeover entropy failure/);
   assert.equal(assertLockOwner({ wikiRoot, token: successor.token }).operation, 'construction-successor');
+  releaseLock({ wikiRoot, token: successor.token });
+});
+
+test('owner-construction cleanup rejects reused directory inode with a changed birth-time generation', () => {
+  const { acquireLock, assertLockOwner, releaseLock } = runtimeModule('lock.js');
+  const wikiRoot = newWikiRoot('deep wiki owner generation takeover ');
+  const lockDir = path.join(wikiRoot, '.wiki-meta', '.wiki-lock');
+  let successor;
+  let replaced = false;
+  const generationFs = new Proxy(fs, {
+    get(target, property) {
+      if (property === 'lstatSync') {
+        return (pathname, options) => {
+          const stat = target.lstatSync(pathname, options);
+          if (pathname !== lockDir) return stat;
+          return {
+            ...stat,
+            dev: 13n,
+            ino: 17n,
+            birthtimeNs: replaced ? 200n : 100n,
+          };
+        };
+      }
+      const value = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  assert.throws(() => acquireLock({
+    wikiRoot,
+    operation: 'failing-generation-owner',
+    fs: generationFs,
+    randomBytes() {
+      fs.rmSync(lockDir, { recursive: true });
+      successor = acquireLock({ wikiRoot, operation: 'generation-successor' });
+      replaced = true;
+      const error = new Error('injected generation replacement');
+      error.code = 'EIO';
+      throw error;
+    },
+  }), /generation replacement/);
+  assert.equal(assertLockOwner({ wikiRoot, token: successor.token }).operation, 'generation-successor');
   releaseLock({ wikiRoot, token: successor.token });
 });
 

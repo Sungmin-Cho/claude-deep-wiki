@@ -29,9 +29,11 @@ function fileIdentity(stat) {
   const dev = identityComponent(stat?.dev);
   const ino = identityComponent(stat?.ino);
   const mode = identityComponent(stat?.mode);
-  if (dev === null || ino === null || mode === null || dev < 0n || ino <= 0n) return null;
+  const birthtimeNs = identityComponent(stat?.birthtimeNs);
+  if (dev === null || ino === null || mode === null || birthtimeNs === null
+      || dev < 0n || ino <= 0n || birthtimeNs < 0n) return null;
   if ((mode & FILE_TYPE_MASK) !== REGULAR_FILE_TYPE) return null;
-  return { dev, ino };
+  return { dev, ino, birthtimeNs };
 }
 
 function identityError(message, cause) {
@@ -55,7 +57,8 @@ function descriptorFileIdentity(fs, descriptor) {
 function pathHasFileIdentity(fs, pathname, expected) {
   try {
     const current = fileIdentity(fs.lstatSync(pathname, { bigint: true }));
-    return current !== null && current.dev === expected.dev && current.ino === expected.ino;
+    return current !== null && current.dev === expected.dev && current.ino === expected.ino
+      && current.birthtimeNs === expected.birthtimeNs;
   } catch {
     return false;
   }
@@ -82,13 +85,13 @@ function atomicWriteFile(destination, bytes, options = {}) {
     temporaryIdentity = descriptorFileIdentity(fs, descriptor);
     fs.writeFileSync(descriptor, payload);
     fs.fsyncSync(descriptor);
-    fs.closeSync(descriptor);
-    descriptor = undefined;
     if (typeof options.beforeRename === 'function') options.beforeRename({ destination, temporary });
     assertPathHasFileIdentity(fs, temporary, temporaryIdentity);
     if (typeof options.beforePublish === 'function') options.beforePublish({ destination, temporary });
     fs.renameSync(temporary, destination);
     temporaryIdentity = undefined;
+    fs.closeSync(descriptor);
+    descriptor = undefined;
   } catch (error) {
     if (descriptor !== undefined) {
       try { fs.closeSync(descriptor); } catch { /* preserve the primary error */ }

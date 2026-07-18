@@ -56,6 +56,14 @@ function scrubHostEnv(extra = {}) {
   return { ...scrubbed, ...extra };
 }
 
+function interpolateYamlDoubleQuotedPlaceholder(text, placeholder, value) {
+  if (typeof text !== 'string' || typeof placeholder !== 'string' || placeholder.length === 0) {
+    throw new TypeError('YAML placeholder interpolation requires nonempty strings');
+  }
+  const escaped = JSON.stringify(String(value)).slice(1, -1);
+  return text.replaceAll(placeholder, escaped);
+}
+
 /**
  * Spawn scan-vault-changes.js under hermetic test isolation.
  *
@@ -168,6 +176,7 @@ function parseHookOutput(stdout) {
 
 module.exports = {
   scrubHostEnv,
+  interpolateYamlDoubleQuotedPlaceholder,
   runScanVault,
   parseHookOutput,
   HOST_LEAK_VARS,

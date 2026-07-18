@@ -522,6 +522,39 @@ test('old pending publication cannot overwrite a successor commit after temp ide
   releaseLock({ wikiRoot: root, token: successor.token });
 });
 
+test('transaction parent rejects reused dev and inode with a changed birth-time generation', () => {
+  const { ensurePendingScan, createDeadline } = modules();
+  const root = temporaryWiki('deep wiki transaction parent generation ');
+  const meta = metaPath(root, '.');
+  const originalLstat = fs.lstatSync;
+  let changed = false;
+  fs.lstatSync = function generationLstat(pathname, options) {
+    const stat = originalLstat.call(fs, pathname, options);
+    if (path.resolve(String(pathname)) !== path.resolve(meta) || options?.bigint !== true) return stat;
+    return {
+      ...stat,
+      dev: 19n,
+      ino: 23n,
+      birthtimeNs: changed ? 200n : 100n,
+    };
+  };
+  let result;
+  try {
+    result = ensurePendingScan({
+      wikiRoot: root,
+      proposed: T1,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+      faultInjector(stage) {
+        if (stage === 'before-journal-create-write') changed = true;
+      },
+    });
+  } finally {
+    fs.lstatSync = originalLstat;
+  }
+  assert.deepEqual(result, { status: 'deferred', reason: 'SCAN_WINDOW_FILESYSTEM' });
+  assert.equal(readMaybe(metaPath(root, '.pending-scan')), null);
+});
+
 test('old last-scan publication cannot overwrite a successor repair after temp identity validation', () => {
   const {
     promotePendingScan, planScanWindowTransition, applyScanWindowTransition,

@@ -301,7 +301,7 @@ function modelHookInvocation(command, variant, options = {}) {
     return { outerExecutable: null, outerArgv: [], command: expanded, argv: tokenizePosixCommand(expanded) };
   }
   if (variant === 'commandWindows') {
-    const expanded = String(command).replaceAll('%CLAUDE_PLUGIN_ROOT%', pluginRoot);
+    const expanded = String(command).replaceAll('%PLUGIN_ROOT%', pluginRoot);
     const comspec = options.comspec || 'C:\\Windows\\System32\\cmd.exe';
     return {
       outerExecutable: comspec,
@@ -378,7 +378,7 @@ function validateHookVariant(handler, variant, violations, commands) {
     return;
   }
   const expected = variant === 'commandWindows'
-    ? '%CLAUDE_PLUGIN_ROOT%\\hooks\\scripts\\scan-vault-changes.js'
+    ? '%PLUGIN_ROOT%\\hooks\\scripts\\scan-vault-changes.js'
     : '${CLAUDE_PLUGIN_ROOT}/hooks/scripts/scan-vault-changes.js';
   if (tokens.length !== 2 || tokens[1] !== expected) {
     violations.push({ reason: 'HOOK_SCRIPT_NOT_ALLOWED', variant });

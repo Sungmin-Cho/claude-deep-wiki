@@ -484,7 +484,10 @@ function redactDiagnosticText(value) {
   return String(value || '')
     .replace(/\bBearer\s+[^\s"']+/gi, 'Bearer <redacted>')
     .replace(/\bsk-[A-Za-z0-9_-]+\b/g, '<redacted>')
-    .replace(/\b((?:OPENAI_)?API_KEY|ACCESS_TOKEN)\s*[=:]\s*[^\s"']+/gi, '$1=<redacted>');
+    .replace(
+      /\b((?:[A-Za-z][A-Za-z0-9_]*_)?(?:API_KEY|ACCESS_TOKEN))\s*[=:]\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s"']+)/gi,
+      '$1=<redacted>',
+    );
 }
 
 function trustedFailureMessage(result, reason, records = []) {

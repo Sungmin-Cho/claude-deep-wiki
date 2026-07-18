@@ -243,18 +243,23 @@ test('Codex trusted failure reports bounded structured evidence without secrets'
     7,
     `${JSON.stringify({
       type: 'turn.failed',
-      error: { message: 'hook command failed before model request' },
+      error: {
+        message: 'hook command failed CODEX_ACCESS_TOKEN="codex-private" CUSTOM_API_KEY=custom-private',
+      },
     })}\n`,
-    'Authorization: Bearer private-value OPENAI_API_KEY=sk-private-value',
+    "Authorization: Bearer private-value OPENAI_API_KEY=sk-private-value ACCESS_TOKEN='access-private'",
   );
   assert.throws(
     () => trustedJsonlReceipt(failed, releaseFixture),
     (error) => {
       assert.equal(error.code, 'CODEX_TRUSTED_EXEC_FAILED');
       assert.match(error.message, /"status":7/);
-      assert.match(error.message, /hook command failed before model request/);
+      assert.match(error.message, /hook command failed/);
       assert.match(error.message, /<redacted>/);
-      assert.doesNotMatch(error.message, /private-value|sk-private/);
+      assert.doesNotMatch(
+        error.message,
+        /private-value|sk-private|codex-private|custom-private|access-private/,
+      );
       return true;
     },
   );

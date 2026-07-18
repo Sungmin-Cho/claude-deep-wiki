@@ -65,6 +65,7 @@ test('portable npm test cannot discover the native installed-Codex release smoke
   assert.match(driver, /\.test\.js$/);
   assert.doesNotMatch(release, /\.test\.js$/);
   assert.doesNotMatch(portable, /codex-plugin-hook-smoke\.release|test:codex-windows-release/);
+  assert.match(portable, /^node --test --test-concurrency=1$/);
 
   const workflow = fs.readFileSync(path.join(ROOT, '.github', 'workflows', 'tests.yml'), 'utf8');
   const smoke = fs.readFileSync(path.join(ROOT, 'scripts', 'codex-plugin-hook-smoke.js'), 'utf8');
@@ -90,6 +91,7 @@ test('portable npm test cannot discover the native installed-Codex release smoke
   assert.match(workflow, /@openai\/codex-win32-x64\/vendor\/x86_64-pc-windows-msvc\/bin\/codex\.exe/);
   assert.match(workflow, /--ignore-scripts/);
   assert.match(workflow, /codex-cli 0\.144\.1/);
+  assert.match(workflow, /vendorVersion -ne '0\.144\.1-win32-x64'/);
   assert.match(workflow, /test:codex-windows-release/);
   assert.match(releaseSource, /CANDIDATE_SHA/);
   assert.match(releaseSource, /CODEX_BINARY_SHA256/);

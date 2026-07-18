@@ -68,7 +68,7 @@ jobs:
           $cliVersion = (Get-Content -LiteralPath $cliPackage -Raw | ConvertFrom-Json).version
           $vendorVersion = (Get-Content -LiteralPath $vendorPackage -Raw | ConvertFrom-Json).version
           $reported = (& $codexBin --version | Out-String).Trim()
-          if ($cliVersion -ne '0.144.1' -or $vendorVersion -ne '0.144.1' -or $reported -ne 'codex-cli 0.144.1') {
+          if ($cliVersion -ne '0.144.1' -or $vendorVersion -ne '0.144.1-win32-x64' -or $reported -ne 'codex-cli 0.144.1') {
             throw 'Codex package or executable version mismatch'
           }
           $binarySha256 = (Get-FileHash -LiteralPath $codexBin -Algorithm SHA256).Hash.ToLowerInvariant()

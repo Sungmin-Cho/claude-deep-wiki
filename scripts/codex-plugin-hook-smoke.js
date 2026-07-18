@@ -578,7 +578,7 @@ if (!result.equal) process.exitCode = 42;
     hooks: { SessionStart: [{ matcher: '*', hooks: [{
       type: 'command',
       command: 'node "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/diagnostic.js" command',
-      commandWindows: 'node "%PLUGIN_ROOT%\\hooks\\scripts\\diagnostic.js" commandWindows',
+      commandWindows: 'node "${CLAUDE_PLUGIN_ROOT}\\hooks\\scripts\\diagnostic.js" commandWindows',
       timeout: 15,
     }] }] },
   }, null, 2)}\n`);

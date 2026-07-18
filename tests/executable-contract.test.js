@@ -73,8 +73,8 @@ test('quote-aware tokenizers preserve one path argument on both hosts', () => {
     ['node', '${CLAUDE_PLUGIN_ROOT}/hooks/scripts/scan-vault-changes.js'],
   );
   assert.deepEqual(
-    tokenizeWindowsCommand('node "%PLUGIN_ROOT%\\hooks\\scripts\\scan-vault-changes.js"'),
-    ['node', '%PLUGIN_ROOT%\\hooks\\scripts\\scan-vault-changes.js'],
+    tokenizeWindowsCommand('node "${CLAUDE_PLUGIN_ROOT}\\hooks\\scripts\\scan-vault-changes.js"'),
+    ['node', '${CLAUDE_PLUGIN_ROOT}\\hooks\\scripts\\scan-vault-changes.js'],
   );
 });
 
@@ -99,14 +99,13 @@ test('hook host model expands each native variable form and preserves the Window
   assert.equal(posix.outerExecutable, null);
 
   const windows = modelHookInvocation(
-    'node "%PLUGIN_ROOT%\\hooks\\scripts\\scan-vault-changes.js"',
+    'node "${CLAUDE_PLUGIN_ROOT}\\hooks\\scripts\\scan-vault-changes.js"',
     'commandWindows',
     { pluginRoot: 'C:\\Users\\민수\\Deep Wiki', comspec: 'C:\\Windows\\System32\\cmd.exe' },
   );
   assert.deepEqual(windows.argv, ['node', 'C:\\Users\\민수\\Deep Wiki\\hooks\\scripts\\scan-vault-changes.js']);
   assert.equal(windows.outerExecutable, 'C:\\Windows\\System32\\cmd.exe');
-  assert.deepEqual(windows.outerArgv.slice(0, 3), ['/D', '/S', '/C']);
-  assert.equal(windows.outerArgv[3], windows.command);
+  assert.deepEqual(windows.outerArgv, ['/C', windows.command]);
 });
 
 test('shipped command policies reject malformed subcommands and misplaced probes', () => {

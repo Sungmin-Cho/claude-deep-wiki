@@ -23,6 +23,6 @@
     "lint:hook-command": "node scripts/lib/executable-contract.js --check-hooks",
     "lint:commands": "node scripts/lib/executable-contract.js --check",
     "lint:agents": "node scripts/lint-agent-tools.js",
-    "test:codex-windows-release": "node --test tests/release/codex-plugin-hook-smoke.release.js"
+    "test:codex-windows-release": "node --test --test-concurrency=1 tests/release/codex-plugin-hook-smoke.release.js"
   }
 }

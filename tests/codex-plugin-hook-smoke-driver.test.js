@@ -6,311 +6,371 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
+const releaseFixture = require('./fixtures/codex-release-smoke.json');
 const {
-  SmokeError,
+  buildResponsesEvents,
+  startLoopbackResponsesServer,
+} = require('./helpers/codex-loopback-responses.js');
+const {
+  buildChildEnvironment,
+  buildExpectedDirectOutput,
+  buildProviderArgv,
+  createCandidateLayout,
+  defaultRunProcess,
+  assertPending,
   runCodexPluginHookSmoke,
+  trustedJsonlReceipt,
 } = require('../scripts/codex-plugin-hook-smoke.js');
 
 const repositoryRoot = path.resolve(__dirname, '..');
 
+test('local Responses helper emits the exact ordered nine-event stream', () => {
+  const events = buildResponsesEvents(releaseFixture);
+  assert.equal(events.length, 9);
+  assert.deepEqual(events.map(({ event }) => event), releaseFixture.sse_events);
+  assert.deepEqual(events.map(({ data }) => data.sequence_number), [0, 1, 2, 3, 4, 5, 6, 7, 8]);
+  assert.equal(events.at(-1).data.response.output[0].content[0].text, releaseFixture.response_text);
+  assert.deepEqual(events.at(-1).data.response.usage, {
+    input_tokens: 1,
+    input_tokens_details: { cached_tokens: 0 },
+    output_tokens: 1,
+    output_tokens_details: { reasoning_tokens: 0 },
+    total_tokens: 2,
+  });
+  const serialized = events.map(({ event, data }) => (
+    `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
+  )).join('');
+  assert.equal(serialized.includes('\r'), false);
+  assert.equal(serialized.includes('[DONE]'), false);
+  assert.deepEqual(events.map(({ data }) => Object.keys(data).sort()), [
+    ['response', 'sequence_number', 'type'],
+    ['response', 'sequence_number', 'type'],
+    ['item', 'output_index', 'sequence_number', 'type'],
+    ['content_index', 'item_id', 'output_index', 'part', 'sequence_number', 'type'],
+    ['content_index', 'delta', 'item_id', 'logprobs', 'output_index', 'sequence_number', 'type'],
+    ['content_index', 'item_id', 'logprobs', 'output_index', 'sequence_number', 'text', 'type'],
+    ['content_index', 'item_id', 'output_index', 'part', 'sequence_number', 'type'],
+    ['item', 'output_index', 'sequence_number', 'type'],
+    ['response', 'sequence_number', 'type'],
+  ]);
+  assert.deepEqual(Object.keys(events[0].data.response).sort(), [
+    'background', 'created_at', 'error', 'id', 'incomplete_details', 'instructions',
+    'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output',
+    'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning',
+    'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text',
+    'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user',
+  ].sort());
+});
+
+test('local Responses server binds loopback, authenticates invariants, and closes', async () => {
+  const server = await startLoopbackResponsesServer({ fixture: releaseFixture, expectedRequestCount: 1 });
+  try {
+    assert.match(server.baseUrl, /^http:\/\/127\.0\.0\.1:\d+\/v1$/);
+    const response = await fetch(`${server.baseUrl}/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${releaseFixture.public_bearer}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: releaseFixture.model,
+        stream: true,
+        store: false,
+        input: [{
+          role: 'user',
+          content: `fixture prompt is never retained: ${releaseFixture.expected_candidates.join(',')}`,
+        }],
+      }),
+    });
+    assert.equal(response.status, 200);
+    const bytes = await response.text();
+    assert.equal((bytes.match(/^event: /gm) || []).length, 9);
+    assert.equal(bytes.includes('[DONE]'), false);
+    assert.equal(server.requests.length, 1);
+    assert.equal(Object.hasOwn(server.requests[0], 'rawBody'), false);
+    assert.equal(server.requests[0].authorization_public, true);
+  } finally { await server.close(); }
+});
+
+test('local Responses server rejects a wrong request and authenticates zero-request close', async () => {
+  const rejecting = await startLoopbackResponsesServer({ fixture: releaseFixture, expectedRequestCount: 1 });
+  const response = await fetch(`${rejecting.baseUrl}/responses`, {
+    method: 'GET',
+    headers: {
+      authorization: `Bearer ${releaseFixture.public_bearer}`,
+      'content-type': 'application/json',
+    },
+  });
+  assert.equal(response.status, 400);
+  await response.text();
+  await assert.rejects(rejecting.close, /LOOPBACK_REQUEST_CONTRACT/);
+
+  const zero = await startLoopbackResponsesServer({ fixture: releaseFixture, expectedRequestCount: 0 });
+  await zero.close();
+  assert.deepEqual(zero.requests, []);
+});
+
 test('shipped Windows hook models Codex commandWindows expansion through the outer command processor', () => {
-  const hookDocument = JSON.parse(fs.readFileSync(
-    path.join(repositoryRoot, 'hooks', 'hooks.json'),
-    'utf8',
-  ));
+  const hookDocument = JSON.parse(fs.readFileSync(path.join(repositoryRoot, 'hooks', 'hooks.json'), 'utf8'));
   const hook = hookDocument.hooks.SessionStart[0].hooks[0];
   const installedRoot = 'C:\\Users\\Example User\\.codex\\plugins\\deep-wiki';
   const expanded = hook.commandWindows.replaceAll('%CLAUDE_PLUGIN_ROOT%', installedRoot);
-  const hostLaunch = {
-    file: 'C:\\Windows\\System32\\cmd.exe',
-    args: ['/D', '/S', '/C', expanded],
-  };
-
   assert.equal(hook.commandWindows, 'node "%CLAUDE_PLUGIN_ROOT%\\hooks\\scripts\\scan-vault-changes.js"');
-  assert.deepEqual(hostLaunch.args.slice(0, 3), ['/D', '/S', '/C']);
-  assert.equal(
-    hostLaunch.args[3],
-    'node "C:\\Users\\Example User\\.codex\\plugins\\deep-wiki\\hooks\\scripts\\scan-vault-changes.js"',
-  );
-  assert.match(hostLaunch.file, /cmd\.exe$/i);
-  assert.doesNotMatch(hostLaunch.args[3], /[|;&<>`\r\n]|\$\(/);
+  assert.equal(expanded, 'node "C:\\Users\\Example User\\.codex\\plugins\\deep-wiki\\hooks\\scripts\\scan-vault-changes.js"');
+  assert.doesNotMatch(expanded, /[|;&<>`\r\n]|\$\(/);
 });
 
-function makeFixture() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'deep-wiki-smoke-test-'));
-  const codexHome = path.join(root, 'Codex Home');
-  const pluginRoot = path.join(root, 'Source Plugin');
-  const binDir = path.join(root, 'bin');
-  const codexBin = path.join(binDir, 'codex.exe');
-  const installedPath = path.join(
-    codexHome,
-    'plugins',
-    'cache',
-    'deep-wiki-smoke',
-    'deep-wiki',
-    '1.7.1',
-  );
-  fs.mkdirSync(path.join(pluginRoot, '.codex-plugin'), { recursive: true });
-  fs.mkdirSync(path.join(pluginRoot, 'skills'), { recursive: true });
-  fs.mkdirSync(codexHome, { recursive: true });
-  fs.mkdirSync(binDir, { recursive: true });
-  fs.writeFileSync(codexBin, 'fixture');
-  fs.writeFileSync(path.join(pluginRoot, '.codex-plugin', 'plugin.json'), JSON.stringify({
-    name: 'deep-wiki',
-    version: '1.7.1',
-    description: 'fixture',
-    skills: './skills/',
-  }));
-  return { root, codexHome, pluginRoot, codexBin, installedPath };
+test('provider argv is exact, secret-free, non-retrying, and trust differs by one flag', () => {
+  const trusted = buildProviderArgv(43123, 'C:\\Project Space', true, releaseFixture);
+  const untrusted = buildProviderArgv(43124, 'C:\\Other Project', false, releaseFixture);
+  assert.deepEqual(trusted, [
+    'exec',
+    '-c', 'model_provider="deep-wiki-loopback"',
+    '-c', 'model_providers.deep-wiki-loopback={ name = "Deep Wiki Loopback", base_url = "http://127.0.0.1:43123/v1", env_key = "DEEP_WIKI_LOOPBACK_AUTH", wire_api = "responses", request_max_retries = 0, stream_max_retries = 0, stream_idle_timeout_ms = 10000, websocket_connect_timeout_ms = 1000, requires_openai_auth = false, supports_websockets = false }',
+    '-c', 'check_for_update_on_startup=false',
+    '-c', 'analytics.enabled=false',
+    '--json', '--model', 'gpt-5.4-mini', '--ephemeral', '--skip-git-repo-check',
+    '--dangerously-bypass-hook-trust', '--cd', 'C:\\Project Space',
+    'Return exactly DEEP_WIKI_SMOKE_OK',
+  ]);
+  assert.equal(trusted.filter((value) => value === '--dangerously-bypass-hook-trust').length, 1);
+  assert.equal(untrusted.includes('--dangerously-bypass-hook-trust'), false);
+  const normalize = (argv, project) => argv
+    .filter((value) => value !== '--dangerously-bypass-hook-trust')
+    .map((value) => value === project
+      ? '<project>'
+      : value.replace(/http:\/\/127\.0\.0\.1:\d+\/v1/, 'http://127.0.0.1:<port>/v1'));
+  assert.deepEqual(normalize(trusted, 'C:\\Project Space'), normalize(untrusted, 'C:\\Other Project'));
+  assert.doesNotMatch(JSON.stringify([trusted, untrusted]), /login|with-api-key|OPENAI_API_KEY|CODEX_ACCESS_TOKEN|"--websocket"|https:\/\/|request_max_retries = [1-9]|stream_max_retries = [1-9]/i);
+});
+
+test('child environment is a closed allowlist with a committed public routing fixture', () => {
+  const root = path.resolve(os.tmpdir(), 'deep wiki env');
+  const directories = {
+    home: path.join(root, 'home'),
+    codexHome: path.join(root, 'home', '.codex'),
+    appData: path.join(root, 'home', 'AppData', 'Roaming'),
+    localAppData: path.join(root, 'home', 'AppData', 'Local'),
+  };
+  const env = buildChildEnvironment({
+    PATH: '/safe', PATHEXT: '.EXE', SystemRoot: 'C:\\Windows',
+    OPENAI_API_KEY: 'secret', CODEX_ACCESS_TOKEN: 'secret', GITHUB_TOKEN: 'secret',
+    HTTPS_PROXY: 'http://proxy.invalid', RANDOM_AMBIENT: 'ambient',
+  }, directories);
+  assert.deepEqual(Object.keys(env).sort(), [
+    'APPDATA', 'CODEX_HOME', 'DEEP_WIKI_LOOPBACK_AUTH', 'HOME', 'LOCALAPPDATA',
+    'PATH', 'PATHEXT', 'SYSTEMROOT', 'USERPROFILE',
+  ]);
+  assert.equal(env.DEEP_WIKI_LOOPBACK_AUTH, releaseFixture.public_bearer);
+  assert.doesNotMatch(JSON.stringify(env), /secret|proxy\.invalid|RANDOM_AMBIENT/);
+});
+
+test('candidate marketplace reconstructs every tracked blob from one exact commit', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'deep-wiki-candidate-test-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const rev = await defaultRunProcess('git', ['rev-parse', 'HEAD'], {
+    cwd: repositoryRoot, env: process.env, timeoutMs: 10_000,
+  }, { phase: 'test-rev' });
+  const candidateSha = rev.stdout.trim();
+  const layout = await createCandidateLayout({
+    pluginRoot: repositoryRoot, workRoot: root, env: process.env,
+  }, defaultRunProcess, candidateSha);
+  assert.equal(layout.candidateSha, candidateSha);
+  assert.ok(Object.keys(layout.trackedManifest).length > 50);
+  assert.equal(layout.trackedManifest['hooks/hooks.json'], shaFile(path.join(repositoryRoot, 'hooks', 'hooks.json')));
+  assert.equal(fs.lstatSync(layout.candidateRoot).isSymbolicLink(), false);
+});
+
+function shaFile(file) {
+  return require('node:crypto').createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 }
 
-test('portable seam pins exact 0.144.1 argv, copied root, trust boundary, and secret scrub', () => {
-  const fixture = makeFixture();
-  const calls = [];
-  try {
-    const result = runCodexPluginHookSmoke({
-      codexBin: fixture.codexBin,
-      codexHome: fixture.codexHome,
-      model: 'gpt-smoke-model',
-      pluginRoot: fixture.pluginRoot,
-      workRoot: fixture.root,
-      platform: 'win32',
-      keepArtifacts: true,
-      env: {
-        PATH: process.env.PATH || '',
-        SystemRoot: 'C:\\Windows',
-        OPENAI_API_KEY: 'secret-openai-value',
-        CODEX_WINDOWS_SMOKE_API_KEY: 'secret-windows-value',
-        CUSTOM_SECRET: 'secret-custom-value',
-        SAFE_VALUE: 'retained',
-      },
-      runProcess(file, args, options, context) {
-        calls.push({
-          file,
-          args: [...args],
-          env: { ...options.env },
-          cwd: options.cwd,
-          shell: options.shell,
-          windowsHide: options.windowsHide,
-          phase: context.phase,
-        });
-        if (context.phase === 'version') {
-          return { status: 0, stdout: 'codex-cli 0.144.1\n', stderr: '' };
-        }
-        if (context.phase === 'plugin-add') {
-          fs.cpSync(context.layout.marketplacePluginRoot, fixture.installedPath, { recursive: true });
-          return {
-            status: 0,
-            stdout: `${JSON.stringify({
-              pluginId: 'deep-wiki@deep-wiki-smoke',
-              name: 'deep-wiki',
-              marketplaceName: 'deep-wiki-smoke',
-              version: '1.7.1',
-              installedPath: fixture.installedPath,
-            })}\n`,
-            stderr: '',
-          };
-        }
-        if (context.phase === 'trusted-exec') {
-          fs.writeFileSync(context.layout.trustedMarker, JSON.stringify({
-            process_platform: 'win32',
-            selected_command_variant: 'commandWindows',
-            PLUGIN_ROOT: context.installedPluginRoot,
-            CLAUDE_PLUGIN_ROOT: context.installedPluginRoot,
-            secret_leaks: [],
-          }));
-          return { status: 0, stdout: 'DEEP_WIKI_SMOKE_OK\n', stderr: '' };
-        }
-        if (context.phase === 'untrusted-exec') {
-          return { status: 1, stdout: '', stderr: 'hook trust required; execution denied' };
-        }
-        return { status: 0, stdout: '{}\n', stderr: '' };
-      },
-    });
+test('pending receipt requires a canonical valid timestamp inside the fixture freshness window', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'deep-wiki-pending-test-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const pending = path.join(root, '.pending-scan');
+  const vault = { pending };
+  const nowMs = Date.parse('2026-07-18T12:00:30Z');
 
-    assert.equal(result.codexVersion, 'codex-cli 0.144.1');
-    assert.equal(result.trustedHookObserved, true);
-    assert.equal(result.untrustedHookDenied, true);
-    assert.equal(result.pluginRoot, fs.realpathSync.native(fixture.installedPath));
-    assert.notEqual(result.pluginRoot, result.marketplacePluginRoot);
-    assert.equal(result.marker.PLUGIN_ROOT, result.pluginRoot);
-    assert.equal(result.marker.CLAUDE_PLUGIN_ROOT, result.pluginRoot);
-    assert.equal(result.marker.selected_command_variant, 'commandWindows');
-    assert.equal(result.sourceManifestSha256, result.copiedManifestSha256);
+  fs.writeFileSync(pending, '2026-07-18T12:00:00Z\n');
+  assert.equal(assertPending(vault, releaseFixture, 'PENDING_INVALID', nowMs).bytes,
+    '2026-07-18T12:00:00Z\n');
 
-    assert.deepEqual(calls.map(({ args }) => args), [
-      ['--version'],
-      ['plugin', 'marketplace', 'add', result.marketplaceRoot, '--json'],
-      ['plugin', 'add', 'deep-wiki@deep-wiki-smoke', '--json'],
-      [
-        'exec', '--model', 'gpt-smoke-model', '--ephemeral', '--skip-git-repo-check',
-        '--dangerously-bypass-hook-trust', '--cd', result.trustedProject,
-        'Return exactly DEEP_WIKI_SMOKE_OK',
-      ],
-      [
-        'exec', '--model', 'gpt-smoke-model', '--ephemeral', '--skip-git-repo-check',
-        '--cd', result.untrustedProject, 'Return exactly DEEP_WIKI_SMOKE_UNTRUSTED',
-      ],
-    ]);
-    assert.ok(calls.every((call) => call.file === fixture.codexBin));
-    assert.ok(calls.every((call) => call.env.CODEX_HOME === fixture.codexHome));
-    assert.ok(calls.every((call) => call.shell === false));
-    assert.ok(calls.every((call) => call.windowsHide === true));
-    assert.ok(calls.every((call) => path.isAbsolute(call.cwd)));
-    assert.equal(calls.some((call) => call.args.includes('install')), false);
-    assert.equal(calls.some((call) => call.args.includes('enable')), false);
-    for (const call of calls) {
-      const serialized = JSON.stringify(call.env);
-      assert.doesNotMatch(serialized, /OPENAI_API_KEY|CODEX_WINDOWS_SMOKE_API_KEY|CUSTOM_SECRET/);
-      assert.doesNotMatch(serialized, /secret-openai-value|secret-windows-value|secret-custom-value/);
+  for (const value of [
+    '2026-99-99T12:00:00Z\n',
+    '2026-07-18T11:59:29Z\n',
+    '2026-07-18T12:00:31Z\n',
+  ]) {
+    fs.writeFileSync(pending, value);
+    assert.throws(() => assertPending(vault, releaseFixture, 'PENDING_INVALID', nowMs),
+      { code: 'PENDING_INVALID' });
+  }
+});
+
+test('direct installed supervisor witness requires one exact parent-formatted message', (t) => {
+  const vaultRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'deep-wiki-output-root-'));
+  t.after(() => fs.rmSync(vaultRoot, { recursive: true, force: true }));
+  const physicalVaultRoot = fs.realpathSync.native(vaultRoot);
+  assert.equal(buildExpectedDirectOutput({ physicalVaultRoot }, releaseFixture), [
+    '[deep-wiki] 1개의 새로운/수정된 파일이 Obsidian vault에서 감지되었습니다.',
+    '',
+    '자동 ingest 대상:',
+    '',
+    '  - 노트/Windows 검증.md',
+    '',
+    `이 파일들을 /wiki-ingest로 위키에 자동 반영하세요. 각 파일을 읽고 기존 위키 페이지에 병합하거나 새 페이지를 생성하세요. vault 경로: ${physicalVaultRoot}`,
+    '',
+  ].join('\n'));
+});
+
+test('Codex JSONL receipt requires the exact completed assistant message', () => {
+  const exact = `${JSON.stringify({
+    type: 'item.completed',
+    item: { type: 'agent_message', text: releaseFixture.response_text },
+  })}\n`;
+  assert.doesNotThrow(() => trustedJsonlReceipt(result(0, exact), releaseFixture));
+
+  const substringOnly = `${JSON.stringify({
+    type: 'item.completed',
+    item: { type: 'command_execution', text: `diagnostic=${releaseFixture.response_text}` },
+  })}\n`;
+  assert.throws(() => trustedJsonlReceipt(result(0, substringOnly), releaseFixture),
+    { code: 'CODEX_TRUSTED_EXEC_FAILED' });
+});
+
+test('portable full-phase seam proves trusted pre-model effect, independent direct supervisor, untrusted no-state-effect, and diagnostic-last', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'deep-wiki-full-seam-'));
+  const codexBin = path.join(root, 'codex.exe');
+  fs.writeFileSync(codexBin, 'fixture');
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const phases = [];
+  let diagnosticMarketplace;
+
+  async function fakeRun(file, args, options, context = {}) {
+    phases.push(context.phase || 'unknown');
+    if (file === 'git' || file === process.execPath) {
+      return defaultRunProcess(file, args, options, context);
     }
-
-    const marketplace = JSON.parse(fs.readFileSync(
-      path.join(result.marketplaceRoot, '.agents', 'plugins', 'marketplace.json'),
-      'utf8',
-    ));
-    const copiedManifest = JSON.parse(fs.readFileSync(
-      path.join(result.pluginRoot, '.codex-plugin', 'plugin.json'),
-      'utf8',
-    ));
-    assert.equal(marketplace.plugins[0].name, copiedManifest.name);
-    assert.equal(marketplace.plugins[0].source.source, 'local');
-    assert.equal(marketplace.plugins[0].source.path, './plugins/deep-wiki');
-    assert.equal(fs.lstatSync(result.marketplacePluginRoot).isSymbolicLink(), false);
-
-    const hookDocument = JSON.parse(fs.readFileSync(
-      path.join(result.marketplacePluginRoot, 'hooks', 'hooks.json'),
-      'utf8',
-    ));
-    const hook = hookDocument.hooks.SessionStart[0].hooks[0];
-    assert.equal(
-      hook.command,
-      'node "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/smoke-marker.js" command',
-    );
-    assert.equal(
-      hook.commandWindows,
-      'node "%CLAUDE_PLUGIN_ROOT%\\hooks\\scripts\\smoke-marker.js" commandWindows',
-    );
-
-    const markerScript = fs.readFileSync(
-      path.join(result.marketplacePluginRoot, 'hooks', 'scripts', 'smoke-marker.js'),
-      'utf8',
-    );
-    assert.doesNotMatch(markerScript, /secret-openai-value|secret-windows-value|secret-custom-value/);
-  } finally {
-    fs.rmSync(fixture.root, { recursive: true, force: true });
+    if (context.phase === 'version') return result(0, 'codex-cli 0.144.1\n');
+    if (context.phase?.endsWith('marketplace-add')) {
+      if (context.phase === 'diagnostic-marketplace-add') diagnosticMarketplace = args[3];
+      return result(0, JSON.stringify({
+        marketplaceName: context.phase === 'diagnostic-marketplace-add' ? 'deep-wiki-diagnostic' : 'deep-wiki-smoke',
+        installedRoot: args[3], alreadyAdded: false,
+      }));
+    }
+    if (context.phase?.endsWith('marketplace-list')) {
+      const diagnostic = context.phase === 'diagnostic-marketplace-list';
+      return result(0, JSON.stringify({ marketplaces: [{
+        name: diagnostic ? 'deep-wiki-diagnostic' : 'deep-wiki-smoke',
+        root: diagnostic ? diagnosticMarketplace : context.layout.marketplaceRoot,
+      }] }));
+    }
+    if (context.phase?.endsWith('plugin-add')) {
+      const diagnostic = context.phase === 'diagnostic-plugin-add';
+      const name = diagnostic ? 'deep-wiki-diagnostic' : 'deep-wiki';
+      const market = diagnostic ? 'deep-wiki-diagnostic' : 'deep-wiki-smoke';
+      const source = diagnostic
+        ? path.join(diagnosticMarketplace, 'plugins', 'deep-wiki-diagnostic')
+        : context.layout.candidateRoot;
+      const installedPath = path.join(options.env.CODEX_HOME, 'plugins', 'cache', market, name, diagnostic ? '1.0.0' : '1.7.1');
+      fs.cpSync(source, installedPath, { recursive: true });
+      return result(0, JSON.stringify({
+        pluginId: `${name}@${market}`, name, marketplaceName: market,
+        version: diagnostic ? '1.0.0' : '1.7.1', installedPath,
+      }));
+    }
+    if (context.phase?.endsWith('plugin-list')) {
+      const diagnostic = context.phase === 'diagnostic-plugin-list';
+      return result(0, JSON.stringify({ installed: [{
+        pluginId: diagnostic
+          ? 'deep-wiki-diagnostic@deep-wiki-diagnostic'
+          : 'deep-wiki@deep-wiki-smoke',
+        installed: true,
+      }] }));
+    }
+    if (context.phase === 'trusted-exec') {
+      const scanner = path.join(context.installedPluginRoot, 'hooks', 'scripts', 'scan-vault-changes.js');
+      const hook = await defaultRunProcess(process.execPath, [scanner], options, { phase: 'fake-trusted-hook' });
+      assert.equal(hook.status, 0);
+      assert.equal(hook.stderr, '');
+      await requestLoopback(context.server, hook.stdout);
+      return result(0, `${JSON.stringify({
+        type: 'item.completed', item: { type: 'agent_message', text: releaseFixture.response_text },
+      })}\n`);
+    }
+    if (context.phase === 'untrusted-exec') {
+      await requestLoopback(context.server, releaseFixture.expected_candidates.join(','));
+      return result(0, `${JSON.stringify({
+        type: 'item.completed', item: { type: 'agent_message', text: releaseFixture.response_text },
+      })}\n`);
+    }
+    if (context.phase === 'diagnostic-exec') {
+      const installed = path.join(options.env.CODEX_HOME, 'plugins', 'cache', 'deep-wiki-diagnostic', 'deep-wiki-diagnostic', '1.0.0');
+      const hook = await defaultRunProcess(process.execPath, [
+        path.join(installed, 'hooks', 'scripts', 'diagnostic.js'), 'commandWindows',
+      ], {
+        ...options,
+        env: {
+          ...options.env,
+          PLUGIN_ROOT: installed,
+          CLAUDE_PLUGIN_ROOT: installed,
+        },
+      }, { phase: 'fake-diagnostic-hook' });
+      assert.equal(hook.status, 0);
+      await requestLoopback(context.server, releaseFixture.expected_candidates.join(','));
+      return result(0, `${JSON.stringify({
+        type: 'item.completed', item: { type: 'agent_message', text: releaseFixture.response_text },
+      })}\n`);
+    }
+    throw new Error(`unexpected fake phase: ${context.phase}`);
   }
+
+  const receipt = await runCodexPluginHookSmoke({
+    codexBin,
+    candidateSha: (await defaultRunProcess('git', ['rev-parse', 'HEAD'], {
+      cwd: repositoryRoot, env: process.env,
+    })).stdout.trim(),
+    pluginRoot: repositoryRoot,
+    platform: 'win32',
+    workRoot: root,
+    env: { PATH: process.env.PATH || '', SystemRoot: 'C:\\Windows' },
+    runProcess: fakeRun,
+  });
+  assert.equal(receipt.codex_version, 'codex-cli 0.144.1');
+  assert.equal(receipt.trusted.request_count, 1);
+  assert.equal(receipt.direct_installed_supervisor.stderr_empty, true);
+  assert.deepEqual(receipt.untrusted, {
+    deep_wiki_effect: false,
+    model_continued: true,
+    request_count: 1,
+    mutated: false,
+  });
+  assert.deepEqual(receipt.diagnostic, { variant: 'commandWindows', rootEqual: true, requestCount: 1 });
+  assert.ok(phases.indexOf('trusted-exec') < phases.indexOf('direct-supervisor'));
+  assert.ok(phases.indexOf('untrusted-exec') < phases.indexOf('diagnostic-exec'));
 });
 
-test('surface absence is a stable blocking classification', () => {
-  const fixture = makeFixture();
-  try {
-    assert.throws(
-      () => runCodexPluginHookSmoke({
-        codexBin: fixture.codexBin,
-        codexHome: fixture.codexHome,
-        model: 'gpt-smoke-model',
-        pluginRoot: fixture.pluginRoot,
-        workRoot: fixture.root,
-        env: {},
-        runProcess(file, args, options, context) {
-          if (context.phase === 'version') {
-            return { status: 0, stdout: 'codex-cli 0.144.1\n', stderr: '' };
-          }
-          return { status: 2, stdout: '', stderr: "unrecognized subcommand 'marketplace'" };
-        },
-      }),
-      (error) => error instanceof SmokeError && error.code === 'CODEX_PLUGIN_SURFACE_UNAVAILABLE',
-    );
-  } finally {
-    fs.rmSync(fixture.root, { recursive: true, force: true });
-  }
-});
+function result(status, stdout = '', stderr = '') {
+  const stdoutBuffer = Buffer.from(stdout);
+  const stderrBuffer = Buffer.from(stderr);
+  return { status, signal: null, error: null, stdout, stderr, stdoutBuffer, stderrBuffer };
+}
 
-test('layout construction failure removes only its disposable artifact directory', () => {
-  const fixture = makeFixture();
-  try {
-    const manifestPath = path.join(fixture.pluginRoot, '.codex-plugin', 'plugin.json');
-    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-    manifest.hooks = './hooks/hooks.json';
-    fs.writeFileSync(manifestPath, JSON.stringify(manifest));
-
-    assert.throws(
-      () => runCodexPluginHookSmoke({
-        codexBin: fixture.codexBin,
-        codexHome: fixture.codexHome,
-        model: 'gpt-smoke-model',
-        pluginRoot: fixture.pluginRoot,
-        workRoot: fixture.root,
-        env: {},
-        runProcess() {
-          throw new Error('process seam must not run');
-        },
-      }),
-      (error) => error instanceof SmokeError && error.code === 'CODEX_PLUGIN_MANIFEST_INVALID',
-    );
-    assert.deepEqual(
-      fs.readdirSync(fixture.root).filter((name) => name.startsWith('deep-wiki-codex-smoke-')),
-      [],
-    );
-  } finally {
-    fs.rmSync(fixture.root, { recursive: true, force: true });
-  }
-});
-
-test('version and model failures remain distinct release blockers', () => {
-  const fixture = makeFixture();
-  try {
-    assert.throws(
-      () => runCodexPluginHookSmoke({
-        codexBin: fixture.codexBin,
-        codexHome: fixture.codexHome,
-        model: 'gpt-smoke-model',
-        pluginRoot: fixture.pluginRoot,
-        workRoot: fixture.root,
-        env: {},
-        runProcess() {
-          return { status: 0, stdout: 'codex-cli 0.143.0\n', stderr: '' };
-        },
-      }),
-      (error) => error instanceof SmokeError && error.code === 'CODEX_VERSION_MISMATCH',
-    );
-
-    assert.throws(
-      () => runCodexPluginHookSmoke({
-        codexBin: fixture.codexBin,
-        codexHome: fixture.codexHome,
-        model: 'gpt-smoke-model',
-        pluginRoot: fixture.pluginRoot,
-        workRoot: fixture.root,
-        env: {},
-        runProcess(file, args, options, context) {
-          if (context.phase === 'version') {
-            return { status: 0, stdout: 'codex-cli 0.144.1\n', stderr: '' };
-          }
-          if (context.phase === 'plugin-add') {
-            fs.cpSync(context.layout.marketplacePluginRoot, fixture.installedPath, { recursive: true });
-            return {
-              status: 0,
-              stdout: `${JSON.stringify({
-                pluginId: 'deep-wiki@deep-wiki-smoke',
-                name: 'deep-wiki',
-                marketplaceName: 'deep-wiki-smoke',
-                version: '1.7.1',
-                installedPath: fixture.installedPath,
-              })}\n`,
-              stderr: '',
-            };
-          }
-          if (context.phase === 'trusted-exec') {
-            return { status: 1, stdout: '', stderr: 'configured model is unavailable' };
-          }
-          return { status: 0, stdout: '{}\n', stderr: '' };
-        },
-      }),
-      (error) => error instanceof SmokeError && error.code === 'CODEX_MODEL_UNAVAILABLE',
-    );
-  } finally {
-    fs.rmSync(fixture.root, { recursive: true, force: true });
-  }
-});
+async function requestLoopback(server, hookText) {
+  const response = await fetch(`${server.baseUrl}/responses`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${releaseFixture.public_bearer}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: releaseFixture.model,
+      stream: true,
+      store: false,
+      input: [{ role: 'user', content: hookText }],
+    }),
+  });
+  assert.equal(response.status, 200);
+  await response.text();
+}

@@ -1,0 +1,36 @@
+{
+  "markdown_path": "Vault With Spaces/노트/Windows 검증.md",
+  "markdown_crlf_base64": "LS0tDQp0aXRsZTogV2luZG93cw0KLS0tDQojIOuUpSDsnITtgqQNCg==",
+  "expected_candidates": [
+    "노트/Windows 검증.md"
+  ],
+  "pending_scan": {
+    "format": "canonical-utc-z-newline",
+    "max_age_ms": 60000
+  },
+  "provider_id": "deep-wiki-loopback",
+  "provider_name": "Deep Wiki Loopback",
+  "model": "gpt-5.4-mini",
+  "public_bearer": "deep-wiki-loopback-public-v1",
+  "response_id": "resp_deep_wiki_loopback_001",
+  "message_id": "msg_deep_wiki_loopback_001",
+  "response_text": "DEEP_WIKI_SMOKE_OK",
+  "request": {
+    "method": "POST",
+    "path": "/v1/responses",
+    "content_type": "application/json",
+    "stream": true,
+    "store_not_true": true
+  },
+  "sse_events": [
+    "response.created",
+    "response.in_progress",
+    "response.output_item.added",
+    "response.content_part.added",
+    "response.output_text.delta",
+    "response.output_text.done",
+    "response.content_part.done",
+    "response.output_item.done",
+    "response.completed"
+  ]
+}

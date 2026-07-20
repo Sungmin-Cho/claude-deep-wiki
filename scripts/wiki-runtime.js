@@ -13,6 +13,7 @@ const {
 } = require(path.join(runtimeRoot, 'lock.js'));
 const wikiState = require(path.join(runtimeRoot, 'wiki-state.js'));
 const { sha256 } = require(path.join(runtimeRoot, 'fs-safe.js'));
+const { probeObsidian } = require(path.join(runtimeRoot, 'obsidian-probe.js'));
 
 const HELP = `deep-wiki portable runtime
 
@@ -23,6 +24,7 @@ Usage:
   node scripts/wiki-runtime.js lock release --wiki-root <absolute> --token <token> --json
   node scripts/wiki-runtime.js lock recover --wiki-root <absolute> --stale-ms <integer> [--force] --json
   node scripts/wiki-runtime.js setup --wiki-root <absolute> --config-host <claude|codex> [--replace-config] --json
+  node scripts/wiki-runtime.js probe obsidian --json
   node scripts/wiki-runtime.js snapshot --wiki-root <absolute> --json
   node scripts/wiki-runtime.js commit --wiki-root <absolute> --lock-token <token> --manifest-file <absolute-json> --json
   node scripts/wiki-runtime.js transaction recover --wiki-root <absolute> --lock-token <token> --operation-id <id> --json
@@ -176,6 +178,13 @@ function runSetup(argv) {
   }));
 }
 
+function runProbe(argv) {
+  if (argv[0] !== 'obsidian') throw new UsageError('probe requires the obsidian target');
+  const flags = parseFlags(argv.slice(1), { '--json': 'boolean' });
+  requireFlag(flags, '--json');
+  emit(probeObsidian());
+}
+
 function runSnapshot(argv) {
   const flags = wikiFlags(argv, {});
   emit(wikiState.snapshotWiki({ wikiRoot: flags['--wiki-root'] }));
@@ -269,6 +278,7 @@ function main(argv = process.argv.slice(2)) {
     if (argv[0] === 'config') runConfig(argv.slice(1));
     else if (argv[0] === 'lock') runLock(argv.slice(1));
     else if (argv[0] === 'setup') runSetup(argv.slice(1));
+    else if (argv[0] === 'probe') runProbe(argv.slice(1));
     else if (argv[0] === 'snapshot') runSnapshot(argv.slice(1));
     else if (argv[0] === 'commit') runCommit(argv.slice(1));
     else if (argv[0] === 'transaction') runTransaction(argv.slice(1));

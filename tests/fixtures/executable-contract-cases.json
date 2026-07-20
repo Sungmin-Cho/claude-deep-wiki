@@ -16,19 +16,19 @@
       }
     },
     {
-      "name": "obsidian-availability-probe",
+      "name": "obsidian-runtime-probe",
       "valid": true,
       "file": "skills/wiki-setup/SKILL.md",
-      "allowlist": [],
+      "allowlist": ["probe"],
       "commandCount": 1,
-      "source": "# Procedure\n<!-- deep-wiki:exec -->\n```deep-wiki-exec\n{\"executable\":\"obsidian\",\"argv\":[\"vault\"],\"timeout_ms\":3000}\n```\n"
+      "source": "# Procedure\n<!-- deep-wiki:exec -->\n```deep-wiki-exec\n{\"executable\":\"node\",\"argv\":[\"<plugin_root>/scripts/wiki-runtime.js\",\"probe\",\"obsidian\",\"--json\"]}\n```\n"
     },
     {
-      "name": "misplaced-obsidian-probe",
+      "name": "direct-obsidian-exec",
       "valid": false,
-      "file": "skills/wiki-query/SKILL.md",
-      "allowlist": [],
-      "expectedReason": "OBSIDIAN_PROBE_NOT_ALLOWED",
+      "file": "skills/wiki-setup/SKILL.md",
+      "allowlist": ["probe"],
+      "expectedReason": "EXECUTABLE_NOT_ALLOWED",
       "source": "# Procedure\n<!-- deep-wiki:exec -->\n```deep-wiki-exec\n{\"executable\":\"obsidian\",\"argv\":[\"vault\"],\"timeout_ms\":3000}\n```\n"
     },
     {

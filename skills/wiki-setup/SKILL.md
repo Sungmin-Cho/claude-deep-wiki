@@ -45,14 +45,20 @@ The runtime creates the shared layout, seed page, index envelope, lifecycle
 record, and host configuration atomically. A conflict or invalid path must be
 reported without partially claiming setup succeeded.
 
-3. Optionally probe whether a running Obsidian application exposes its vault.
-   This is the sole direct non-Node executable allowed by Deep Wiki and is
-   read-only. Probe failure is informational and does not invalidate setup.
+3. Optionally probe whether an Obsidian CLI is installed and whether a running
+   Obsidian application exposes its vault. The probe runs inside the portable
+   Node runtime: it searches an absolute `DEEP_WIKI_OBSIDIAN_BIN` override,
+   `PATH` under both binary casings, and well-known per-platform install
+   locations, then launches the candidate read-only with `shell:false` and a
+   bounded timeout. `found` reports CLI presence; `reachable` reports whether
+   the running application answered with its vault. Probe failure is
+   informational and does not invalidate setup.
 
 <!-- deep-wiki:exec -->
 ```deep-wiki-exec
-{"executable":"obsidian","argv":["vault"],"timeout_ms":3000}
+{"executable":"node","argv":["<plugin_root>/scripts/wiki-runtime.js","probe","obsidian","--json"]}
 ```
 
 Report the normalized wiki root, configuration host, created artifacts, and
-whether Obsidian was available. Never expose internal owner tokens.
+whether the Obsidian CLI was found and reachable. Never expose internal owner
+tokens.

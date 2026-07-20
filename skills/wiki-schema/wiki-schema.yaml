@@ -224,8 +224,8 @@ recommended_tools:
       check: "which marp"
     - name: obsidian
       purpose: "Obsidian CLI — search, backlinks, tags, properties via running Obsidian app"
-      check: "obsidian version"
-      note: "Requires Obsidian app to be running. Detected automatically by /wiki-setup."
+      check: "node scripts/wiki-runtime.js probe obsidian --json"
+      note: "Requires Obsidian app to be running. /wiki-setup detects the CLI automatically by searching DEEP_WIKI_OBSIDIAN_BIN, PATH, and well-known install locations."
   obsidian_plugins:
     - name: Dataview
       directory: dataview

@@ -117,7 +117,9 @@ test('shipped command policies reject malformed subcommands and misplaced probes
 
   const probe = '# Procedure\n<!-- deep-wiki:exec -->\n```deep-wiki-exec\n'
     + '{"executable":"obsidian","argv":["vault"],"timeout_ms":3000}\n```\n';
-  assert.ok(validateSkillCommands(
-    'skills/wiki-query/SKILL.md', probe, SKILL_COMMAND_CONTRACTS['wiki-query'],
-  ).violations.some((item) => item.reason === 'OBSIDIAN_PROBE_NOT_ALLOWED'));
+  for (const skill of ['wiki-query', 'wiki-setup']) {
+    assert.ok(validateSkillCommands(
+      `skills/${skill}/SKILL.md`, probe, SKILL_COMMAND_CONTRACTS[skill],
+    ).violations.some((item) => item.reason === 'EXECUTABLE_NOT_ALLOWED'), skill);
+  }
 });

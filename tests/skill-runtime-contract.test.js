@@ -27,14 +27,13 @@ function dataObjects(relative) {
     .map((match) => JSON.parse(match[1]));
 }
 
-test('every shipped entry skill uses only classified Node argv or the one Obsidian probe', () => {
+test('every shipped entry skill uses only classified Node argv', () => {
   for (const [skill, allowlist] of Object.entries(ENTRY_SKILLS)) {
     const relative = `skills/${skill}/SKILL.md`;
     const result = validateSkillCommands(relative, read(relative), allowlist);
     assert.deepEqual(result.violations, [], relative);
     assert.ok(result.commands.length > 0, relative);
-    assert.ok(result.commands.every((command) => command.executable === 'node'
-      || (skill === 'wiki-setup' && command.executable === 'obsidian')));
+    assert.ok(result.commands.every((command) => command.executable === 'node'), relative);
   }
 });
 

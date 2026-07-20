@@ -173,10 +173,6 @@ function matchesCommandContract(argv, contract) {
     : argv[index] === expected);
 }
 
-function isSetupSkill(file) {
-  return String(file).replaceAll('\\', '/').endsWith('/wiki-setup/SKILL.md');
-}
-
 function validateSkillCommands(file, markdown, allowlist) {
   const parsed = parseMarkdownCommands(markdown);
   const violations = [...parsed.violations];
@@ -198,20 +194,6 @@ function validateSkillCommands(file, markdown, allowlist) {
           && !policy.commands.some((contract) => matchesCommandContract(command.argv.slice(1), contract))) {
         violations.push(violation('COMMAND_ARGV_NOT_ALLOWED', command.line, command.column));
       }
-      continue;
-    }
-
-    if (command.executable === 'obsidian') {
-      if (!isSetupSkill(file)) {
-        violations.push(violation('OBSIDIAN_PROBE_NOT_ALLOWED', command.line, command.column));
-        continue;
-      }
-      const valid = command.argv.length === 1
-        && command.argv[0] === 'vault'
-        && Number.isInteger(command.timeout_ms)
-        && command.timeout_ms > 0
-        && command.timeout_ms <= 3000;
-      if (!valid) violations.push(violation('OBSIDIAN_PROBE_INVALID', command.line, command.column));
       continue;
     }
 
@@ -424,10 +406,15 @@ const SKILL_COMMAND_CONTRACTS = {
     ['config', 'resolve', '--json'],
     ['setup', '--wiki-root', null, '--config-host', 'claude', '--json'],
     ['setup', '--wiki-root', null, '--config-host', 'codex', '--json'],
+    ['probe', 'obsidian', '--json'],
   ] },
   'wiki-ingest': { commands: [
     ['config', 'resolve', '--json'],
     ['snapshot', '--wiki-root', null, '--json'],
+    ['obsidian', 'search', '--query', null, '--limit', null, '--json'],
+    ['obsidian', 'search', '--query', null, '--json'],
+    ['obsidian', 'backlinks', '--path', null, '--json'],
+    ['obsidian', 'tags', '--json'],
     ['lock', 'acquire', '--wiki-root', null, '--operation', 'ingest', '--json'],
     ['inbox', 'cleanup', '--wiki-root', null, '--lock-token', null, '--max-age-days', '7', '--json'],
     ['commit', '--wiki-root', null, '--lock-token', null, '--manifest-file', null, '--json'],

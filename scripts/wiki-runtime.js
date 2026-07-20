@@ -13,6 +13,7 @@ const {
 } = require(path.join(runtimeRoot, 'lock.js'));
 const wikiState = require(path.join(runtimeRoot, 'wiki-state.js'));
 const { sha256 } = require(path.join(runtimeRoot, 'fs-safe.js'));
+const { probeObsidian, runObsidian } = require(path.join(runtimeRoot, 'obsidian-probe.js'));
 
 const HELP = `deep-wiki portable runtime
 
@@ -23,6 +24,10 @@ Usage:
   node scripts/wiki-runtime.js lock release --wiki-root <absolute> --token <token> --json
   node scripts/wiki-runtime.js lock recover --wiki-root <absolute> --stale-ms <integer> [--force] --json
   node scripts/wiki-runtime.js setup --wiki-root <absolute> --config-host <claude|codex> [--replace-config] --json
+  node scripts/wiki-runtime.js probe obsidian --json
+  node scripts/wiki-runtime.js obsidian search --query <text> [--limit <n>] --json
+  node scripts/wiki-runtime.js obsidian backlinks --path <vault-note-path> --json
+  node scripts/wiki-runtime.js obsidian tags --json
   node scripts/wiki-runtime.js snapshot --wiki-root <absolute> --json
   node scripts/wiki-runtime.js commit --wiki-root <absolute> --lock-token <token> --manifest-file <absolute-json> --json
   node scripts/wiki-runtime.js transaction recover --wiki-root <absolute> --lock-token <token> --operation-id <id> --json
@@ -176,6 +181,53 @@ function runSetup(argv) {
   }));
 }
 
+function runProbe(argv) {
+  if (argv[0] !== 'obsidian') throw new UsageError('probe requires the obsidian target');
+  const flags = parseFlags(argv.slice(1), { '--json': 'boolean' });
+  requireFlag(flags, '--json');
+  emit(probeObsidian());
+}
+
+function runObsidianBridge(argv) {
+  const subcommand = argv[0];
+  const schemas = {
+    search: { '--query': 'value', '--limit': 'value', '--json': 'boolean' },
+    backlinks: { '--path': 'value', '--json': 'boolean' },
+    tags: { '--json': 'boolean' },
+  };
+  if (!subcommand || !Object.hasOwn(schemas, subcommand)) {
+    throw new UsageError(`obsidian requires one of: ${Object.keys(schemas).join(', ')}`);
+  }
+  const flags = parseFlags(argv.slice(1), schemas[subcommand]);
+  requireFlag(flags, '--json');
+  let limit;
+  if (subcommand === 'search') {
+    requireFlag(flags, '--query');
+    if (flags['--limit'] !== undefined) {
+      if (!/^\d+$/.test(flags['--limit'])) throw new UsageError('--limit must be a nonnegative integer');
+      limit = Number(flags['--limit']);
+    }
+  }
+  if (subcommand === 'backlinks') requireFlag(flags, '--path');
+
+  let obsidianCli = null;
+  try { obsidianCli = resolveConfig(process.env).config.obsidianCli; } catch { obsidianCli = null; }
+  if (obsidianCli && obsidianCli.enabled === false) {
+    emit({
+      ok: false, found: false, executable: null, source: null, format: null, data: null,
+      error: 'obsidian integration is disabled in the resolved configuration',
+    });
+    return;
+  }
+  emit(runObsidian({
+    subcommand,
+    query: flags['--query'],
+    targetPath: flags['--path'],
+    limit,
+    vaultName: obsidianCli ? obsidianCli.vaultName : null,
+  }));
+}
+
 function runSnapshot(argv) {
   const flags = wikiFlags(argv, {});
   emit(wikiState.snapshotWiki({ wikiRoot: flags['--wiki-root'] }));
@@ -269,6 +321,8 @@ function main(argv = process.argv.slice(2)) {
     if (argv[0] === 'config') runConfig(argv.slice(1));
     else if (argv[0] === 'lock') runLock(argv.slice(1));
     else if (argv[0] === 'setup') runSetup(argv.slice(1));
+    else if (argv[0] === 'probe') runProbe(argv.slice(1));
+    else if (argv[0] === 'obsidian') runObsidianBridge(argv.slice(1));
     else if (argv[0] === 'snapshot') runSnapshot(argv.slice(1));
     else if (argv[0] === 'commit') runCommit(argv.slice(1));
     else if (argv[0] === 'transaction') runTransaction(argv.slice(1));

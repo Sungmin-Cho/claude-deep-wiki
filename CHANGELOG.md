@@ -5,6 +5,20 @@ All notable changes to deep-wiki are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.1] — 2026-07-20 (portable Obsidian CLI discovery and ingest integration)
+
+### Added
+
+- `/wiki-ingest` now uses the Obsidian CLI for optional read-only vault context when `/wiki-setup` recorded it. A new runtime bridge (`wiki-runtime.js obsidian search|backlinks|tags --json`) reuses the probe's discovery, targets the configured vault by name, allowlists only read-only subcommands, validates argument values, and launches with `shell:false`, a 10-second kill timeout, and bounded output. The ingest skill gates the calls on the resolved `obsidianCli.enabled` configuration and treats every failure as informational, so ingest behavior is unchanged when Obsidian is absent or disabled; the runtime additionally refuses when the configuration disables Obsidian. The bridge also absorbs an upstream CLI race in which an app-connected command exits 0 with entirely empty output before results stream (observed on roughly one in three searches): a genuine zero-match always prints a message, so a fully empty reply is retried within a fixed bound.
+
+### Fixed
+
+- `/wiki-setup`'s Obsidian availability probe no longer depends on a bare `obsidian` name resolving on the caller's `PATH`. The old direct `{"executable":"obsidian"}` probe only worked when the interactive shell profile happened to put the app directory on `PATH` (and, on macOS, only via case-insensitive matching of the `Obsidian` app binary), so non-interactive hosts — Codex `shell:false` structured exec, hooks, or any environment without the user's profile — reported the CLI missing even with Obsidian 1.12+ installed and running. Discovery now runs inside the portable Node runtime (`wiki-runtime.js probe obsidian --json`): it honors an absolute `DEEP_WIKI_OBSIDIAN_BIN` override, scans `PATH` under both binary casings (with Windows executable extensions), and falls back to well-known per-platform install locations (macOS application bundles, `%LOCALAPPDATA%\Programs\obsidian`, Linux system/flatpak/snap paths). Each candidate launches read-only with `shell:false`, a 3-second kill timeout, and bounded output capture; at most three candidates are spawned. The result distinguishes `found` (a CLI binary exists) from `reachable` (the running app answered with its vault), so setup reports why a probe failed instead of a bare "unavailable".
+
+### Changed
+
+- Shipped skills now contain no direct non-Node executables. The former direct `obsidian` exec block was the sole exception; with it replaced by the Node runtime probe, the executable contract rejects every non-`node` executable in every skill (`EXECUTABLE_NOT_ALLOWED`), and the `wiki-setup` allowlist gains the fixed `['probe','obsidian','--json']` argv contract.
+
 ## [1.8.0] — 2026-07-19 (Node 22 runtime, native Windows hook, and Codex authority)
 
 ### Changed

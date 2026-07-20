@@ -5,6 +5,16 @@ deep-wiki의 주요 변경사항을 기록합니다.
 형식은 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)를 따르며,
 이 프로젝트는 [유의적 버전](https://semver.org/spec/v2.0.0.html)을 준수합니다.
 
+## [1.8.1] — 2026-07-20 (이식 가능한 Obsidian CLI 탐지)
+
+### 수정
+
+- `/wiki-setup`의 Obsidian 가용성 프로브가 더 이상 호출자 `PATH`에서의 bare `obsidian` 이름 해석에 의존하지 않습니다. 기존 직접 `{"executable":"obsidian"}` 프로브는 대화형 셸 프로필이 우연히 앱 디렉터리를 `PATH`에 추가했을 때만 (macOS에서는 `Obsidian` 앱 바이너리의 대소문자 무시 매칭을 통해서만) 동작했기 때문에, 비대화형 호스트 — Codex `shell:false` 구조화 exec, hook, 사용자 프로필이 없는 환경 — 에서는 Obsidian 1.12+가 설치·실행 중이어도 CLI 없음으로 보고됐습니다. 탐지는 이제 이식 가능한 Node runtime(`wiki-runtime.js probe obsidian --json`) 안에서 수행됩니다: 절대경로 `DEEP_WIKI_OBSIDIAN_BIN` override를 우선 확인하고, 두 가지 바이너리 대소문자(및 Windows 실행 확장자)로 `PATH`를 스캔한 뒤, 플랫폼별 잘 알려진 설치 경로(macOS 애플리케이션 번들, `%LOCALAPPDATA%\Programs\obsidian`, Linux system/flatpak/snap 경로)로 폴백합니다. 각 후보는 `shell:false`, 3초 kill timeout, 바운드된 출력 캡처로 읽기 전용 실행되며 최대 3개 후보만 spawn합니다. 결과는 `found`(CLI 바이너리 존재)와 `reachable`(실행 중인 앱이 vault로 응답)를 구분하므로, setup이 단순 "unavailable" 대신 프로브 실패 이유를 보고합니다.
+
+### 변경
+
+- 배포 스킬에 더 이상 직접 non-Node 실행 파일이 없습니다. 기존 직접 `obsidian` exec 블록이 유일한 예외였고, 이를 Node runtime 프로브로 교체하면서 executable contract는 모든 스킬에서 모든 non-`node` 실행 파일을 거부하며(`EXECUTABLE_NOT_ALLOWED`), `wiki-setup` allowlist에 고정 `['probe','obsidian','--json']` argv contract가 추가됐습니다.
+
 ## [1.8.0] — 2026-07-19 (Node 22 runtime, 네이티브 Windows hook, Codex 검증)
 
 ### 변경

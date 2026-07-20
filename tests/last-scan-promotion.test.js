@@ -56,7 +56,7 @@ test('ingest routes promotion and failure through classified Node runtime calls'
   const file = 'skills/wiki-ingest/SKILL.md';
   const text = fs.readFileSync(path.resolve(__dirname, '..', file), 'utf8');
   const result = validateSkillCommands(file, text, [
-    'config', 'inbox', 'snapshot', 'lock', 'commit', 'scan-window', 'transaction',
+    'config', 'inbox', 'snapshot', 'lock', 'commit', 'scan-window', 'transaction', 'obsidian',
   ]);
   assert.deepEqual(result.violations, []);
   const scanCommands = result.commands.filter((command) => command.argv[1] === 'scan-window');

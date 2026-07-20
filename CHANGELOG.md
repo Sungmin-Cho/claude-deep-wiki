@@ -5,7 +5,11 @@ All notable changes to deep-wiki are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.8.1] — 2026-07-20 (portable Obsidian CLI discovery)
+## [1.8.1] — 2026-07-20 (portable Obsidian CLI discovery and ingest integration)
+
+### Added
+
+- `/wiki-ingest` now uses the Obsidian CLI for optional read-only vault context when `/wiki-setup` recorded it. A new runtime bridge (`wiki-runtime.js obsidian search|backlinks|tags --json`) reuses the probe's discovery, targets the configured vault by name, allowlists only read-only subcommands, validates argument values, and launches with `shell:false`, a 10-second kill timeout, and bounded output. The ingest skill gates the calls on the resolved `obsidianCli.enabled` configuration and treats every failure as informational, so ingest behavior is unchanged when Obsidian is absent or disabled; the runtime additionally refuses when the configuration disables Obsidian. The bridge also absorbs an upstream CLI race in which an app-connected command exits 0 with entirely empty output before results stream (observed on roughly one in three searches): a genuine zero-match always prints a message, so a fully empty reply is retried within a fixed bound.
 
 ### Fixed
 

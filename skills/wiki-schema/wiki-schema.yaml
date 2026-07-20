@@ -225,7 +225,7 @@ recommended_tools:
     - name: obsidian
       purpose: "Obsidian CLI — search, backlinks, tags, properties via running Obsidian app"
       check: "node scripts/wiki-runtime.js probe obsidian --json"
-      note: "Requires Obsidian app to be running. /wiki-setup detects the CLI automatically by searching DEEP_WIKI_OBSIDIAN_BIN, PATH, and well-known install locations."
+      note: "Requires Obsidian app to be running. /wiki-setup detects the CLI automatically by searching DEEP_WIKI_OBSIDIAN_BIN, PATH, and well-known install locations; when enabled in configuration, /wiki-ingest uses the read-only search/backlinks/tags bridge for vault context."
   obsidian_plugins:
     - name: Dataview
       directory: dataview

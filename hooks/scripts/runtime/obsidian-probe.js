@@ -5,9 +5,14 @@ const nodeFs = require('node:fs');
 const path = require('node:path');
 
 const PROBE_TIMEOUT_MS = 3000;
+const BRIDGE_TIMEOUT_MS = 10000;
 const MAX_PROBE_SPAWNS = 3;
 const MAX_PROBE_OUTPUT_BYTES = 64 * 1024;
+const BRIDGE_MAX_OUTPUT_BYTES = 512 * 1024;
 const MAX_ERROR_CHARS = 200;
+const MAX_BRIDGE_VALUE_CHARS = 512;
+const BRIDGE_SUBCOMMANDS = new Set(['search', 'backlinks', 'tags']);
+const MAX_EMPTY_RETRIES = 2;
 const POSIX_BINARY_NAMES = ['obsidian', 'Obsidian'];
 const WINDOWS_BINARY_NAMES = ['obsidian.exe', 'Obsidian.exe', 'obsidian.cmd', 'obsidian.bat'];
 
@@ -109,43 +114,30 @@ function firstErrorLine(spawnResult) {
   return `exit status ${spawnResult.status}`;
 }
 
-function probeObsidian(options = {}) {
-  const env = options.env || process.env;
-  const platform = options.platform || process.platform;
-  const exists = options.exists || nodeFs.existsSync;
-  const spawnSync = options.spawnSync || childProcess.spawnSync;
-  const timeoutMs = options.timeoutMs || PROBE_TIMEOUT_MS;
+function spawnBounded(spawnSync, executable, argv, timeoutMs, maxBuffer) {
+  try {
+    return spawnSync(executable, argv, {
+      shell: false,
+      timeout: timeoutMs,
+      killSignal: 'SIGKILL',
+      encoding: 'utf8',
+      maxBuffer,
+      windowsHide: true,
+    });
+  } catch (error) {
+    return { status: null, stdout: '', stderr: '', error };
+  }
+}
 
-  const candidates = discoverCandidates({ env, platform, exists });
+function runCandidates({ candidates, argv, spawnSync, timeoutMs, maxBuffer }) {
   let checked = 0;
   let firstFailure = null;
-
   for (const candidate of candidates) {
     if (checked >= MAX_PROBE_SPAWNS) break;
     checked += 1;
-    let result;
-    try {
-      result = spawnSync(candidate.executable, ['vault'], {
-        shell: false,
-        timeout: timeoutMs,
-        killSignal: 'SIGKILL',
-        encoding: 'utf8',
-        maxBuffer: MAX_PROBE_OUTPUT_BYTES,
-        windowsHide: true,
-      });
-    } catch (error) {
-      result = { status: null, stdout: '', stderr: '', error };
-    }
+    const result = spawnBounded(spawnSync, candidate.executable, argv, timeoutMs, maxBuffer);
     if (result.status === 0 && !result.error) {
-      return {
-        found: true,
-        reachable: true,
-        executable: candidate.executable,
-        source: candidate.source,
-        vault: parseVaultOutput(result.stdout),
-        error: null,
-        candidatesChecked: checked,
-      };
+      return { success: true, candidate, stdout: result.stdout, checked, firstFailure };
     }
     if (!firstFailure) {
       firstFailure = {
@@ -154,6 +146,36 @@ function probeObsidian(options = {}) {
         error: firstErrorLine(result),
       };
     }
+  }
+  return { success: false, candidate: null, stdout: '', checked, firstFailure };
+}
+
+function probeObsidian(options = {}) {
+  const env = options.env || process.env;
+  const platform = options.platform || process.platform;
+  const exists = options.exists || nodeFs.existsSync;
+  const spawnSync = options.spawnSync || childProcess.spawnSync;
+  const timeoutMs = options.timeoutMs || PROBE_TIMEOUT_MS;
+
+  const run = runCandidates({
+    candidates: discoverCandidates({ env, platform, exists }),
+    argv: ['vault'],
+    spawnSync,
+    timeoutMs,
+    maxBuffer: MAX_PROBE_OUTPUT_BYTES,
+  });
+  const checked = run.checked;
+  const firstFailure = run.firstFailure;
+  if (run.success) {
+    return {
+      found: true,
+      reachable: true,
+      executable: run.candidate.executable,
+      source: run.candidate.source,
+      vault: parseVaultOutput(run.stdout),
+      error: null,
+      candidatesChecked: checked,
+    };
   }
 
   if (firstFailure) {
@@ -178,9 +200,112 @@ function probeObsidian(options = {}) {
   };
 }
 
+function usageError(message) {
+  return Object.assign(new Error(message), { code: 'USAGE' });
+}
+
+function safeBridgeValue(name, value) {
+  if (typeof value !== 'string' || value.trim() === '') throw usageError(`${name} must be a nonempty string`);
+  if (value.length > MAX_BRIDGE_VALUE_CHARS) throw usageError(`${name} exceeds ${MAX_BRIDGE_VALUE_CHARS} characters`);
+  if (/[\0\r\n]/.test(value)) throw usageError(`${name} must not contain control characters`);
+  return value;
+}
+
+function bridgeArgv(options) {
+  const subcommand = options.subcommand;
+  if (!BRIDGE_SUBCOMMANDS.has(subcommand)) {
+    throw usageError(`unsupported obsidian subcommand: ${String(subcommand)}`);
+  }
+  const argv = [];
+  if (subcommand === 'search') {
+    argv.push('search', `query=${safeBridgeValue('--query', options.query)}`);
+    const limit = options.limit === undefined ? 20 : options.limit;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw usageError('--limit must be an integer between 1 and 100');
+    }
+    argv.push(`limit=${limit}`, 'format=json');
+  } else if (subcommand === 'backlinks') {
+    argv.push('backlinks', `path=${safeBridgeValue('--path', options.targetPath)}`, 'format=json');
+  } else {
+    argv.push('tags', 'counts', 'format=json');
+  }
+  if (options.vaultName !== undefined && options.vaultName !== null) {
+    argv.push(`vault=${safeBridgeValue('vault name', options.vaultName)}`);
+  }
+  return argv;
+}
+
+function runObsidian(options = {}) {
+  const env = options.env || process.env;
+  const platform = options.platform || process.platform;
+  const exists = options.exists || nodeFs.existsSync;
+  const spawnSync = options.spawnSync || childProcess.spawnSync;
+  const timeoutMs = options.timeoutMs || BRIDGE_TIMEOUT_MS;
+
+  const argv = bridgeArgv(options);
+  const run = runCandidates({
+    candidates: discoverCandidates({ env, platform, exists }),
+    argv,
+    spawnSync,
+    timeoutMs,
+    maxBuffer: BRIDGE_MAX_OUTPUT_BYTES,
+  });
+  if (run.success) {
+    let stdout = run.stdout;
+    // The app-connected CLI occasionally exits 0 with no output at all before
+    // results stream in; a genuine zero-match always prints a message, so an
+    // entirely empty reply is retried within a fixed bound.
+    for (let retry = 0; stdout.trim() === '' && retry < MAX_EMPTY_RETRIES; retry += 1) {
+      const again = spawnBounded(spawnSync, run.candidate.executable, argv, timeoutMs, BRIDGE_MAX_OUTPUT_BYTES);
+      if (again.status !== 0 || again.error) break;
+      stdout = again.stdout;
+    }
+    let format = 'text';
+    let data = stdout.trim();
+    if (argv.includes('format=json')) {
+      try {
+        data = JSON.parse(stdout);
+        format = 'json';
+      } catch {
+        format = 'text';
+      }
+    }
+    return {
+      ok: true,
+      found: true,
+      executable: run.candidate.executable,
+      source: run.candidate.source,
+      format,
+      data,
+      error: null,
+    };
+  }
+  if (run.firstFailure) {
+    return {
+      ok: false,
+      found: true,
+      executable: run.firstFailure.executable,
+      source: run.firstFailure.source,
+      format: null,
+      data: null,
+      error: run.firstFailure.error,
+    };
+  }
+  return {
+    ok: false,
+    found: false,
+    executable: null,
+    source: null,
+    format: null,
+    data: null,
+    error: 'obsidian CLI not found',
+  };
+}
+
 module.exports = {
   PROBE_TIMEOUT_MS,
   discoverCandidates,
   parseVaultOutput,
   probeObsidian,
+  runObsidian,
 };

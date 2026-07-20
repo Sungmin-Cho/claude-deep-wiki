@@ -411,6 +411,10 @@ const SKILL_COMMAND_CONTRACTS = {
   'wiki-ingest': { commands: [
     ['config', 'resolve', '--json'],
     ['snapshot', '--wiki-root', null, '--json'],
+    ['obsidian', 'search', '--query', null, '--limit', null, '--json'],
+    ['obsidian', 'search', '--query', null, '--json'],
+    ['obsidian', 'backlinks', '--path', null, '--json'],
+    ['obsidian', 'tags', '--json'],
     ['lock', 'acquire', '--wiki-root', null, '--operation', 'ingest', '--json'],
     ['inbox', 'cleanup', '--wiki-root', null, '--lock-token', null, '--max-age-days', '7', '--json'],
     ['commit', '--wiki-root', null, '--lock-token', null, '--manifest-file', null, '--json'],

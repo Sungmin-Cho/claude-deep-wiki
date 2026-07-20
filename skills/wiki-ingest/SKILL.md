@@ -38,6 +38,33 @@ or a source that cannot be read. An unchanged hash may be skipped only when its
 pages, provenance, and last terminal lifecycle record are intact; otherwise
 perform an ingest repair.
 
+### Obsidian-assisted context (optional)
+
+When the resolved configuration reports `obsidianCli.enabled: true`, the caller
+may enrich analysis with read-only vault context served by the running Obsidian
+application through the portable runtime bridge: find merge candidates beyond
+the changed files, discover notes referencing an ingested source, and align new
+page tags with the existing taxonomy. The bridge targets the configured vault,
+allows only read-only subcommands, bounds output and timeout, and refuses when
+the configuration disables Obsidian. Every call is optional and every failure
+is informational — fall back to direct file reads and never block, fail, or
+alter ingest state because of it.
+
+<!-- deep-wiki:exec -->
+```deep-wiki-exec
+{"executable":"node","argv":["<plugin_root>/scripts/wiki-runtime.js","obsidian","search","--query","QUERY_TEXT","--limit","20","--json"]}
+```
+
+<!-- deep-wiki:exec -->
+```deep-wiki-exec
+{"executable":"node","argv":["<plugin_root>/scripts/wiki-runtime.js","obsidian","backlinks","--path","VAULT_NOTE_PATH","--json"]}
+```
+
+<!-- deep-wiki:exec -->
+```deep-wiki-exec
+{"executable":"node","argv":["<plugin_root>/scripts/wiki-runtime.js","obsidian","tags","--json"]}
+```
+
 ## 2. Host routing
 
 Both hosts use identical page-plan and manifest schemas.

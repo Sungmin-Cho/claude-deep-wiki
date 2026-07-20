@@ -8,6 +8,7 @@ const {
   discoverCandidates,
   parseVaultOutput,
   probeObsidian,
+  runObsidian,
 } = require('../hooks/scripts/runtime/obsidian-probe.js');
 
 function existsIn(paths) {
@@ -176,6 +177,159 @@ test('probe reports not found when no candidate exists anywhere', () => {
     error: null,
     candidatesChecked: 0,
   });
+});
+
+test('bridge search targets the configured vault and parses JSON output', () => {
+  const bundled = '/Applications/Obsidian.app/Contents/MacOS/Obsidian';
+  const calls = [];
+  const result = runObsidian({
+    subcommand: 'search',
+    query: 'deep wiki philosophy',
+    limit: 20,
+    vaultName: 'Personal Vault',
+    env: { PATH: '', HOME: '/Users/tester' },
+    platform: 'darwin',
+    exists: existsIn([bundled]),
+    spawnSync: (executable, argv, options) => {
+      calls.push({ executable, argv, options });
+      return { status: 0, stdout: '[{"path":"pages/llm-wiki.md","score":1}]', stderr: '' };
+    },
+  });
+  assert.deepEqual(calls[0].argv, [
+    'search', 'query=deep wiki philosophy', 'limit=20', 'format=json', 'vault=Personal Vault',
+  ]);
+  assert.equal(calls[0].options.shell, false);
+  assert.equal(calls[0].options.timeout, 10000);
+  assert.deepEqual(result, {
+    ok: true,
+    found: true,
+    executable: bundled,
+    source: 'well-known',
+    format: 'json',
+    data: [{ path: 'pages/llm-wiki.md', score: 1 }],
+    error: null,
+  });
+});
+
+test('bridge backlinks and tags build read-only argv without vault when unconfigured', () => {
+  const bundled = '/Applications/Obsidian.app/Contents/MacOS/Obsidian';
+  const argvSeen = [];
+  const options = {
+    env: { PATH: '', HOME: '/Users/tester' },
+    platform: 'darwin',
+    exists: existsIn([bundled]),
+    spawnSync: (executable, argv) => {
+      argvSeen.push(argv);
+      return { status: 0, stdout: '[]', stderr: '' };
+    },
+  };
+  runObsidian({ ...options, subcommand: 'backlinks', targetPath: 'NOTES/2026-07-13 Daily.md' });
+  runObsidian({ ...options, subcommand: 'tags' });
+  assert.deepEqual(argvSeen[0], ['backlinks', 'path=NOTES/2026-07-13 Daily.md', 'format=json']);
+  assert.deepEqual(argvSeen[1], ['tags', 'counts', 'format=json']);
+});
+
+test('bridge falls back to raw text when JSON output does not parse', () => {
+  const bundled = '/Applications/Obsidian.app/Contents/MacOS/Obsidian';
+  const result = runObsidian({
+    subcommand: 'tags',
+    env: { PATH: '', HOME: '/Users/tester' },
+    platform: 'darwin',
+    exists: existsIn([bundled]),
+    spawnSync: () => ({ status: 0, stdout: '#news\t12\n#daily\t9\n', stderr: '' }),
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.format, 'text');
+  assert.equal(result.data, '#news\t12\n#daily\t9');
+});
+
+test('bridge reports found-but-unreachable and not-found failures distinctly', () => {
+  const bundled = '/Applications/Obsidian.app/Contents/MacOS/Obsidian';
+  const unreachable = runObsidian({
+    subcommand: 'tags',
+    env: { PATH: '', HOME: '/Users/tester' },
+    platform: 'darwin',
+    exists: existsIn([bundled]),
+    spawnSync: () => ({ status: 1, stdout: '', stderr: 'Error: no running Obsidian app\n' }),
+  });
+  assert.equal(unreachable.ok, false);
+  assert.equal(unreachable.found, true);
+  assert.match(unreachable.error, /no running Obsidian app/);
+  const missing = runObsidian({
+    subcommand: 'tags',
+    env: { PATH: '/usr/bin', HOME: '/Users/tester' },
+    platform: 'linux',
+    exists: () => false,
+    spawnSync: () => { throw new Error('must not spawn'); },
+  });
+  assert.deepEqual(missing, {
+    ok: false,
+    found: false,
+    executable: null,
+    source: null,
+    format: null,
+    data: null,
+    error: 'obsidian CLI not found',
+  });
+});
+
+test('bridge retries a successful-but-empty reply and returns the late data', () => {
+  const bundled = '/Applications/Obsidian.app/Contents/MacOS/Obsidian';
+  let spawns = 0;
+  const result = runObsidian({
+    subcommand: 'search',
+    query: '경제 뉴스',
+    env: { PATH: '', HOME: '/Users/tester' },
+    platform: 'darwin',
+    exists: existsIn([bundled]),
+    spawnSync: () => {
+      spawns += 1;
+      return spawns < 3
+        ? { status: 0, stdout: '', stderr: '' }
+        : { status: 0, stdout: '["a.md"]', stderr: '' };
+    },
+  });
+  assert.equal(spawns, 3);
+  assert.equal(result.ok, true);
+  assert.equal(result.format, 'json');
+  assert.deepEqual(result.data, ['a.md']);
+});
+
+test('bridge stops after bounded retries when the reply stays empty', () => {
+  const bundled = '/Applications/Obsidian.app/Contents/MacOS/Obsidian';
+  let spawns = 0;
+  const result = runObsidian({
+    subcommand: 'search',
+    query: 'anything',
+    env: { PATH: '', HOME: '/Users/tester' },
+    platform: 'darwin',
+    exists: existsIn([bundled]),
+    spawnSync: () => {
+      spawns += 1;
+      return { status: 0, stdout: '', stderr: '' };
+    },
+  });
+  assert.equal(spawns, 3);
+  assert.equal(result.ok, true);
+  assert.equal(result.format, 'text');
+  assert.equal(result.data, '');
+});
+
+test('bridge rejects unsafe values, bad limits, and unknown subcommands as usage errors', () => {
+  const base = {
+    env: { PATH: '', HOME: '/Users/tester' },
+    platform: 'darwin',
+    exists: () => true,
+    spawnSync: () => { throw new Error('must not spawn'); },
+  };
+  const usage = (callback) => assert.throws(callback, (error) => error.code === 'USAGE');
+  usage(() => runObsidian({ ...base, subcommand: 'delete', targetPath: 'a.md' }));
+  usage(() => runObsidian({ ...base, subcommand: 'search', query: 'line\nbreak' }));
+  usage(() => runObsidian({ ...base, subcommand: 'search', query: 'x'.repeat(600) }));
+  usage(() => runObsidian({ ...base, subcommand: 'search', query: 'ok', limit: 0 }));
+  usage(() => runObsidian({ ...base, subcommand: 'search', query: 'ok', limit: 101 }));
+  usage(() => runObsidian({ ...base, subcommand: 'backlinks' }));
+  usage(() => runObsidian({ ...base, subcommand: 'search', query: 'ok', vaultName: 'bad\rname' }));
 });
 
 test('probe spawns at most three candidates', () => {

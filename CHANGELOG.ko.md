@@ -5,7 +5,11 @@ deep-wiki의 주요 변경사항을 기록합니다.
 형식은 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)를 따르며,
 이 프로젝트는 [유의적 버전](https://semver.org/spec/v2.0.0.html)을 준수합니다.
 
-## [1.8.1] — 2026-07-20 (이식 가능한 Obsidian CLI 탐지)
+## [1.8.1] — 2026-07-20 (이식 가능한 Obsidian CLI 탐지 및 ingest 통합)
+
+### 추가
+
+- `/wiki-setup`이 Obsidian을 기록해 둔 경우, `/wiki-ingest`가 이제 선택적 읽기 전용 vault 컨텍스트에 Obsidian CLI를 사용합니다. 새 runtime 브리지(`wiki-runtime.js obsidian search|backlinks|tags --json`)는 프로브와 같은 탐색 로직을 재사용하고, 설정된 vault를 이름으로 타게팅하며, 읽기 전용 서브커맨드만 허용하고, 인자 값을 검증하며, `shell:false` + 10초 kill timeout + 바운드된 출력으로 실행합니다. ingest 스킬은 resolve된 `obsidianCli.enabled` 설정으로 호출을 게이팅하고 모든 실패를 정보성으로 취급하므로, Obsidian이 없거나 비활성화된 환경에서 ingest 동작은 변하지 않습니다. runtime도 설정이 Obsidian을 비활성화하면 호출을 거부합니다. 또한 브리지는 앱 연결 명령이 결과 스트리밍 전에 exit 0 + 완전 빈 출력으로 종료되는 업스트림 CLI 레이스(검색 약 3회 중 1회 관측)를 흡수합니다: 진짜 무결과는 항상 메시지를 출력하므로, 완전히 빈 응답만 고정 한도 내에서 재시도합니다.
 
 ### 수정
 

@@ -308,7 +308,8 @@ function exitCode(error) {
   if (error.code === 'CONFIG_CONFLICT' || error.code === 'CONFIG_TARGET_CONFLICT'
       || error.code === 'CONFIG_NOT_FOUND' || error.code === 'CONFIG_INVALID'
       || error.code === 'LOCK_INVALID' || error.code === 'MANIFEST_INVALID'
-      || error.code === 'EXPECTED_HASH_CONFLICT' || error.code === 'WIKI_STATE_INVALID') return 4;
+      || error.code === 'EXPECTED_HASH_CONFLICT' || error.code === 'TRANSACTION_CANCELLED'
+      || error.code === 'WIKI_STATE_INVALID') return 4;
   return 5;
 }
 

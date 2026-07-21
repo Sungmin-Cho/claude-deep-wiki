@@ -5,6 +5,25 @@ deep-wiki의 주요 변경사항을 기록합니다.
 형식은 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)를 따르며,
 이 프로젝트는 [유의적 버전](https://semver.org/spec/v2.0.0.html)을 준수합니다.
 
+## [1.9.0] — 2026-07-21 (커밋 deadline 스케일링 — hash-only catalog seal + crash-safe cancel)
+
+### 수정
+
+- 대형 vault에서 `wiki-runtime commit`이 단일 논리 커밋을 여러 번의 `transaction recover` 호출로 쪼개던 문제를 해결했습니다 ([#30](https://github.com/Sungmin-Cho/claude-deep-wiki/issues/30) Issue 2). per-commit 비용이 diff가 아니라 카탈로그 크기에 비례했습니다: `buildPlan`이 미변경 page/version/source를 전부 full-byte `before==after` 아티팩트로 seal해서 journal(`atomicWriteFile`의 fsync로 최대 ~14회 재영속)과 staging(2N fsync 쓰기)을 부풀렸고, 이 구간에 deadline 체크가 없어 고정 12초 예산이 staging에서 소진된 뒤 `wiki-state:publish:versions`에서 오해를 부르며 터졌습니다. 이제 미변경 파일은 hash-only `catalog_seal`(`{relative_path, sha256}`)로 기록되어 journal 영속화와 staging이 O(diff)로 떨어지고, 실측된 590·~1,406 페이지 케이스가 단일 커밋에서 12초 안에 여유 있게 완료됩니다.
+
+### 변경
+
+- journal `contract_version`을 1 → 2로 올렸습니다(`catalog_seal`, `catalog_seal_sha256`, `catalog_seal_cursor` 추가). `validateJournal`이 레거시 v1 또는 v2 exact-key journal을 모두 수용하므로, 업그레이드 전 중단된 v1.8.x 커밋은 원래 의미론대로 recover되고, v1.9 in-flight journal은 v1.8.x가 거부합니다(backup-only downgrade — `CLAUDE.md`의 갱신된 안전 경계 참조). receipt 형상과 성공 result 형상은 무변경입니다.
+- drift 대응을 cancel-only로 전환했습니다. 재개형 drift 스캔이 커밋 도중 미변경 카탈로그 파일의 변경/삭제를 감지하면, transaction을 crash-safe하게 해체하고(tombstone-before-destruction: durable한 `cancelled.json` 결정점이 모든 파괴적 단계보다 먼저) `TRANSACTION_CANCELLED`(exit 4, receipt 없음)로 종료합니다 — 낡은 파생 index를 커밋하지 않습니다. fail-before-stale-publication 속성은 보존되고, 동시 외부 편집을 clobber할 수 있던 기존 전체 스냅샷 복원은 cooperative-writer 계약 하의 데이터 안전성 개선으로 의도적으로 폐기했습니다. Source provenance는 커밋-시점 / 무증폭 보장으로 재정의했습니다.
+
+### 추가
+
+- journal-first 원자적 트랜잭션 활성화: 트랜잭션 디렉터리는 journal이 존재할 때만 reader에게 보입니다(`.activate-<pid>-<uuid>/` 아래에 만든 뒤 `renameSync`). "journal 없음 ⟹ 살아있지 않음"이 프로토콜 불변식이 되어 lock-free reader가 살아있는 pre-journal writer를 잔해로 오인할 수 없습니다. 유계·lock-보유·deadline-aware `sweepTransactionDebris`(공유 leaf 모듈 `hooks/scripts/runtime/transaction-debris.js`)가 버려진 활성화/트랜잭션 잔해를 reader 차단 없이 수렴시키며 journal 보유 디렉터리는 절대 건드리지 않습니다. 그 외: stage/verify/publish 전반의 per-artifact 재개형 deadline checkpoint, commit·recover 공유 lock-owner-guarded runtime-manifest 정리, `DEADLINE_EXCEEDED` 출력에 붙는 `transaction recover` 재개 힌트.
+
+### 리뷰
+
+- 설계는 6라운드 크로스모델 리뷰 루프(Claude Opus + Codex, adversarial 패스 포함)로 수렴했으며, cancel/tombstone crash-safety 행렬과 journal-first 활성화 불변식을 reader-race·부분-teardown 엣지에 대해 강화했습니다. 구현은 gpt-5.6-sol이 수행했고, 모든 커밋이 스위트 green을 유지했습니다.
+
 ## [1.8.2] — 2026-07-21 (Windows st_dev 비대칭으로 인한 atomic write·lock 획득 실패 수정)
 
 ### 수정

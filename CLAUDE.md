@@ -38,6 +38,10 @@ For detailed change history see [`CHANGELOG.md`](CHANGELOG.md) / [`CHANGELOG.ko.
   arbitrary-user-machine, or OS-level no-egress certification.
 - After any 1.8 write, only a backup-only downgrade is supported: stop every host,
   recover with 1.8, restore the authenticated pre-upgrade backup, then start 1.7.1.
+- After any 1.9 write, only a backup-only downgrade is supported: stop every host,
+  recover with 1.9, restore the authenticated pre-upgrade backup, then start 1.8.2.
+  1.9 writes an in-flight journal at `contract_version` 2 that 1.8.x cannot recover,
+  so an interrupted 1.9 commit must be completed with 1.9 before any downgrade.
 
 ---
 
@@ -176,7 +180,7 @@ deep-wiki/
 - **`pages_created` exactly-once across the log** — every page filename appears in `pages_created` arrays at most once across the entire log history. `ingest-repair` is exempt because it always emits `pages_created:[]` (lifecycle restoration ≠ creation).
 - **`.last-scan` monotonic** — never moves backward.
 - **Lock atomicity** — single-writer guaranteed by `mkdir <wiki>/.wiki-meta/.wiki-lock`.
-- **Source provenance** — every `sources:` slug in a page's frontmatter has a corresponding `<wiki>/.wiki-meta/sources/<slug>.yaml` file on disk.
+- **Source provenance (commit-time, no-compounding)** — every `sources:` slug that a commit introduces or updates has a corresponding `<wiki>/.wiki-meta/sources/<slug>.yaml` file at commit time. Out-of-band deletion of an unchanged source's YAML mid-commit is preserved (never clobbered) and cancels the in-flight commit (`TRANSACTION_CANCELLED`) rather than compounding stale provenance; `/wiki-lint` surfaces it as `MISSING_SOURCE`. Commits never build derived state on stale provenance.
 
 ---
 

@@ -926,6 +926,52 @@ test('unchanged-source deletion cancels; provenance is never built upon', () => 
   withLock(root, (token) => applyCommit({ wikiRoot: root, token, manifest: value, now: new Date(TS) }));
 });
 
+test('transaction recover removes the recovered operation\'s runtime manifest under lock', () => {
+  const root = fixture('deep wiki runtime manifest recover cleanup ');
+  const runtimeDirectory = path.join(root, '.wiki-meta', '.runtime');
+  fs.mkdirSync(runtimeDirectory, { recursive: true });
+  const targetManifest = path.join(runtimeDirectory, `${OPERATION_ID}.json`);
+  const unrelatedManifest = path.join(runtimeDirectory, 'unrelated-op.json');
+  const strayFile = path.join(runtimeDirectory, 'not-json.txt');
+  fs.writeFileSync(targetManifest, JSON.stringify({ operation_id: OPERATION_ID }));
+  fs.writeFileSync(unrelatedManifest, JSON.stringify({ operation_id: 'unrelated-operation-id' }));
+  fs.writeFileSync(strayFile, 'not json\n');
+  stageInterrupted(root, manifest());
+  const owner = acquireLock({ wikiRoot: root, operation: 'runtime-cleanup-recover', now: new Date(TS) });
+  try {
+    const recovered = spawnSync(process.execPath, [
+      cli, 'transaction', 'recover', '--wiki-root', root, '--lock-token', owner.token,
+      '--operation-id', OPERATION_ID, '--json',
+    ], { encoding: 'utf8', shell: false });
+    assert.equal(recovered.status, 0, recovered.stderr);
+  } finally { releaseLock({ wikiRoot: root, token: owner.token }); }
+  assert.equal(fs.existsSync(targetManifest), false);
+  assert.equal(fs.existsSync(unrelatedManifest), true);
+  assert.equal(fs.existsSync(strayFile), true);
+});
+
+test('cleanup helper refuses under a replaced lock owner', () => {
+  const { cleanupRuntimeManifests } = require('../scripts/wiki-runtime.js');
+  const root = fixture('deep wiki runtime cleanup lock seizure ');
+  const runtimeDirectory = path.join(root, '.wiki-meta', '.runtime');
+  fs.mkdirSync(runtimeDirectory, { recursive: true });
+  const targetManifest = path.join(runtimeDirectory, `${OPERATION_ID}.json`);
+  fs.writeFileSync(targetManifest, JSON.stringify({ operation_id: OPERATION_ID }));
+  const owner = acquireLock({ wikiRoot: root, operation: 'runtime-cleanup-direct', now: new Date(TS) });
+  cleanupRuntimeManifests(root, owner.token, OPERATION_ID);
+  assert.equal(fs.existsSync(targetManifest), false);
+
+  fs.writeFileSync(targetManifest, JSON.stringify({ operation_id: OPERATION_ID }));
+  const ownerPath = path.join(root, '.wiki-meta', '.wiki-lock', 'owner.json');
+  const seized = { ...JSON.parse(fs.readFileSync(ownerPath, 'utf8')), token: 'f'.repeat(64) };
+  fs.writeFileSync(ownerPath, `${JSON.stringify(seized)}\n`);
+  assert.throws(
+    () => cleanupRuntimeManifests(root, owner.token, OPERATION_ID),
+    (error) => error.code === 'LOCK_TOKEN_MISMATCH',
+  );
+  assert.equal(fs.existsSync(targetManifest), true);
+});
+
 test('supported readers block on a nonterminal shared scan-window journal', () => {
   const { snapshotWiki } = require(statePath);
   const root = fixture('deep wiki scan reader block ');

@@ -10,6 +10,7 @@ const {
   acquireLock,
   releaseLock,
   recoverLock,
+  assertLockOwner,
 } = require(path.join(runtimeRoot, 'lock.js'));
 const wikiState = require(path.join(runtimeRoot, 'wiki-state.js'));
 const { sha256 } = require(path.join(runtimeRoot, 'fs-safe.js'));
@@ -233,27 +234,71 @@ function runSnapshot(argv) {
   emit(wikiState.snapshotWiki({ wikiRoot: flags['--wiki-root'] }));
 }
 
+function cleanupRuntimeManifests(wikiRoot, token, operationId) {
+  const root = path.resolve(wikiRoot);
+  const directory = path.join(root, '.wiki-meta', '.runtime');
+  assertLockOwner({ wikiRoot: root, token });
+  let entries;
+  try {
+    entries = fs.readdirSync(directory, { withFileTypes: true });
+  } catch (error) {
+    if (error.code === 'ENOENT') return;
+    throw error;
+  }
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    const file = path.join(directory, entry.name);
+    let parsed;
+    try {
+      parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch {
+      continue;
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || parsed.operation_id !== operationId) continue;
+    assertLockOwner({ wikiRoot: root, token });
+    fs.rmSync(file, { force: true });
+    assertLockOwner({ wikiRoot: root, token });
+  }
+}
+
 function runCommit(argv) {
   const flags = wikiFlags(argv, { '--lock-token': 'value', '--manifest-file': 'value' });
   const manifestFile = requireFlag(flags, '--manifest-file');
+  const token = requireFlag(flags, '--lock-token');
+  const manifest = readManifestFile(manifestFile);
   const result = wikiState.applyCommit({
     wikiRoot: flags['--wiki-root'],
-    token: requireFlag(flags, '--lock-token'),
-    manifest: readManifestFile(manifestFile),
+    token,
+    manifest,
   });
   emit(result);
   const runtimeDirectory = path.join(path.resolve(flags['--wiki-root']), '.wiki-meta', '.runtime');
   const relative = path.relative(runtimeDirectory, path.resolve(manifestFile));
-  if (relative && !relative.startsWith('..') && !path.isAbsolute(relative)) fs.rmSync(manifestFile, { force: true });
+  if (relative && !relative.startsWith('..') && !path.isAbsolute(relative)) {
+    try {
+      cleanupRuntimeManifests(flags['--wiki-root'], token, manifest.operation_id);
+    } catch (error) {
+      if (error.code !== 'LOCK_TOKEN_MISMATCH') throw error;
+      process.stderr.write(`WARNING: runtime manifest cleanup skipped after lock ownership changed: ${error.message}\n`);
+    }
+  }
 }
 
 function runTransaction(argv) {
   if (argv[0] !== 'recover') throw new UsageError('transaction requires recover');
   const flags = wikiFlags(argv.slice(1), { '--lock-token': 'value', '--operation-id': 'value' });
-  emit(wikiState.recoverTransaction({
-    wikiRoot: flags['--wiki-root'], token: requireFlag(flags, '--lock-token'),
-    operationId: requireFlag(flags, '--operation-id'),
-  }));
+  const token = requireFlag(flags, '--lock-token');
+  const operationId = requireFlag(flags, '--operation-id');
+  const result = wikiState.recoverTransaction({
+    wikiRoot: flags['--wiki-root'], token, operationId,
+  });
+  emit(result);
+  try {
+    cleanupRuntimeManifests(flags['--wiki-root'], token, operationId);
+  } catch (error) {
+    if (error.code !== 'LOCK_TOKEN_MISMATCH') throw error;
+    process.stderr.write(`WARNING: runtime manifest cleanup skipped after lock ownership changed: ${error.message}\n`);
+  }
 }
 
 function runIndex(argv) {
@@ -341,4 +386,4 @@ function main(argv = process.argv.slice(2)) {
 
 if (require.main === module) process.exitCode = main();
 
-module.exports = { main };
+module.exports = { main, cleanupRuntimeManifests };

@@ -61,7 +61,7 @@ const JOURNAL_KEYS = [
   'event_ids', 'scan_window_journal', 'result', 'result_sha256',
 ];
 const JOURNAL_KEYS_V2 = [
-  ...JOURNAL_KEYS, 'catalog_seal', 'catalog_seal_sha256', 'catalog_seal_cursor',
+  ...JOURNAL_KEYS, 'catalog_seal', 'catalog_seal_sha256', 'catalog_seal_cursor', 'verify_stage_cursor',
 ];
 const CATALOG_SEAL_KEYS = ['relative_path', 'sha256'];
 const SCAN_YIELD_MARGIN_MS = 250;
@@ -616,7 +616,10 @@ function validateJournal(journal, root, operationId, manifestHash) {
         || sha256(Buffer.from(JSON.stringify(journal.catalog_seal))) !== journal.catalog_seal_sha256
         || !Number.isInteger(journal.catalog_seal_cursor)
         || journal.catalog_seal_cursor < 0
-        || journal.catalog_seal_cursor > journal.catalog_seal.length) {
+        || journal.catalog_seal_cursor > journal.catalog_seal.length
+        || !Number.isInteger(journal.verify_stage_cursor)
+        || journal.verify_stage_cursor < 0
+        || journal.verify_stage_cursor > journal.artifacts.length) {
       throw stateError('TRANSACTION_RECOVERY_REQUIRED', 'journal catalog seal is malformed');
     }
     const artifactPaths = new Set(journal.artifacts.map((item) => item.relative_path));
@@ -724,9 +727,34 @@ function prepareTransaction(root, token, locations, journal, faultInjector, dead
   stageTransaction(root, token, locations, journal, faultInjector, deadline);
 }
 
-function verifyStages(locations, journal, deadline) {
-  journal.artifacts.forEach((item, index) => {
-    assertBeforeDeadline(deadline, `wiki-state:verify-stage:${item.key}`);
+function verifyStages(root, token, locations, journal, faultInjector, deadline) {
+  if (journal.contract_version !== 2) {
+    journal.artifacts.forEach((item, index) => {
+      assertBeforeDeadline(deadline, `wiki-state:verify-stage:${item.key}`);
+      for (const side of ['before', 'after']) {
+        const expected = Buffer.from(`${JSON.stringify(item[side])}\n`);
+        const actual = readMaybe(path.join(locations[side], `${String(index).padStart(4, '0')}.json`));
+        if (!actual || !actual.equals(expected)) {
+          throw stateError('TRANSACTION_RECOVERY_REQUIRED', `staged ${side} bytes are corrupt for ${item.key}`);
+        }
+      }
+    });
+    return;
+  }
+  const initialCursor = journal.verify_stage_cursor;
+  while (journal.verify_stage_cursor < journal.artifacts.length) {
+    const index = journal.verify_stage_cursor;
+    const item = journal.artifacts[index];
+    invokeFault(faultInjector, `verify-stage-scan:${item.key}`);
+    if (remainingMs(deadline) < SCAN_YIELD_MARGIN_MS) {
+      if (journal.verify_stage_cursor !== initialCursor) {
+        persistJournal(
+          root, token, locations, journal, faultInjector,
+          `verify-stage-cursor-${journal.verify_stage_cursor}`,
+        );
+      }
+      throw new DeadlineExceeded(`wiki-state:verify-stage:${item.key}`);
+    }
     for (const side of ['before', 'after']) {
       const expected = Buffer.from(`${JSON.stringify(item[side])}\n`);
       const actual = readMaybe(path.join(locations[side], `${String(index).padStart(4, '0')}.json`));
@@ -734,7 +762,14 @@ function verifyStages(locations, journal, deadline) {
         throw stateError('TRANSACTION_RECOVERY_REQUIRED', `staged ${side} bytes are corrupt for ${item.key}`);
       }
     }
-  });
+    journal.verify_stage_cursor += 1;
+  }
+  if (journal.verify_stage_cursor !== initialCursor) {
+    persistJournal(
+      root, token, locations, journal, faultInjector,
+      `verify-stage-cursor-${journal.verify_stage_cursor}`,
+    );
+  }
 }
 
 function publishArtifact(root, token, item, faultInjector) {
@@ -940,7 +975,7 @@ function finishTransaction(root, token, locations, journal, faultInjector, deadl
     if (!journal.transitions.includes('staged')) {
       stageTransaction(root, token, locations, journal, faultInjector, deadline);
     }
-    verifyStages(locations, journal, deadline);
+    verifyStages(root, token, locations, journal, faultInjector, deadline);
     if (journal.contract_version === 2
         && journal.catalog_seal_cursor < journal.catalog_seal.length) {
       const initialCursor = journal.catalog_seal_cursor;
@@ -1034,6 +1069,11 @@ function applyCommit(options = {}) {
         && !journal.transitions.includes('committed')) {
       journal.catalog_seal_cursor = 0;
     }
+    if (journal.contract_version === 2
+        && journal.verify_stage_cursor === journal.artifacts.length
+        && !journal.transitions.includes('committed')) {
+      journal.verify_stage_cursor = 0;
+    }
     return finishTransaction(root, options.token, locations, journal, options.faultInjector, deadline);
   }
 
@@ -1072,7 +1112,8 @@ function applyCommit(options = {}) {
     artifacts_sha256: sha256(Buffer.from(JSON.stringify(artifacts))),
     catalog_seal: catalogSeal,
     catalog_seal_sha256: sha256(Buffer.from(JSON.stringify(catalogSeal))),
-    catalog_seal_cursor: catalogSeal.length,
+    catalog_seal_cursor: 0,
+    verify_stage_cursor: 0,
     event_ids: manifest.events.map((event) => event.event_id),
     scan_window_journal: null,
     result,

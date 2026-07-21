@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const { remainingMs } = require('./deadline.js');
-const { readMaybe, stateError, SHA_RE } = require('./fs-safe.js');
+const { readMaybe, stateError } = require('./fs-safe.js');
 const { assertLockOwner } = require('./lock.js');
 
 const SWEEP_RESERVE_MS = 10_000;
@@ -66,9 +66,44 @@ function entryExists(pathname) {
   catch (error) { if (error.code === 'ENOENT') return false; throw error; }
 }
 
+function invokeFault(faultInjector, boundary) {
+  if (typeof faultInjector === 'function') faultInjector(boundary);
+}
+
+// Removes `pathname` (file or directory tree) leaf-first, checking the sweep reserve before
+// each removal. Returns true if `pathname` is fully gone when this returns; false if the sweep
+// reserve ran out partway through (some descendants may remain — safe to resume on a later call,
+// since the remaining filesystem state alone is what a future sweep re-discovers and classifies).
+function removeEntryBounded(pathname, deadline, assertOwner, faultInjector, counter) {
+  let stat;
+  try { stat = fs.lstatSync(pathname); }
+  catch (error) { if (error.code === 'ENOENT') return true; throw error; }
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    invokeFault(faultInjector, `sweep-remove:${counter.value}`);
+    counter.value += 1;
+    if (remainingMs(deadline) < SWEEP_RESERVE_MS) return false;
+    assertOwner();
+    fs.rmSync(pathname, { force: true });
+    return true;
+  }
+  let children;
+  try { children = fs.readdirSync(pathname); }
+  catch (error) { if (error.code === 'ENOENT') return true; throw error; }
+  for (const name of children) {
+    if (remainingMs(deadline) < SWEEP_RESERVE_MS) return false;
+    if (!removeEntryBounded(path.join(pathname, name), deadline, assertOwner, faultInjector, counter)) return false;
+  }
+  invokeFault(faultInjector, `sweep-remove:${counter.value}`);
+  counter.value += 1;
+  if (remainingMs(deadline) < SWEEP_RESERVE_MS) return false;
+  assertOwner();
+  fs.rmdirSync(pathname);
+  return true;
+}
+
 // Returns the number and names of debris directories removed during this bounded pass.
 function sweepTransactionDebris(root, token, options = {}) {
-  const { deadline, limit = 8 } = options;
+  const { deadline, limit = 8, faultInjector } = options;
   const classes = options.classes === undefined
     ? new Set(SWEEP_CLASSES)
     : new Set(options.classes);
@@ -106,26 +141,30 @@ function sweepTransactionDebris(root, token, options = {}) {
     }
     if (debrisClass === null) continue;
     if (remainingMs(deadline) < SWEEP_RESERVE_MS) break;
-    processed += 1;
 
     if (debrisClass !== 'cancelled') {
-      assertOwner();
-      fs.rmSync(transaction, { recursive: true, force: true });
-      assertOwner();
+      const counter = { value: 0 };
+      if (!removeEntryBounded(transaction, deadline, assertOwner, faultInjector, counter)) {
+        return { processed, removed };
+      }
+      processed += 1;
       removed.push(entry.name);
       continue;
     }
 
+    const counter = { value: 0 };
     for (const name of fs.readdirSync(transaction)) {
       if (name === 'cancelled.json') continue;
-      assertOwner();
-      fs.rmSync(path.join(transaction, name), { recursive: true, force: true });
+      if (!removeEntryBounded(path.join(transaction, name), deadline, assertOwner, faultInjector, counter)) {
+        return { processed, removed };
+      }
     }
     assertOwner();
     fs.rmSync(path.join(transaction, 'cancelled.json'), { force: true });
     assertOwner();
     fs.rmdirSync(transaction);
     assertOwner();
+    processed += 1;
     removed.push(entry.name);
   }
   return { processed, removed };

@@ -263,7 +263,19 @@ function cleanupRuntimeManifests(wikiRoot, token, operationId) {
 
 function recoverHint(wikiRoot, operationId) {
   const root = path.resolve(wikiRoot);
-  return `resume with:\nnode scripts/wiki-runtime.js transaction recover --wiki-root ${root} --lock-token <token> --operation-id ${operationId} --json`;
+  return `resume with:\nnode scripts/wiki-runtime.js transaction recover --wiki-root "${root}" --lock-token <token> --operation-id ${operationId} --json`;
+}
+
+function transactionDurablyExists(wikiRoot, operationId) {
+  const transaction = path.join(path.resolve(wikiRoot), '.wiki-meta', '.transactions', operationId);
+  return fs.existsSync(path.join(transaction, 'journal.json'))
+    || fs.existsSync(path.join(transaction, 'cancelled.json'));
+}
+
+function commitRetryHint(wikiRoot, manifestFile) {
+  const root = path.resolve(wikiRoot);
+  const manifest = path.resolve(manifestFile);
+  return `rerun with:\nnode scripts/wiki-runtime.js commit --wiki-root "${root}" --lock-token <token> --manifest-file "${manifest}" --json`;
 }
 
 function runCommit(argv) {
@@ -280,7 +292,9 @@ function runCommit(argv) {
     });
   } catch (error) {
     if (error.code === 'DEADLINE_EXCEEDED') {
-      error.message = `${error.message} — ${recoverHint(flags['--wiki-root'], manifest.operation_id)}`;
+      error.message = transactionDurablyExists(flags['--wiki-root'], manifest.operation_id)
+        ? `${error.message} — ${recoverHint(flags['--wiki-root'], manifest.operation_id)}`
+        : `${error.message} — ${commitRetryHint(flags['--wiki-root'], manifestFile)}`;
     }
     throw error;
   }
@@ -407,4 +421,4 @@ function main(argv = process.argv.slice(2)) {
 
 if (require.main === module) process.exitCode = main();
 
-module.exports = { main, recoverHint, cleanupRuntimeManifests };
+module.exports = { main, recoverHint, commitRetryHint, cleanupRuntimeManifests };

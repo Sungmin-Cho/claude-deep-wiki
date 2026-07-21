@@ -416,10 +416,6 @@ function defaultJournalAdapter(wikiRoot, operationId) {
     locations,
     activateTransaction(value, assertOwner, options) {
       parents.prepareParent(assertOwner);
-      sweepTransactionDebris(wikiRoot, options.token, {
-        deadline: options.deadline || createDeadline({ budgetMs: 12_000 }),
-        classes: ['activation'],
-      });
       const activation = path.join(
         locations.transactions,
         `.activate-${process.pid}-${crypto.randomUUID()}`,
@@ -476,6 +472,9 @@ function defaultJournalAdapter(wikiRoot, operationId) {
     },
     tombstonePath: locations.tombstone,
     [DEFAULT_ADAPTER_CONTROL]: {
+      prepareDebrisSweep(assertOwner) {
+        parents.prepareParent(assertOwner);
+      },
       readDestination(file) {
         if (file !== locations.pending && file !== locations.last) {
           throw scanError('SCAN_WINDOW_FILESYSTEM', 'default adapter destination is outside .wiki-meta');
@@ -912,6 +911,15 @@ function applyScanWindowTransition(options = {}) {
   assertLockOwner({ wikiRoot: physicalRoot, token });
   assertPersistenceDeadline(options.deadline, 'transaction-entry');
   const adapter = adapterFor(physicalRoot, operationId, options.journalAdapter);
+  const control = adapter[DEFAULT_ADAPTER_CONTROL];
+  if (control) {
+    const assertOwner = () => assertLockOwner({ wikiRoot: physicalRoot, token });
+    control.prepareDebrisSweep(assertOwner);
+    sweepTransactionDebris(physicalRoot, token, {
+      deadline: options.deadline || createDeadline({ budgetMs: 12_000 }),
+      classes: ['activation', 'plain'],
+    });
+  }
   const transactionOptions = { ...options, wikiRoot: physicalRoot, token };
   let journal = adapter.readJournal();
   const planHash = options.plan ? inputHash(physicalRoot, options.plan) : null;

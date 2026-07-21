@@ -468,7 +468,7 @@ test('commit journal and staging scale with the manifest, not the catalog', () =
   const artifactPaths = new Set(journal.artifacts.map((item) => item.relative_path));
   assert.equal(journal.catalog_seal.some((entry) => artifactPaths.has(entry.relative_path)), false);
   assert.equal(journal.catalog_seal_sha256, sha(Buffer.from(JSON.stringify(journal.catalog_seal))));
-  assert.equal(journal.catalog_seal_cursor, 78);
+  assert.equal(journal.catalog_seal_cursor, 0);
   assert.equal(fs.readdirSync(path.join(transactionPath(root), 'before')).length, 7);
   assert.equal(fs.readdirSync(path.join(transactionPath(root), 'after')).length, 7);
   withLock(root, (token) => recoverTransaction({ wikiRoot: root, token, operationId: OPERATION_ID }));
@@ -555,6 +555,25 @@ test('resume via plain commit (not recover) also rescans and cancels', () => {
   assert.equal(fs.existsSync(path.join(root, '.wiki-meta', 'index.json')), false);
 });
 
+test('a same-invocation catalog edit after staging cancels the fresh commit instead of publishing stale state', () => {
+  const { applyCommit } = require(statePath);
+  const root = fixture('deep wiki fresh same-call drift ');
+  seedUnchangedPage(root, 'untouched.md', 'Untouched', []);
+  const value = manifest();
+  withLock(root, (token) => assert.throws(() => applyCommit({
+    wikiRoot: root, token, manifest: value, now: new Date(TS),
+    faultInjector(boundary) {
+      if (boundary === 'after-transition-staged') {
+        fs.writeFileSync(path.join(root, 'pages', 'untouched.md'), pageContent('Drifted Mid-Commit', []));
+      }
+    },
+  }), (error) => error.code === 'TRANSACTION_CANCELLED'));
+  assert.equal(fs.existsSync(path.join(root, '.wiki-meta', 'index.json')), false);
+  assert.equal(fs.existsSync(path.join(root, 'pages', 'topic.md')), false);
+  assert.match(fs.readFileSync(path.join(root, 'pages', 'untouched.md'), 'utf8'), /Drifted Mid-Commit/);
+  assert.equal(fs.existsSync(transactionPath(root)), false);
+});
+
 test('authentic v1.8.2 interrupted journal recovers with legacy G1+G2 semantics', (t) => {
   const listing = spawnSync('git', [
     'ls-tree', '-r', '--name-only', '3ebe6bd', 'hooks/scripts/runtime',
@@ -615,6 +634,8 @@ test('catalog_seal and tombstone tampering are rejected fail-closed', () => {
     ['artifact collision', true, (journal) => { journal.catalog_seal[0].relative_path = journal.artifacts[0].relative_path; }],
     ['negative cursor', true, (journal) => { journal.catalog_seal_cursor = -1; }],
     ['oversize cursor', true, (journal) => { journal.catalog_seal_cursor = journal.catalog_seal.length + 1; }],
+    ['negative verify cursor', true, (journal) => { journal.verify_stage_cursor = -1; }],
+    ['oversize verify cursor', true, (journal) => { journal.verify_stage_cursor = journal.artifacts.length + 1; }],
   ];
   for (const [name, reseal, mutate] of sealCases) {
     const root = fixture(`deep wiki catalog tamper ${name} `);
@@ -848,6 +869,50 @@ test('staging deadline trips at the next artifact and resumes file-precise', () 
   assert.deepEqual(artifactSnapshot(root), artifactSnapshot(baseline));
 });
 
+test('verify-stage deadline recovery persists a resumable cursor across multiple deadlines', () => {
+  const { applyCommit, recoverTransaction } = require(statePath);
+  const value = manifest({
+    pages: [
+      { file: 'page-a.md', action: 'create', expected_sha256: null, content: pageContent('A', []) },
+      { file: 'page-b.md', action: 'create', expected_sha256: null, content: pageContent('B', []) },
+      { file: 'page-c.md', action: 'create', expected_sha256: null, content: pageContent('C', []) },
+    ],
+    sources: [],
+    events: [{ ...manifest().events[0], pages_created: ['page-a.md', 'page-b.md', 'page-c.md'] }],
+  });
+  const root = fixture('deep wiki verify cursor resume ');
+  stageInterrupted(root, value);
+  let journal = JSON.parse(fs.readFileSync(journalPath(root), 'utf8'));
+  assert.equal(journal.artifacts.length, 7);
+  assert.equal(journal.verify_stage_cursor, 0);
+
+  const clock = { now: 0, nowMs() { return this.now; } };
+  const deadline = createDeadline({ clock, budgetMs: 12_000 });
+  withLock(root, (token) => assert.throws(() => recoverTransaction({
+    wikiRoot: root, token, operationId: OPERATION_ID, deadline,
+    faultInjector(boundary) {
+      if (boundary === 'verify-stage-scan:page-page-b.md') clock.now = 20_000;
+    },
+  }), (error) => error.code === 'DEADLINE_EXCEEDED'
+      && error.boundary === 'wiki-state:verify-stage:page-page-b.md'));
+  journal = JSON.parse(fs.readFileSync(journalPath(root), 'utf8'));
+  assert.equal(journal.verify_stage_cursor, 1);
+
+  const observed = [];
+  withLock(root, (token) => recoverTransaction({
+    wikiRoot: root, token, operationId: OPERATION_ID,
+    faultInjector(boundary) {
+      if (boundary.startsWith('verify-stage-scan:')) observed.push(boundary.slice('verify-stage-scan:'.length));
+    },
+  }));
+  assert.equal(observed.includes('page-page-a.md'), false);
+  assert.equal(observed.includes('page-page-b.md'), true);
+  assert.equal(fs.existsSync(path.join(root, 'pages', 'page-a.md')), true);
+  assert.equal(fs.existsSync(path.join(root, 'pages', 'page-b.md')), true);
+  assert.equal(fs.existsSync(path.join(root, 'pages', 'page-c.md')), true);
+  assert.equal(fs.existsSync(transactionPath(root)), false);
+});
+
 test('deadline expiry inside the catalog scan persists the cursor; resumed scan reaches the drift and cancels', () => {
   const { recoverTransaction } = require(statePath);
   const root = fixture('deep wiki catalog cursor resume ');
@@ -983,13 +1048,18 @@ test('recover hint is appended to a DEADLINE_EXCEEDED commit failure and exit co
 
   assert.equal(
     recoverHint(root, OPERATION_ID),
-    `resume with:\nnode scripts/wiki-runtime.js transaction recover --wiki-root ${root} --lock-token <token> --operation-id ${OPERATION_ID} --json`,
+    `resume with:\nnode scripts/wiki-runtime.js transaction recover --wiki-root "${root}" --lock-token <token> --operation-id ${OPERATION_ID} --json`,
   );
 
   const originalApplyCommit = wikiRuntimeState.applyCommit;
   const originalWrite = process.stderr.write;
   const chunks = [];
-  wikiRuntimeState.applyCommit = () => { throw new DeadlineExceeded('wiki-state:catalog-seal:pages/x.md'); };
+  wikiRuntimeState.applyCommit = () => {
+    const transactionDir = path.join(root, '.wiki-meta', '.transactions', OPERATION_ID);
+    fs.mkdirSync(transactionDir, { recursive: true });
+    fs.writeFileSync(path.join(transactionDir, 'journal.json'), JSON.stringify({ operation_id: OPERATION_ID }));
+    throw new DeadlineExceeded('wiki-state:catalog-seal:pages/x.md');
+  };
   process.stderr.write = (chunk) => { chunks.push(chunk); return true; };
   let exitCode;
   try {
@@ -1007,8 +1077,39 @@ test('recover hint is appended to a DEADLINE_EXCEEDED commit failure and exit co
     'DEADLINE_EXCEEDED: DEADLINE_EXCEEDED at wiki-state:catalog-seal:pages/x.md — resume with:\n',
   ));
   assert.ok(stderr.includes(
-    `node scripts/wiki-runtime.js transaction recover --wiki-root ${root} --lock-token <token> --operation-id ${OPERATION_ID} --json`,
+    `node scripts/wiki-runtime.js transaction recover --wiki-root "${root}" --lock-token <token> --operation-id ${OPERATION_ID} --json`,
   ));
+});
+
+test('commit at a pre-activation deadline instructs a plain rerun instead of an unusable recover hint', () => {
+  const { main } = require('../scripts/wiki-runtime.js');
+  const wikiRuntimeState = require('../hooks/scripts/runtime/wiki-state.js');
+  const { DeadlineExceeded } = require('../hooks/scripts/runtime/deadline.js');
+
+  const root = fixture('deep wiki recover hint pre-activation ');
+  const manifestFile = path.join(root, 'stub-manifest.json');
+  fs.writeFileSync(manifestFile, JSON.stringify({ operation_id: OPERATION_ID }));
+
+  const originalApplyCommit = wikiRuntimeState.applyCommit;
+  const originalWrite = process.stderr.write;
+  const chunks = [];
+  wikiRuntimeState.applyCommit = () => { throw new DeadlineExceeded('wiki-state:commit-entry'); };
+  process.stderr.write = (chunk) => { chunks.push(chunk); return true; };
+  let exitCode;
+  try {
+    exitCode = main([
+      'commit', '--wiki-root', root, '--lock-token', 'stub-token',
+      '--manifest-file', manifestFile, '--json',
+    ]);
+  } finally {
+    wikiRuntimeState.applyCommit = originalApplyCommit;
+    process.stderr.write = originalWrite;
+  }
+  assert.equal(exitCode, 5);
+  const stderr = chunks.join('');
+  assert.ok(!stderr.includes('transaction recover'));
+  assert.ok(stderr.includes('rerun with:'));
+  assert.ok(stderr.includes(manifestFile));
 });
 
 test('supported readers block on a nonterminal shared scan-window journal', () => {
@@ -1350,6 +1451,33 @@ test('transaction debris sweep completes valid cancelled tombstone teardown', ()
   })}\n`);
   const deadline = createDeadline({ budgetMs: 12_000 });
   withLock(root, (token) => sweepTransactionDebris(root, token, { deadline }));
+  assert.equal(fs.existsSync(transaction), false);
+});
+
+test('debris removal is interruptible between entries when the clock advances mid-teardown', () => {
+  const { sweepTransactionDebris } = require('../hooks/scripts/runtime/transaction-debris.js');
+  const root = fixture('deep wiki sweep mid-removal interrupt ');
+  const transaction = path.join(root, '.wiki-meta', '.transactions', 'plain-large');
+  fs.mkdirSync(transaction, { recursive: true });
+  for (let index = 0; index < 4; index += 1) {
+    fs.writeFileSync(path.join(transaction, `file-${index}.txt`), 'debris\n');
+  }
+  const clock = { now: 0, nowMs() { return this.now; } };
+  const deadline = createDeadline({ clock, budgetMs: 12_000 });
+  withLock(root, (token) => {
+    const result = sweepTransactionDebris(root, token, {
+      deadline,
+      faultInjector(boundary) { if (boundary === 'sweep-remove:1') clock.now = 2_001; },
+    });
+    assert.deepEqual(result, { processed: 0, removed: [] });
+  });
+  assert.equal(fs.existsSync(transaction), true);
+  assert.equal(fs.readdirSync(transaction).length, 3);
+
+  withLock(root, (token) => {
+    const result = sweepTransactionDebris(root, token, { deadline: createDeadline({ budgetMs: 12_000 }) });
+    assert.deepEqual(result, { processed: 1, removed: ['plain-large'] });
+  });
   assert.equal(fs.existsSync(transaction), false);
 });
 

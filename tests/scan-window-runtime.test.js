@@ -6,7 +6,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { spawn } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const { once } = require('node:events');
 
 const repoRoot = path.resolve(__dirname, '..');
@@ -99,6 +99,38 @@ function journalFiles(root) {
     .map((entry) => path.join(transactions, entry.name, 'journal.json'))
     .filter((file) => fs.existsSync(file));
 }
+
+test('standalone scan-window activation converges a genuine v1.8.2 pre-journal crash residue', (t) => {
+  const listing = spawnSync('git', [
+    'ls-tree', '-r', '--name-only', '3ebe6bd', 'hooks/scripts/runtime',
+  ], { cwd: repoRoot, encoding: 'utf8', shell: false });
+  if (listing.status !== 0) { t.skip(`git show unavailable: ${listing.stderr.trim()}`); return; }
+  const extraction = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'deep wiki legacy scan-window ')));
+  roots.add(extraction);
+  for (const relative of listing.stdout.trim().split('\n').filter(Boolean)) {
+    const shown = spawnSync('git', ['show', `3ebe6bd:${relative}`], { cwd: repoRoot, encoding: null, shell: false });
+    if (shown.status !== 0) { t.skip(`git show unavailable for ${relative}`); return; }
+    const destination = path.join(extraction, relative);
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    fs.writeFileSync(destination, shown.stdout);
+  }
+  const legacy = require(path.join(extraction, 'hooks', 'scripts', 'runtime', 'scan-window.js'));
+
+  const root = temporaryWiki('deep wiki legacy scan-window crash ');
+  const operationId = 'legacy-scan-window-upgrade-probe';
+  setState(root, { pending: T1, last: T0 });
+  withOwner(root, 'legacy-scan-window-promote', (owner) => assert.throws(() => legacy.promotePendingScan({
+    wikiRoot: root, token: owner.token, expected: T1, operationId, now: new Date(T3),
+    faultInjector(boundary) { if (boundary === 'before-journal-create-write') throw new Error('legacy crash'); },
+  }), /legacy crash/));
+  const transaction = path.join(metaPath(root, '.transactions'), operationId);
+  assert.equal(fs.existsSync(transaction), true);
+  assert.equal(fs.existsSync(path.join(transaction, 'journal.json')), false);
+
+  const promoted = promote(root, T1, operationId);
+  assert.equal(promoted.status, 'promoted');
+  assertState(root, { pending: null, last: `${T1}\n` });
+});
 
 function snapshotFlatDirectory(directory) {
   return Object.fromEntries(fs.readdirSync(directory).sort().map((name) => [

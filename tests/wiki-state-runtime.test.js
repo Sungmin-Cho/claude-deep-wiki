@@ -1037,6 +1037,21 @@ test('cleanup helper refuses under a replaced lock owner', () => {
   assert.equal(fs.existsSync(targetManifest), true);
 });
 
+function shellArgvAfterPrefix(commandLine, prefix) {
+  assert.ok(commandLine.startsWith(prefix), commandLine);
+  const rest = commandLine.slice(prefix.length).replace('<token>', 'stub-token');
+  const script = `node -e "console.log(JSON.stringify(process.argv))" -- ${rest}`;
+  const result = spawnSync('bash', ['-c', script], { encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
+  return JSON.parse(result.stdout);
+}
+
+function argAfterFlag(argv, flag) {
+  const index = argv.indexOf(flag);
+  assert.ok(index !== -1, JSON.stringify(argv));
+  return argv[index + 1];
+}
+
 test('recover hint is appended to a DEADLINE_EXCEEDED commit failure and exit code stays 5', () => {
   const { main, recoverHint } = require('../scripts/wiki-runtime.js');
   const wikiRuntimeState = require('../hooks/scripts/runtime/wiki-state.js');
@@ -1048,7 +1063,7 @@ test('recover hint is appended to a DEADLINE_EXCEEDED commit failure and exit co
 
   assert.equal(
     recoverHint(root, OPERATION_ID),
-    `resume with:\nnode scripts/wiki-runtime.js transaction recover --wiki-root "${root}" --lock-token <token> --operation-id ${OPERATION_ID} --json`,
+    `resume with:\nnode scripts/wiki-runtime.js transaction recover --wiki-root '${root}' --lock-token <token> --operation-id '${OPERATION_ID}' --json`,
   );
 
   const originalApplyCommit = wikiRuntimeState.applyCommit;
@@ -1077,8 +1092,50 @@ test('recover hint is appended to a DEADLINE_EXCEEDED commit failure and exit co
     'DEADLINE_EXCEEDED: DEADLINE_EXCEEDED at wiki-state:catalog-seal:pages/x.md — resume with:\n',
   ));
   assert.ok(stderr.includes(
-    `node scripts/wiki-runtime.js transaction recover --wiki-root "${root}" --lock-token <token> --operation-id ${OPERATION_ID} --json`,
+    `node scripts/wiki-runtime.js transaction recover --wiki-root '${root}' --lock-token <token> --operation-id '${OPERATION_ID}' --json`,
   ));
+});
+
+test('recoverHint shell-escapes adversarial wiki roots and operation ids', (t) => {
+  const probe = spawnSync('bash', ['-c', 'echo ok'], { encoding: 'utf8' });
+  if (probe.status !== 0) { t.skip('bash unavailable for POSIX shell-quoting verification'); return; }
+  const { recoverHint } = require('../scripts/wiki-runtime.js');
+  const adversarial = [
+    '/tmp/deep wiki has space',
+    '/tmp/deep wiki has"quote',
+    "/tmp/deep wiki has'quote",
+    '/tmp/deep wiki $(printf shell-injection-probe)',
+    '/tmp/deep wiki `printf shell-injection-probe`',
+    '/tmp/deep wiki has\nnewline',
+  ];
+  for (const value of adversarial) {
+    const hint = recoverHint(value, value);
+    const commandLine = hint.slice(hint.indexOf('\n') + 1);
+    const argv = shellArgvAfterPrefix(commandLine, 'node scripts/wiki-runtime.js transaction recover ');
+    assert.equal(argAfterFlag(argv, '--wiki-root'), path.resolve(value));
+    assert.equal(argAfterFlag(argv, '--operation-id'), value);
+  }
+});
+
+test('commitRetryHint shell-escapes adversarial wiki roots and manifest paths', (t) => {
+  const probe = spawnSync('bash', ['-c', 'echo ok'], { encoding: 'utf8' });
+  if (probe.status !== 0) { t.skip('bash unavailable for POSIX shell-quoting verification'); return; }
+  const { commitRetryHint } = require('../scripts/wiki-runtime.js');
+  const adversarial = [
+    '/tmp/deep wiki has space',
+    '/tmp/deep wiki has"quote',
+    "/tmp/deep wiki has'quote",
+    '/tmp/deep wiki $(printf shell-injection-probe)',
+    '/tmp/deep wiki `printf shell-injection-probe`',
+    '/tmp/deep wiki has\nnewline',
+  ];
+  for (const value of adversarial) {
+    const hint = commitRetryHint(value, value);
+    const commandLine = hint.slice(hint.indexOf('\n') + 1);
+    const argv = shellArgvAfterPrefix(commandLine, 'node scripts/wiki-runtime.js commit ');
+    assert.equal(argAfterFlag(argv, '--wiki-root'), path.resolve(value));
+    assert.equal(argAfterFlag(argv, '--manifest-file'), path.resolve(value));
+  }
 });
 
 test('commit at a pre-activation deadline instructs a plain rerun instead of an unusable recover hint', () => {

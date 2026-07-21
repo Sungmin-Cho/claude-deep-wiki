@@ -261,9 +261,13 @@ function cleanupRuntimeManifests(wikiRoot, token, operationId) {
   }
 }
 
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
 function recoverHint(wikiRoot, operationId) {
   const root = path.resolve(wikiRoot);
-  return `resume with:\nnode scripts/wiki-runtime.js transaction recover --wiki-root "${root}" --lock-token <token> --operation-id ${operationId} --json`;
+  return `resume with:\nnode scripts/wiki-runtime.js transaction recover --wiki-root ${shellQuote(root)} --lock-token <token> --operation-id ${shellQuote(operationId)} --json`;
 }
 
 function transactionDurablyExists(wikiRoot, operationId) {
@@ -275,7 +279,7 @@ function transactionDurablyExists(wikiRoot, operationId) {
 function commitRetryHint(wikiRoot, manifestFile) {
   const root = path.resolve(wikiRoot);
   const manifest = path.resolve(manifestFile);
-  return `rerun with:\nnode scripts/wiki-runtime.js commit --wiki-root "${root}" --lock-token <token> --manifest-file "${manifest}" --json`;
+  return `rerun with:\nnode scripts/wiki-runtime.js commit --wiki-root ${shellQuote(root)} --lock-token <token> --manifest-file ${shellQuote(manifest)} --json`;
 }
 
 function runCommit(argv) {

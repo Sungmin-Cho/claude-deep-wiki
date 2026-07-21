@@ -1222,6 +1222,35 @@ test('atomicWriteFile accepts 64-bit lstat dev with a truncated fstat dev', () =
   assert.equal(fs.readFileSync(destination, 'utf8'), 'owned\n');
 });
 
+test('atomicWriteFile rejects a non-truncated fstat dev whose low 32 bits merely coincide with lstat dev', () => {
+  const { atomicWriteFile } = runtimeModule('fs-safe.js');
+  const root = temporaryRoot('deep wiki atomic non-truncated fstat dev ');
+  const destination = write(path.join(root, 'destination'), 'original\n');
+  const coincidentalLowBitsFs = new Proxy(fs, {
+    get(target, property) {
+      if (property === 'fstatSync') {
+        return (descriptor, options) => ({
+          ...target.fstatSync(descriptor, options),
+          dev: 0x100000005n,
+        });
+      }
+      if (property === 'lstatSync') {
+        return (pathname, options) => ({
+          ...target.lstatSync(pathname, options),
+          dev: 5n,
+        });
+      }
+      const value = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  assert.throws(
+    () => atomicWriteFile(destination, 'owned\n', { fs: coincidentalLowBitsFs }),
+    /identity|ownership/i,
+  );
+  assert.equal(fs.readFileSync(destination, 'utf8'), 'original\n');
+});
+
 test('acquireLock accepts an lstat dev zero with a nonzero fstat dev', () => {
   const { acquireLock } = runtimeModule('lock.js');
   const wikiRoot = newWikiRoot('deep wiki lock asymmetric dev zero ');

@@ -146,6 +146,19 @@ representations, and rollback.
 For an interrupted commit, recover the same operation before retrying. Recovery
 must be idempotent and token-authenticated.
 
+Every runtime call carries an internal 12-second deadline. On a large or slow
+(sync-drive) vault a single `commit` can exceed it and exit with
+`DEADLINE_EXCEEDED at <boundary>`; the progress made so far is durable in the
+journal. Recovering the same operation id until it returns a result is the normal
+path — it may take several idempotent, resumable calls, and the error output
+carries the exact recover argv to re-run.
+
+If an unchanged catalog file is changed or deleted externally mid-commit, the
+transaction is cancelled cleanly with `TRANSACTION_CANCELLED` (exit 4): it is torn
+down, the wiki is left in its pre-commit state (the external edit is preserved, not
+clobbered), and no receipt is written. Re-snapshot and resubmit the same manifest;
+run `/wiki-lint` to surface any `MISSING_SOURCE` left by the external change.
+
 <!-- deep-wiki:exec -->
 ```deep-wiki-exec
 {"executable":"node","argv":["<plugin_root>/scripts/wiki-runtime.js","transaction","recover","--wiki-root","ABSOLUTE_WIKI_ROOT","--lock-token","LOCK_TOKEN","--operation-id","01JZ7P9Q6MD7S5PB8H4Y40HJ80","--json"]}

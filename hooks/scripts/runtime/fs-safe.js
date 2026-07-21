@@ -36,6 +36,18 @@ function fileIdentity(stat) {
   return { dev, ino, birthtimeNs };
 }
 
+const DEVICE_LOW_32_MASK = 0xFFFFFFFFn;
+
+// libuv >=1.49 on Windows can report st_dev for the very same file as either the 64-bit
+// or zero GetFileInformationByHandle form (path lstat) or the truncated 32-bit
+// NtQueryVolumeInformationFile form (fd fstat); strict equality would break every atomic
+// write there, so this predicate must not be tightened back to strict equality.
+function devicesCompatible(expectedDev, currentDev) {
+  if (expectedDev === currentDev) return true;
+  if (expectedDev === 0n || currentDev === 0n) return true;
+  return (expectedDev & DEVICE_LOW_32_MASK) === (currentDev & DEVICE_LOW_32_MASK);
+}
+
 function identityError(message, cause) {
   const error = new Error(message, cause ? { cause } : undefined);
   error.code = 'FILESYSTEM_IDENTITY_UNAVAILABLE';
@@ -57,8 +69,8 @@ function descriptorFileIdentity(fs, descriptor) {
 function pathHasFileIdentity(fs, pathname, expected) {
   try {
     const current = fileIdentity(fs.lstatSync(pathname, { bigint: true }));
-    return current !== null && current.dev === expected.dev && current.ino === expected.ino
-      && current.birthtimeNs === expected.birthtimeNs;
+    return current !== null && devicesCompatible(expected.dev, current.dev)
+      && current.ino === expected.ino && current.birthtimeNs === expected.birthtimeNs;
   } catch {
     return false;
   }

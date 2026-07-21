@@ -972,6 +972,45 @@ test('cleanup helper refuses under a replaced lock owner', () => {
   assert.equal(fs.existsSync(targetManifest), true);
 });
 
+test('recover hint is appended to a DEADLINE_EXCEEDED commit failure and exit code stays 5', () => {
+  const { main, recoverHint } = require('../scripts/wiki-runtime.js');
+  const wikiRuntimeState = require('../hooks/scripts/runtime/wiki-state.js');
+  const { DeadlineExceeded } = require('../hooks/scripts/runtime/deadline.js');
+
+  const root = fixture('deep wiki recover hint stub ');
+  const manifestFile = path.join(root, 'stub-manifest.json');
+  fs.writeFileSync(manifestFile, JSON.stringify({ operation_id: OPERATION_ID }));
+
+  assert.equal(
+    recoverHint(root, OPERATION_ID),
+    `resume with:\nnode scripts/wiki-runtime.js transaction recover --wiki-root ${root} --lock-token <token> --operation-id ${OPERATION_ID} --json`,
+  );
+
+  const originalApplyCommit = wikiRuntimeState.applyCommit;
+  const originalWrite = process.stderr.write;
+  const chunks = [];
+  wikiRuntimeState.applyCommit = () => { throw new DeadlineExceeded('wiki-state:catalog-seal:pages/x.md'); };
+  process.stderr.write = (chunk) => { chunks.push(chunk); return true; };
+  let exitCode;
+  try {
+    exitCode = main([
+      'commit', '--wiki-root', root, '--lock-token', 'stub-token',
+      '--manifest-file', manifestFile, '--json',
+    ]);
+  } finally {
+    wikiRuntimeState.applyCommit = originalApplyCommit;
+    process.stderr.write = originalWrite;
+  }
+  assert.equal(exitCode, 5);
+  const stderr = chunks.join('');
+  assert.ok(stderr.startsWith(
+    'DEADLINE_EXCEEDED: DEADLINE_EXCEEDED at wiki-state:catalog-seal:pages/x.md — resume with:\n',
+  ));
+  assert.ok(stderr.includes(
+    `node scripts/wiki-runtime.js transaction recover --wiki-root ${root} --lock-token <token> --operation-id ${OPERATION_ID} --json`,
+  ));
+});
+
 test('supported readers block on a nonterminal shared scan-window journal', () => {
   const { snapshotWiki } = require(statePath);
   const root = fixture('deep wiki scan reader block ');

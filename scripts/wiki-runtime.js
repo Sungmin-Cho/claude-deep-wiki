@@ -261,16 +261,29 @@ function cleanupRuntimeManifests(wikiRoot, token, operationId) {
   }
 }
 
+function recoverHint(wikiRoot, operationId) {
+  const root = path.resolve(wikiRoot);
+  return `resume with:\nnode scripts/wiki-runtime.js transaction recover --wiki-root ${root} --lock-token <token> --operation-id ${operationId} --json`;
+}
+
 function runCommit(argv) {
   const flags = wikiFlags(argv, { '--lock-token': 'value', '--manifest-file': 'value' });
   const manifestFile = requireFlag(flags, '--manifest-file');
   const token = requireFlag(flags, '--lock-token');
   const manifest = readManifestFile(manifestFile);
-  const result = wikiState.applyCommit({
-    wikiRoot: flags['--wiki-root'],
-    token,
-    manifest,
-  });
+  let result;
+  try {
+    result = wikiState.applyCommit({
+      wikiRoot: flags['--wiki-root'],
+      token,
+      manifest,
+    });
+  } catch (error) {
+    if (error.code === 'DEADLINE_EXCEEDED') {
+      error.message = `${error.message} — ${recoverHint(flags['--wiki-root'], manifest.operation_id)}`;
+    }
+    throw error;
+  }
   emit(result);
   const runtimeDirectory = path.join(path.resolve(flags['--wiki-root']), '.wiki-meta', '.runtime');
   const relative = path.relative(runtimeDirectory, path.resolve(manifestFile));
@@ -289,9 +302,17 @@ function runTransaction(argv) {
   const flags = wikiFlags(argv.slice(1), { '--lock-token': 'value', '--operation-id': 'value' });
   const token = requireFlag(flags, '--lock-token');
   const operationId = requireFlag(flags, '--operation-id');
-  const result = wikiState.recoverTransaction({
-    wikiRoot: flags['--wiki-root'], token, operationId,
-  });
+  let result;
+  try {
+    result = wikiState.recoverTransaction({
+      wikiRoot: flags['--wiki-root'], token, operationId,
+    });
+  } catch (error) {
+    if (error.code === 'DEADLINE_EXCEEDED') {
+      error.message = `${error.message} — ${recoverHint(flags['--wiki-root'], operationId)}`;
+    }
+    throw error;
+  }
   emit(result);
   try {
     cleanupRuntimeManifests(flags['--wiki-root'], token, operationId);
@@ -386,4 +407,4 @@ function main(argv = process.argv.slice(2)) {
 
 if (require.main === module) process.exitCode = main();
 
-module.exports = { main, cleanupRuntimeManifests };
+module.exports = { main, recoverHint, cleanupRuntimeManifests };

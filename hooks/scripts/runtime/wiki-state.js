@@ -659,7 +659,7 @@ function appendTransition(root, token, locations, journal, transition, faultInje
   }
 }
 
-function stageTransaction(root, token, locations, journal, faultInjector) {
+function stageTransaction(root, token, locations, journal, faultInjector, deadline) {
   assertLockOwner({ wikiRoot: root, token });
   ensureDirectory(locations.transactions);
   ensureDirectory(locations.transaction);
@@ -667,6 +667,7 @@ function stageTransaction(root, token, locations, journal, faultInjector) {
   ensureDirectory(locations.after);
   appendTransition(root, token, locations, journal, 'journaled', faultInjector);
   journal.artifacts.forEach((item, index) => {
+    assertBeforeDeadline(deadline, `wiki-state:stage:${item.key}`);
     for (const side of ['before', 'after']) {
       const staged = Buffer.from(`${JSON.stringify(item[side])}\n`);
       const destination = path.join(locations[side], `${String(index).padStart(4, '0')}.json`);
@@ -689,7 +690,7 @@ function stageTransaction(root, token, locations, journal, faultInjector) {
   appendTransition(root, token, locations, journal, 'staged', faultInjector);
 }
 
-function prepareTransaction(root, token, locations, journal, faultInjector) {
+function prepareTransaction(root, token, locations, journal, faultInjector, deadline) {
   assertLockOwner({ wikiRoot: root, token });
   ensureDirectory(locations.transactions);
   const activation = path.join(
@@ -720,11 +721,12 @@ function prepareTransaction(root, token, locations, journal, faultInjector) {
   fs.renameSync(activation, locations.transaction);
   invokeFault(faultInjector, 'after-transaction-activate');
   assertOwner();
-  stageTransaction(root, token, locations, journal, faultInjector);
+  stageTransaction(root, token, locations, journal, faultInjector, deadline);
 }
 
-function verifyStages(locations, journal) {
+function verifyStages(locations, journal, deadline) {
   journal.artifacts.forEach((item, index) => {
+    assertBeforeDeadline(deadline, `wiki-state:verify-stage:${item.key}`);
     for (const side of ['before', 'after']) {
       const expected = Buffer.from(`${JSON.stringify(item[side])}\n`);
       const actual = readMaybe(path.join(locations[side], `${String(index).padStart(4, '0')}.json`));
@@ -757,9 +759,10 @@ function publishArtifact(root, token, item, faultInjector) {
   invokeFault(faultInjector, `after-publish-${item.key}`);
 }
 
-function publishPhase(root, token, locations, journal, phase, transition, faultInjector) {
+function publishPhase(root, token, locations, journal, phase, transition, faultInjector, deadline) {
   if (!journal.transitions.includes(transition)) {
     for (const item of journal.artifacts.filter((candidate) => candidate.phase === phase)) {
+      assertBeforeDeadline(deadline, `wiki-state:publish:${phase}:${item.key}`);
       publishArtifact(root, token, item, faultInjector);
     }
     appendTransition(root, token, locations, journal, transition, faultInjector);
@@ -935,9 +938,9 @@ function finishTransaction(root, token, locations, journal, faultInjector, deadl
   }
   try {
     if (!journal.transitions.includes('staged')) {
-      stageTransaction(root, token, locations, journal, faultInjector);
+      stageTransaction(root, token, locations, journal, faultInjector, deadline);
     }
-    verifyStages(locations, journal);
+    verifyStages(locations, journal, deadline);
     if (journal.contract_version === 2
         && journal.catalog_seal_cursor < journal.catalog_seal.length) {
       const initialCursor = journal.catalog_seal_cursor;
@@ -973,7 +976,7 @@ function finishTransaction(root, token, locations, journal, faultInjector, deadl
     ];
     for (const [phase, transition] of phases) {
       assertBeforeDeadline(deadline, `wiki-state:publish:${phase}`);
-      publishPhase(root, token, locations, journal, phase, transition, faultInjector);
+      publishPhase(root, token, locations, journal, phase, transition, faultInjector, deadline);
     }
     appendTransition(root, token, locations, journal, 'scan-window-staged', faultInjector);
     if (!journal.transitions.includes('pending-promoted')) {
@@ -1075,7 +1078,7 @@ function applyCommit(options = {}) {
     result,
     result_sha256: sha256(Buffer.from(JSON.stringify(result))),
   };
-  prepareTransaction(root, options.token, locations, journal, options.faultInjector);
+  prepareTransaction(root, options.token, locations, journal, options.faultInjector, deadline);
   return finishTransaction(root, options.token, locations, journal, options.faultInjector, deadline);
 }
 

@@ -817,7 +817,30 @@ test('an expired deadline surfaces a resumable boundary and recover completes', 
       if (boundary === 'after-transition-staged') clock.now = 20_000;
     },
   }), (error) => error.code === 'DEADLINE_EXCEEDED'
-      && error.boundary === 'wiki-state:publish:versions'));
+      && error.boundary === 'wiki-state:verify-stage:page-topic.md'));
+  withLock(root, (token) => recoverTransaction({
+    wikiRoot: root, token, operationId: OPERATION_ID,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  }));
+  assert.deepEqual(artifactSnapshot(root), artifactSnapshot(baseline));
+});
+
+test('staging deadline trips at the next artifact and resumes file-precise', () => {
+  const { applyCommit, recoverTransaction } = require(statePath);
+  const baseline = fixture('deep wiki staging deadline baseline ');
+  withLock(baseline, (token) => applyCommit({
+    wikiRoot: baseline, token, manifest: manifest(), now: new Date(TS),
+  }));
+  const root = fixture('deep wiki staging deadline resume ');
+  const clock = { now: 0, nowMs() { return this.now; } };
+  const deadline = createDeadline({ clock, budgetMs: 12_000 });
+  withLock(root, (token) => assert.throws(() => applyCommit({
+    wikiRoot: root, token, manifest: manifest(), now: new Date(TS), deadline,
+    faultInjector(boundary) {
+      if (boundary === 'after-stage-0-after') clock.now = 20_000;
+    },
+  }), (error) => error.code === 'DEADLINE_EXCEEDED'
+      && error.boundary === 'wiki-state:stage:source-source-a'));
   withLock(root, (token) => recoverTransaction({
     wikiRoot: root, token, operationId: OPERATION_ID,
     deadline: createDeadline({ budgetMs: 12_000 }),

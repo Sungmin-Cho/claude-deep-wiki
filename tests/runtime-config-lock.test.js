@@ -1102,7 +1102,7 @@ test('atomicWriteFile refuses to publish a foreign same-path temp replacement', 
   assert.equal(fs.readFileSync(temporary, 'utf8'), 'foreign\n');
 });
 
-test('atomicWriteFile rejects a reused dev and inode with a changed birth-time generation', () => {
+test('atomicWriteFile rejects a reused inode with a changed birth-time generation', () => {
   const { atomicWriteFile } = runtimeModule('fs-safe.js');
   const root = temporaryRoot('deep wiki atomic reused inode generation ');
   const destination = write(path.join(root, 'destination'), 'original\n');
@@ -1113,7 +1113,6 @@ test('atomicWriteFile rejects a reused dev and inode with a changed birth-time g
       if (property === 'fstatSync') {
         return (descriptor, options) => ({
           ...target.fstatSync(descriptor, options),
-          dev: 7n,
           ino: 11n,
           birthtimeNs: 100n,
         });
@@ -1121,7 +1120,6 @@ test('atomicWriteFile rejects a reused dev and inode with a changed birth-time g
       if (property === 'lstatSync') {
         return (pathname, options) => ({
           ...target.lstatSync(pathname, options),
-          dev: 7n,
           ino: 11n,
           birthtimeNs: replaced ? 200n : 100n,
         });
@@ -1141,6 +1139,149 @@ test('atomicWriteFile rejects a reused dev and inode with a changed birth-time g
   }), /identity|ownership/i);
   assert.equal(fs.readFileSync(destination, 'utf8'), 'original\n');
   assert.equal(fs.readFileSync(temporary, 'utf8'), 'foreign\n');
+});
+
+test('atomicWriteFile rejects genuinely different devices with matching inode identity', () => {
+  const { atomicWriteFile } = runtimeModule('fs-safe.js');
+  const root = temporaryRoot('deep wiki atomic distinct devices ');
+  const destination = write(path.join(root, 'destination'), 'original\n');
+  const distinctDeviceFs = new Proxy(fs, {
+    get(target, property) {
+      if (property === 'fstatSync') {
+        return (descriptor, options) => ({
+          ...target.fstatSync(descriptor, options),
+          dev: 6n,
+        });
+      }
+      if (property === 'lstatSync') {
+        return (pathname, options) => ({
+          ...target.lstatSync(pathname, options),
+          dev: 5n,
+        });
+      }
+      const value = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  assert.throws(
+    () => atomicWriteFile(destination, 'owned\n', { fs: distinctDeviceFs }),
+    /identity|ownership/i,
+  );
+  assert.equal(fs.readFileSync(destination, 'utf8'), 'original\n');
+});
+
+test('atomicWriteFile accepts an lstat dev zero with a nonzero fstat dev', () => {
+  const { atomicWriteFile } = runtimeModule('fs-safe.js');
+  const root = temporaryRoot('deep wiki atomic asymmetric dev zero ');
+  const destination = path.join(root, 'destination');
+  const asymmetricFs = new Proxy(fs, {
+    get(target, property) {
+      if (property === 'fstatSync') {
+        return (descriptor, options) => ({
+          ...target.fstatSync(descriptor, options),
+          dev: 0x12345678n,
+        });
+      }
+      if (property === 'lstatSync') {
+        return (pathname, options) => ({
+          ...target.lstatSync(pathname, options),
+          dev: 0n,
+        });
+      }
+      const value = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  atomicWriteFile(destination, 'owned\n', { fs: asymmetricFs });
+  assert.equal(fs.readFileSync(destination, 'utf8'), 'owned\n');
+});
+
+test('atomicWriteFile accepts 64-bit lstat dev with a truncated fstat dev', () => {
+  const { atomicWriteFile } = runtimeModule('fs-safe.js');
+  const root = temporaryRoot('deep wiki atomic truncated dev ');
+  const destination = path.join(root, 'destination');
+  const asymmetricFs = new Proxy(fs, {
+    get(target, property) {
+      if (property === 'fstatSync') {
+        return (descriptor, options) => ({
+          ...target.fstatSync(descriptor, options),
+          dev: 0xabcdef01n,
+        });
+      }
+      if (property === 'lstatSync') {
+        return (pathname, options) => ({
+          ...target.lstatSync(pathname, options),
+          dev: 0x12345678abcdef01n,
+        });
+      }
+      const value = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  atomicWriteFile(destination, 'owned\n', { fs: asymmetricFs });
+  assert.equal(fs.readFileSync(destination, 'utf8'), 'owned\n');
+});
+
+test('atomicWriteFile rejects a non-truncated fstat dev whose low 32 bits merely coincide with lstat dev', () => {
+  const { atomicWriteFile } = runtimeModule('fs-safe.js');
+  const root = temporaryRoot('deep wiki atomic non-truncated fstat dev ');
+  const destination = write(path.join(root, 'destination'), 'original\n');
+  const coincidentalLowBitsFs = new Proxy(fs, {
+    get(target, property) {
+      if (property === 'fstatSync') {
+        return (descriptor, options) => ({
+          ...target.fstatSync(descriptor, options),
+          dev: 0x100000005n,
+        });
+      }
+      if (property === 'lstatSync') {
+        return (pathname, options) => ({
+          ...target.lstatSync(pathname, options),
+          dev: 5n,
+        });
+      }
+      const value = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  assert.throws(
+    () => atomicWriteFile(destination, 'owned\n', { fs: coincidentalLowBitsFs }),
+    /identity|ownership/i,
+  );
+  assert.equal(fs.readFileSync(destination, 'utf8'), 'original\n');
+});
+
+test('acquireLock accepts an lstat dev zero with a nonzero fstat dev', () => {
+  const { acquireLock } = runtimeModule('lock.js');
+  const wikiRoot = newWikiRoot('deep wiki lock asymmetric dev zero ');
+  const asymmetricFs = new Proxy(fs, {
+    get(target, property) {
+      if (property === 'fstatSync') {
+        return (descriptor, options) => ({
+          ...target.fstatSync(descriptor, options),
+          dev: 0x12345678n,
+        });
+      }
+      if (property === 'lstatSync') {
+        return (pathname, options) => ({
+          ...target.lstatSync(pathname, options),
+          dev: 0n,
+        });
+      }
+      const value = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  const owner = acquireLock({
+    wikiRoot,
+    operation: 'asymmetric-device-identity',
+    fs: asymmetricFs,
+  });
+  assert.equal(owner.operation, 'asymmetric-device-identity');
+  assert.equal(JSON.parse(fs.readFileSync(
+    path.join(wikiRoot, '.wiki-meta', '.wiki-lock', 'owner.json'),
+    'utf8',
+  )).token, owner.token);
 });
 
 test('atomicWriteFile accepts Windows-style dev zero only with a nonzero inode identity', () => {

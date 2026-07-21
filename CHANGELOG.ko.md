@@ -5,6 +5,16 @@ deep-wiki의 주요 변경사항을 기록합니다.
 형식은 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)를 따르며,
 이 프로젝트는 [유의적 버전](https://semver.org/spec/v2.0.0.html)을 준수합니다.
 
+## [1.8.2] — 2026-07-21 (Windows st_dev 비대칭으로 인한 atomic write·lock 획득 실패 수정)
+
+### 수정
+
+- 최신 Windows에서 wiki lock 획득(및 다른 모든 runtime 상태 쓰기)이 더 이상 영구 실패하지 않습니다. `atomicWriteFile`은 temp 파일 소유권을 fd 기반 `fstatSync` identity와 경로 기반 `lstatSync` identity의 비교로 봉인하는데 — runtime에서 유일한 교차 API stat 비교 — 이 seal이 엄격한 `st_dev` 동등성을 포함했습니다. Windows 11 24H2 / Server 2025에서 libuv ≥ 1.49.0(Node 22.12.0부터 번들)은 경로 stat을 `GetFileInformationByName` fast path로, fd stat은 여전히 `NtQueryVolumeInformationFile`로 처리하므로 같은 파일에 대해 두 API가 서로 다른 `st_dev`를 보고할 수 있습니다: libuv 1.51.0 이전(Node 22.12.0–22.16.0)에는 64-bit 대 절단된 32-bit 볼륨 시리얼, 이후에도 시리얼 미가용 환경(예: FSLogix 계열)에서는 0. 그 결과 모든 `owner.json` 쓰기가 `FILESYSTEM_IDENTITY_UNAVAILABLE`로 중단되어 `/wiki-*` lock 획득이 불가능했습니다. seal은 이제 방향성 `devicesCompatible` 술어 — 정확 일치, 한쪽 0, 또는 절단된 32-bit fd측 시리얼이 경로측 하위 32비트와 일치(정확히 문서화된 Windows 표현들) — 를 사용하며, `ino`와 `birthtimeNs`는 여전히 엄격 비교되고 진짜 다른 디바이스는 계속 거부됩니다. 회귀 테스트는 수용되는 두 Windows 형태, 종단 `acquireLock` 경로, 거부 3케이스(다른 디바이스, fd측 비절단형의 우연한 low-32 일치, inode 재사용 세대 변경)를 포괄합니다.
+
+### 리뷰
+
+- 이 수정은 3라운드 교차 모델 리뷰 루프(Claude Opus + Codex review + Codex adversarial)를 거쳤습니다. 라운드 1–2에서 "dev 전면 제거"에서 위의 방향성 형태로 술어를 조였고, 라운드 3에서 Opus와 Codex review 승인으로 종료됐습니다. `lock.js` / `scan-window.js`의 lstat-vs-lstat identity seal은 이 비대칭의 영향을 받지 않으므로 의도적으로 엄격 비교를 유지합니다.
+
 ## [1.8.1] — 2026-07-20 (이식 가능한 Obsidian CLI 탐지 및 ingest 통합)
 
 ### 추가

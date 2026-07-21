@@ -36,6 +36,24 @@ function fileIdentity(stat) {
   return { dev, ino, birthtimeNs };
 }
 
+const DEVICE_LOW_32_MASK = 0xFFFFFFFFn;
+
+// libuv >=1.49 on Windows can report st_dev for the very same file two different ways
+// depending on which syscall produced it. The fd side (fstat) always comes from
+// NtQueryVolumeInformationFile's 32-bit ULONG serial, so it is always <= 0xFFFFFFFF. The
+// path side (lstat fast-path) may report the 64-bit GetFileInformationByName form, or
+// zero when the serial is unavailable. The low-32 clause is therefore directional: it only
+// applies when expectedDev (the fd/fstat value) is itself a truncated 32-bit value, and it
+// compares that against the low 32 bits of currentDev (the path/lstat value). This
+// predicate must not be widened back to a symmetric low-32 match (which would also accept
+// two full-width 64-bit devices with different upper bits) nor tightened back to strict
+// equality, and it must not reject a zero-valued device on either side.
+function devicesCompatible(expectedDev, currentDev) {
+  if (expectedDev === currentDev) return true;
+  if (expectedDev === 0n || currentDev === 0n) return true;
+  return expectedDev <= DEVICE_LOW_32_MASK && (currentDev & DEVICE_LOW_32_MASK) === expectedDev;
+}
+
 function identityError(message, cause) {
   const error = new Error(message, cause ? { cause } : undefined);
   error.code = 'FILESYSTEM_IDENTITY_UNAVAILABLE';
@@ -57,8 +75,8 @@ function descriptorFileIdentity(fs, descriptor) {
 function pathHasFileIdentity(fs, pathname, expected) {
   try {
     const current = fileIdentity(fs.lstatSync(pathname, { bigint: true }));
-    return current !== null && current.dev === expected.dev && current.ino === expected.ino
-      && current.birthtimeNs === expected.birthtimeNs;
+    return current !== null && devicesCompatible(expected.dev, current.dev)
+      && current.ino === expected.ino && current.birthtimeNs === expected.birthtimeNs;
   } catch {
     return false;
   }

@@ -5,6 +5,16 @@ All notable changes to deep-wiki are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.2] — 2026-07-21 (Windows st_dev asymmetry fix for atomic writes and lock acquisition)
+
+### Fixed
+
+- Wiki lock acquisition (and every other runtime state write) no longer fails permanently on recent Windows. `atomicWriteFile` seals ownership of its temp file by comparing an fd-based `fstatSync` identity against a path-based `lstatSync` identity — the only cross-API stat comparison in the runtime — and that seal included strict `st_dev` equality. On Windows 11 24H2 / Server 2025, libuv ≥ 1.49.0 (bundled from Node 22.12.0) serves path stats through the `GetFileInformationByName` fast path while fd stats still use `NtQueryVolumeInformationFile`, so the two APIs can report different `st_dev` for the same file: a 64-bit versus truncated 32-bit volume serial before libuv 1.51.0 (Node 22.12.0–22.16.0), and zero when the serial is unavailable (for example FSLogix-style environments) even after. Every `owner.json` write then aborted with `FILESYSTEM_IDENTITY_UNAVAILABLE`, making `/wiki-*` lock acquisition impossible. The seal now uses a directional `devicesCompatible` predicate — exact equality, either side zero, or a truncated 32-bit fd-side serial matching the path-side low 32 bits, which are exactly the documented Windows representations — while `ino` and `birthtimeNs` remain strictly compared and genuinely different devices are still rejected. Regression tests cover both accepted Windows forms, the end-to-end `acquireLock` path, and three rejection cases (distinct devices, coincidental low-32 with a non-truncated fd serial, reused-inode generation change).
+
+### Review
+
+- The fix went through a 3-round cross-model review loop (Claude Opus + Codex review + Codex adversarial). Rounds 1–2 tightened the predicate from "drop `dev` entirely" to the directional shape above; round 3 closed with Opus and Codex review approving. lstat-vs-lstat identity seals in `lock.js` / `scan-window.js` are unaffected by the asymmetry and intentionally stay strict.
+
 ## [1.8.1] — 2026-07-20 (portable Obsidian CLI discovery and ingest integration)
 
 ### Added

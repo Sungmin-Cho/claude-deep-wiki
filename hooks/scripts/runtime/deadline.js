@@ -35,8 +35,16 @@ function assertBeforeDeadline(deadline, boundary) {
   if (deadline.clock.nowMs() >= deadline.expiresAtMs) throw new DeadlineExceeded(boundary);
 }
 
+function remainingMs(deadline) {
+  if (!deadline || !deadline.clock || typeof deadline.clock.nowMs !== 'function') {
+    throw new TypeError('a deadline created by createDeadline() is required');
+  }
+  return deadline.expiresAtMs - deadline.clock.nowMs();
+}
+
 module.exports = {
   createDeadline,
   assertBeforeDeadline,
+  remainingMs,
   DeadlineExceeded,
 };

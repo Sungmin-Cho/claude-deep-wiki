@@ -11,6 +11,7 @@ const statePath = '../hooks/scripts/runtime/wiki-state.js';
 const scanWindow = require('../hooks/scripts/runtime/scan-window.js');
 const { spawnSync } = require('node:child_process');
 const { acquireLock, releaseLock } = require('../hooks/scripts/runtime/lock.js');
+const { createDeadline } = require('../hooks/scripts/runtime/deadline.js');
 const { readIndexPayload } = require('../hooks/scripts/read-index-envelope.js');
 
 const OPERATION_ID = '01JZ7P9Q6MD7S5PB8H4Y40HJ83';
@@ -637,6 +638,152 @@ test('cleaned transactions compact to bounded receipts while preserving idempote
   const before = artifactSnapshot(root);
   withLock(root, (token) => applyCommit({ wikiRoot: root, token, manifest: manifest(), now: new Date(TS) }));
   assert.deepEqual(artifactSnapshot(root), before);
+});
+
+test('success-path residual dir self-heals via receipt compaction', () => {
+  const { applyCommit, snapshotWiki } = require(statePath);
+  const root = fixture('deep wiki residual receipt ');
+  const first = withLock(root, (token) => applyCommit({
+    wikiRoot: root, token, manifest: manifest(), now: new Date(TS),
+  }));
+  const residual = path.join(root, '.wiki-meta', '.transactions', OPERATION_ID);
+  fs.mkdirSync(path.join(residual, 'before'), { recursive: true });
+  assert.doesNotThrow(() => snapshotWiki({ wikiRoot: root }));
+  const clock = { now: 0, nowMs() { return this.now; } };
+  const deadline = createDeadline({ clock, budgetMs: 12_000 });
+  clock.now = 2_001;
+  const retry = withLock(root, (token) => applyCommit({
+    wikiRoot: root, token, manifest: manifest(), now: new Date(TS), deadline,
+  }));
+  assert.deepEqual(retry, first);
+  assert.equal(fs.existsSync(residual), false);
+});
+
+test('readers never see a journal-less live transaction', () => {
+  const { applyCommit, snapshotWiki } = require(statePath);
+  const root = fixture('deep wiki journal first ');
+  const transactions = path.join(root, '.wiki-meta', '.transactions');
+  const operation = path.join(transactions, OPERATION_ID);
+  const observed = new Set();
+  withLock(root, (token) => applyCommit({
+    wikiRoot: root, token, manifest: manifest(), now: new Date(TS),
+    faultInjector(boundary) {
+      if (!['before-transaction-activate', 'after-transaction-activate', 'before-stage-0-before'].includes(boundary)) return;
+      observed.add(boundary);
+      if (boundary === 'before-transaction-activate') {
+        assert.doesNotThrow(() => snapshotWiki({ wikiRoot: root }));
+        const names = fs.readdirSync(transactions);
+        assert.equal(names.includes(OPERATION_ID), false);
+        assert.equal(names.some((name) => name.startsWith('.activate-')), true);
+      } else {
+        assert.equal(fs.existsSync(path.join(operation, 'journal.json')), true);
+        assert.throws(
+          () => snapshotWiki({ wikiRoot: root }),
+          (error) => error.code === 'TRANSACTION_RECOVERY_REQUIRED',
+        );
+      }
+    },
+  }));
+  assert.deepEqual([...observed].sort(), [
+    'after-transaction-activate', 'before-stage-0-before', 'before-transaction-activate',
+  ]);
+
+  const crashRoot = fixture('deep wiki abandoned activation ');
+  const crashTransactions = path.join(crashRoot, '.wiki-meta', '.transactions');
+  withLock(crashRoot, (token) => assert.throws(() => applyCommit({
+    wikiRoot: crashRoot, token, manifest: manifest(), now: new Date(TS),
+    faultInjector(boundary) {
+      if (boundary === 'before-transaction-activate') throw new Error('activation crash');
+    },
+  }), /activation crash/));
+  assert.equal(fs.readdirSync(crashTransactions).some((name) => name.startsWith('.activate-')), true);
+  const unrelated = manifest({ operation_id: '01JZ7P9Q6MD7S5PB8H4Y40HJ85' });
+  unrelated.events[0].event_id = '01JZ7P9Q6MD7S5PB8H4Y40HJ86';
+  withLock(crashRoot, (token) => applyCommit({
+    wikiRoot: crashRoot, token, manifest: unrelated, now: new Date(TS),
+  }));
+  assert.equal(fs.readdirSync(crashTransactions).some((name) => name.startsWith('.activate-')), false);
+});
+
+test('scan-window producer never exposes a journal-less operation dir', () => {
+  const root = fixture('deep wiki scan atomic activation ');
+  const operationId = 'scan-window-atomic-activation';
+  const transactions = path.join(root, '.wiki-meta', '.transactions');
+  fs.mkdirSync(transactions, { recursive: true });
+  fs.writeFileSync(path.join(root, '.wiki-meta', '.pending-scan'), `${TS}\n`);
+  const observed = [];
+  withLock(root, (token) => scanWindow.promotePendingScan({
+    wikiRoot: root, token, expected: TS, operationId,
+    faultInjector(boundary) {
+      observed.push(boundary);
+      const operation = path.join(transactions, operationId);
+      assert.equal(!fs.existsSync(operation) || fs.existsSync(path.join(operation, 'journal.json')), true, boundary);
+    },
+  }));
+  assert.equal(observed.includes('before-transaction-activate'), true);
+  assert.equal(observed.includes('after-transaction-activate'), true);
+
+  const crashRoot = fixture('deep wiki scan activation retry ');
+  const crashTransactions = path.join(crashRoot, '.wiki-meta', '.transactions');
+  fs.mkdirSync(crashTransactions, { recursive: true });
+  fs.writeFileSync(path.join(crashRoot, '.wiki-meta', '.pending-scan'), `${TS}\n`);
+  withLock(crashRoot, (token) => assert.throws(() => scanWindow.promotePendingScan({
+    wikiRoot: crashRoot, token, expected: TS, operationId,
+    faultInjector(boundary) {
+      if (boundary === 'before-transaction-activate') throw new Error('scan activation crash');
+    },
+  }), /scan activation crash/));
+  assert.equal(fs.readdirSync(crashTransactions).some((name) => name.startsWith('.activate-')), true);
+  const retry = withLock(crashRoot, (token) => scanWindow.promotePendingScan({
+    wikiRoot: crashRoot, token, expected: TS, operationId,
+  }));
+  assert.equal(retry.status, 'promoted');
+  assert.equal(fs.readFileSync(path.join(crashRoot, '.wiki-meta', '.last-scan'), 'utf8'), `${TS}\n`);
+  assert.equal(fs.readdirSync(crashTransactions).some((name) => name.startsWith('.activate-')), false);
+});
+
+test('transaction debris sweep yields before consuming the primary-operation reserve', () => {
+  const { sweepTransactionDebris } = require('../hooks/scripts/runtime/transaction-debris.js');
+  const root = fixture('deep wiki sweep deadline reserve ');
+  const transactions = path.join(root, '.wiki-meta', '.transactions');
+  fs.mkdirSync(transactions, { recursive: true });
+  for (const name of ['plain-a', 'plain-b', 'plain-c']) fs.mkdirSync(path.join(transactions, name));
+  const clock = { now: 0, nowMs() { return this.now; } };
+  const deadline = createDeadline({ clock, budgetMs: 12_000 });
+  clock.now = 2_001;
+  withLock(root, (token) => assert.doesNotThrow(() => sweepTransactionDebris(root, token, { deadline })));
+  assert.deepEqual(fs.readdirSync(transactions).sort(), ['plain-a', 'plain-b', 'plain-c']);
+});
+
+test('transaction debris sweep never removes a transaction with a journal', () => {
+  const { sweepTransactionDebris } = require('../hooks/scripts/runtime/transaction-debris.js');
+  const root = fixture('deep wiki sweep journal safety ');
+  const transaction = path.join(root, '.wiki-meta', '.transactions', 'journalled');
+  fs.mkdirSync(transaction, { recursive: true });
+  fs.writeFileSync(path.join(transaction, 'journal.json'), 'preserve exactly\n');
+  fs.writeFileSync(path.join(transaction, 'stray'), 'also preserve\n');
+  const deadline = createDeadline({ budgetMs: 12_000 });
+  withLock(root, (token) => sweepTransactionDebris(root, token, { deadline }));
+  assert.equal(fs.readFileSync(path.join(transaction, 'journal.json'), 'utf8'), 'preserve exactly\n');
+  assert.equal(fs.readFileSync(path.join(transaction, 'stray'), 'utf8'), 'also preserve\n');
+});
+
+test('transaction debris sweep completes valid cancelled tombstone teardown', () => {
+  const { sweepTransactionDebris } = require('../hooks/scripts/runtime/transaction-debris.js');
+  const root = fixture('deep wiki sweep cancelled teardown ');
+  const operationId = '01JZ7P9Q6MD7S5PB8H4Y40HJ85';
+  const transaction = path.join(root, '.wiki-meta', '.transactions', operationId);
+  fs.mkdirSync(path.join(transaction, 'after'), { recursive: true });
+  fs.writeFileSync(path.join(transaction, 'after', '0000.json'), 'staged\n');
+  fs.writeFileSync(path.join(transaction, 'cancelled.json'), `${JSON.stringify({
+    contract_version: 1,
+    operation_id: operationId,
+    reason: 'catalog-drift',
+    drift: ['pages/topic.md'],
+  })}\n`);
+  const deadline = createDeadline({ budgetMs: 12_000 });
+  withLock(root, (token) => sweepTransactionDebris(root, token, { deadline }));
+  assert.equal(fs.existsSync(transaction), false);
 });
 
 test('setup refuses a nonempty incompatible target before creating wiki state', () => {

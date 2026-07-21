@@ -95,7 +95,7 @@ function promote(root, expected, operationId, extra = {}) {
 function journalFiles(root) {
   const transactions = metaPath(root, '.transactions');
   return fs.readdirSync(transactions, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory())
+    .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.activate-'))
     .map((entry) => path.join(transactions, entry.name, 'journal.json'))
     .filter((file) => fs.existsSync(file));
 }
@@ -299,7 +299,7 @@ for (const linkedParent of ['.wiki-meta', '.transactions', 'operation']) {
 
 test('ensurePendingScan enforces its persistence deadline at journal, stage, destination, commit, and cleanup boundaries', async (t) => {
   const boundaries = [
-    'after-journal-created',
+    'after-transaction-activate',
     'after-stage-pending-after',
     'after-pending-rename',
     'after-scan-window-committed',
@@ -358,7 +358,7 @@ test('deadline deferral releases only the caller token and preserves a successor
     now: new Date(T1),
     deadline: createDeadline({ clock, budgetMs: 10 }),
     faultInjector(stage) {
-      if (stage !== 'after-journal-created') return;
+      if (stage !== 'after-transaction-activate') return;
       clock.advance(10);
       replaceLiveLockExternallyAtInjectedGuard(root);
       successor = acquireLock({ wikiRoot: root, operation: 'deadline-successor' });
@@ -383,7 +383,7 @@ test('non-expired takeover after journal creation fences every later transaction
     now: new Date(T1),
     deadline: createDeadline({ budgetMs: 12_000 }),
     faultInjector(stage) {
-      if (stage !== 'after-journal-created') return;
+      if (stage !== 'after-transaction-activate') return;
       replaceLiveLockExternallyAtInjectedGuard(root);
       successor = acquireLock({ wikiRoot: root, operation: 'journal-successor' });
       transaction = path.dirname(journalFiles(root)[0]);
@@ -545,7 +545,7 @@ test('transaction parent rejects reused dev and inode with a changed birth-time 
       proposed: T1,
       deadline: createDeadline({ budgetMs: 12_000 }),
       faultInjector(stage) {
-        if (stage === 'before-journal-create-write') changed = true;
+        if (stage === 'before-transaction-activate') changed = true;
       },
     });
   } finally {
@@ -756,7 +756,7 @@ for (const order of ['ensure-first', 'promote-first']) {
 }
 
 const ensureFaults = [
-  'after-journal-created',
+  'after-transaction-activate',
   'after-stage-pending-before',
   'after-stage-pending-after',
   'after-stage-last-before',
@@ -799,7 +799,7 @@ for (const faultPoint of ensureFaults) {
 }
 
 const promoteFaults = [
-  'after-journal-created',
+  'after-transaction-activate',
   'after-stage-pending-before',
   'after-stage-pending-after',
   'after-stage-last-before',

@@ -6,6 +6,33 @@ const path = require('node:path');
 
 const { assertBeforeDeadline } = require('./deadline.js');
 
+const SHA_RE = /^[a-f0-9]{64}$/;
+
+class WikiStateError extends Error {
+  constructor(code, message, cause) {
+    super(message, cause ? { cause } : undefined);
+    this.name = 'WikiStateError';
+    this.code = code;
+  }
+}
+
+function stateError(code, message, cause) {
+  return new WikiStateError(code, message, cause);
+}
+
+function readMaybe(file) {
+  try {
+    const stat = nodeFs.lstatSync(file);
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw stateError('WIKI_STATE_FILESYSTEM', `${file} must be a regular non-symlink file`);
+    }
+    return nodeFs.readFileSync(file);
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
 function codePointCompare(left, right) {
   const a = Array.from(left, (value) => value.codePointAt(0));
   const b = Array.from(right, (value) => value.codePointAt(0));
@@ -234,4 +261,7 @@ module.exports = {
   walkFiles,
   sha256,
   parsePageFrontmatter,
+  readMaybe,
+  stateError,
+  SHA_RE,
 };

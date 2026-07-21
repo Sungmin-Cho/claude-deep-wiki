@@ -6,15 +6,17 @@ const crypto = require('node:crypto');
 
 const envelope = require('../envelope.js');
 const { readIndexPayload } = require('../read-index-envelope.js');
-const { atomicWriteFile, parsePageFrontmatter, sha256 } = require('./fs-safe.js');
+const {
+  atomicWriteFile, parsePageFrontmatter, readMaybe, sha256, stateError, SHA_RE,
+} = require('./fs-safe.js');
 const { ISO_UTC_RE, resolveConfigWriteTarget } = require('./config.js');
 const { createDeadline, assertBeforeDeadline } = require('./deadline.js');
 const { acquireLock, assertLockOwner, releaseLock } = require('./lock.js');
 const scanWindow = require('./scan-window.js');
+const { sweepTransactionDebris } = require('./transaction-debris.js');
 
 const { promotePendingScan } = scanWindow;
 const ULID_RE = envelope.ULID_RE;
-const SHA_RE = /^[a-f0-9]{64}$/;
 const PAGE_RE = /^[a-z0-9][a-z0-9-]*\.md$/;
 const SLUG_RE = /^[a-z0-9][a-z0-9-]*$/;
 const MANIFEST_KEYS = [
@@ -63,18 +65,6 @@ const SETUP_INTENT_KEYS = [
   'contract_version', 'wiki_root', 'manifest_sha256', 'manifest',
 ];
 
-class WikiStateError extends Error {
-  constructor(code, message, cause) {
-    super(message, cause ? { cause } : undefined);
-    this.name = 'WikiStateError';
-    this.code = code;
-  }
-}
-
-function stateError(code, message, cause) {
-  return new WikiStateError(code, message, cause);
-}
-
 function hasExactKeys(value, keys) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const actual = Object.keys(value).sort();
@@ -99,19 +89,6 @@ function physicalRoot(wikiRoot) {
   }
   try { return fs.realpathSync.native(wikiRoot); }
   catch (cause) { throw stateError('WIKI_STATE_FILESYSTEM', 'wiki root is unavailable', cause); }
-}
-
-function readMaybe(file) {
-  try {
-    const stat = fs.lstatSync(file);
-    if (!stat.isFile() || stat.isSymbolicLink()) {
-      throw stateError('WIKI_STATE_FILESYSTEM', `${file} must be a regular non-symlink file`);
-    }
-    return fs.readFileSync(file);
-  } catch (error) {
-    if (error.code === 'ENOENT') return null;
-    throw error;
-  }
 }
 
 function ensureDirectory(directory) {
@@ -314,7 +291,13 @@ function readReceipt(locations, manifestHash) {
 function compactReceiptTransaction(root, token, locations, receipt) {
   if (!fs.existsSync(locations.transaction)) return;
   const journal = readJournal(locations.journal);
-  if (!journal || journal.engine !== 'wiki-state'
+  if (!journal) {
+    assertLockOwner({ wikiRoot: root, token });
+    fs.rmSync(locations.transaction, { recursive: true, force: true });
+    assertLockOwner({ wikiRoot: root, token });
+    return;
+  }
+  if (journal.engine !== 'wiki-state'
       || journal.manifest_sha256 !== receipt.manifest_sha256
       || !journal.transitions?.includes('cleaned')) {
     throw stateError('TRANSACTION_RECOVERY_REQUIRED', 'receipt has a nonterminal transaction directory');
@@ -331,16 +314,12 @@ function inspectTransactions(root, allowedOperationId = null, deadline = operati
   catch (error) { if (error.code === 'ENOENT') return; throw error; }
   for (const entry of entries) {
     assertBeforeDeadline(deadline, `wiki-state:inspect-transaction:${entry.name}`);
+    if (entry.name.startsWith('.activate-') && entry.isDirectory() && !entry.isSymbolicLink()) continue;
     if (!entry.isDirectory() || entry.isSymbolicLink()) {
       throw stateError('TRANSACTION_RECOVERY_REQUIRED', 'transaction store contains a non-directory entry');
     }
     const journal = readJournal(path.join(directory, entry.name, 'journal.json'));
-    if (!journal) {
-      if (entry.name !== allowedOperationId) {
-        throw stateError('TRANSACTION_RECOVERY_REQUIRED', 'transaction directory has no journal');
-      }
-      continue;
-    }
+    if (!journal) continue;
     const terminal = journal.engine === 'wiki-state'
       ? journal.transitions?.includes('committed')
       : journal.transitions?.includes('scan-window-committed');
@@ -666,10 +645,34 @@ function stageTransaction(root, token, locations, journal, faultInjector) {
 function prepareTransaction(root, token, locations, journal, faultInjector) {
   assertLockOwner({ wikiRoot: root, token });
   ensureDirectory(locations.transactions);
-  ensureDirectory(locations.transaction);
-  ensureDirectory(locations.before);
-  ensureDirectory(locations.after);
-  persistJournal(root, token, locations, journal, faultInjector, 'journal-created');
+  const activation = path.join(
+    locations.transactions,
+    `.activate-${process.pid}-${crypto.randomUUID()}`,
+  );
+  assertLockOwner({ wikiRoot: root, token });
+  fs.mkdirSync(activation);
+  const activationLocations = {
+    ...locations,
+    transaction: activation,
+    before: path.join(activation, 'before'),
+    after: path.join(activation, 'after'),
+    journal: path.join(activation, 'journal.json'),
+  };
+  const assertOwner = () => assertLockOwner({ wikiRoot: root, token });
+  assertOwner();
+  ensureDirectory(activationLocations.before);
+  assertOwner();
+  ensureDirectory(activationLocations.after);
+  assertOwner();
+  atomicWriteFile(activationLocations.journal, `${JSON.stringify(journal)}\n`, {
+    createParent: false, beforeRename: assertOwner, beforePublish: assertOwner,
+  });
+  assertOwner();
+  invokeFault(faultInjector, 'before-transaction-activate');
+  assertOwner();
+  fs.renameSync(activation, locations.transaction);
+  invokeFault(faultInjector, 'after-transaction-activate');
+  assertOwner();
   stageTransaction(root, token, locations, journal, faultInjector);
 }
 
@@ -863,6 +866,9 @@ function applyCommit(options = {}) {
   assertBeforeDeadline(deadline, 'wiki-state:commit-entry');
   const root = physicalRoot(options.wikiRoot);
   assertLockOwner({ wikiRoot: root, token: options.token });
+  sweepTransactionDebris(root, options.token, {
+    deadline, classes: ['activation', 'plain', 'cancelled'],
+  });
   const manifest = validateManifestSchema(options.manifest);
   const manifestHash = sha256(Buffer.from(JSON.stringify(manifest)));
   const locations = transactionPaths(root, manifest.operation_id);
@@ -1033,6 +1039,7 @@ function interruptedSetupManifest(root) {
   try { entries = fs.readdirSync(transactions, { withFileTypes: true }); }
   catch (error) { if (error.code === 'ENOENT') return null; throw error; }
   for (const entry of entries) {
+    if (entry.name.startsWith('.activate-')) continue;
     if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
     const journal = readJournal(path.join(transactions, entry.name, 'journal.json'));
     if (journal?.engine === 'wiki-state' && journal.manifest?.operation === 'setup'
@@ -1279,6 +1286,10 @@ function fixWiki(options = {}) {
     throw error;
   }
   try {
+    assertLockOwner({ wikiRoot: root, token: owner.token });
+    sweepTransactionDebris(root, owner.token, {
+      deadline, classes: ['activation', 'plain', 'cancelled'],
+    });
     const before = inspectWiki({ wikiRoot: root, deadline });
     const pendingBytes = readMaybe(path.join(root, '.wiki-meta', '.pending-scan'));
     const lastBytes = readMaybe(path.join(root, '.wiki-meta', '.last-scan'));

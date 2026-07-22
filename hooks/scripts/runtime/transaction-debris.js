@@ -1,0 +1,177 @@
+'use strict';
+
+const fs = require('node:fs');
+const path = require('node:path');
+
+const { remainingMs } = require('./deadline.js');
+const { readMaybe, stateError } = require('./fs-safe.js');
+const { assertLockOwner } = require('./lock.js');
+
+const SWEEP_RESERVE_MS = 10_000;
+const ULID_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/;
+const TOMBSTONE_KEYS = ['contract_version', 'operation_id', 'reason', 'drift'];
+const TOMBSTONE_REASONS = new Set(['catalog-drift']);
+const SWEEP_CLASSES = new Set(['activation', 'plain', 'cancelled']);
+
+function hasExactKeys(value, keys) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+}
+
+function validWikiRelativePath(value) {
+  return typeof value === 'string' && value.length > 0
+    && !path.isAbsolute(value) && !value.split('/').includes('..');
+}
+
+function validateTombstoneV1(source, requestedOperationId) {
+  const reject = (message) => ({
+    valid: false,
+    error: stateError('TRANSACTION_RECOVERY_REQUIRED', message),
+  });
+  let bytes;
+  let operationId = requestedOperationId;
+  if (Buffer.isBuffer(source) || source instanceof Uint8Array) {
+    bytes = Buffer.from(source);
+  } else if (typeof source === 'string') {
+    operationId ||= path.basename(source);
+    bytes = readMaybe(path.join(source, 'cancelled.json'));
+  } else {
+    return reject('cancel tombstone source is invalid');
+  }
+  if (bytes === null) return reject('cancel tombstone is absent');
+  let value;
+  try { value = JSON.parse(bytes.toString('utf8')); }
+  catch { return reject('cancel tombstone is unreadable'); }
+  if (!hasExactKeys(value, TOMBSTONE_KEYS) || value.contract_version !== 1
+      || typeof operationId !== 'string' || !ULID_RE.test(value.operation_id)
+      || value.operation_id !== operationId || !TOMBSTONE_REASONS.has(value.reason)
+      || !Array.isArray(value.drift) || value.drift.length < 1 || value.drift.length > 8
+      || value.drift.some((entry) => !validWikiRelativePath(entry))) {
+    return reject('cancel tombstone schema is invalid');
+  }
+  return {
+    valid: true,
+    value: {
+      operation_id: value.operation_id,
+      reason: value.reason,
+      drift: [...value.drift],
+    },
+  };
+}
+
+function entryExists(pathname) {
+  try { fs.lstatSync(pathname); return true; }
+  catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+}
+
+function invokeFault(faultInjector, boundary) {
+  if (typeof faultInjector === 'function') faultInjector(boundary);
+}
+
+// Removes `pathname` (file or directory tree) leaf-first, checking the sweep reserve before
+// each removal. Returns true if `pathname` is fully gone when this returns; false if the sweep
+// reserve ran out partway through (some descendants may remain — safe to resume on a later call,
+// since the remaining filesystem state alone is what a future sweep re-discovers and classifies).
+function removeEntryBounded(pathname, deadline, assertOwner, faultInjector, counter) {
+  let stat;
+  try { stat = fs.lstatSync(pathname); }
+  catch (error) { if (error.code === 'ENOENT') return true; throw error; }
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    invokeFault(faultInjector, `sweep-remove:${counter.value}`);
+    counter.value += 1;
+    if (remainingMs(deadline) < SWEEP_RESERVE_MS) return false;
+    assertOwner();
+    fs.rmSync(pathname, { force: true });
+    return true;
+  }
+  let children;
+  try { children = fs.readdirSync(pathname); }
+  catch (error) { if (error.code === 'ENOENT') return true; throw error; }
+  for (const name of children) {
+    if (remainingMs(deadline) < SWEEP_RESERVE_MS) return false;
+    if (!removeEntryBounded(path.join(pathname, name), deadline, assertOwner, faultInjector, counter)) return false;
+  }
+  invokeFault(faultInjector, `sweep-remove:${counter.value}`);
+  counter.value += 1;
+  if (remainingMs(deadline) < SWEEP_RESERVE_MS) return false;
+  assertOwner();
+  fs.rmdirSync(pathname);
+  return true;
+}
+
+// Returns the number and names of debris directories removed during this bounded pass.
+function sweepTransactionDebris(root, token, options = {}) {
+  const { deadline, limit = 8, faultInjector } = options;
+  const classes = options.classes === undefined
+    ? new Set(SWEEP_CLASSES)
+    : new Set(options.classes);
+  if (!Number.isInteger(limit) || limit < 0) throw new RangeError('debris sweep limit must be a nonnegative integer');
+  if ([...classes].some((name) => !SWEEP_CLASSES.has(name))) throw new TypeError('unknown transaction debris class');
+  const transactions = path.join(root, '.wiki-meta', '.transactions');
+  let entries;
+  try { entries = fs.readdirSync(transactions, { withFileTypes: true }); }
+  catch (error) {
+    if (error.code === 'ENOENT') return { processed: 0, removed: [] };
+    throw error;
+  }
+  const assertOwner = () => assertLockOwner({ wikiRoot: root, token });
+  let processed = 0;
+  const removed = [];
+  for (const entry of entries) {
+    if (processed >= limit || !entry.isDirectory() || entry.isSymbolicLink()) continue;
+    const transaction = path.join(transactions, entry.name);
+    const journal = path.join(transaction, 'journal.json');
+
+    let debrisClass = null;
+    if (entry.name.startsWith('.activate-')) {
+      if (classes.has('activation')) debrisClass = 'activation';
+    } else {
+      if (entryExists(journal)) continue;
+      const tombstone = path.join(transaction, 'cancelled.json');
+      if (!entryExists(tombstone)) {
+        if (classes.has('plain')) debrisClass = 'plain';
+      } else if (classes.has('cancelled')) {
+        let verdict;
+        try { verdict = validateTombstoneV1(transaction, entry.name); }
+        catch { continue; }
+        if (verdict.valid) debrisClass = 'cancelled';
+      }
+    }
+    if (debrisClass === null) continue;
+    if (remainingMs(deadline) < SWEEP_RESERVE_MS) break;
+
+    if (debrisClass !== 'cancelled') {
+      const counter = { value: 0 };
+      if (!removeEntryBounded(transaction, deadline, assertOwner, faultInjector, counter)) {
+        return { processed, removed };
+      }
+      processed += 1;
+      removed.push(entry.name);
+      continue;
+    }
+
+    const counter = { value: 0 };
+    for (const name of fs.readdirSync(transaction)) {
+      if (name === 'cancelled.json') continue;
+      if (!removeEntryBounded(path.join(transaction, name), deadline, assertOwner, faultInjector, counter)) {
+        return { processed, removed };
+      }
+    }
+    assertOwner();
+    fs.rmSync(path.join(transaction, 'cancelled.json'), { force: true });
+    assertOwner();
+    fs.rmdirSync(transaction);
+    assertOwner();
+    processed += 1;
+    removed.push(entry.name);
+  }
+  return { processed, removed };
+}
+
+module.exports = {
+  SWEEP_RESERVE_MS,
+  validateTombstoneV1,
+  sweepTransactionDebris,
+};

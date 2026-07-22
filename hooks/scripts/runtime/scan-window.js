@@ -2,15 +2,17 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 
 const { ISO_UTC_RE } = require('./config.js');
 const { atomicWriteFile, sha256 } = require('./fs-safe.js');
-const { assertBeforeDeadline } = require('./deadline.js');
+const { assertBeforeDeadline, createDeadline } = require('./deadline.js');
 const {
   acquireLock,
   assertLockOwner,
   releaseLock,
 } = require('./lock.js');
+const { sweepTransactionDebris } = require('./transaction-debris.js');
 
 const sleepArray = new Int32Array(new SharedArrayBuffer(4));
 const STAGES = ['pending-before', 'pending-after', 'last-before', 'last-after'];
@@ -273,20 +275,18 @@ function defaultTransactionParentGuard(locations) {
       assertTransactions();
     }
   };
-  const prepare = (assertOwner) => {
+  const prepareParent = (assertOwner) => {
     assertMeta();
     if (observe('transactions', true) === null) createDirectory('transactions', assertOwner);
     else assertTransactions();
-    if (observe('transaction', true) === null) createDirectory('transaction', assertOwner);
-    else assertAll();
     if (typeof assertOwner === 'function') assertOwner();
-    assertAll();
+    assertTransactions();
   };
-
   return {
     assertAll,
+    assertTransactions,
     inspectExistingOperation,
-    prepare,
+    prepareParent,
   };
 }
 
@@ -414,8 +414,39 @@ function defaultJournalAdapter(wikiRoot, operationId) {
   };
   return {
     locations,
-    prepareTransaction(assertOwner) {
-      parents.prepare(assertOwner);
+    activateTransaction(value, assertOwner, options) {
+      parents.prepareParent(assertOwner);
+      const activation = path.join(
+        locations.transactions,
+        `.activate-${process.pid}-${crypto.randomUUID()}`,
+      );
+      assertOwner();
+      parents.assertTransactions();
+      fs.mkdirSync(activation);
+      const identity = inspectPhysicalDirectory(
+        activation, activation, 'scan-window activation directory',
+      );
+      const assertActivation = () => {
+        assertOwner();
+        parents.assertTransactions();
+        const current = inspectPhysicalDirectory(
+          activation, activation, 'scan-window activation directory',
+        );
+        if (!identitiesMatch(current, identity)) {
+          throw scanError('SCAN_WINDOW_FILESYSTEM', 'scan-window activation directory identity changed');
+        }
+        parents.assertTransactions();
+      };
+      atomicWriteFile(path.join(activation, 'journal.json'), `${JSON.stringify(value)}\n`, {
+        createParent: false,
+        beforeRename: assertActivation,
+        beforePublish: assertActivation,
+      });
+      assertActivation();
+      invokeFault(options.faultInjector, 'before-transaction-activate');
+      assertActivation();
+      fs.renameSync(activation, locations.transaction);
+      invokeFault(options.faultInjector, 'after-transaction-activate');
     },
     readJournal() {
       if (!parents.inspectExistingOperation()) return null;
@@ -441,6 +472,9 @@ function defaultJournalAdapter(wikiRoot, operationId) {
     },
     tombstonePath: locations.tombstone,
     [DEFAULT_ADAPTER_CONTROL]: {
+      prepareDebrisSweep(assertOwner) {
+        parents.prepareParent(assertOwner);
+      },
       readDestination(file) {
         if (file !== locations.pending && file !== locations.last) {
           throw scanError('SCAN_WINDOW_FILESYSTEM', 'default adapter destination is outside .wiki-meta');
@@ -877,13 +911,17 @@ function applyScanWindowTransition(options = {}) {
   assertLockOwner({ wikiRoot: physicalRoot, token });
   assertPersistenceDeadline(options.deadline, 'transaction-entry');
   const adapter = adapterFor(physicalRoot, operationId, options.journalAdapter);
-  const transactionOptions = { ...options, wikiRoot: physicalRoot, token };
-  let journal = adapter.readJournal();
-  if (!journal && typeof adapter.prepareTransaction === 'function') {
-    mutateTransactionMetadata(transactionOptions, 'before-transaction-directory-create', (assertOwner) => {
-      adapter.prepareTransaction(assertOwner);
+  const control = adapter[DEFAULT_ADAPTER_CONTROL];
+  if (control) {
+    const assertOwner = () => assertLockOwner({ wikiRoot: physicalRoot, token });
+    control.prepareDebrisSweep(assertOwner);
+    sweepTransactionDebris(physicalRoot, token, {
+      deadline: options.deadline || createDeadline({ budgetMs: 12_000 }),
+      classes: ['activation', 'plain'],
     });
   }
+  const transactionOptions = { ...options, wikiRoot: physicalRoot, token };
+  let journal = adapter.readJournal();
   const planHash = options.plan ? inputHash(physicalRoot, options.plan) : null;
   if (options.inputHash && planHash && options.inputHash !== planHash) {
     throw scanError('SCAN_WINDOW_INVALID', 'provided input hash does not match the requested scan-window plan');
@@ -901,10 +939,16 @@ function applyScanWindowTransition(options = {}) {
       throw scanError('SCAN_WINDOW_INVALID', 'requested scan-window plan did not produce the canonical input hash');
     }
     assertPersistenceDeadline(options.deadline, 'journal-before-create');
-    mutateTransactionMetadata(transactionOptions, 'before-journal-create-write', (assertOwner) => {
-      adapter.writeJournal(journal, assertOwner);
-    });
-    invokeFault(options.faultInjector, 'after-journal-created');
+    if (typeof adapter.activateTransaction === 'function') {
+      mutateTransactionMetadata(transactionOptions, 'before-transaction-directory-create', () => {});
+      const assertOwner = () => assertLockOwner({ wikiRoot: physicalRoot, token });
+      adapter.activateTransaction(journal, assertOwner, transactionOptions);
+    } else {
+      mutateTransactionMetadata(transactionOptions, 'before-journal-create-write', (assertOwner) => {
+        adapter.writeJournal(journal, assertOwner);
+      });
+      invokeFault(options.faultInjector, 'after-journal-created');
+    }
     assertPersistenceDeadline(options.deadline, 'journal-after-create');
   }
   const cleaned = journal.transitions.includes('cleaned');

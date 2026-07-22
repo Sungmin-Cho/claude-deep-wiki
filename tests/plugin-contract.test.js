@@ -144,13 +144,13 @@ test('portable npm test cannot discover the native installed-Codex release smoke
   assert.match(smoke, /windowsHide: true/);
 });
 
-test('1.8.1 release keeps every package version exact', () => {
+test('1.9.0 release keeps every package version exact', () => {
   const packageFiles = [
     '.claude-plugin/plugin.json',
     '.codex-plugin/plugin.json',
     'package.json',
   ];
-  for (const file of packageFiles) assert.equal(readJson(file).version, '1.8.1', file);
+  for (const file of packageFiles) assert.equal(readJson(file).version, '1.9.0', file);
 });
 
 test('1.8.0 release documents the reviewed runtime and evidence boundary', () => {

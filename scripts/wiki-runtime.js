@@ -10,6 +10,7 @@ const {
   acquireLock,
   releaseLock,
   recoverLock,
+  assertLockOwner,
 } = require(path.join(runtimeRoot, 'lock.js'));
 const wikiState = require(path.join(runtimeRoot, 'wiki-state.js'));
 const { sha256 } = require(path.join(runtimeRoot, 'fs-safe.js'));
@@ -233,27 +234,128 @@ function runSnapshot(argv) {
   emit(wikiState.snapshotWiki({ wikiRoot: flags['--wiki-root'] }));
 }
 
+function cleanupRuntimeManifests(wikiRoot, token, operationId) {
+  const root = path.resolve(wikiRoot);
+  const directory = path.join(root, '.wiki-meta', '.runtime');
+  assertLockOwner({ wikiRoot: root, token });
+  let entries;
+  try {
+    entries = fs.readdirSync(directory, { withFileTypes: true });
+  } catch (error) {
+    if (error.code === 'ENOENT') return;
+    throw error;
+  }
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    const file = path.join(directory, entry.name);
+    let parsed;
+    try {
+      parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch {
+      continue;
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || parsed.operation_id !== operationId) continue;
+    assertLockOwner({ wikiRoot: root, token });
+    fs.rmSync(file, { force: true });
+    assertLockOwner({ wikiRoot: root, token });
+  }
+}
+
+function powershellQuote(value) {
+  // PowerShell single-quoted strings are fully literal (no interpolation, no metacharacter
+  // interpretation of %, &, ", ^, etc.) except that an embedded literal single quote must be
+  // doubled -- the PowerShell analogue of the POSIX single-quote escape below. We deliberately do
+  // NOT attempt a cmd.exe-safe encoding: cmd.exe has no general-purpose literal-string quoting
+  // mechanism (its own metacharacters -- %, &, |, ^, <, >, and ! under delayed expansion -- are
+  // interpreted by cmd.exe's parser even inside double quotes, with no escape that neutralizes
+  // all of them for an arbitrary byte string), so no cmd.exe encoding here could be made
+  // genuinely safe. The rendered hint is explicitly labeled "(PowerShell)" so a Windows user
+  // knows which shell to run it in.
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+function shellQuote(value) {
+  if (process.platform === 'win32') return powershellQuote(value);
+  // POSIX: wrap in single quotes; nothing is special inside them except the single quote itself,
+  // which must be closed, escaped literally, and reopened.
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
+function recoverHint(wikiRoot, operationId) {
+  const root = path.resolve(wikiRoot);
+  const label = process.platform === 'win32' ? 'resume with (PowerShell):' : 'resume with:';
+  return `${label}\nnode scripts/wiki-runtime.js transaction recover --wiki-root ${shellQuote(root)} --lock-token <token> --operation-id ${shellQuote(operationId)} --json`;
+}
+
+function transactionDurablyExists(wikiRoot, operationId) {
+  const transaction = path.join(path.resolve(wikiRoot), '.wiki-meta', '.transactions', operationId);
+  return fs.existsSync(path.join(transaction, 'journal.json'))
+    || fs.existsSync(path.join(transaction, 'cancelled.json'));
+}
+
+function commitRetryHint(wikiRoot, manifestFile) {
+  const root = path.resolve(wikiRoot);
+  const manifest = path.resolve(manifestFile);
+  const label = process.platform === 'win32' ? 'rerun with (PowerShell):' : 'rerun with:';
+  return `${label}\nnode scripts/wiki-runtime.js commit --wiki-root ${shellQuote(root)} --lock-token <token> --manifest-file ${shellQuote(manifest)} --json`;
+}
+
 function runCommit(argv) {
   const flags = wikiFlags(argv, { '--lock-token': 'value', '--manifest-file': 'value' });
   const manifestFile = requireFlag(flags, '--manifest-file');
-  const result = wikiState.applyCommit({
-    wikiRoot: flags['--wiki-root'],
-    token: requireFlag(flags, '--lock-token'),
-    manifest: readManifestFile(manifestFile),
-  });
+  const token = requireFlag(flags, '--lock-token');
+  const manifest = readManifestFile(manifestFile);
+  let result;
+  try {
+    result = wikiState.applyCommit({
+      wikiRoot: flags['--wiki-root'],
+      token,
+      manifest,
+    });
+  } catch (error) {
+    if (error.code === 'DEADLINE_EXCEEDED') {
+      error.message = transactionDurablyExists(flags['--wiki-root'], manifest.operation_id)
+        ? `${error.message} — ${recoverHint(flags['--wiki-root'], manifest.operation_id)}`
+        : `${error.message} — ${commitRetryHint(flags['--wiki-root'], manifestFile)}`;
+    }
+    throw error;
+  }
   emit(result);
   const runtimeDirectory = path.join(path.resolve(flags['--wiki-root']), '.wiki-meta', '.runtime');
   const relative = path.relative(runtimeDirectory, path.resolve(manifestFile));
-  if (relative && !relative.startsWith('..') && !path.isAbsolute(relative)) fs.rmSync(manifestFile, { force: true });
+  if (relative && !relative.startsWith('..') && !path.isAbsolute(relative)) {
+    try {
+      cleanupRuntimeManifests(flags['--wiki-root'], token, manifest.operation_id);
+    } catch (error) {
+      if (error.code !== 'LOCK_TOKEN_MISMATCH') throw error;
+      process.stderr.write(`WARNING: runtime manifest cleanup skipped after lock ownership changed: ${error.message}\n`);
+    }
+  }
 }
 
 function runTransaction(argv) {
   if (argv[0] !== 'recover') throw new UsageError('transaction requires recover');
   const flags = wikiFlags(argv.slice(1), { '--lock-token': 'value', '--operation-id': 'value' });
-  emit(wikiState.recoverTransaction({
-    wikiRoot: flags['--wiki-root'], token: requireFlag(flags, '--lock-token'),
-    operationId: requireFlag(flags, '--operation-id'),
-  }));
+  const token = requireFlag(flags, '--lock-token');
+  const operationId = requireFlag(flags, '--operation-id');
+  let result;
+  try {
+    result = wikiState.recoverTransaction({
+      wikiRoot: flags['--wiki-root'], token, operationId,
+    });
+  } catch (error) {
+    if (error.code === 'DEADLINE_EXCEEDED') {
+      error.message = `${error.message} — ${recoverHint(flags['--wiki-root'], operationId)}`;
+    }
+    throw error;
+  }
+  emit(result);
+  try {
+    cleanupRuntimeManifests(flags['--wiki-root'], token, operationId);
+  } catch (error) {
+    if (error.code !== 'LOCK_TOKEN_MISMATCH') throw error;
+    process.stderr.write(`WARNING: runtime manifest cleanup skipped after lock ownership changed: ${error.message}\n`);
+  }
 }
 
 function runIndex(argv) {
@@ -308,7 +410,8 @@ function exitCode(error) {
   if (error.code === 'CONFIG_CONFLICT' || error.code === 'CONFIG_TARGET_CONFLICT'
       || error.code === 'CONFIG_NOT_FOUND' || error.code === 'CONFIG_INVALID'
       || error.code === 'LOCK_INVALID' || error.code === 'MANIFEST_INVALID'
-      || error.code === 'EXPECTED_HASH_CONFLICT' || error.code === 'WIKI_STATE_INVALID') return 4;
+      || error.code === 'EXPECTED_HASH_CONFLICT' || error.code === 'TRANSACTION_CANCELLED'
+      || error.code === 'WIKI_STATE_INVALID') return 4;
   return 5;
 }
 
@@ -340,4 +443,4 @@ function main(argv = process.argv.slice(2)) {
 
 if (require.main === module) process.exitCode = main();
 
-module.exports = { main };
+module.exports = { main, recoverHint, commitRetryHint, cleanupRuntimeManifests };

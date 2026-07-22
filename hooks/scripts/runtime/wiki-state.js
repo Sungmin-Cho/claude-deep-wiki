@@ -6,15 +6,19 @@ const crypto = require('node:crypto');
 
 const envelope = require('../envelope.js');
 const { readIndexPayload } = require('../read-index-envelope.js');
-const { atomicWriteFile, parsePageFrontmatter, sha256 } = require('./fs-safe.js');
+const {
+  atomicWriteFile, parsePageFrontmatter, readMaybe, sha256, stateError, SHA_RE,
+} = require('./fs-safe.js');
 const { ISO_UTC_RE, resolveConfigWriteTarget } = require('./config.js');
-const { createDeadline, assertBeforeDeadline } = require('./deadline.js');
+const {
+  createDeadline, assertBeforeDeadline, remainingMs, DeadlineExceeded,
+} = require('./deadline.js');
 const { acquireLock, assertLockOwner, releaseLock } = require('./lock.js');
 const scanWindow = require('./scan-window.js');
+const { sweepTransactionDebris, validateTombstoneV1 } = require('./transaction-debris.js');
 
 const { promotePendingScan } = scanWindow;
 const ULID_RE = envelope.ULID_RE;
-const SHA_RE = /^[a-f0-9]{64}$/;
 const PAGE_RE = /^[a-z0-9][a-z0-9-]*\.md$/;
 const SLUG_RE = /^[a-z0-9][a-z0-9-]*$/;
 const MANIFEST_KEYS = [
@@ -56,24 +60,17 @@ const JOURNAL_KEYS = [
   'manifest', 'owner_token', 'transitions', 'artifacts', 'artifacts_sha256',
   'event_ids', 'scan_window_journal', 'result', 'result_sha256',
 ];
+const JOURNAL_KEYS_V2 = [
+  ...JOURNAL_KEYS, 'catalog_seal', 'catalog_seal_sha256', 'catalog_seal_cursor', 'verify_stage_cursor',
+];
+const CATALOG_SEAL_KEYS = ['relative_path', 'sha256'];
+const SCAN_YIELD_MARGIN_MS = 250;
 const RECEIPT_KEYS = [
   'contract_version', 'operation_id', 'manifest_sha256', 'result', 'result_sha256',
 ];
 const SETUP_INTENT_KEYS = [
   'contract_version', 'wiki_root', 'manifest_sha256', 'manifest',
 ];
-
-class WikiStateError extends Error {
-  constructor(code, message, cause) {
-    super(message, cause ? { cause } : undefined);
-    this.name = 'WikiStateError';
-    this.code = code;
-  }
-}
-
-function stateError(code, message, cause) {
-  return new WikiStateError(code, message, cause);
-}
 
 function hasExactKeys(value, keys) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -99,19 +96,6 @@ function physicalRoot(wikiRoot) {
   }
   try { return fs.realpathSync.native(wikiRoot); }
   catch (cause) { throw stateError('WIKI_STATE_FILESYSTEM', 'wiki root is unavailable', cause); }
-}
-
-function readMaybe(file) {
-  try {
-    const stat = fs.lstatSync(file);
-    if (!stat.isFile() || stat.isSymbolicLink()) {
-      throw stateError('WIKI_STATE_FILESYSTEM', `${file} must be a regular non-symlink file`);
-    }
-    return fs.readFileSync(file);
-  } catch (error) {
-    if (error.code === 'ENOENT') return null;
-    throw error;
-  }
 }
 
 function ensureDirectory(directory) {
@@ -281,6 +265,7 @@ function transactionPaths(root, operationId) {
     before: path.join(transaction, 'before'),
     after: path.join(transaction, 'after'),
     journal: path.join(transaction, 'journal.json'),
+    tombstone: path.join(transaction, 'cancelled.json'),
   };
 }
 
@@ -314,7 +299,13 @@ function readReceipt(locations, manifestHash) {
 function compactReceiptTransaction(root, token, locations, receipt) {
   if (!fs.existsSync(locations.transaction)) return;
   const journal = readJournal(locations.journal);
-  if (!journal || journal.engine !== 'wiki-state'
+  if (!journal) {
+    assertLockOwner({ wikiRoot: root, token });
+    fs.rmSync(locations.transaction, { recursive: true, force: true });
+    assertLockOwner({ wikiRoot: root, token });
+    return;
+  }
+  if (journal.engine !== 'wiki-state'
       || journal.manifest_sha256 !== receipt.manifest_sha256
       || !journal.transitions?.includes('cleaned')) {
     throw stateError('TRANSACTION_RECOVERY_REQUIRED', 'receipt has a nonterminal transaction directory');
@@ -331,13 +322,19 @@ function inspectTransactions(root, allowedOperationId = null, deadline = operati
   catch (error) { if (error.code === 'ENOENT') return; throw error; }
   for (const entry of entries) {
     assertBeforeDeadline(deadline, `wiki-state:inspect-transaction:${entry.name}`);
+    if (entry.name.startsWith('.activate-') && entry.isDirectory() && !entry.isSymbolicLink()) continue;
     if (!entry.isDirectory() || entry.isSymbolicLink()) {
       throw stateError('TRANSACTION_RECOVERY_REQUIRED', 'transaction store contains a non-directory entry');
     }
-    const journal = readJournal(path.join(directory, entry.name, 'journal.json'));
+    const transaction = path.join(directory, entry.name);
+    const journal = readJournal(path.join(transaction, 'journal.json'));
     if (!journal) {
+      const tombstoneBytes = readMaybe(path.join(transaction, 'cancelled.json'));
+      if (tombstoneBytes === null) continue;
+      const verdict = validateTombstoneV1(tombstoneBytes, entry.name);
+      if (!verdict.valid) throw verdict.error;
       if (entry.name !== allowedOperationId) {
-        throw stateError('TRANSACTION_RECOVERY_REQUIRED', 'transaction directory has no journal');
+        throw stateError('TRANSACTION_RECOVERY_REQUIRED', 'a cancelled transaction requires teardown');
       }
       continue;
     }
@@ -447,6 +444,7 @@ function buildPlan(root, manifest, now, deadline) {
   const finalPages = new Map(existingPages);
   const finalSources = new Map(existingSources);
   const artifacts = [];
+  const catalogSeal = [];
 
   const beforeLogJson = readMaybe(path.join(root, 'log.jsonl'));
   const beforeLogMd = readMaybe(path.join(root, 'log.md'));
@@ -537,19 +535,19 @@ function buildPlan(root, manifest, now, deadline) {
   }
 
   const represented = new Set(artifacts.map((item) => item.relative_path));
-  const sealUnchanged = (entries, phase, prefix, keyPrefix) => {
+  const sealUnchanged = (entries, prefix) => {
     for (const [file, bytes] of entries) {
       assertBeforeDeadline(deadline, `wiki-state:seal:${prefix}${file}`);
       const relative = `${prefix}${file}`;
       if (!represented.has(relative)) {
-        artifacts.push(artifact(`${keyPrefix}-${file}`, phase, relative, bytes, bytes));
+        catalogSeal.push({ relative_path: relative, sha256: sha256(bytes) });
         represented.add(relative);
       }
     }
   };
-  sealUnchanged(existingVersions, 'versions', '.wiki-meta/.versions/', 'seal-version');
-  sealUnchanged(existingPages, 'pages', 'pages/', 'seal-page');
-  sealUnchanged(existingSources, 'sources', '.wiki-meta/sources/', 'seal-source');
+  sealUnchanged(existingVersions, '.wiki-meta/.versions/');
+  sealUnchanged(existingPages, 'pages/');
+  sealUnchanged(existingSources, '.wiki-meta/sources/');
 
   const indexes = indexArtifacts(finalPages, manifest, root, now, deadline);
   artifacts.push(artifact(
@@ -562,12 +560,19 @@ function buildPlan(root, manifest, now, deadline) {
   const logs = logArtifacts(beforeLogJson, beforeLogMd, manifest.events, deadline);
   artifacts.push(artifact('log-jsonl', 'log-jsonl', 'log.jsonl', beforeLogJson, logs.json));
   artifacts.push(artifact('log-md', 'log-md', 'log.md', beforeLogMd, logs.markdown));
-  return artifacts;
+  return { artifacts, catalogSeal };
+}
+
+function validJournalRelativePath(relativePath) {
+  return typeof relativePath === 'string' && !path.isAbsolute(relativePath)
+    && !relativePath.split('/').includes('..');
 }
 
 function validateJournal(journal, root, operationId, manifestHash) {
-  if (!hasExactKeys(journal, JOURNAL_KEYS)
-      || journal.engine !== 'wiki-state' || journal.contract_version !== 1
+  const legacyShape = journal?.contract_version === 1 && hasExactKeys(journal, JOURNAL_KEYS);
+  const currentShape = journal?.contract_version === 2 && hasExactKeys(journal, JOURNAL_KEYS_V2);
+  if ((!legacyShape && !currentShape)
+      || journal.engine !== 'wiki-state'
       || journal.wiki_root !== root || journal.operation_id !== operationId
       || typeof journal.manifest_sha256 !== 'string' || !SHA_RE.test(journal.manifest_sha256)
       || typeof journal.artifacts_sha256 !== 'string' || !SHA_RE.test(journal.artifacts_sha256)
@@ -598,12 +603,36 @@ function validateJournal(journal, root, operationId, manifestHash) {
   }
   for (const item of journal.artifacts) {
     if (typeof item.key !== 'string' || typeof item.phase !== 'string'
-        || typeof item.relative_path !== 'string' || path.isAbsolute(item.relative_path)
-        || item.relative_path.split('/').includes('..')) {
+        || !validJournalRelativePath(item.relative_path)) {
       throw stateError('TRANSACTION_RECOVERY_REQUIRED', 'journal artifact path is invalid');
     }
     descriptorBytes(item.before);
     descriptorBytes(item.after);
+  }
+  if (currentShape) {
+    if (!Array.isArray(journal.catalog_seal)
+        || typeof journal.catalog_seal_sha256 !== 'string'
+        || !SHA_RE.test(journal.catalog_seal_sha256)
+        || sha256(Buffer.from(JSON.stringify(journal.catalog_seal))) !== journal.catalog_seal_sha256
+        || !Number.isInteger(journal.catalog_seal_cursor)
+        || journal.catalog_seal_cursor < 0
+        || journal.catalog_seal_cursor > journal.catalog_seal.length
+        || !Number.isInteger(journal.verify_stage_cursor)
+        || journal.verify_stage_cursor < 0
+        || journal.verify_stage_cursor > journal.artifacts.length) {
+      throw stateError('TRANSACTION_RECOVERY_REQUIRED', 'journal catalog seal is malformed');
+    }
+    const artifactPaths = new Set(journal.artifacts.map((item) => item.relative_path));
+    const sealPaths = new Set();
+    for (const entry of journal.catalog_seal) {
+      if (!hasExactKeys(entry, CATALOG_SEAL_KEYS)
+          || !validJournalRelativePath(entry.relative_path)
+          || typeof entry.sha256 !== 'string' || !SHA_RE.test(entry.sha256)
+          || sealPaths.has(entry.relative_path) || artifactPaths.has(entry.relative_path)) {
+        throw stateError('TRANSACTION_RECOVERY_REQUIRED', 'journal catalog seal entry is invalid');
+      }
+      sealPaths.add(entry.relative_path);
+    }
   }
   return journal;
 }
@@ -633,7 +662,7 @@ function appendTransition(root, token, locations, journal, transition, faultInje
   }
 }
 
-function stageTransaction(root, token, locations, journal, faultInjector) {
+function stageTransaction(root, token, locations, journal, faultInjector, deadline) {
   assertLockOwner({ wikiRoot: root, token });
   ensureDirectory(locations.transactions);
   ensureDirectory(locations.transaction);
@@ -641,6 +670,7 @@ function stageTransaction(root, token, locations, journal, faultInjector) {
   ensureDirectory(locations.after);
   appendTransition(root, token, locations, journal, 'journaled', faultInjector);
   journal.artifacts.forEach((item, index) => {
+    assertBeforeDeadline(deadline, `wiki-state:stage:${item.key}`);
     for (const side of ['before', 'after']) {
       const staged = Buffer.from(`${JSON.stringify(item[side])}\n`);
       const destination = path.join(locations[side], `${String(index).padStart(4, '0')}.json`);
@@ -663,18 +693,68 @@ function stageTransaction(root, token, locations, journal, faultInjector) {
   appendTransition(root, token, locations, journal, 'staged', faultInjector);
 }
 
-function prepareTransaction(root, token, locations, journal, faultInjector) {
+function prepareTransaction(root, token, locations, journal, faultInjector, deadline) {
   assertLockOwner({ wikiRoot: root, token });
   ensureDirectory(locations.transactions);
-  ensureDirectory(locations.transaction);
-  ensureDirectory(locations.before);
-  ensureDirectory(locations.after);
-  persistJournal(root, token, locations, journal, faultInjector, 'journal-created');
-  stageTransaction(root, token, locations, journal, faultInjector);
+  const activation = path.join(
+    locations.transactions,
+    `.activate-${process.pid}-${crypto.randomUUID()}`,
+  );
+  assertLockOwner({ wikiRoot: root, token });
+  fs.mkdirSync(activation);
+  const activationLocations = {
+    ...locations,
+    transaction: activation,
+    before: path.join(activation, 'before'),
+    after: path.join(activation, 'after'),
+    journal: path.join(activation, 'journal.json'),
+  };
+  const assertOwner = () => assertLockOwner({ wikiRoot: root, token });
+  assertOwner();
+  ensureDirectory(activationLocations.before);
+  assertOwner();
+  ensureDirectory(activationLocations.after);
+  assertOwner();
+  atomicWriteFile(activationLocations.journal, `${JSON.stringify(journal)}\n`, {
+    createParent: false, beforeRename: assertOwner, beforePublish: assertOwner,
+  });
+  assertOwner();
+  invokeFault(faultInjector, 'before-transaction-activate');
+  assertOwner();
+  fs.renameSync(activation, locations.transaction);
+  invokeFault(faultInjector, 'after-transaction-activate');
+  assertOwner();
+  stageTransaction(root, token, locations, journal, faultInjector, deadline);
 }
 
-function verifyStages(locations, journal) {
-  journal.artifacts.forEach((item, index) => {
+function verifyStages(root, token, locations, journal, faultInjector, deadline) {
+  if (journal.contract_version !== 2) {
+    journal.artifacts.forEach((item, index) => {
+      assertBeforeDeadline(deadline, `wiki-state:verify-stage:${item.key}`);
+      for (const side of ['before', 'after']) {
+        const expected = Buffer.from(`${JSON.stringify(item[side])}\n`);
+        const actual = readMaybe(path.join(locations[side], `${String(index).padStart(4, '0')}.json`));
+        if (!actual || !actual.equals(expected)) {
+          throw stateError('TRANSACTION_RECOVERY_REQUIRED', `staged ${side} bytes are corrupt for ${item.key}`);
+        }
+      }
+    });
+    return;
+  }
+  const initialCursor = journal.verify_stage_cursor;
+  while (journal.verify_stage_cursor < journal.artifacts.length) {
+    const index = journal.verify_stage_cursor;
+    const item = journal.artifacts[index];
+    invokeFault(faultInjector, `verify-stage-scan:${item.key}`);
+    if (remainingMs(deadline) < SCAN_YIELD_MARGIN_MS) {
+      if (journal.verify_stage_cursor !== initialCursor) {
+        persistJournal(
+          root, token, locations, journal, faultInjector,
+          `verify-stage-cursor-${journal.verify_stage_cursor}`,
+        );
+      }
+      throw new DeadlineExceeded(`wiki-state:verify-stage:${item.key}`);
+    }
     for (const side of ['before', 'after']) {
       const expected = Buffer.from(`${JSON.stringify(item[side])}\n`);
       const actual = readMaybe(path.join(locations[side], `${String(index).padStart(4, '0')}.json`));
@@ -682,7 +762,14 @@ function verifyStages(locations, journal) {
         throw stateError('TRANSACTION_RECOVERY_REQUIRED', `staged ${side} bytes are corrupt for ${item.key}`);
       }
     }
-  });
+    journal.verify_stage_cursor += 1;
+  }
+  if (journal.verify_stage_cursor !== initialCursor) {
+    persistJournal(
+      root, token, locations, journal, faultInjector,
+      `verify-stage-cursor-${journal.verify_stage_cursor}`,
+    );
+  }
 }
 
 function publishArtifact(root, token, item, faultInjector) {
@@ -707,9 +794,10 @@ function publishArtifact(root, token, item, faultInjector) {
   invokeFault(faultInjector, `after-publish-${item.key}`);
 }
 
-function publishPhase(root, token, locations, journal, phase, transition, faultInjector) {
+function publishPhase(root, token, locations, journal, phase, transition, faultInjector, deadline) {
   if (!journal.transitions.includes(transition)) {
     for (const item of journal.artifacts.filter((candidate) => candidate.phase === phase)) {
+      assertBeforeDeadline(deadline, `wiki-state:publish:${phase}:${item.key}`);
       publishArtifact(root, token, item, faultInjector);
     }
     appendTransition(root, token, locations, journal, transition, faultInjector);
@@ -772,6 +860,70 @@ function rollbackTransaction(root, token, journal, deadline) {
   }
 }
 
+function readValidatedTombstone(locations, operationId) {
+  const bytes = readMaybe(locations.tombstone);
+  if (bytes === null) return null;
+  const verdict = validateTombstoneV1(bytes, operationId);
+  if (!verdict.valid) throw verdict.error;
+  return verdict.value;
+}
+
+function transactionCancelled(tombstone) {
+  return stateError(
+    'TRANSACTION_CANCELLED',
+    `transaction cancelled after catalog drift at ${tombstone.drift.join(', ')}`,
+  );
+}
+
+function teardownCancelledTransaction(root, token, locations, tombstone, faultInjector) {
+  const assertOwner = () => assertLockOwner({ wikiRoot: root, token });
+  for (const entry of fs.readdirSync(locations.transaction)) {
+    if (entry === 'cancelled.json') continue;
+    assertOwner();
+    fs.rmSync(path.join(locations.transaction, entry), { recursive: true, force: true });
+    assertOwner();
+    invokeFault(faultInjector, `during-cancel-teardown:${entry}`);
+  }
+  assertOwner();
+  fs.rmSync(locations.tombstone, { force: true });
+  assertOwner();
+  invokeFault(faultInjector, 'after-cancel-tombstone-removed');
+  assertOwner();
+  fs.rmdirSync(locations.transaction);
+  assertOwner();
+  throw transactionCancelled(tombstone);
+}
+
+function resumeCancelledTransaction(root, token, locations, journal, tombstone, faultInjector, deadline) {
+  rollbackTransaction(root, token, journal, deadline);
+  invokeFault(faultInjector, 'after-cancel-rollback');
+  assertLockOwner({ wikiRoot: root, token });
+  fs.rmSync(locations.journal, { force: true });
+  assertLockOwner({ wikiRoot: root, token });
+  invokeFault(faultInjector, 'after-cancel-journal-removed');
+  return teardownCancelledTransaction(root, token, locations, tombstone, faultInjector);
+}
+
+function cancelTransaction(root, token, locations, journal, faultInjector, deadline, driftPath) {
+  const tombstone = {
+    contract_version: 1,
+    operation_id: journal.operation_id,
+    reason: 'catalog-drift',
+    drift: [driftPath],
+  };
+  const assertOwner = () => assertLockOwner({ wikiRoot: root, token });
+  invokeFault(faultInjector, 'before-cancel-tombstone');
+  assertOwner();
+  atomicWriteFile(locations.tombstone, `${JSON.stringify(tombstone)}\n`, {
+    createParent: false, beforeRename: assertOwner, beforePublish: assertOwner,
+  });
+  assertOwner();
+  invokeFault(faultInjector, 'after-cancel-tombstone');
+  return resumeCancelledTransaction(
+    root, token, locations, journal, tombstone, faultInjector, deadline,
+  );
+}
+
 function cleanupTransaction(root, token, locations, journal, faultInjector) {
   if (!journal.transitions.includes('cleaned')) {
     invokeFault(faultInjector, 'before-cleanup');
@@ -813,11 +965,45 @@ function finishTransaction(root, token, locations, journal, faultInjector, deadl
     cleanupTransaction(root, token, locations, journal, faultInjector);
     return resultFromJournal(journal);
   }
+  const tombstone = readValidatedTombstone(locations, journal.operation_id);
+  if (tombstone) {
+    return resumeCancelledTransaction(
+      root, token, locations, journal, tombstone, faultInjector, deadline,
+    );
+  }
   try {
     if (!journal.transitions.includes('staged')) {
-      stageTransaction(root, token, locations, journal, faultInjector);
+      stageTransaction(root, token, locations, journal, faultInjector, deadline);
     }
-    verifyStages(locations, journal);
+    verifyStages(root, token, locations, journal, faultInjector, deadline);
+    if (journal.contract_version === 2
+        && journal.catalog_seal_cursor < journal.catalog_seal.length) {
+      const initialCursor = journal.catalog_seal_cursor;
+      while (journal.catalog_seal_cursor < journal.catalog_seal.length) {
+        const entry = journal.catalog_seal[journal.catalog_seal_cursor];
+        invokeFault(faultInjector, `catalog-seal-scan:${entry.relative_path}`);
+        if (remainingMs(deadline) < SCAN_YIELD_MARGIN_MS) {
+          persistJournal(
+            root, token, locations, journal, faultInjector,
+            `catalog-seal-cursor-${journal.catalog_seal_cursor}`,
+          );
+          throw new DeadlineExceeded(`wiki-state:catalog-seal:${entry.relative_path}`);
+        }
+        const current = readMaybe(path.join(root, ...entry.relative_path.split('/')));
+        if (current === null || sha256(current) !== entry.sha256) {
+          return cancelTransaction(
+            root, token, locations, journal, faultInjector, deadline, entry.relative_path,
+          );
+        }
+        journal.catalog_seal_cursor += 1;
+      }
+      if (journal.catalog_seal_cursor !== initialCursor) {
+        persistJournal(
+          root, token, locations, journal, faultInjector,
+          `catalog-seal-cursor-${journal.catalog_seal_cursor}`,
+        );
+      }
+    }
     const phases = [
       ['versions', 'versions-written'], ['pages', 'pages-written'], ['sources', 'sources-written'],
       ['index-json', 'index-json-written'], ['index-md', 'index-md-written'],
@@ -825,7 +1011,7 @@ function finishTransaction(root, token, locations, journal, faultInjector, deadl
     ];
     for (const [phase, transition] of phases) {
       assertBeforeDeadline(deadline, `wiki-state:publish:${phase}`);
-      publishPhase(root, token, locations, journal, phase, transition, faultInjector);
+      publishPhase(root, token, locations, journal, phase, transition, faultInjector, deadline);
     }
     appendTransition(root, token, locations, journal, 'scan-window-staged', faultInjector);
     if (!journal.transitions.includes('pending-promoted')) {
@@ -863,6 +1049,9 @@ function applyCommit(options = {}) {
   assertBeforeDeadline(deadline, 'wiki-state:commit-entry');
   const root = physicalRoot(options.wikiRoot);
   assertLockOwner({ wikiRoot: root, token: options.token });
+  sweepTransactionDebris(root, options.token, {
+    deadline, classes: ['activation', 'plain', 'cancelled'],
+  });
   const manifest = validateManifestSchema(options.manifest);
   const manifestHash = sha256(Buffer.from(JSON.stringify(manifest)));
   const locations = transactionPaths(root, manifest.operation_id);
@@ -875,7 +1064,28 @@ function applyCommit(options = {}) {
   let journal = readJournal(locations.journal);
   if (journal) {
     journal = validateJournal(journal, root, manifest.operation_id, manifestHash);
+    if (journal.contract_version === 2
+        && journal.catalog_seal_cursor === journal.catalog_seal.length
+        && !journal.transitions.includes('committed')) {
+      journal.catalog_seal_cursor = 0;
+    }
+    if (journal.contract_version === 2
+        && journal.verify_stage_cursor === journal.artifacts.length
+        && !journal.transitions.includes('committed')) {
+      journal.verify_stage_cursor = 0;
+    }
     return finishTransaction(root, options.token, locations, journal, options.faultInjector, deadline);
+  }
+
+  const residualTombstone = readValidatedTombstone(locations, manifest.operation_id);
+  if (residualTombstone) {
+    try {
+      teardownCancelledTransaction(
+        root, options.token, locations, residualTombstone, options.faultInjector,
+      );
+    } catch (error) {
+      if (error.code !== 'TRANSACTION_CANCELLED') throw error;
+    }
   }
 
   const now = options.now instanceof Date ? options.now : new Date(options.now || Date.now());
@@ -886,7 +1096,7 @@ function applyCommit(options = {}) {
       expected: manifest.promote_pending_scan,
     });
   }
-  const artifacts = buildPlan(root, manifest, now, deadline);
+  const { artifacts, catalogSeal } = buildPlan(root, manifest, now, deadline);
   const result = {
     operationId: manifest.operation_id,
     pagesCreated: manifest.pages.filter((page) => page.action === 'create').map((page) => page.file),
@@ -896,16 +1106,20 @@ function applyCommit(options = {}) {
     promotedWindow: null,
   };
   journal = {
-    engine: 'wiki-state', contract_version: 1, wiki_root: root,
+    engine: 'wiki-state', contract_version: 2, wiki_root: root,
     operation_id: manifest.operation_id, manifest_sha256: manifestHash, manifest,
     owner_token: options.token, transitions: ['preflighted'], artifacts,
     artifacts_sha256: sha256(Buffer.from(JSON.stringify(artifacts))),
+    catalog_seal: catalogSeal,
+    catalog_seal_sha256: sha256(Buffer.from(JSON.stringify(catalogSeal))),
+    catalog_seal_cursor: 0,
+    verify_stage_cursor: 0,
     event_ids: manifest.events.map((event) => event.event_id),
     scan_window_journal: null,
     result,
     result_sha256: sha256(Buffer.from(JSON.stringify(result))),
   };
-  prepareTransaction(root, options.token, locations, journal, options.faultInjector);
+  prepareTransaction(root, options.token, locations, journal, options.faultInjector, deadline);
   return finishTransaction(root, options.token, locations, journal, options.faultInjector, deadline);
 }
 
@@ -916,7 +1130,16 @@ function recoverTransaction(options = {}) {
   if (!ULID_RE.test(options.operationId)) throw stateError('WIKI_STATE_INVALID', 'operationId is invalid');
   const locations = transactionPaths(root, options.operationId);
   const journal = readJournal(locations.journal);
-  if (!journal || journal.engine !== 'wiki-state' || !journal.manifest) {
+  if (!journal) {
+    const tombstone = readValidatedTombstone(locations, options.operationId);
+    if (tombstone) {
+      return teardownCancelledTransaction(
+        root, options.token, locations, tombstone, options.faultInjector,
+      );
+    }
+    throw stateError('TRANSACTION_NOT_FOUND', 'wiki-state transaction does not exist');
+  }
+  if (journal.engine !== 'wiki-state' || !journal.manifest) {
     throw stateError('TRANSACTION_NOT_FOUND', 'wiki-state transaction does not exist');
   }
   return applyCommit({
@@ -1033,6 +1256,7 @@ function interruptedSetupManifest(root) {
   try { entries = fs.readdirSync(transactions, { withFileTypes: true }); }
   catch (error) { if (error.code === 'ENOENT') return null; throw error; }
   for (const entry of entries) {
+    if (entry.name.startsWith('.activate-')) continue;
     if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
     const journal = readJournal(path.join(transactions, entry.name, 'journal.json'));
     if (journal?.engine === 'wiki-state' && journal.manifest?.operation === 'setup'
@@ -1279,6 +1503,10 @@ function fixWiki(options = {}) {
     throw error;
   }
   try {
+    assertLockOwner({ wikiRoot: root, token: owner.token });
+    sweepTransactionDebris(root, owner.token, {
+      deadline, classes: ['activation', 'plain', 'cancelled'],
+    });
     const before = inspectWiki({ wikiRoot: root, deadline });
     const pendingBytes = readMaybe(path.join(root, '.wiki-meta', '.pending-scan'));
     const lastBytes = readMaybe(path.join(root, '.wiki-meta', '.last-scan'));

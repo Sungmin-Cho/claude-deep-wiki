@@ -5,6 +5,25 @@ All notable changes to deep-wiki are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.0] — 2026-07-21 (commit deadline scaling — hash-only catalog seal and crash-safe cancel)
+
+### Fixed
+
+- `wiki-runtime commit` no longer forces a single logical commit to be split across repeated `transaction recover` calls on large vaults ([#30](https://github.com/Sungmin-Cho/claude-deep-wiki/issues/30) Issue 2). The per-commit cost was O(catalog) rather than O(diff): `buildPlan` sealed every unchanged page/version/source as a full-byte `before==after` artifact, which inflated the journal (re-persisted up to ~14× through `atomicWriteFile`'s fsync) and staging (2N fsync writes) with no deadline checks — so the fixed 12-second budget was consumed during staging and surfaced misleadingly at `wiki-state:publish:versions`. Unchanged files are now recorded as a hash-only `catalog_seal` (`{relative_path, sha256}`); journal persistence and staging drop to O(diff), bringing the measured 590- and ~1,406-page cases comfortably inside the 12-second budget in a single commit.
+
+### Changed
+
+- Journal `contract_version` bumped 1 → 2 (adds `catalog_seal`, `catalog_seal_sha256`, `catalog_seal_cursor`). `validateJournal` dual-accepts either a legacy v1 or a v2 exact-key journal, so a v1.8.x commit interrupted before upgrade still recovers under its original semantics, while a v1.9 in-flight journal is rejected by v1.8.x (backup-only downgrade — see the updated safety boundary in `CLAUDE.md`). Receipt shape and success-result shape are unchanged.
+- Drift response is now cancel-only. When the resumable drift scan detects that an unchanged catalog file changed or was deleted mid-commit, the transaction is torn down crash-safely (tombstone-before-destruction: a durable `cancelled.json` decision point precedes any destructive step) and exits `TRANSACTION_CANCELLED` (exit 4, no receipt) instead of committing a stale derived index. The fail-before-stale-publication property is preserved; the previous full-snapshot restore — which could clobber a concurrent external edit — is intentionally dropped as a data-safety improvement under the cooperative-writer contract. Source provenance is restated as a commit-time / no-compounding guarantee.
+
+### Added
+
+- Journal-first atomic transaction activation: a transaction directory becomes reader-visible only once its journal exists (built under `.activate-<pid>-<uuid>/` then `renameSync`d into place), making "journal-less ⟹ not-live" a protocol invariant so lock-free readers can never mistake a live pre-journal writer for debris. A bounded, lock-guarded, deadline-aware `sweepTransactionDebris` (in the shared leaf module `hooks/scripts/runtime/transaction-debris.js`) converges abandoned activation/transaction remnants without blocking readers and never touches a journal-present directory. Also: per-artifact resumable deadline checkpoints across stage/verify/publish, lock-owner-guarded runtime-manifest cleanup shared by commit and recover, and a `transaction recover` resume hint appended to `DEADLINE_EXCEEDED` output.
+
+### Review
+
+- The design converged over a 6-round cross-model review loop (Claude Opus + Codex, with adversarial passes) that hardened the cancel/tombstone crash-safety matrix and the journal-first activation invariant against reader-race and partial-teardown edge cases. Implementation by gpt-5.6-sol; every commit kept the suite green.
+
 ## [1.8.2] — 2026-07-21 (Windows st_dev asymmetry fix for atomic writes and lock acquisition)
 
 ### Fixed

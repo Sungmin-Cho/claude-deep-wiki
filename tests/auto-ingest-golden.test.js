@@ -181,6 +181,10 @@ describe('scan-vault-changes.js golden fixtures (M5.5 #3)', () => {
               `with count=${parsed.count}, stdout=<<<${result.stdout}>>>`,
             );
           } else {
+            const hookOutput = JSON.parse(result.stdout);
+            assert.deepEqual(Object.keys(hookOutput), ['hookSpecificOutput']);
+            assert.equal(hookOutput.hookSpecificOutput.hookEventName, 'SessionStart');
+            assert.equal(typeof hookOutput.hookSpecificOutput.additionalContext, 'string');
             assert.equal(
               parsed.hasHeader,
               true,

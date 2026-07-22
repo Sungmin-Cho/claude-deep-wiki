@@ -5,6 +5,12 @@ deep-wiki의 주요 변경사항을 기록합니다.
 형식은 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)를 따르며,
 이 프로젝트는 [유의적 버전](https://semver.org/spec/v2.0.0.html)을 준수합니다.
 
+## [1.9.1] — 2026-07-22
+
+### 수정
+
+- SessionStart vault 변경 알림이 공용 `hookSpecificOutput.additionalContext` JSON 계약을 사용하여 Codex hook 오류를 방지하고, 변경 없음의 무출력 및 fail-open 동작은 그대로 유지합니다.
+
 ## [1.9.0] — 2026-07-21 (커밋 deadline 스케일링 — hash-only catalog seal + crash-safe cancel)
 
 ### 수정

@@ -10,6 +10,9 @@ const { spawn } = require('node:child_process');
 const {
   startLoopbackResponsesServer,
 } = require('../tests/helpers/codex-loopback-responses.js');
+const {
+  formatSessionStartOutput,
+} = require('../hooks/scripts/scan-vault-changes.js');
 
 const EXPECTED_CODEX_VERSION = 'codex-cli 0.144.1';
 const MARKETPLACE_NAME = 'deep-wiki-smoke';
@@ -327,7 +330,7 @@ function buildExpectedDirectOutput(vault, fixture) {
     throw new SmokeError('CODEX_DIRECT_SUPERVISOR_FAILED');
   }
   const lines = candidates.map((candidate) => `  - ${candidate}`);
-  return [
+  const additionalContext = [
     `[deep-wiki] ${candidates.length}개의 새로운/수정된 파일이 Obsidian vault에서 감지되었습니다.`,
     '',
     '자동 ingest 대상:',
@@ -338,6 +341,7 @@ function buildExpectedDirectOutput(vault, fixture) {
       + `vault 경로: ${vault.physicalVaultRoot}`,
     '',
   ].join('\n');
+  return formatSessionStartOutput(additionalContext);
 }
 
 function assertPending(vault, fixture, code, nowMs = Date.now()) {

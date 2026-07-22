@@ -1073,7 +1073,7 @@ function extractQuotedFlagValue(commandLine, flag) {
   throw new Error(`unterminated quoted value for ${flag}`);
 }
 
-test('recover hint is appended to a DEADLINE_EXCEEDED commit failure and exit code stays 5', () => {
+test('recover hint is appended to a DEADLINE_EXCEEDED commit failure and exit code stays 5', { skip: process.platform === 'win32' ? 'POSIX hint-label assertion; win32 label covered by the platform-mock tests' : false }, () => {
   const { main, recoverHint } = require('../scripts/wiki-runtime.js');
   const wikiRuntimeState = require('../hooks/scripts/runtime/wiki-state.js');
   const { DeadlineExceeded } = require('../hooks/scripts/runtime/deadline.js');
@@ -1213,7 +1213,7 @@ test('shellQuote (Windows) round-trips through a real PowerShell when available'
   assert.equal(result.stdout.trim(), decodePowershellSingleQuoted(wikiRootToken));
 });
 
-test('commit at a pre-activation deadline instructs a plain rerun instead of an unusable recover hint', () => {
+test('commit at a pre-activation deadline instructs a plain rerun instead of an unusable recover hint', { skip: process.platform === 'win32' ? 'POSIX hint-label assertion; win32 label covered by the platform-mock tests' : false }, () => {
   const { main } = require('../scripts/wiki-runtime.js');
   const wikiRuntimeState = require('../hooks/scripts/runtime/wiki-state.js');
   const { DeadlineExceeded } = require('../hooks/scripts/runtime/deadline.js');

@@ -261,13 +261,30 @@ function cleanupRuntimeManifests(wikiRoot, token, operationId) {
   }
 }
 
+function powershellQuote(value) {
+  // PowerShell single-quoted strings are fully literal (no interpolation, no metacharacter
+  // interpretation of %, &, ", ^, etc.) except that an embedded literal single quote must be
+  // doubled -- the PowerShell analogue of the POSIX single-quote escape below. We deliberately do
+  // NOT attempt a cmd.exe-safe encoding: cmd.exe has no general-purpose literal-string quoting
+  // mechanism (its own metacharacters -- %, &, |, ^, <, >, and ! under delayed expansion -- are
+  // interpreted by cmd.exe's parser even inside double quotes, with no escape that neutralizes
+  // all of them for an arbitrary byte string), so no cmd.exe encoding here could be made
+  // genuinely safe. The rendered hint is explicitly labeled "(PowerShell)" so a Windows user
+  // knows which shell to run it in.
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
 function shellQuote(value) {
+  if (process.platform === 'win32') return powershellQuote(value);
+  // POSIX: wrap in single quotes; nothing is special inside them except the single quote itself,
+  // which must be closed, escaped literally, and reopened.
   return `'${String(value).replace(/'/g, "'\\''")}'`;
 }
 
 function recoverHint(wikiRoot, operationId) {
   const root = path.resolve(wikiRoot);
-  return `resume with:\nnode scripts/wiki-runtime.js transaction recover --wiki-root ${shellQuote(root)} --lock-token <token> --operation-id ${shellQuote(operationId)} --json`;
+  const label = process.platform === 'win32' ? 'resume with (PowerShell):' : 'resume with:';
+  return `${label}\nnode scripts/wiki-runtime.js transaction recover --wiki-root ${shellQuote(root)} --lock-token <token> --operation-id ${shellQuote(operationId)} --json`;
 }
 
 function transactionDurablyExists(wikiRoot, operationId) {
@@ -279,7 +296,8 @@ function transactionDurablyExists(wikiRoot, operationId) {
 function commitRetryHint(wikiRoot, manifestFile) {
   const root = path.resolve(wikiRoot);
   const manifest = path.resolve(manifestFile);
-  return `rerun with:\nnode scripts/wiki-runtime.js commit --wiki-root ${shellQuote(root)} --lock-token <token> --manifest-file ${shellQuote(manifest)} --json`;
+  const label = process.platform === 'win32' ? 'rerun with (PowerShell):' : 'rerun with:';
+  return `${label}\nnode scripts/wiki-runtime.js commit --wiki-root ${shellQuote(root)} --lock-token <token> --manifest-file ${shellQuote(manifest)} --json`;
 }
 
 function runCommit(argv) {

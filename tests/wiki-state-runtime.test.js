@@ -1052,6 +1052,27 @@ function argAfterFlag(argv, flag) {
   return argv[index + 1];
 }
 
+function decodePowershellSingleQuoted(token) {
+  assert.ok(token.startsWith("'") && token.endsWith("'"), token);
+  return token.slice(1, -1).replace(/''/g, "'");
+}
+
+function extractQuotedFlagValue(commandLine, flag) {
+  const marker = `${flag} '`;
+  const start = commandLine.indexOf(marker);
+  assert.ok(start !== -1, commandLine);
+  const openQuoteIndex = start + marker.length - 1;
+  let cursor = openQuoteIndex + 1;
+  while (cursor < commandLine.length) {
+    if (commandLine[cursor] === "'") {
+      if (commandLine[cursor + 1] === "'") { cursor += 2; continue; }
+      return commandLine.slice(openQuoteIndex, cursor + 1);
+    }
+    cursor += 1;
+  }
+  throw new Error(`unterminated quoted value for ${flag}`);
+}
+
 test('recover hint is appended to a DEADLINE_EXCEEDED commit failure and exit code stays 5', () => {
   const { main, recoverHint } = require('../scripts/wiki-runtime.js');
   const wikiRuntimeState = require('../hooks/scripts/runtime/wiki-state.js');
@@ -1136,6 +1157,60 @@ test('commitRetryHint shell-escapes adversarial wiki roots and manifest paths', 
     assert.equal(argAfterFlag(argv, '--wiki-root'), path.resolve(value));
     assert.equal(argAfterFlag(argv, '--manifest-file'), path.resolve(value));
   }
+});
+
+test('shellQuote renders a PowerShell-safe literal on win32 for adversarial characters', () => {
+  const { recoverHint, commitRetryHint } = require('../scripts/wiki-runtime.js');
+  const originalDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
+  Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+  try {
+    const adversarial = [
+      'C:\\Deep Wiki has space',
+      'C:\\Deep Wiki & evil',
+      'C:\\Deep Wiki %PATH%',
+      'C:\\Deep Wiki "quoted"',
+      "C:\\Deep Wiki has'quote",
+      'C:\\Deep Wiki ^caret',
+      'C:\\Deep Wiki\nnewline',
+    ];
+    for (const value of adversarial) {
+      const hint = recoverHint(value, value);
+      assert.ok(hint.startsWith('resume with (PowerShell):\n'), hint);
+      const commandLine = hint.split('\n').slice(1).join('\n');
+      const wikiRootValue = decodePowershellSingleQuoted(extractQuotedFlagValue(commandLine, '--wiki-root'));
+      assert.equal(wikiRootValue, path.resolve(value));
+      const operationIdValue = decodePowershellSingleQuoted(extractQuotedFlagValue(commandLine, '--operation-id'));
+      assert.equal(operationIdValue, value);
+
+      const retryHint = commitRetryHint(value, value);
+      assert.ok(retryHint.startsWith('rerun with (PowerShell):\n'), retryHint);
+      const retryLine = retryHint.split('\n').slice(1).join('\n');
+      const retryRootValue = decodePowershellSingleQuoted(extractQuotedFlagValue(retryLine, '--wiki-root'));
+      assert.equal(retryRootValue, path.resolve(value));
+      const manifestValue = decodePowershellSingleQuoted(extractQuotedFlagValue(retryLine, '--manifest-file'));
+      assert.equal(manifestValue, path.resolve(value));
+    }
+  } finally {
+    Object.defineProperty(process, 'platform', originalDescriptor);
+  }
+});
+
+test('shellQuote (Windows) round-trips through a real PowerShell when available', (t) => {
+  const shell = process.platform === 'win32' ? 'powershell.exe' : 'pwsh';
+  const probe = spawnSync(shell, ['-NoProfile', '-Command', 'Write-Output ok'], { encoding: 'utf8' });
+  if (probe.status !== 0 || probe.error) { t.skip(`${shell} unavailable for real PowerShell round-trip`); return; }
+  const { recoverHint } = require('../scripts/wiki-runtime.js');
+  const originalDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
+  Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+  let hint;
+  try { hint = recoverHint('C:\\Deep Wiki & evil "quoted"', 'OP-ID'); }
+  finally { Object.defineProperty(process, 'platform', originalDescriptor); }
+  const commandLine = hint.split('\n').slice(1).join('\n');
+  const wikiRootToken = extractQuotedFlagValue(commandLine, '--wiki-root');
+  const script = `Write-Output ${wikiRootToken}`;
+  const result = spawnSync(shell, ['-NoProfile', '-Command', script], { encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), decodePowershellSingleQuoted(wikiRootToken));
 });
 
 test('commit at a pre-activation deadline instructs a plain rerun instead of an unusable recover hint', () => {

@@ -152,6 +152,16 @@ function formatOutput(result) {
   ].join('\n');
 }
 
+function formatSessionStartOutput(additionalContext) {
+  if (!additionalContext) return '';
+  return `${JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: 'SessionStart',
+      additionalContext,
+    },
+  })}\n`;
+}
+
 async function runSupervisor(options = {}) {
   const workerPath = options.workerPath || path.join(__dirname, 'scan-vault-worker.js');
   const timeoutMs = options.timeoutMs === undefined ? PARENT_BUDGET_MS : options.timeoutMs;
@@ -258,7 +268,7 @@ async function hookMain(options = {}) {
   const stdout = options.stdout || process.stdout;
   try {
     const output = await runSupervisor(options);
-    if (output) stdout.write(output);
+    if (output) stdout.write(formatSessionStartOutput(output));
   } catch { /* SessionStart hooks must never surface boundary failures */ }
   return 0;
 }
@@ -273,4 +283,5 @@ module.exports = {
   terminateWorkerTree,
   runSupervisor,
   hookMain,
+  formatSessionStartOutput,
 };

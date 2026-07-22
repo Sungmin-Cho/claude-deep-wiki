@@ -211,7 +211,7 @@ test('direct installed supervisor witness requires one exact parent-formatted me
   const vaultRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'deep-wiki-output-root-'));
   t.after(() => fs.rmSync(vaultRoot, { recursive: true, force: true }));
   const physicalVaultRoot = fs.realpathSync.native(vaultRoot);
-  assert.equal(buildExpectedDirectOutput({ physicalVaultRoot }, releaseFixture), [
+  const additionalContext = [
     '[deep-wiki] 1개의 새로운/수정된 파일이 Obsidian vault에서 감지되었습니다.',
     '',
     '자동 ingest 대상:',
@@ -220,7 +220,13 @@ test('direct installed supervisor witness requires one exact parent-formatted me
     '',
     `이 파일들을 /wiki-ingest로 위키에 자동 반영하세요. 각 파일을 읽고 기존 위키 페이지에 병합하거나 새 페이지를 생성하세요. vault 경로: ${physicalVaultRoot}`,
     '',
-  ].join('\n'));
+  ].join('\n');
+  assert.deepEqual(JSON.parse(buildExpectedDirectOutput({ physicalVaultRoot }, releaseFixture)), {
+    hookSpecificOutput: {
+      hookEventName: 'SessionStart',
+      additionalContext,
+    },
+  });
 });
 
 test('Codex JSONL receipt requires the exact completed assistant message', () => {

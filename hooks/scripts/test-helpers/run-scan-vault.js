@@ -150,8 +150,17 @@ function parseHookOutput(stdout) {
   const result = { count: null, files: [], hasHeader: false };
   if (!stdout) return result;
 
+  let context = stdout;
+  try {
+    const output = JSON.parse(stdout);
+    if (output?.hookSpecificOutput?.hookEventName === 'SessionStart'
+        && typeof output.hookSpecificOutput.additionalContext === 'string') {
+      context = output.hookSpecificOutput.additionalContext;
+    }
+  } catch { /* legacy/plain output remains readable by old fixtures */ }
+
   // Header: "[deep-wiki] N개의 새로운/수정된 파일이..."
-  const headerMatch = stdout.match(
+  const headerMatch = context.match(
     /\[deep-wiki\]\s+(\d+)개의\s+새로운\/수정된\s+파일이/,
   );
   if (headerMatch) {
@@ -161,7 +170,7 @@ function parseHookOutput(stdout) {
 
   // File list lines are `  - <relpath>`. Accept any leading whitespace
   // defensively in case the presentation shape ever shifts.
-  const lines = stdout.split('\n');
+  const lines = context.split('\n');
   for (const line of lines) {
     const m = line.match(/^\s*-\s+(.+?)\s*$/);
     if (!m) continue;

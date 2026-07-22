@@ -54,6 +54,30 @@ test('supervisor owns a 12-second cap and validates one exact newline-terminated
   assert.match(output, /한글 폴더\/space note\.md/);
 });
 
+test('hook boundary wraps detected files in the shared SessionStart JSON contract', async () => {
+  const { hookMain } = require(supervisorPath);
+  const base = temporaryRoot('deep wiki supervisor hook output ');
+  const stdout = [];
+  const status = await hookMain({
+    workerPath: fixturePath,
+    timeoutMs: 1000,
+    env: {
+      ...process.env,
+      SCANNER_FIXTURE_MODE: 'valid',
+      SCANNER_RESULT_JSON: JSON.stringify(validResult(base)),
+    },
+    ensurePendingScan() { return { status: 'created' }; },
+    stdout: { write(value) { stdout.push(value); } },
+  });
+
+  assert.equal(status, 0);
+  const output = JSON.parse(stdout.join(''));
+  assert.deepEqual(Object.keys(output), ['hookSpecificOutput']);
+  assert.equal(output.hookSpecificOutput.hookEventName, 'SessionStart');
+  assert.match(output.hookSpecificOutput.additionalContext, /2개의 새로운\/수정된 파일/);
+  assert.match(output.hookSpecificOutput.additionalContext, /한글 폴더\/space note\.md/);
+});
+
 test('parent deadline remains authoritative through persistence and before output', async () => {
   const { runSupervisor } = require(supervisorPath);
   const base = temporaryRoot('deep wiki supervisor persistence deadline ');

@@ -5,6 +5,12 @@ All notable changes to deep-wiki are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.1] — 2026-07-22
+
+### Fixed
+
+- SessionStart vault-change notices now use the shared `hookSpecificOutput.additionalContext` JSON contract, preventing Codex hook errors while preserving silent no-change and fail-open behavior.
+
 ## [1.9.0] — 2026-07-21 (commit deadline scaling — hash-only catalog seal and crash-safe cancel)
 
 ### Fixed

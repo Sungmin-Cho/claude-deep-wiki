@@ -1,6 +1,6 @@
 ---
 name: wiki-lint
-description: Inspect or repair Deep Wiki structure, links, and provenance. Triggers on /wiki-lint, wiki health checks, audits, --fix repair.
+description: Inspect or repair Deep Wiki structure, links, provenance, lifecycle invariants, and scan-window state. Triggers on /wiki-lint, wiki health checks, audits, --fix repair.
 user-invocable: true
 runtime_hosts: [claude, codex]
 ---

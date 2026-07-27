@@ -156,7 +156,9 @@ test('1.9.2 release keeps every package version exact', () => {
 test('1.8.0 release documents the reviewed runtime and evidence boundary', () => {
   // CLAUDE.md is excluded: AGENTS.md is the single source for shared runtime rules
   // and CLAUDE.md reaches it through `@AGENTS.md`. Asserting the boundary in both
-  // would require the duplication the AGENTS-first restructure removed.
+  // would require the duplication the AGENTS-first restructure removed. That import
+  // is what makes the exclusion sound, so it is asserted rather than assumed.
+  assert.match(readText('CLAUDE.md'), /^@AGENTS\.md/m);
   const englishRuntimeDocs = [
     'README.md', 'AGENTS.md', 'CONTRIBUTING.md', 'SECURITY.md',
   ];

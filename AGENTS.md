@@ -91,8 +91,8 @@ The plugin repo owns its own release: bump the version triple, add the entry to
 `CHANGELOG.md` **and** `CHANGELOG.ko.md`, then merge to `main`.
 
 Re-pinning the suite is then one command in `claude-deep-suite`:
-`npm run release:bump -- deep-wiki <sha40>` followed by `npm run preflight`. It rewrites
-`.claude-plugin/marketplace.json` and regenerates every auto-generated doc region —
+`npm run release:bump -- deep-wiki <sha40>`, which runs the `preflight` gate itself. It
+rewrites `.claude-plugin/marketplace.json` and regenerates every auto-generated doc region —
 do not hand-edit the suite README plugin table, which lives inside
 `<!-- deep-suite:auto-generated:plugin-table-en -->` markers. Two things the command
 does not do: `.agents/plugins/marketplace.json` must be synced by hand, and a feature

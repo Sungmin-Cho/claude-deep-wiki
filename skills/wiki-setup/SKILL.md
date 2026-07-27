@@ -1,6 +1,6 @@
 ---
 name: wiki-setup
-description: Initialize a Deep Wiki at a native absolute path. Triggers on /wiki-setup, wiki bootstrap, wiki initialization, first-time configuration.
+description: Initialize a Deep Wiki on Claude Code or Codex at a native absolute path, with an optional read-only Obsidian availability probe. Triggers on /wiki-setup, wiki bootstrap, wiki initialization, first-time configuration.
 user-invocable: true
 runtime_hosts: [claude, codex]
 ---
@@ -8,7 +8,7 @@ runtime_hosts: [claude, codex]
 # wiki-setup
 
 Initialize a wiki without invoking a shell. Every deterministic operation below
-is one structured argv call to `scripts/wiki-runtime.js`; paths remain one argv
+is one structured argv call to `<plugin_root>/scripts/wiki-runtime.js`; paths remain one argv
 element and are never rewritten into another host's syntax.
 
 ## Inputs

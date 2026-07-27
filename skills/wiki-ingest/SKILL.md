@@ -1,6 +1,6 @@
 ---
 name: wiki-ingest
-description: Ingest files, URLs, text, or Deep Work reports into the Deep Wiki. Triggers on /wiki-ingest, wiki updates, SessionStart change ingestion.
+description: Ingest files, URLs, pasted text, or Deep Work reports into the Deep Wiki. Triggers on /wiki-ingest, wiki updates, SessionStart change ingestion.
 user-invocable: true
 runtime_hosts: [claude, codex]
 codex_agent_fanout: disabled_for_1.8.0
@@ -9,7 +9,7 @@ codex_agent_fanout: disabled_for_1.8.0
 # wiki-ingest
 
 Turn source material into durable, source-grounded wiki pages. You select and
-synthesize; `scripts/wiki-runtime.js` owns every deterministic operation, called
+synthesize; `<plugin_root>/scripts/wiki-runtime.js` owns every deterministic operation, called
 as structured argv with no shell wrapper. Page, provenance and lifecycle rules
 are in the `wiki-schema` skill.
 

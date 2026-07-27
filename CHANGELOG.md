@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- The 1.9 backup-only downgrade boundary (`contract_version` 2 in-flight journal is unrecoverable by 1.8.x) is now stated in AGENTS.md, CONTRIBUTING.md, SECURITY.md, and the README safety-boundary section (EN + KO).
+- The 1.9 backup-only downgrade boundary (`contract_version` 2 in-flight journal is unrecoverable by 1.8.x) is now stated in AGENTS.md, CONTRIBUTING.md, and the README safety-boundary section (EN + KO).
 - The documented release workflow no longer directs maintainers to hand-edit the auto-generated deep-suite README plugin table or to commit the marketplace by hand; it points at the suite's `release:bump` and `preflight` commands, and names the two steps those do not cover.
 - The optional `.wiki-meta/.config.json` fan-out knobs are no longer presented as runtime configuration in the agent guide — no shipped code reads that file. The declaration remains in `wiki-schema.yaml`, where callers honor it.
 

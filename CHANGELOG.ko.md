@@ -7,13 +7,19 @@ deep-wiki의 주요 변경사항을 기록합니다.
 
 ## [Unreleased]
 
+## [1.9.2] — 2026-07-27 (컨텍스트 다이어트)
+
 ### 변경
 
-- 에이전트 문서를 AGENTS-first 단일 소스로 재구성: AGENTS.md가 공유 런타임 규칙(디렉토리 구조, storage layout, lifecycle actions, 불변식, 컨벤션, 릴리스 워크플로우)을 보유하고, CLAUDE.md는 `@AGENTS.md` import + Claude Code 전용 노트만 남긴 thin wrapper가 됩니다.
+- 에이전트 문서를 AGENTS-first 단일 소스로 재구성: AGENTS.md가 공유 런타임 규칙(storage layout, lifecycle actions, 불변식, 컨벤션, 릴리스 워크플로우)을 보유하고, CLAUDE.md는 `@AGENTS.md` import + Claude Code 전용 노트만 남긴 thin wrapper가 됩니다.
+- AGENTS.md와 CLAUDE.md가 크게 짧아져 세션 컨텍스트 예산을 그만큼 실제 작업에 쓸 수 있습니다. 중복된 디렉토리·storage 트리, 주석 달린 lifecycle action 목록, 이미 CONTRIBUTING.md가 다루는 컨벤션은 다시 서술하는 대신 정본 위치를 가리킵니다.
+- 스킬과 에이전트 description이 짧아지고 동작을 앞세우도록 바뀌었습니다. 트리거 문구는 모두 그대로여서 기존 호출 경로는 동일하게 동작합니다.
 
 ### 수정
 
-- 1.9 백업 전용 downgrade 경계(`contract_version` 2 in-flight journal은 1.8.x가 recover 불가)를 AGENTS.md, CONTRIBUTING.md, README 안전 경계 섹션(EN + KO)에도 명시하여 CLAUDE.md와 일치시켰습니다.
+- 1.9 백업 전용 downgrade 경계(`contract_version` 2 in-flight journal은 1.8.x가 recover 불가)를 AGENTS.md, CONTRIBUTING.md, SECURITY.md, README 안전 경계 섹션(EN + KO)에 명시했습니다.
+- 문서화된 릴리스 워크플로우가 더 이상 자동 생성되는 deep-suite README 플러그인 표를 직접 편집하거나 marketplace를 수동 커밋하도록 안내하지 않습니다. 대신 suite의 `release:bump`와 `preflight` 명령을 가리키고, 그 명령이 처리하지 않는 두 단계를 명시합니다.
+- 선택적 `.wiki-meta/.config.json` fan-out 노브를 에이전트 가이드에서 런타임 설정처럼 서술하던 부분을 제거했습니다 — 배포되는 코드 중 이 파일을 읽는 곳은 없습니다. 선언은 호출자가 준수하는 `wiki-schema.yaml`에 남습니다.
 
 ## [1.9.1] — 2026-07-22
 

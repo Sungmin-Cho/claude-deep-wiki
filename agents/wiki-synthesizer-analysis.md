@@ -2,9 +2,9 @@
 name: wiki-synthesizer-analysis
 model: sonnet
 color: blue
-description: Claude Code-only source analysis worker. Reads one source and candidate pages, then returns a validated page plan without mutating wiki state.
+description: Claude Code-only worker. Reads one source and candidates, returns a page plan, never mutates wiki state.
 whenToUse: |
-  Use only when /wiki-ingest invokes the qualified deep-wiki:wiki-synthesizer-analysis role on Claude Code. Codex performs the equivalent analysis in its main caller.
+  Only when /wiki-ingest invokes the qualified deep-wiki:wiki-synthesizer-analysis role. Codex performs the equivalent analysis in its main caller.
 tools: [Read, Glob, Grep, WebFetch]
 ---
 

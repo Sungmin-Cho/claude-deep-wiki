@@ -144,18 +144,25 @@ test('portable npm test cannot discover the native installed-Codex release smoke
   assert.match(smoke, /windowsHide: true/);
 });
 
-test('1.9.1 release keeps every package version exact', () => {
+test('1.9.2 release keeps every package version exact', () => {
   const packageFiles = [
     '.claude-plugin/plugin.json',
     '.codex-plugin/plugin.json',
     'package.json',
   ];
-  for (const file of packageFiles) assert.equal(readJson(file).version, '1.9.1', file);
+  for (const file of packageFiles) assert.equal(readJson(file).version, '1.9.2', file);
 });
 
 test('1.8.0 release documents the reviewed runtime and evidence boundary', () => {
+  // CLAUDE.md is excluded: AGENTS.md is the single source for shared runtime rules
+  // and CLAUDE.md reaches it through `@AGENTS.md`. Asserting the boundary in both
+  // would require the duplication the AGENTS-first restructure removed. That import
+  // is what makes the exclusion sound, so it is asserted rather than assumed.
+  // Pinned to line 1: a multiline-anchored match would accept the import anywhere
+  // in the file, which is not the AGENTS-first standard.
+  assert.equal(readText('CLAUDE.md').split('\n')[0].trim(), '@AGENTS.md');
   const englishRuntimeDocs = [
-    'README.md', 'CLAUDE.md', 'AGENTS.md', 'CONTRIBUTING.md', 'SECURITY.md',
+    'README.md', 'AGENTS.md', 'CONTRIBUTING.md', 'SECURITY.md',
   ];
   const englishBoundary = [
     /cooperative current writer/i,

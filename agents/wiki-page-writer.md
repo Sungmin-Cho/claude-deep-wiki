@@ -2,9 +2,9 @@
 name: wiki-page-writer
 model: sonnet
 color: blue
-description: Claude Code-only pure page-body worker. Converts one validated page-plan entry into one grounded Markdown draft.
+description: Claude Code-only worker. One page-plan entry in, one grounded Markdown draft out.
 whenToUse: |
-  Use only when /wiki-ingest invokes the qualified deep-wiki:wiki-page-writer role on Claude Code. Codex writes the equivalent body in its main caller.
+  Only when /wiki-ingest invokes the qualified deep-wiki:wiki-page-writer role. Codex writes the equivalent body in its main caller.
 tools: []
 ---
 

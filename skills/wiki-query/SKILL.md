@@ -1,6 +1,6 @@
 ---
 name: wiki-query
-description: Answer a question from the Deep Wiki and optionally file substantive cross-page synthesis through the shared journaled runtime. Use for /wiki-query, wiki search, or grounded wiki questions.
+description: Answer questions from the Deep Wiki and optionally file cross-page synthesis. Triggers on /wiki-query, wiki search, grounded wiki questions.
 user-invocable: true
 runtime_hosts: [claude, codex]
 ---

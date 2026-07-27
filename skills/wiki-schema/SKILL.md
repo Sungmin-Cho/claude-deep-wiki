@@ -1,12 +1,12 @@
 ---
 name: wiki-schema
-description: Canonical Deep Wiki page, provenance, lifecycle, concurrency, and recovery rules shared by Claude Code and Codex. Apply whenever reading, creating, updating, rebuilding, linting, or querying wiki state.
+description: Canonical Deep Wiki page, provenance, lifecycle, concurrency, and recovery rules. Apply whenever reading, creating, updating, rebuilding, linting, or querying wiki state.
 ---
 
 # Wiki schema
 
 The wiki is the durable artifact. LLM callers may interpret and synthesize
-knowledge, but `scripts/wiki-runtime.js` is the sole authority for deterministic
+knowledge, but `<plugin_root>/scripts/wiki-runtime.js` is the sole authority for deterministic
 configuration, lock ownership, versioning, journaled mutation, derived state,
 and scan-window transitions on every supported host.
 
@@ -51,7 +51,7 @@ ID, title, type, origin, ingestion time, and created/updated page lists.
    directory acquisition. `.wiki-lock/owner.json` binds token, operation,
    process, host, start time, and lock identity. Release and recovery revalidate
    full ownership; direct directory deletion is forbidden. The canonical
-   operation catalog is in `references/storage-layout.md` and applies to
+   operation catalog is in `<plugin_root>/skills/wiki-schema/references/storage-layout.md` and applies to
    wiki-ingest, wiki-query, wiki-rebuild, and wiki-lint.
 4. Every page source slug has a corresponding provenance record.
 5. A transaction operation ID is stable across retry and journal recovery.

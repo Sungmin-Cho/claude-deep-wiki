@@ -2,9 +2,9 @@
 name: wiki-synthesizer-inline
 model: sonnet
 color: green
-description: Dormant historical Deep Wiki synthesizer retained only as a schema reference. It has no active caller or tools.
+description: Dormant. Historical Deep Wiki synthesizer kept as a schema reference; no active caller or tools.
 whenToUse: |
-  DO NOT USE. This role is dormant; active Claude Code routing uses the qualified analysis, worker, and page-writer roles. Codex performs synthesis in its main caller.
+  DO NOT USE. This role is dormant; active Claude Code routing uses the qualified analysis, worker, and page-writer roles.
 tools: []
 status: dormant
 last_known_active: v1.3.0

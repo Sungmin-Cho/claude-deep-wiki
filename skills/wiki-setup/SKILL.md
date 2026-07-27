@@ -1,6 +1,6 @@
 ---
 name: wiki-setup
-description: Initialize a Deep Wiki on Claude Code or Codex with a native absolute path, portable Node runtime, and optional read-only Obsidian availability probe. Use for /wiki-setup, wiki bootstrap, wiki initialization, or first-time configuration.
+description: Initialize a Deep Wiki on Claude Code or Codex at a native absolute path, with an optional read-only Obsidian availability probe. Triggers on /wiki-setup, wiki bootstrap, wiki initialization, first-time configuration.
 user-invocable: true
 runtime_hosts: [claude, codex]
 ---
@@ -8,7 +8,7 @@ runtime_hosts: [claude, codex]
 # wiki-setup
 
 Initialize a wiki without invoking a shell. Every deterministic operation below
-is one structured argv call to `scripts/wiki-runtime.js`; paths remain one argv
+is one structured argv call to `<plugin_root>/scripts/wiki-runtime.js`; paths remain one argv
 element and are never rewritten into another host's syntax.
 
 ## Inputs
@@ -45,14 +45,10 @@ The runtime creates the shared layout, seed page, index envelope, lifecycle
 record, and host configuration atomically. A conflict or invalid path must be
 reported without partially claiming setup succeeded.
 
-3. Optionally probe whether an Obsidian CLI is installed and whether a running
-   Obsidian application exposes its vault. The probe runs inside the portable
-   Node runtime: it searches an absolute `DEEP_WIKI_OBSIDIAN_BIN` override,
-   `PATH` under both binary casings, and well-known per-platform install
-   locations, then launches the candidate read-only with `shell:false` and a
-   bounded timeout. `found` reports CLI presence; `reachable` reports whether
-   the running application answered with its vault. Probe failure is
-   informational and does not invalidate setup.
+3. Optionally probe for an Obsidian CLI. `found` reports CLI presence;
+   `reachable` reports whether a running Obsidian application answered with its
+   vault. An absolute `DEEP_WIKI_OBSIDIAN_BIN` overrides discovery. Probe
+   failure is informational and never invalidates setup.
 
 <!-- deep-wiki:exec -->
 ```deep-wiki-exec

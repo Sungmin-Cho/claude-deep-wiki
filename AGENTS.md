@@ -23,7 +23,9 @@ versioning, journaled mutation, derived state and scan-window transitions. Skill
 agents describe intent; they never mutate wiki state directly.
 
 A new entry skill is auto-discovered on both hosts from `skills/<name>/SKILL.md` with
-`user-invocable: true` and `runtime_hosts: [claude, codex]` frontmatter.
+`user-invocable: true` and `runtime_hosts: [claude, codex]` frontmatter. Register it in
+`SKILL_COMMAND_CONTRACTS` (`scripts/lib/executable-contract.js`) in the same change: the
+linters iterate that map, so a skill missing from it is never argv-validated by anything.
 
 ## Invariants that bite
 
@@ -54,8 +56,9 @@ A new entry skill is auto-discovered on both hosts from `skills/<name>/SKILL.md`
 `README.md`, this file, `CONTRIBUTING.md` and `SECURITY.md` (with a Korean mirror in
 `README.ko.md`). That covers the load-bearing wording, not every clause: the
 version-specific detail — `contract_version` 2, the 1.8 → 1.7.1 and 1.9 → 1.8.2 pairs, the
-Windows plugin-root pre-expansion — is asserted nowhere and can rot silently. Change any
-of it only when the evidence changes.
+Windows plugin-root pre-expansion — is asserted by **no doc test**, so the prose can rot
+even while the behaviour holds (`tests/wiki-state-runtime.test.js` does pin the journal's
+`contract_version`). Change any of it only when the evidence changes.
 
 - Mutation is governed by a cooperative current writer contract with complete
   post-seizure owner and directory checks. Ambiguous locks require stopped-host
@@ -102,17 +105,20 @@ Re-pinning the suite happens in `claude-deep-suite` and takes four steps, becaus
 1. `npm run release:bump -- deep-wiki <sha40> --description="<new headline>"`. The
    `--description=` flag is the only thing that updates the marketplace blurb; omit it
    and the old headline stays. The command applies the sha and then runs `preflight`,
-   which is **expected to fail** here — currently first at
-   `tests/codex-marketplace-contract.test.js`, since the mirror still carries the
-   previous sha.
-2. Sync `.agents/plugins/marketplace.json` by hand. Copy all three fields the bump
-   touched: the `source` object, the redundant top-level `sha` mirror, and
-   `description`. The contract test compares only `source`, so a stale top-level `sha`
-   or blurb in the mirror passes every gate and drifts silently.
-3. Update the deep-wiki version mentions in `guides/integrated-workflow-guide.md` and
-   `guides/integrated-workflow-guide.ko.md`. `check-guide-version.js` gates that
-   narrative against the pinned `plugin.json.version`, and `docs:write` does not
-   regenerate it — it is hand-curated prose outside the auto-generated markers.
+   which is **expected to fail** here. Steps 2 and 3 are ordered to match how that
+   failure surfaces: `preflight` is an `&&` chain
+   (`validate → docs:check → docs:sync → validate-artifact-fixtures → test`), so
+   `docs:sync` stops it before `npm test` ever runs.
+2. Update the deep-wiki version mentions in `guides/integrated-workflow-guide.md` and
+   `guides/integrated-workflow-guide.ko.md` — this is the **first** failure, raised by
+   `check-guide-version.js` inside `docs:sync`. That narrative is hand-curated prose
+   outside the auto-generated markers, so `docs:write` never regenerates it.
+3. Sync `.agents/plugins/marketplace.json` by hand — the next failure, from
+   `tests/codex-marketplace-contract.test.js`, which only becomes reachable once
+   `docs:sync` passes. Copy all three fields the bump touched: the `source` object, the
+   redundant top-level `sha` mirror, and `description`. The contract test compares only
+   `source`, so a stale top-level `sha` or blurb in the mirror passes every gate and
+   drifts silently.
 4. `npm run preflight` — confirm green, then commit and push. The edits above are
    automated or hand-made per step, but committing and pushing the suite is still manual.
 

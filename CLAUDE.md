@@ -57,7 +57,7 @@ Update the following files in `/Users/sungmin/Dev/claude-plugins/deep-suite/`:
   - `sha`: full 40-character merge commit hash on the new `main` (`git rev-parse HEAD`)
   - `description`: a one-line summary of the headline feature for the new version
 - **`README.md`** — the `deep-wiki` row in the Plugins table (version + description)
-- **`README.md`** — append a new bullet for this version to the version list at the end of the `## deep-wiki` section
+- **`README.md`** — for feature releases, append a version-tagged bullet (e.g. `**Commit deadline scaling (v1.9.0)**`) to the end of the `### Key features` list inside the `## deep-wiki` section; patch releases may skip this
 - **`README.ko.md`** — the Korean mirror of all of the above
 
 After editing the deep-suite repo:
@@ -124,17 +124,10 @@ deep-wiki/
 ├── scripts/                        # plugin-level utility scripts
 │   ├── lint-agent-tools.js        # frontmatter and tool-contract lint
 │   ├── wiki-runtime.js            # portable wiki transaction CLI
-│   └── validate-envelope-emit.js  # release-lint, mirrors the suite envelope schema
+│   ├── validate-envelope-emit.js  # release-lint, mirrors the suite envelope schema
+│   └── codex-plugin-hook-smoke.js # installed-Codex smoke against the local Responses fixture (evidence claim above)
 ├── tests/                          # `npm test` (Node test runner)
-│   ├── envelope-{emit,chain}.test.js
-│   ├── auto-ingest-golden.test.js
-│   ├── pending-scan-recovery.test.js
-│   └── fixtures/
-├── package.json                    # test runner manifest (private, no runtime deps)
-├── CHANGELOG.md / CHANGELOG.ko.md
-├── README.md / README.ko.md
 ├── docs/                           # author-local artifacts (gitignored, untracked)
-├── test-wiki/                      # small example wiki
 └── .deep-review/                   # gitignored — review cycle artifacts
 ```
 
@@ -275,11 +268,3 @@ To check the current version: `jq -r .version .claude-plugin/plugin.json`
 - **deep-review**: https://github.com/Sungmin-Cho/claude-deep-review
 - **deep-docs**: https://github.com/Sungmin-Cho/claude-deep-docs
 - **deep-dashboard**: https://github.com/Sungmin-Cho/claude-deep-dashboard
-
----
-
-**🔁 Reminder**: This CLAUDE.md is intentionally kept short. For every new release:
-
-1. **Write the details in CHANGELOG** (not here — prevents drift)
-2. **Only sync the schema sections** (Storage layout / Lifecycle actions / Critical invariants) if the schema itself changed
-3. **Sync the deep-suite marketplace** (see the "CRITICAL" section above)

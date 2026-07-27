@@ -34,6 +34,10 @@ intentional test fixtures.
   arbitrary-user-machine, or OS-level no-egress certification.
 - After a 1.8 write, use a backup-only downgrade: stop all hosts, recover with
   1.8, restore the authenticated pre-upgrade backup, then start 1.7.1.
+- After a 1.9 write, use a backup-only downgrade: stop all hosts, recover with
+  1.9, restore the authenticated pre-upgrade backup, then start 1.8.2. A 1.9
+  in-flight journal uses `contract_version` 2, which 1.8.x cannot recover, so an
+  interrupted 1.9 commit must be completed with 1.9 before any downgrade.
 
 ## Verification
 

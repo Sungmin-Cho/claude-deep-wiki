@@ -9,6 +9,8 @@
 # These are author-local artifacts and must never reach the remote.
 docs/
 .deep-review/
+.deep-loop/
+.deep-docs/
 
 # V-0 / V-1 / V-2 / V-3 probe results (per scripts/v0-probe/{v0,v1,v2-v3}-procedure.md §5)
 # — outcomes are session-specific and authored by the main session at run

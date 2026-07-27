@@ -40,6 +40,9 @@ Use `node:` APIs, preserve drive/UNC paths, and launch children with `shell:fals
   arbitrary-user-machine, or OS-level no-egress certification.
 - A post-1.8 rollback is a backup-only downgrade after all hosts stop and 1.8
   completes recovery.
+- A post-1.9 rollback is likewise backup-only: all hosts stop, 1.9 completes
+  recovery, then restore the authenticated pre-upgrade backup and start 1.8.2.
+  A 1.9 in-flight journal (`contract_version` 2) is unrecoverable by 1.8.x.
 
 ## Conventions
 

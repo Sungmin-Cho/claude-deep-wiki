@@ -254,7 +254,10 @@ deep-work 세션 리포트를 위키로 ingest:
 - **Upgrade와 rollback.** 첫 1.8 작업 전에 모든 host를 중지하고 완전한 인증
   backup을 만드세요. 1.8이 state를 썼다면 직접 in-place rollback은 지원하지
   않습니다. 중지 상태에서 1.8로 recovery한 뒤 1.7.1을 시작하기 전에 백업 전용
-  downgrade를 수행해야 합니다.
+  downgrade를 수행해야 합니다. 1.9도 동일합니다: 1.9가 state를 쓴 뒤에는 중지
+  상태에서 1.9로 recovery하고, 인증된 업그레이드 전 backup을 복원한 뒤 1.8.2를
+  시작하세요 — 1.9의 in-flight journal(`contract_version` 2)은 1.8.x가 recover할
+  수 없습니다.
 
 ## 철학
 

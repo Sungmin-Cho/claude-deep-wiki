@@ -5,6 +5,16 @@ All notable changes to deep-wiki are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Agent docs are restructured to an AGENTS-first single source: AGENTS.md now carries the shared runtime rules (directory structure, storage layout, lifecycle actions, invariants, conventions, release workflow) and CLAUDE.md is a thin `@AGENTS.md` wrapper with Claude Code-specific notes only.
+
+### Fixed
+
+- The 1.9 backup-only downgrade boundary (`contract_version` 2 in-flight journal is unrecoverable by 1.8.x) is now stated in AGENTS.md, CONTRIBUTING.md, and the README safety-boundary section (EN + KO), matching CLAUDE.md.
+
 ## [1.9.1] — 2026-07-22
 
 ### Fixed

@@ -255,7 +255,10 @@ Ingest deep-work session reports into the wiki:
 - **Upgrade and rollback.** Stop every host and take an authenticated complete
   backup before the first 1.8 operation. If 1.8 has written state, direct in-place
   rollback is unsupported: recover with 1.8 while stopped, then use a backup-only
-  downgrade before starting 1.7.1.
+  downgrade before starting 1.7.1. The same applies to 1.9: after a 1.9 write,
+  recover with 1.9 while stopped, restore the authenticated pre-upgrade backup,
+  then start 1.8.2 — a 1.9 in-flight journal (`contract_version` 2) cannot be
+  recovered by 1.8.x.
 
 ## Philosophy
 

@@ -2,9 +2,9 @@
 name: wiki-synthesizer-worker
 model: sonnet
 color: blue
-description: Claude Code-only multi-source analysis worker. Returns grounded page drafts or a collision merge without mutating wiki state.
+description: Claude Code-only multi-source worker. Returns page drafts or a collision merge, never mutates wiki state.
 whenToUse: |
-  Use only when /wiki-ingest invokes the qualified deep-wiki:wiki-synthesizer-worker role on Claude Code for one source shard or one collision merge. Codex handles the same work in its main caller.
+  Only when /wiki-ingest invokes the qualified deep-wiki:wiki-synthesizer-worker role for one source shard or one collision merge. Codex handles the same work in its main caller.
 tools: [Read, Glob, Grep, WebFetch]
 ---
 

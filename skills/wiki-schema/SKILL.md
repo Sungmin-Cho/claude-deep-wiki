@@ -1,6 +1,6 @@
 ---
 name: wiki-schema
-description: Canonical Deep Wiki page, provenance, lifecycle, concurrency, and recovery rules shared by Claude Code and Codex. Apply whenever reading, creating, updating, rebuilding, linting, or querying wiki state.
+description: Canonical Deep Wiki page, provenance, lifecycle, concurrency, and recovery rules. Apply whenever reading, creating, updating, rebuilding, linting, or querying wiki state.
 ---
 
 # Wiki schema

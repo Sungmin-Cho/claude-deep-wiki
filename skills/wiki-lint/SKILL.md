@@ -1,15 +1,15 @@
 ---
 name: wiki-lint
-description: Inspect or repair Deep Wiki structure, links, provenance, lifecycle invariants, and scan-window state through the portable Node runtime. Use for /wiki-lint, wiki health checks, audits, or --fix repair.
+description: Inspect or repair Deep Wiki structure, links, and provenance. Triggers on /wiki-lint, wiki health checks, audits, --fix repair.
 user-invocable: true
 runtime_hosts: [claude, codex]
 ---
 
 # wiki-lint
 
-Run a host-neutral health check. The default path is read-only and reports page
-schema violations, broken links, catalog drift, orphan pages, source provenance
-gaps, lifecycle violations, version retention, and scan-window state.
+Run a host-neutral health check. The default path is read-only and reports drift
+in page schema, links, provenance, catalog, orphans, lifecycle, version
+retention, and the scan window.
 
 <!-- deep-wiki:exec -->
 ```deep-wiki-exec

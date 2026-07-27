@@ -1,6 +1,6 @@
 ---
 name: wiki-ingest
-description: Ingest files, URLs, pasted text, or Deep Work reports into Deep Wiki with shared Claude Code and Codex semantics, portable Node state transitions, provenance, and recoverable journaled commits. Use for /wiki-ingest, wiki updates, or SessionStart change ingestion.
+description: Ingest files, URLs, text, or Deep Work reports into the Deep Wiki. Triggers on /wiki-ingest, wiki updates, SessionStart change ingestion.
 user-invocable: true
 runtime_hosts: [claude, codex]
 codex_agent_fanout: disabled_for_1.8.0
@@ -8,11 +8,10 @@ codex_agent_fanout: disabled_for_1.8.0
 
 # wiki-ingest
 
-Turn source material into durable, source-grounded wiki pages. Human judgment
-selects and synthesizes knowledge; `scripts/wiki-runtime.js` exclusively owns
-configuration, locking, snapshots, versions, catalog/log state, pending scan
-windows, and journal recovery. Every deterministic call is a structured argv
-operation with no shell wrapper.
+Turn source material into durable, source-grounded wiki pages. You select and
+synthesize; `scripts/wiki-runtime.js` owns every deterministic operation, called
+as structured argv with no shell wrapper. Page, provenance and lifecycle rules
+are in the `wiki-schema` skill.
 
 ## 1. Resolve and inspect
 
@@ -40,15 +39,11 @@ perform an ingest repair.
 
 ### Obsidian-assisted context (optional)
 
-When the resolved configuration reports `obsidianCli.enabled: true`, the caller
-may enrich analysis with read-only vault context served by the running Obsidian
-application through the portable runtime bridge: find merge candidates beyond
-the changed files, discover notes referencing an ingested source, and align new
-page tags with the existing taxonomy. The bridge targets the configured vault,
-allows only read-only subcommands, bounds output and timeout, and refuses when
-the configuration disables Obsidian. Every call is optional and every failure
-is informational — fall back to direct file reads and never block, fail, or
-alter ingest state because of it.
+When the resolved configuration reports `obsidianCli.enabled: true`, enrich the
+analysis with read-only vault context: merge candidates beyond the changed
+files, notes referencing an ingested source, and the existing tag taxonomy.
+Every call is optional and every failure is informational — fall back to direct
+file reads, and never block, fail, or alter ingest state because of it.
 
 <!-- deep-wiki:exec -->
 ```deep-wiki-exec
@@ -78,16 +73,14 @@ Both hosts use identical page-plan and manifest schemas.
 Claude Code may fan out only to those three qualified names. A named-agent resolution error must fail the affected work; there is no unqualified or generic fallback. `wiki-synthesizer-inline` is dormant and is never dispatched.
 
 For Codex, `codex_agent_fanout: disabled_for_1.8.0` is unconditional. The main
-caller fixes the page-plan sequence once in stable input order. For each plan,
-it completes analysis, writes the body, validates the unchanged JSON output
-schema, appends the validated manifest entry in memory, and only then advances.
-For plans `p1,p2,p3`, the observable trace is exactly
-`analyze:p1,write:p1,validate:p1,analyze:p2,write:p2,validate:p2,analyze:p3,write:p3,validate:p3`.
-It never launches a child. This can be slower for large sources, but the
-committed semantics and failure behavior are the same as Claude Code.
+caller fixes the page-plan sequence once in stable input order, then for each
+plan completes analysis, writes the body, validates the unchanged JSON output
+schema, and appends the validated manifest entry in memory before advancing. It
+never launches a child. This can be slower on large sources, but the committed
+semantics and failure behavior match Claude Code.
 
-The following inert policy record makes the Codex loop auditable. The main
-caller applies the listed phases to each plan before advancing.
+The inert policy record below is the authority for that loop: apply its listed
+phases to each plan, in order, before advancing.
 
 <!-- deep-wiki:data -->
 ```json
@@ -143,21 +136,20 @@ representations, and rollback.
 {"executable":"node","argv":["<plugin_root>/scripts/wiki-runtime.js","commit","--wiki-root","ABSOLUTE_WIKI_ROOT","--lock-token","LOCK_TOKEN","--manifest-file","ABSOLUTE_MANIFEST_FILE","--json"]}
 ```
 
-For an interrupted commit, recover the same operation before retrying. Recovery
-must be idempotent and token-authenticated.
+For an interrupted commit, recover the same operation before retrying; recovery
+is idempotent and token-authenticated.
 
 Every runtime call carries an internal 12-second deadline. On a large or slow
-(sync-drive) vault a single `commit` can exceed it and exit with
-`DEADLINE_EXCEEDED at <boundary>`; the progress made so far is durable in the
-journal. Recovering the same operation id until it returns a result is the normal
-path — it may take several idempotent, resumable calls, and the error output
-carries the exact recover argv to re-run.
+(sync-drive) vault one `commit` can exceed it and exit `DEADLINE_EXCEEDED at
+<boundary>`, with the progress made so far durable in the journal. Recovering
+the same operation id until it returns a result is the normal path — it may take
+several resumable calls, and the error output carries the exact recover argv.
 
 If an unchanged catalog file is changed or deleted externally mid-commit, the
-transaction is cancelled cleanly with `TRANSACTION_CANCELLED` (exit 4): it is torn
-down, the wiki is left in its pre-commit state (the external edit is preserved, not
-clobbered), and no receipt is written. Re-snapshot and resubmit the same manifest;
-run `/wiki-lint` to surface any `MISSING_SOURCE` left by the external change.
+transaction is cancelled with `TRANSACTION_CANCELLED` (exit 4): torn down, no
+receipt written, and the wiki left in its pre-commit state with the external edit
+preserved rather than clobbered. Re-snapshot and resubmit the same manifest, then
+run `/wiki-lint` to surface any `MISSING_SOURCE` the external change left behind.
 
 <!-- deep-wiki:exec -->
 ```deep-wiki-exec

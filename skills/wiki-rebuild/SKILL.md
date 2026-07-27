@@ -1,6 +1,6 @@
 ---
 name: wiki-rebuild
-description: Regenerate Deep Wiki derived catalogs from page frontmatter with one token-owned journaled transaction and a rebuild lifecycle record. Use for /wiki-rebuild, stale catalog repair, or wiki reindexing.
+description: Regenerate Deep Wiki derived catalogs from page frontmatter. Triggers on /wiki-rebuild, stale catalog repair, wiki reindexing.
 user-invocable: true
 runtime_hosts: [claude, codex]
 ---

@@ -5,6 +5,16 @@ deep-wiki의 주요 변경사항을 기록합니다.
 형식은 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)를 따르며,
 이 프로젝트는 [유의적 버전](https://semver.org/spec/v2.0.0.html)을 준수합니다.
 
+## [Unreleased]
+
+### 변경
+
+- 에이전트 문서를 AGENTS-first 단일 소스로 재구성: AGENTS.md가 공유 런타임 규칙(디렉토리 구조, storage layout, lifecycle actions, 불변식, 컨벤션, 릴리스 워크플로우)을 보유하고, CLAUDE.md는 `@AGENTS.md` import + Claude Code 전용 노트만 남긴 thin wrapper가 됩니다.
+
+### 수정
+
+- 1.9 백업 전용 downgrade 경계(`contract_version` 2 in-flight journal은 1.8.x가 recover 불가)를 AGENTS.md, CONTRIBUTING.md, README 안전 경계 섹션(EN + KO)에도 명시하여 CLAUDE.md와 일치시켰습니다.
+
 ## [1.9.1] — 2026-07-22
 
 ### 수정

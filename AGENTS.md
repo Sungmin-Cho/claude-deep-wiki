@@ -38,7 +38,9 @@ A new entry skill is auto-discovered on both hosts from `skills/<name>/SKILL.md`
   `log.actions`; the manifest `operation` for auto-filing is `query-autofile` while the
   emitted `action` is `query-filed`, and both literals are test-pinned.
 - **`.wiki-meta/index.json` is an M3 aggregator envelope**: its payload must keep
-  `pages`, and it never carries `parent_run_id`.
+  `pages`, and `parent_run_id` is absent by default — only an explicit
+  `--parent-run-id` sets it, and deep-dashboard treats this kind as an aggregator whose
+  `run_id` is never a valid parent target.
 - **Timestamps are `YYYY-MM-DDTHH:MM:SSZ`** — never a local offset, because log
   analysis relies on lexicographic order matching chronological order.
 - **The suite advertises these paths** in `suite-extensions.json`; renaming one breaks
@@ -90,11 +92,19 @@ Rewording one fails the suite — change the claim only when the evidence change
 The plugin repo owns its own release: bump the version triple, add the entry to
 `CHANGELOG.md` **and** `CHANGELOG.ko.md`, then merge to `main`.
 
-Re-pinning the suite is then one command in `claude-deep-suite`:
-`npm run release:bump -- deep-wiki <sha40>`, which runs the `preflight` gate itself. It
-rewrites `.claude-plugin/marketplace.json` and regenerates every auto-generated doc region —
-do not hand-edit the suite README plugin table, which lives inside
-`<!-- deep-suite:auto-generated:plugin-table-en -->` markers. Two things the command
-does not do: `.agents/plugins/marketplace.json` must be synced by hand, and a feature
-release should get a hand-written bullet appended to the `### Key features` list in the
-suite `README.md` / `README.ko.md` `## deep-wiki` section.
+Re-pinning the suite happens in `claude-deep-suite` and takes three steps, because
+`scripts/release-bump.js` writes `.claude-plugin/marketplace.json` only while the
+`preflight` it runs compares that file against the Codex mirror:
+
+1. `npm run release:bump -- deep-wiki <sha40> --description="<new headline>"`. The
+   `--description=` flag is the only thing that updates the marketplace blurb; omit it
+   and the old headline stays. The command applies the sha and then runs `preflight`,
+   which is **expected to fail** at this point on `tests/codex-marketplace-contract.test.js`,
+   since the mirror still carries the previous sha.
+2. Sync `.agents/plugins/marketplace.json` by hand so its `source` object matches.
+3. `npm run preflight` — confirm green, then commit and push.
+
+Never hand-edit the suite README plugin table: it lives inside
+`<!-- deep-suite:auto-generated:plugin-table-en -->` markers and step 1 regenerates it. A
+feature release should also get a hand-written bullet appended to the `### Key features`
+list in the suite `README.md` / `README.ko.md` `## deep-wiki` section.

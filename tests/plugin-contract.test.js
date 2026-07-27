@@ -158,7 +158,9 @@ test('1.8.0 release documents the reviewed runtime and evidence boundary', () =>
   // and CLAUDE.md reaches it through `@AGENTS.md`. Asserting the boundary in both
   // would require the duplication the AGENTS-first restructure removed. That import
   // is what makes the exclusion sound, so it is asserted rather than assumed.
-  assert.match(readText('CLAUDE.md'), /^@AGENTS\.md/m);
+  // Pinned to line 1: a multiline-anchored match would accept the import anywhere
+  // in the file, which is not the AGENTS-first standard.
+  assert.equal(readText('CLAUDE.md').split('\n')[0].trim(), '@AGENTS.md');
   const englishRuntimeDocs = [
     'README.md', 'AGENTS.md', 'CONTRIBUTING.md', 'SECURITY.md',
   ];

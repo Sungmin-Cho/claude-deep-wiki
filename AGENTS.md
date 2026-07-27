@@ -6,7 +6,7 @@ hooks and agents to both Claude Code and Codex.
 Read the version with `jq -r .version .claude-plugin/plugin.json` — it is triple-synced
 across `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json` and `package.json`.
 Never hardcode it in a doc. Dev setup, tests and PR rules live in `CONTRIBUTING.md`;
-documentation rules in `docs/DOCS_RULE.md`.
+documentation rules in `docs/DOCS_RULE.md` (local-only, gitignored).
 
 ## Where the contracts live
 
@@ -50,9 +50,12 @@ A new entry skill is auto-discovered on both hosts from `skills/<name>/SKILL.md`
 
 ## Runtime safety boundary
 
-`tests/plugin-contract.test.js` asserts each statement below in `README.md`, this file,
-`CONTRIBUTING.md` and `SECURITY.md` (and its Korean mirror in `README.ko.md`).
-Rewording one fails the suite — change the claim only when the evidence changes.
+`tests/plugin-contract.test.js` pins fourteen phrases drawn from the bullets below across
+`README.md`, this file, `CONTRIBUTING.md` and `SECURITY.md` (with a Korean mirror in
+`README.ko.md`). That covers the load-bearing wording, not every clause: the
+version-specific detail — `contract_version` 2, the 1.8 → 1.7.1 and 1.9 → 1.8.2 pairs, the
+Windows plugin-root pre-expansion — is asserted nowhere and can rot silently. Change any
+of it only when the evidence changes.
 
 - Mutation is governed by a cooperative current writer contract with complete
   post-seizure owner and directory checks. Ambiguous locks require stopped-host
@@ -92,17 +95,26 @@ Rewording one fails the suite — change the claim only when the evidence change
 The plugin repo owns its own release: bump the version triple, add the entry to
 `CHANGELOG.md` **and** `CHANGELOG.ko.md`, then merge to `main`.
 
-Re-pinning the suite happens in `claude-deep-suite` and takes three steps, because
+Re-pinning the suite happens in `claude-deep-suite` and takes four steps, because
 `scripts/release-bump.js` writes `.claude-plugin/marketplace.json` only while the
-`preflight` it runs compares that file against the Codex mirror:
+`preflight` it runs checks the Codex mirror and the workflow guides too:
 
 1. `npm run release:bump -- deep-wiki <sha40> --description="<new headline>"`. The
    `--description=` flag is the only thing that updates the marketplace blurb; omit it
    and the old headline stays. The command applies the sha and then runs `preflight`,
-   which is **expected to fail** at this point on `tests/codex-marketplace-contract.test.js`,
-   since the mirror still carries the previous sha.
-2. Sync `.agents/plugins/marketplace.json` by hand so its `source` object matches.
-3. `npm run preflight` — confirm green, then commit and push.
+   which is **expected to fail** here — currently first at
+   `tests/codex-marketplace-contract.test.js`, since the mirror still carries the
+   previous sha.
+2. Sync `.agents/plugins/marketplace.json` by hand. Copy all three fields the bump
+   touched: the `source` object, the redundant top-level `sha` mirror, and
+   `description`. The contract test compares only `source`, so a stale top-level `sha`
+   or blurb in the mirror passes every gate and drifts silently.
+3. Update the deep-wiki version mentions in `guides/integrated-workflow-guide.md` and
+   `guides/integrated-workflow-guide.ko.md`. `check-guide-version.js` gates that
+   narrative against the pinned `plugin.json.version`, and `docs:write` does not
+   regenerate it — it is hand-curated prose outside the auto-generated markers.
+4. `npm run preflight` — confirm green, then commit and push. The edits above are
+   automated or hand-made per step, but committing and pushing the suite is still manual.
 
 Never hand-edit the suite README plugin table: it lives inside
 `<!-- deep-suite:auto-generated:plugin-table-en -->` markers and step 1 regenerates it. A

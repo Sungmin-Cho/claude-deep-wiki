@@ -18,7 +18,7 @@ deep-wiki의 주요 변경사항을 기록합니다.
 ### 수정
 
 - 1.9 백업 전용 downgrade 경계(`contract_version` 2 in-flight journal은 1.8.x가 recover 불가)를 AGENTS.md, CONTRIBUTING.md, README 안전 경계 섹션(EN + KO)에 명시했습니다.
-- 문서화된 릴리스 워크플로우가 더 이상 자동 생성되는 deep-suite README 플러그인 표를 직접 편집하거나 marketplace를 수동 커밋하도록 안내하지 않습니다. 대신 suite의 `release:bump`와 `preflight` 명령을 가리키고, 그 명령이 처리하지 않는 두 단계를 명시합니다.
+- 문서화된 릴리스 워크플로우가 더 이상 자동 생성되는 deep-suite README 플러그인 표를 직접 편집하도록 안내하지 않습니다. 실제로 실행되는 순서를 제시합니다: `release:bump`가 marketplace와 자동 생성 문서 영역 편집을 자동화하고, Codex 미러와 워크플로우 가이드의 버전 서술은 여전히 수동 편집이 필요하며, suite 커밋·푸시도 수동입니다.
 - 선택적 `.wiki-meta/.config.json` fan-out 노브를 에이전트 가이드에서 런타임 설정처럼 서술하던 부분을 제거했습니다 — 배포되는 코드 중 이 파일을 읽는 곳은 없습니다. 선언은 호출자가 준수하는 `wiki-schema.yaml`에 남습니다.
 
 ## [1.9.1] — 2026-07-22

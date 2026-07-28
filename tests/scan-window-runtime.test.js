@@ -613,7 +613,7 @@ test('transaction pruning preserves a terminal journal whose mtime becomes young
   assert.deepEqual(fs.readdirSync(transaction), ['journal.json']);
 });
 
-test('transaction pruning removes an empty quarantine when final eligibility changes', () => {
+test('transaction pruning preserves the whole quarantine when identity changes at rename', () => {
   const {
     acquireLock,
     createDeadline,
@@ -640,19 +640,19 @@ test('transaction pruning removes an empty quarantine when final eligibility cha
   fs.utimesSync(journal, oldTime, oldTime);
   const before = fs.readFileSync(journal);
 
-  const originalMkdir = fs.mkdirSync;
+  const originalRename = fs.renameSync;
   let timestampChanged = false;
-  fs.mkdirSync = (pathname, ...args) => {
-    const result = originalMkdir(pathname, ...args);
+  fs.renameSync = (source, destination, ...args) => {
     if (!timestampChanged
-        && path.dirname(pathname) === transactions
-        && path.basename(pathname).startsWith('.prune-')) {
+        && source === transaction
+        && path.dirname(destination) === transactions
+        && path.basename(destination).startsWith('.prune-')) {
       fs.utimesSync(journal, youngTime, youngTime);
       timestampChanged = true;
     }
-    return result;
+    return originalRename(source, destination, ...args);
   };
-  const owner = acquireLock({ wikiRoot: root, operation: 'empty-quarantine-prune' });
+  const owner = acquireLock({ wikiRoot: root, operation: 'identity-rename-prune' });
   let result;
   try {
     result = pruneScanWindowTransactions({
@@ -664,14 +664,19 @@ test('transaction pruning removes an empty quarantine when final eligibility cha
       deadline: createDeadline({ budgetMs: 12_000 }),
     });
   } finally {
-    fs.mkdirSync = originalMkdir;
+    fs.renameSync = originalRename;
     releaseLock({ wikiRoot: root, token: owner.token });
   }
 
   assert.equal(timestampChanged, true);
   assert.deepEqual(result.removed, []);
-  assert.deepEqual(fs.readFileSync(journal), before);
-  assert.deepEqual(fs.readdirSync(transaction), ['journal.json']);
+  const preservedJournal = fs.readdirSync(transactions, { recursive: true })
+    .map((relative) => path.join(transactions, relative))
+    .find((pathname) => {
+      try { return fs.statSync(pathname).isFile() && fs.readFileSync(pathname).equals(before); }
+      catch { return false; }
+    });
+  assert.ok(preservedJournal);
 });
 
 test('transaction pruning preserves the journal when a late transaction entry appears', () => {
@@ -700,17 +705,17 @@ test('transaction pruning preserves the journal when a late transaction entry ap
   fs.utimesSync(journal, oldTime, oldTime);
   const journalBytes = fs.readFileSync(journal);
 
-  const originalMkdir = fs.mkdirSync;
+  const originalRename = fs.renameSync;
   let lateEntryCreated = false;
-  fs.mkdirSync = (pathname, ...args) => {
-    const result = originalMkdir(pathname, ...args);
+  fs.renameSync = (source, destination, ...args) => {
     if (!lateEntryCreated
-        && path.dirname(pathname) === transactions
-        && path.basename(pathname).startsWith('.prune-')) {
+        && source === transaction
+        && path.dirname(destination) === transactions
+        && path.basename(destination).startsWith('.prune-')) {
       fs.writeFileSync(path.join(transaction, 'late-entry'), 'ambiguous\n');
       lateEntryCreated = true;
     }
-    return result;
+    return originalRename(source, destination, ...args);
   };
   const owner = acquireLock({ wikiRoot: root, operation: 'late-entry-prune' });
   let result;
@@ -724,12 +729,19 @@ test('transaction pruning preserves the journal when a late transaction entry ap
       deadline: createDeadline({ budgetMs: 12_000 }),
     });
   } finally {
-    fs.mkdirSync = originalMkdir;
+    fs.renameSync = originalRename;
     releaseLock({ wikiRoot: root, token: owner.token });
   }
 
   assert.equal(lateEntryCreated, true);
   assert.deepEqual(result.removed, []);
+  fs.rmSync(metaPath(root, '.pending-scan'), { force: true });
+  const retry = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T2,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(retry.status, 'deferred');
   const preservedJournal = fs.readdirSync(transactions, { recursive: true })
     .map((relative) => path.join(transactions, relative))
     .find((pathname) => {
@@ -743,7 +755,7 @@ test('transaction pruning preserves the journal when a late transaction entry ap
   assert.ok(preservedJournal);
 });
 
-test('transaction pruning preserves a sibling journal across late removal races and retry', () => {
+test('transaction pruning resumes an interrupted whole-directory quarantine', () => {
   const {
     acquireLock,
     createDeadline,
@@ -751,82 +763,77 @@ test('transaction pruning preserves a sibling journal across late removal races 
     pruneScanWindowTransactions,
     releaseLock,
   } = modules();
+  const root = temporaryWiki('deep wiki resumable terminal quarantine ');
+  const completed = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(completed.status, 'deferred');
+  const transactions = metaPath(root, '.transactions');
+  const transaction = path.join(transactions, completed.operationId);
+  const journal = path.join(transaction, 'journal.json');
+  const oldTime = new Date('2026-07-01T00:00:00.000Z');
+  const pruneNow = new Date('2026-07-28T00:00:00.000Z');
+  fs.utimesSync(journal, oldTime, oldTime);
+  const journalBytes = fs.readFileSync(journal);
 
-  for (const seam of ['after-journal-move', 'before-transaction-rmdir']) {
-    const root = temporaryWiki(`deep wiki terminal prune ${seam} `);
-    const completed = ensurePendingScan({
-      wikiRoot: root,
-      proposed: T1,
-      deadline: createDeadline({ budgetMs: 12_000 }),
-    });
-    assert.notEqual(completed.status, 'deferred');
-    const transactions = metaPath(root, '.transactions');
-    const transaction = path.join(transactions, completed.operationId);
-    const journal = path.join(transaction, 'journal.json');
-    const oldTime = new Date('2026-07-01T00:00:00.000Z');
-    const pruneNow = new Date('2026-07-28T00:00:00.000Z');
-    fs.utimesSync(journal, oldTime, oldTime);
-    const journalBytes = fs.readFileSync(journal);
-
-    const originalRename = fs.renameSync;
-    const originalRmdir = fs.rmdirSync;
-    let seamReached = false;
-    fs.renameSync = (source, destination, ...args) => {
-      const result = originalRename(source, destination, ...args);
-      if (!seamReached
-          && seam === 'after-journal-move'
-          && source === journal
-          && path.basename(path.dirname(destination)).startsWith('.prune-')) {
-        fs.writeFileSync(path.join(transaction, 'late-entry'), 'ambiguous\n');
-        seamReached = true;
-      }
-      return result;
-    };
-    fs.rmdirSync = (pathname, ...args) => {
-      if (!seamReached && seam === 'before-transaction-rmdir' && pathname === transaction) {
-        fs.writeFileSync(path.join(transaction, 'late-entry'), 'ambiguous\n');
-        seamReached = true;
-      }
-      return originalRmdir(pathname, ...args);
-    };
-
-    const owner = acquireLock({ wikiRoot: root, operation: `late-removal-${seam}` });
-    let result;
-    try {
-      result = pruneScanWindowTransactions({
-        wikiRoot: root,
-        token: owner.token,
-        maxAgeDays: 7,
-        limit: 1,
-        now: pruneNow,
-        deadline: createDeadline({ budgetMs: 12_000 }),
-      });
-    } finally {
-      fs.renameSync = originalRename;
-      fs.rmdirSync = originalRmdir;
-      releaseLock({ wikiRoot: root, token: owner.token });
+  const originalUnlink = fs.unlinkSync;
+  let unlinkRefused = false;
+  fs.unlinkSync = (pathname, ...args) => {
+    if (!unlinkRefused
+        && path.basename(pathname) === 'journal.json'
+        && path.basename(path.dirname(pathname)).startsWith('.prune-')) {
+      unlinkRefused = true;
+      const error = new Error('injected terminal quarantine interruption');
+      error.code = 'EPERM';
+      throw error;
     }
+    return originalUnlink(pathname, ...args);
+  };
 
-    assert.equal(seamReached, true, seam);
-    assert.deepEqual(result.removed, [], seam);
-    fs.rmSync(metaPath(root, '.pending-scan'), { force: true });
-    const retry = ensurePendingScan({
+  const owner = acquireLock({ wikiRoot: root, operation: 'resumable-quarantine-prune' });
+  try {
+    const first = pruneScanWindowTransactions({
       wikiRoot: root,
-      proposed: T2,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 1,
+      now: pruneNow,
       deadline: createDeadline({ budgetMs: 12_000 }),
     });
-    assert.notEqual(retry.status, 'deferred', seam);
-    const preservedJournal = fs.readdirSync(transactions, { recursive: true })
-      .map((relative) => path.join(transactions, relative))
-      .find((pathname) => {
-        try {
-          return fs.statSync(pathname).isFile()
-            && fs.readFileSync(pathname).equals(journalBytes);
-        } catch {
-          return false;
-        }
-      });
-    assert.ok(preservedJournal, seam);
+    assert.equal(unlinkRefused, true);
+    assert.deepEqual(first.removed, []);
+  } finally {
+    fs.unlinkSync = originalUnlink;
+  }
+
+  const quarantinedJournal = fs.readdirSync(transactions, { recursive: true })
+    .map((relative) => path.join(transactions, relative))
+    .find((pathname) => {
+      try {
+        return path.basename(path.dirname(pathname)).startsWith('.prune-')
+          && fs.statSync(pathname).isFile()
+          && fs.readFileSync(pathname).equals(journalBytes);
+      } catch {
+        return false;
+      }
+    });
+  assert.ok(quarantinedJournal);
+
+  try {
+    const second = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 1,
+      now: pruneNow,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+    assert.deepEqual(second.removed, [completed.operationId]);
+    assert.equal(fs.existsSync(path.dirname(quarantinedJournal)), false);
+  } finally {
+    releaseLock({ wikiRoot: root, token: owner.token });
   }
 });
 

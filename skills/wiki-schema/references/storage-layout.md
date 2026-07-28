@@ -56,10 +56,10 @@ The operator-only `transaction prune` command is the bounded terminal cleanup op
 current owner token, it removes only structurally valid scan-window journals
 whose final transition is `cleaned`, whose directory contains no other entry,
 and whose journal age exceeds `--max-age-days`. Before unlinking, the runtime
-atomically moves the candidate journal into a fresh identity-bound sibling
-quarantine and revalidates its identity, bytes, age, and link count there. It
-deletes the authenticated journal only after the original transaction
-directory has been removed successfully. It preserves in-flight,
+atomically moves the complete transaction directory into a fresh identity-bound
+sibling quarantine and revalidates the directory plus journal identity, bytes,
+age, and link count there. An interrupted quarantine remains recognizable and
+is retried by a later bounded pass. It preserves in-flight,
 malformed, foreign-kind, linked, young, and otherwise ambiguous entries.
 Repeat the command while `complete` is `false` to traverse more than one bounded
 pass. `complete: true` means every entry listed for that pass was inspected; it

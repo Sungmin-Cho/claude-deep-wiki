@@ -495,6 +495,65 @@ test('transaction pruning preserves a hard-linked terminal journal byte-identica
   assert.equal(fs.statSync(linked).nlink, 2);
 });
 
+test('transaction pruning preserves noncanonical terminal journal bytes', () => {
+  const {
+    acquireLock,
+    createDeadline,
+    ensurePendingScan,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki noncanonical terminal journal ');
+  const completed = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(completed.status, 'deferred');
+  const transactions = metaPath(root, '.transactions');
+  const source = path.join(transactions, completed.operationId);
+  const oldTime = new Date('2026-07-01T00:00:00.000Z');
+  const pruneNow = new Date('2026-07-28T00:00:00.000Z');
+  const candidates = new Map();
+
+  for (const [operationId, mutate] of [
+    ['noncanonical-trailing-whitespace', (bytes) => bytes.replace(/\n$/, ' \n')],
+    ['noncanonical-duplicate-key', (bytes, journal) =>
+      bytes.replace(/^\{/, `{"kind":${JSON.stringify(journal.kind)},`)],
+  ]) {
+    const transaction = path.join(transactions, operationId);
+    fs.cpSync(source, transaction, { recursive: true });
+    const journalPath = path.join(transaction, 'journal.json');
+    const journal = JSON.parse(fs.readFileSync(journalPath, 'utf8'));
+    const canonical = `${JSON.stringify({ ...journal, operation_id: operationId })}\n`;
+    const noncanonical = Buffer.from(mutate(canonical, journal));
+    fs.writeFileSync(journalPath, noncanonical);
+    fs.utimesSync(journalPath, oldTime, oldTime);
+    fs.utimesSync(transaction, oldTime, oldTime);
+    candidates.set(journalPath, noncanonical);
+  }
+  fs.rmSync(source, { recursive: true });
+
+  const owner = acquireLock({ wikiRoot: root, operation: 'noncanonical-prune' });
+  try {
+    const result = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 8,
+      now: pruneNow,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+    assert.deepEqual(result, { processed: 0, removed: [], complete: true });
+  } finally {
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+
+  for (const [journalPath, before] of candidates) {
+    assert.deepEqual(fs.readFileSync(journalPath), before);
+  }
+});
+
 test('transaction pruning preserves a terminal journal whose mtime becomes young after eligibility', () => {
   const {
     acquireLock,

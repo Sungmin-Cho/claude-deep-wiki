@@ -84,6 +84,18 @@ function bytesEqual(left, right) {
   return Buffer.from(left).equals(Buffer.from(right));
 }
 
+function sealBytes(bytes) {
+  const value = Buffer.from(bytes);
+  return { length: value.length, sha256: sha256(value) };
+}
+
+function sealedBytesEqual(bytes, expectedBytes, expectedSeal) {
+  const value = Buffer.from(bytes);
+  return value.length === expectedSeal.length
+    && sha256(value) === expectedSeal.sha256
+    && value.equals(expectedBytes);
+}
+
 function descriptor(bytes) {
   if (bytes === null) return { exists: false, bytes_base64: null, sha256: null };
   const value = Buffer.from(bytes);
@@ -567,7 +579,17 @@ function defaultJournalAdapter(wikiRoot, operationId) {
         fs.renameSync(file, tombstone);
         assertMutation(assertOwner);
       },
-      removeCleanedTransaction(expectedJournal, expectedJournalIdentity, assertOwner, ageGate) {
+      readJournalBytes() {
+        return readGuarded(locations.journal);
+      },
+      removeCleanedTransaction(
+        expectedJournal,
+        expectedJournalBytes,
+        expectedJournalSeal,
+        expectedJournalIdentity,
+        assertOwner,
+        ageGate,
+      ) {
         assertMutation(assertOwner);
         const names = fs.readdirSync(locations.transaction).sort();
         if (names.length !== 1 || names[0] !== 'journal.json') {
@@ -577,14 +599,19 @@ function defaultJournalAdapter(wikiRoot, operationId) {
           );
         }
         let current;
+        let currentBytes;
         try {
           assertRegularFileIdentity(locations.journal, expectedJournalIdentity);
-          current = JSON.parse(fs.readFileSync(locations.journal, 'utf8'));
+          currentBytes = fs.readFileSync(locations.journal);
+          assertRegularFileIdentity(locations.journal, expectedJournalIdentity);
+          current = JSON.parse(currentBytes.toString('utf8'));
         } catch (cause) {
           throw scanError('TRANSACTION_RECOVERY_REQUIRED', 'cleaned journal is unreadable', cause);
         }
         validateJournal(current, operationId, wikiRoot);
         if (current.transitions.at(-1) !== 'cleaned'
+            || !sealedBytesEqual(currentBytes, expectedJournalBytes, expectedJournalSeal)
+            || !currentBytes.equals(stageBytes(current))
             || JSON.stringify(current) !== JSON.stringify(expectedJournal)) {
           throw scanError('TRANSACTION_RECOVERY_REQUIRED', 'cleaned journal changed before pruning');
         }
@@ -639,9 +666,17 @@ function defaultJournalAdapter(wikiRoot, operationId) {
         try {
           assertQuarantine(['journal.json']);
           assertRegularFileIdentity(quarantinedJournal, expectedJournalIdentity, ageGate);
-          const quarantined = JSON.parse(fs.readFileSync(quarantinedJournal, 'utf8'));
+          const quarantinedBytes = fs.readFileSync(quarantinedJournal);
+          assertRegularFileIdentity(quarantinedJournal, expectedJournalIdentity, ageGate);
+          const quarantined = JSON.parse(quarantinedBytes.toString('utf8'));
           validateJournal(quarantined, operationId, wikiRoot);
           if (quarantined.transitions.at(-1) !== 'cleaned'
+              || !sealedBytesEqual(
+                quarantinedBytes,
+                expectedJournalBytes,
+                expectedJournalSeal,
+              )
+              || !quarantinedBytes.equals(stageBytes(quarantined))
               || JSON.stringify(quarantined) !== JSON.stringify(expectedJournal)) {
             throw scanError(
               'TRANSACTION_RECOVERY_REQUIRED',
@@ -1197,35 +1232,42 @@ function pruneScanWindowTransactions(options = {}) {
     const adapter = defaultJournalAdapter(physicalRoot, operationId);
     const control = adapter[DEFAULT_ADAPTER_CONTROL];
     let journal;
+    let journalBytes;
+    let journalIdentity;
     try {
-      journal = adapter.readJournal();
-      if (!journal) continue;
+      const journalStat = fs.lstatSync(adapter.locations.journal, { bigint: true });
+      journalIdentity = regularFileIdentity(journalStat);
+      if (!journalIdentity) continue;
+      journalBytes = control.readJournalBytes();
+      if (journalBytes === null) continue;
+      assertRegularFileIdentity(adapter.locations.journal, journalIdentity);
+      journal = JSON.parse(journalBytes.toString('utf8'));
       validateJournal(journal, operationId, physicalRoot);
+      if (!journalBytes.equals(stageBytes(journal))) continue;
     } catch {
       continue;
     }
     if (journal.transitions.at(-1) !== 'cleaned'
         || (kinds && !kinds.has(journal.kind))) continue;
 
-    let journalStat;
-    try {
-      journalStat = fs.lstatSync(adapter.locations.journal, { bigint: true });
-    } catch { continue; }
-    const journalIdentity = regularFileIdentity(journalStat);
-    if (!journalIdentity) continue;
-    const ageMs = now.getTime() - Number(journalStat.mtimeMs);
-    if (!Number.isFinite(ageMs) || ageMs < 0
-        || (maxAgeDays > 0 && ageMs <= maxAgeDays * DAY_MS)) continue;
+    if (!terminalJournalIsOldEnough(journalIdentity, now.getTime(), maxAgeDays)) continue;
     let names;
     try { names = fs.readdirSync(adapter.locations.transaction).sort(); } catch { continue; }
     if (names.length !== 1 || names[0] !== 'journal.json') continue;
 
     assertOwner();
     try {
-      control.removeCleanedTransaction(journal, journalIdentity, assertOwner, {
-        nowMs: now.getTime(),
-        maxAgeDays,
-      });
+      control.removeCleanedTransaction(
+        journal,
+        journalBytes,
+        sealBytes(journalBytes),
+        journalIdentity,
+        assertOwner,
+        {
+          nowMs: now.getTime(),
+          maxAgeDays,
+        },
+      );
     } catch (error) {
       if (error.code === 'TRANSACTION_RECOVERY_REQUIRED') continue;
       throw error;

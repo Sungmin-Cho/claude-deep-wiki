@@ -1728,12 +1728,12 @@ function pruneScanWindowTransactions(options = {}) {
     deadline,
     'scan-window-transaction-prune',
   );
-  assertBudget();
-  assertOwner();
-  assertBudget();
   const transactions = path.join(physicalRoot, '.wiki-meta', '.transactions');
   let entries;
   try {
+    assertBudget();
+    assertOwner();
+    assertBudget();
     if (inspectPhysicalDirectory(
       transactions,
       transactions,

@@ -1562,6 +1562,64 @@ test('transaction prune bounds cumulative filesystem discovery after its deadlin
   assert.deepEqual(fs.readdirSync(transaction), ['journal.json']);
 });
 
+test('transaction prune returns incomplete when its deadline expires during owner preflight', () => {
+  const {
+    acquireLock,
+    createDeadline,
+    ensurePendingScan,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki bounded prune owner preflight ');
+  const completed = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(completed.status, 'deferred');
+  const transaction = path.join(
+    metaPath(root, '.transactions'),
+    completed.operationId,
+  );
+  const journal = path.join(transaction, 'journal.json');
+  const journalBytes = fs.readFileSync(journal);
+  const clock = makeClock();
+  const owner = acquireLock({ wikiRoot: root, operation: 'bounded-owner-preflight-prune' });
+  const originalRealpath = fs.realpathSync.native;
+  const originalRead = fs.readFileSync;
+  fs.realpathSync.native = (...args) => {
+    const value = originalRealpath(...args);
+    clock.advance(700);
+    return value;
+  };
+  fs.readFileSync = (...args) => {
+    const value = originalRead(...args);
+    clock.advance(700);
+    return value;
+  };
+
+  let result;
+  try {
+    result = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 1,
+      now: new Date('2026-07-28T00:00:00.000Z'),
+      deadline: createDeadline({ clock, budgetMs: 1_000 }),
+    });
+  } finally {
+    fs.realpathSync.native = originalRealpath;
+    fs.readFileSync = originalRead;
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+
+  assert.deepEqual(result, { processed: 0, removed: [], complete: false });
+  assert.equal(clock.nowMs(), 1_400);
+  assert.deepEqual(fs.readFileSync(journal), journalBytes);
+  assert.deepEqual(fs.readdirSync(transaction), ['journal.json']);
+});
+
 test('transaction prune CLI exposes bounded terminal cleanup under the caller lock', () => {
   const { acquireLock, createDeadline, ensurePendingScan, releaseLock } = modules();
   const root = temporaryWiki('deep wiki transaction prune cli ');

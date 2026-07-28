@@ -654,14 +654,26 @@ function defaultJournalAdapter(wikiRoot, operationId) {
 
         try {
           assertRegularFileIdentity(locations.journal, expectedJournalIdentity, ageGate);
+          fs.renameSync(locations.journal, quarantinedJournal);
         } catch (cause) {
+          if (typeof cause.code === 'string' && cause.code.startsWith('LOCK_')) throw cause;
+          try {
+            assertQuarantine([]);
+            fs.rmdirSync(quarantine);
+            assertMutation(assertOwner);
+          } catch (cleanupCause) {
+            throw scanError(
+              'TRANSACTION_RECOVERY_REQUIRED',
+              'empty terminal journal prune quarantine requires recovery',
+              cleanupCause,
+            );
+          }
           throw scanError(
             'TRANSACTION_RECOVERY_REQUIRED',
             'cleaned journal changed before final prune eligibility',
             cause,
           );
         }
-        fs.renameSync(locations.journal, quarantinedJournal);
 
         try {
           assertQuarantine(['journal.json']);

@@ -609,6 +609,67 @@ test('transaction pruning preserves a terminal journal whose mtime becomes young
   assert.deepEqual(result.removed, []);
   assert.deepEqual(fs.readFileSync(journal), before);
   assert.equal(fs.statSync(journal).mtimeMs, youngTime.getTime());
+  assert.deepEqual(fs.readdirSync(transaction), ['journal.json']);
+});
+
+test('transaction pruning removes an empty quarantine when final eligibility changes', () => {
+  const {
+    acquireLock,
+    createDeadline,
+    ensurePendingScan,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki terminal prune empty quarantine ');
+  const completed = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(completed.status, 'deferred');
+  const transaction = path.join(
+    metaPath(root, '.transactions'),
+    completed.operationId,
+  );
+  const journal = path.join(transaction, 'journal.json');
+  const oldTime = new Date('2026-07-01T00:00:00.000Z');
+  const youngTime = new Date('2026-07-27T00:00:00.000Z');
+  const pruneNow = new Date('2026-07-28T00:00:00.000Z');
+  fs.utimesSync(journal, oldTime, oldTime);
+  const before = fs.readFileSync(journal);
+
+  const originalMkdir = fs.mkdirSync;
+  let timestampChanged = false;
+  fs.mkdirSync = (pathname, ...args) => {
+    const result = originalMkdir(pathname, ...args);
+    if (!timestampChanged
+        && path.dirname(pathname) === transaction
+        && path.basename(pathname).startsWith('.prune-')) {
+      fs.utimesSync(journal, youngTime, youngTime);
+      timestampChanged = true;
+    }
+    return result;
+  };
+  const owner = acquireLock({ wikiRoot: root, operation: 'empty-quarantine-prune' });
+  let result;
+  try {
+    result = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 1,
+      now: pruneNow,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+  } finally {
+    fs.mkdirSync = originalMkdir;
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+
+  assert.equal(timestampChanged, true);
+  assert.deepEqual(result.removed, []);
+  assert.deepEqual(fs.readFileSync(journal), before);
+  assert.deepEqual(fs.readdirSync(transaction), ['journal.json']);
 });
 
 test('transaction pruning quarantines before deletion and preserves a last-check pathname replacement', () => {

@@ -38,7 +38,10 @@ The supported operation catalog is:
 
 Callers never use shell traps or direct directory removal. They release in a
 guaranteed final step. A crash intentionally leaves authenticated state for
-`lock recover` rather than risking release of a replacement owner's lock.
+recovery rather than risking release of a replacement owner's lock. The next
+ordinary acquisition may reclaim that state without an age delay only after
+the complete owner is structurally valid, same-host, and proved dead;
+otherwise `lock recover` remains the explicit operator route.
 
 ## Journal protocol
 
@@ -49,7 +52,7 @@ state. `transaction recover` accepts the same operation ID and owner token and
 is idempotent. It either completes the recorded operation or restores the
 pre-operation state; it never invents a new action.
 
-`transaction prune` is the bounded terminal cleanup operation. With the caller's
+The operator-only `transaction prune` command is the bounded terminal cleanup operation. With the caller's
 current owner token, it removes only structurally valid scan-window journals
 whose final transition is `cleaned`, whose directory contains no other entry,
 and whose journal age exceeds `--max-age-days`. It preserves in-flight,

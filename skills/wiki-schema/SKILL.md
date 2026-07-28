@@ -64,6 +64,9 @@ lock recover` only when the stored owner is structurally valid, the same-host
 process is no longer live, the directory identity still matches, and the age
 policy is met. `--force` bypasses age only. `owner.json` and the owner token are
 capabilities, not informational labels.
+Ordinary acquisition may self-heal without an age delay only after proving the
+existing owner is structurally valid, same-host, and dead; live, foreign,
+malformed, and ownerless states remain contended.
 
 ## Journal and atomic commit
 
@@ -72,7 +75,7 @@ catalog refresh, and lifecycle records. The runtime writes a journal intent,
 applies expected-hash-guarded changes, and records terminal state. An
 interruption is resolved with `wiki-runtime.js transaction recover` using the
 same owner token and operation ID; a caller never creates split mutations.
-`wiki-runtime.js transaction prune` removes only fully validated, terminal
+The operator command `wiki-runtime.js transaction prune` removes only fully validated, terminal
 scan-window journals older than the requested age while the caller still owns
 the lock. The command is bounded; rerun it until `removed` is empty when a
 larger backlog must be retired. In-flight, malformed, foreign-kind, linked, or

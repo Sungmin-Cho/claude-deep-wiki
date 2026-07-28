@@ -12,10 +12,7 @@ const {
   assertLockOwner,
   releaseLock,
 } = require('./lock.js');
-const {
-  SWEEP_RESERVE_MS,
-  sweepTransactionDebris,
-} = require('./transaction-debris.js');
+const { sweepTransactionDebris } = require('./transaction-debris.js');
 
 const sleepArray = new Int32Array(new SharedArrayBuffer(4));
 const STAGES = ['pending-before', 'pending-after', 'last-before', 'last-after'];
@@ -23,6 +20,7 @@ const SHA256_RE = /^[a-f0-9]{64}$/;
 const TOKEN_RE = /^[a-f0-9]{32,}$/;
 const FILE_TYPE_MASK = 0o170000n;
 const DIRECTORY_TYPE = 0o040000n;
+const REGULAR_FILE_TYPE = 0o100000n;
 const DEFAULT_ADAPTER_CONTROL = Symbol('default-scan-window-adapter-control');
 const INPUT_KEYS = [
   'wiki_root', 'kind', 'proposed', 'expected', 'repair_pending_after', 'repair_last_after',
@@ -41,6 +39,7 @@ const TRANSITIONS = [
 ];
 const DAY_MS = 24 * 60 * 60 * 1000;
 const AUTOMATIC_PRUNE_LIMIT = 8;
+const PRUNE_RESERVE_MS = 250;
 
 class ScanWindowError extends Error {
   constructor(code, message, cause) {
@@ -155,6 +154,29 @@ function identitiesMatch(actual, expected) {
   return actual !== null && expected !== null
     && actual.dev === expected.dev && actual.ino === expected.ino && actual.type === expected.type
     && actual.birthtimeNs === expected.birthtimeNs;
+}
+
+function regularFileIdentity(stat) {
+  const dev = identityComponent(stat?.dev);
+  const ino = identityComponent(stat?.ino);
+  const mode = identityComponent(stat?.mode);
+  const birthtimeNs = identityComponent(stat?.birthtimeNs);
+  const nlink = identityComponent(stat?.nlink);
+  if (dev === null || ino === null || mode === null || birthtimeNs === null || nlink === null
+      || dev < 0n || ino <= 0n || birthtimeNs < 0n || nlink !== 1n
+      || (mode & FILE_TYPE_MASK) !== REGULAR_FILE_TYPE) return null;
+  return { dev, ino, type: mode & FILE_TYPE_MASK, birthtimeNs, nlink };
+}
+
+function assertRegularFileIdentity(pathname, expected) {
+  let actual;
+  try { actual = regularFileIdentity(fs.lstatSync(pathname, { bigint: true })); }
+  catch (cause) {
+    throw scanError('SCAN_WINDOW_FILESYSTEM', 'terminal journal identity is unavailable', cause);
+  }
+  if (!identitiesMatch(actual, expected) || actual.nlink !== expected.nlink) {
+    throw scanError('SCAN_WINDOW_FILESYSTEM', 'terminal journal identity changed');
+  }
 }
 
 function samePhysicalPath(actual, expected) {
@@ -531,7 +553,7 @@ function defaultJournalAdapter(wikiRoot, operationId) {
         fs.renameSync(file, tombstone);
         assertMutation(assertOwner);
       },
-      removeCleanedTransaction(expectedJournal, assertOwner) {
+      removeCleanedTransaction(expectedJournal, expectedJournalIdentity, assertOwner) {
         assertMutation(assertOwner);
         const names = fs.readdirSync(locations.transaction).sort();
         if (names.length !== 1 || names[0] !== 'journal.json') {
@@ -542,6 +564,7 @@ function defaultJournalAdapter(wikiRoot, operationId) {
         }
         let current;
         try {
+          assertRegularFileIdentity(locations.journal, expectedJournalIdentity);
           current = JSON.parse(fs.readFileSync(locations.journal, 'utf8'));
         } catch (cause) {
           throw scanError('TRANSACTION_RECOVERY_REQUIRED', 'cleaned journal is unreadable', cause);
@@ -552,6 +575,7 @@ function defaultJournalAdapter(wikiRoot, operationId) {
           throw scanError('TRANSACTION_RECOVERY_REQUIRED', 'cleaned journal changed before pruning');
         }
         assertMutation(assertOwner);
+        assertRegularFileIdentity(locations.journal, expectedJournalIdentity);
         fs.unlinkSync(locations.journal);
         if (typeof assertOwner === 'function') assertOwner();
         parents.assertAll();
@@ -1076,7 +1100,7 @@ function pruneScanWindowTransactions(options = {}) {
 
   const removed = [];
   for (const entry of entries) {
-    if (removed.length >= limit || remainingMs(deadline) < SWEEP_RESERVE_MS) break;
+    if (removed.length >= limit || remainingMs(deadline) < PRUNE_RESERVE_MS) break;
     if (!entry.isDirectory() || entry.isSymbolicLink()
         || entry.name === excludeOperationId) continue;
     let operationId;
@@ -1095,9 +1119,12 @@ function pruneScanWindowTransactions(options = {}) {
         || (kinds && !kinds.has(journal.kind))) continue;
 
     let journalStat;
-    try { journalStat = fs.lstatSync(adapter.locations.journal); } catch { continue; }
-    if (!journalStat.isFile() || journalStat.isSymbolicLink()) continue;
-    const ageMs = now.getTime() - journalStat.mtimeMs;
+    try {
+      journalStat = fs.lstatSync(adapter.locations.journal, { bigint: true });
+    } catch { continue; }
+    const journalIdentity = regularFileIdentity(journalStat);
+    if (!journalIdentity) continue;
+    const ageMs = now.getTime() - Number(journalStat.mtimeMs);
     if (!Number.isFinite(ageMs) || ageMs < 0
         || (maxAgeDays > 0 && ageMs <= maxAgeDays * DAY_MS)) continue;
     let names;
@@ -1105,7 +1132,7 @@ function pruneScanWindowTransactions(options = {}) {
     if (names.length !== 1 || names[0] !== 'journal.json') continue;
 
     assertOwner();
-    control.removeCleanedTransaction(journal, assertOwner);
+    control.removeCleanedTransaction(journal, journalIdentity, assertOwner);
     removed.push(operationId);
   }
   return { processed: removed.length, removed };
@@ -1120,6 +1147,7 @@ function ensurePendingScan(options = {}) {
   let owner;
   let result;
   let lockContended = false;
+  let recoveryAttempted = false;
   try {
     physicalRoot = physicalWikiRoot(options.wikiRoot);
     canonicalTimestamp(options.proposed, 'proposed');
@@ -1134,8 +1162,15 @@ function ensurePendingScan(options = {}) {
         throw error;
       }
       try {
-        owner = acquireLock({ wikiRoot: physicalRoot, operation: 'scan-window-ensure', now: options.now });
+        owner = acquireLock({
+          wikiRoot: physicalRoot,
+          operation: 'scan-window-ensure',
+          now: options.now,
+          recoverDeadOwner: !recoveryAttempted,
+        });
+        recoveryAttempted = true;
       } catch (error) {
+        recoveryAttempted = true;
         if (error.code !== 'LOCK_CONTENDED') throw error;
         lockContended = true;
         Atomics.wait(sleepArray, 0, 0, 2);
@@ -1143,16 +1178,6 @@ function ensurePendingScan(options = {}) {
     }
     assertBeforeDeadline(options.deadline, 'scan-window-preflight');
     const operationId = deterministicEnsureId(physicalRoot, options.proposed);
-    pruneScanWindowTransactions({
-      wikiRoot: physicalRoot,
-      token: owner.token,
-      maxAgeDays: 0,
-      limit: AUTOMATIC_PRUNE_LIMIT,
-      now: options.now,
-      deadline: options.deadline,
-      kinds: ['ensure'],
-      excludeOperationId: operationId,
-    });
     const plan = planScanWindowTransition({
       wikiRoot: physicalRoot,
       kind: 'ensure',
@@ -1167,6 +1192,18 @@ function ensurePendingScan(options = {}) {
       deadline: options.deadline,
     });
     result = { status: applied.status, operationId };
+    try {
+      pruneScanWindowTransactions({
+        wikiRoot: physicalRoot,
+        token: owner.token,
+        maxAgeDays: 0,
+        limit: AUTOMATIC_PRUNE_LIMIT,
+        now: options.now,
+        deadline: options.deadline,
+        kinds: ['ensure'],
+        excludeOperationId: operationId,
+      });
+    } catch { /* terminal maintenance never suppresses the persisted scan window */ }
   } catch (error) {
     result = { status: 'deferred', reason: error.code || 'SCAN_WINDOW_FILESYSTEM' };
   } finally {

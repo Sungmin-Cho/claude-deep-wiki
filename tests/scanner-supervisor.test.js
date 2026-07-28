@@ -247,6 +247,10 @@ test('persistence child success preserves exact hook stdout and releases its loc
 
   assert.equal(status, 0);
   assert.equal(fs.existsSync(successMarker), true);
+  const persistenceWitness = JSON.parse(fs.readFileSync(successMarker, 'utf8'));
+  assert.equal(Number.isSafeInteger(persistenceWitness.pid), true);
+  assert.ok(persistenceWitness.budgetMs > 0);
+  assert.ok(persistenceWitness.budgetMs < 2_000);
   assert.equal(fs.readFileSync(path.join(result.wiki_root, '.wiki-meta', '.pending-scan'), 'utf8'),
     `${result.detected_at}\n`);
   assert.deepEqual(stdout, [expectedStdout]);

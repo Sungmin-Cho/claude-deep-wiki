@@ -32,6 +32,10 @@ if (!['success', 'hang-after-lock'].includes(mode)) {
 
 const wikiRoot = flagValue('--wiki-root');
 const proposed = flagValue('--proposed');
+const budgetMs = Number(flagValue('--budget-ms'));
+if (!Number.isSafeInteger(budgetMs) || budgetMs <= 0 || budgetMs > 12_000) {
+  throw new Error('invalid --budget-ms');
+}
 
 if (mode === 'success') {
   const markerFile = absoluteEnvironmentPath('PERSIST_SUCCESS_MARKER_FILE');
@@ -39,10 +43,10 @@ if (mode === 'success') {
     wikiRoot,
     proposed,
     now: new Date(proposed),
-    deadline: createDeadline({ budgetMs: 10_000 }),
+    deadline: createDeadline({ budgetMs }),
   });
   if (!result || result.status === 'deferred') process.exitCode = 2;
-  else fs.writeFileSync(markerFile, String(process.pid));
+  else fs.writeFileSync(markerFile, `${JSON.stringify({ pid: process.pid, budgetMs })}\n`);
 } else {
   const pidFile = absoluteEnvironmentPath('PERSIST_LOCK_PID_FILE');
   acquireLock({ wikiRoot, operation: 'scan-window-ensure' });

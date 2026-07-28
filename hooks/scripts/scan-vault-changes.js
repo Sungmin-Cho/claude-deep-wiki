@@ -13,6 +13,7 @@ const {
 const { recoverLock: defaultRecoverLock } = require('./runtime/lock.js');
 
 const PARENT_BUDGET_MS = 12_000;
+const PERSISTENCE_GRACE_MS = 250;
 const MAX_CAPTURE_BYTES = 1024 * 1024;
 const RESULT_KEYS = [
   'contract_version', 'status', 'detected_at', 'wiki_root', 'vault_root', 'total', 'files',
@@ -178,6 +179,7 @@ function runPersistenceWorker(result, deadline, options = {}) {
   }
   assertBeforeDeadline(deadline, 'scanner-supervisor-before-persistence-spawn');
   const budgetMs = Math.max(1, Math.min(PARENT_BUDGET_MS, Math.floor(remainingMs(deadline))));
+  const workerBudgetMs = Math.max(1, budgetMs - PERSISTENCE_GRACE_MS);
 
   return new Promise((resolve, reject) => {
     let child;
@@ -185,6 +187,7 @@ function runPersistenceWorker(result, deadline, options = {}) {
     let timer;
 
     const recoverBoundLock = () => {
+      if (!Number.isSafeInteger(child?.pid) || child.pid <= 0) return;
       try {
         recover({
           wikiRoot: result.wiki_root,
@@ -221,7 +224,7 @@ function runPersistenceWorker(result, deadline, options = {}) {
         workerPath,
         '--wiki-root', result.wiki_root,
         '--proposed', result.detected_at,
-        '--budget-ms', String(budgetMs),
+        '--budget-ms', String(workerBudgetMs),
       ], {
         cwd: path.dirname(workerPath),
         env,

@@ -241,7 +241,7 @@ test('automatic scan-window maintenance keeps terminal transaction growth bounde
     const result = ensurePendingScan({
       wikiRoot: root,
       proposed: finalProposal,
-      deadline: createDeadline({ budgetMs: 12_000 }),
+      deadline: createDeadline({ budgetMs: 3_000 }),
     });
     assert.notEqual(result.status, 'deferred');
   }
@@ -259,6 +259,41 @@ test('automatic scan-window maintenance keeps terminal transaction growth bounde
   });
   assert.notEqual(retry.status, 'deferred');
   assert.deepEqual(snapshotTree(transactions), beforeRetry);
+});
+
+test('automatic maintenance failure never suppresses the persisted scan window', () => {
+  const { createDeadline, ensurePendingScan } = modules();
+  const root = temporaryWiki('deep wiki nonfatal automatic prune ');
+  const first = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(first.status, 'deferred');
+  fs.rmSync(metaPath(root, '.pending-scan'));
+  const journal = path.join(metaPath(root, '.transactions'), first.operationId, 'journal.json');
+  const originalUnlink = fs.unlinkSync;
+  fs.unlinkSync = (pathname) => {
+    if (pathname === journal) {
+      const error = new Error('injected terminal cleanup refusal');
+      error.code = 'EPERM';
+      throw error;
+    }
+    return originalUnlink(pathname);
+  };
+  let second;
+  try {
+    second = ensurePendingScan({
+      wikiRoot: root,
+      proposed: T2,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+  } finally {
+    fs.unlinkSync = originalUnlink;
+  }
+  assert.equal(second.status, 'created');
+  assert.equal(readMaybe(metaPath(root, '.pending-scan')).toString('utf8'), `${T2}\n`);
+  assert.equal(fs.existsSync(journal), true);
 });
 
 test('transaction pruning is token-fenced, conservative, age-gated, and exactly bounded', () => {
@@ -404,6 +439,48 @@ test('transaction pruning is token-fenced, conservative, age-gated, and exactly 
   const directoryCountAfter = fs.readdirSync(transactions, { withFileTypes: true })
     .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink()).length;
   assert.equal(directoryCountAfter, 5);
+});
+
+test('transaction pruning preserves a hard-linked terminal journal byte-identically', () => {
+  const {
+    acquireLock,
+    createDeadline,
+    ensurePendingScan,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki hard linked terminal ');
+  const completed = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(completed.status, 'deferred');
+  const journal = path.join(
+    metaPath(root, '.transactions'),
+    completed.operationId,
+    'journal.json',
+  );
+  const linked = path.join(root, 'linked-terminal-journal.json');
+  fs.linkSync(journal, linked);
+  const before = fs.readFileSync(journal);
+  const owner = acquireLock({ wikiRoot: root, operation: 'hard-link-prune' });
+  try {
+    const result = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 0,
+      limit: 1,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+    assert.deepEqual(result.removed, []);
+  } finally {
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+  assert.deepEqual(fs.readFileSync(journal), before);
+  assert.deepEqual(fs.readFileSync(linked), before);
+  assert.equal(fs.statSync(journal).nlink, 2);
+  assert.equal(fs.statSync(linked).nlink, 2);
 });
 
 test('transaction prune CLI exposes bounded terminal cleanup under the caller lock', () => {

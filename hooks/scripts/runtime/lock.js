@@ -996,16 +996,26 @@ function acquireLock(options = {}) {
   try {
     fs.mkdirSync(lockDir);
   } catch (cause) {
-    if (cause.code === 'EEXIST') {
-      const recovered = recoverLock({
-        wikiRoot,
-        fs,
-        staleMs: 0,
-        force: true,
-        now: options.now,
-        hostname: options.hostname,
-        isPidAlive: options.isPidAlive,
-      });
+    if (cause.code === 'EEXIST' && options.recoverDeadOwner !== false) {
+      let recovered = false;
+      try {
+        recovered = recoverLock({
+          wikiRoot,
+          fs,
+          staleMs: 0,
+          force: true,
+          now: options.now,
+          hostname: options.hostname,
+          isPidAlive: options.isPidAlive,
+        });
+      } catch (recoveryCause) {
+        throw new LockError(
+          'LOCK_CONTENDED',
+          'wiki lock is contended',
+          readOwner(ownerPath, fs),
+          recoveryCause,
+        );
+      }
       if (!recovered) {
         throw new LockError('LOCK_CONTENDED', 'wiki lock is contended', readOwner(ownerPath, fs), cause);
       }
@@ -1022,6 +1032,8 @@ function acquireLock(options = {}) {
         }
         throw new LockError('LOCK_FILESYSTEM', 'cannot create wiki lock', undefined, retryCause);
       }
+    } else if (cause.code === 'EEXIST') {
+      throw new LockError('LOCK_CONTENDED', 'wiki lock is contended', readOwner(ownerPath, fs), cause);
     } else {
       throw new LockError('LOCK_FILESYSTEM', 'cannot create wiki lock', undefined, cause);
     }

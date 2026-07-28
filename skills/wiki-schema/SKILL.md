@@ -85,8 +85,8 @@ exact journal-copy reservation at the canonical source through quarantine
 removal and creates an exact fsynced journal backup before unlinking the
 original. Both use exclusive crash-recoverable pending publication, so a later
 bounded pass can resume partial publication, backup-only, empty-quarantine, or
-orphaned exact-reservation states. Cleanup checks its deadline between
-recoverable mutation phases. The command is
+orphaned exact-reservation states. Cleanup checks its deadline across
+discovery, validation, and recoverable mutation phases. The command is
 bounded; rerun it while `complete` is `false` when a larger backlog must be
 traversed. `complete: true` means the pass inspected every listed entry, not
 that every ambiguous entry was removed. In-flight, malformed, foreign-kind,

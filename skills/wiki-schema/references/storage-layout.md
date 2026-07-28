@@ -64,8 +64,8 @@ the canonical source generation through quarantine removal, and an exact
 fsynced backup preserves authenticated evidence after the original journal
 unlink. Both use exclusive crash-recoverable pending publication. Later
 bounded passes resume partial publications, backup-only or empty quarantines,
-and orphaned exact reservations, checking the deadline between recoverable
-mutation phases. It preserves in-flight,
+and orphaned exact reservations, checking the deadline across discovery,
+validation, and recoverable mutation phases. It preserves in-flight,
 malformed, foreign-kind, linked, young, and otherwise ambiguous entries.
 Repeat the command while `complete` is `false` to traverse more than one bounded
 pass. `complete: true` means every entry listed for that pass was inspected; it

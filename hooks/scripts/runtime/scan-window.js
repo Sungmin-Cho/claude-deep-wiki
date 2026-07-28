@@ -498,24 +498,53 @@ function defaultJournalAdapter(wikiRoot, operationId) {
     ageGate,
   ) => {
     const quarantinedJournal = path.join(quarantine, 'journal.json');
+    const quarantineName = path.basename(quarantine);
+    const retiredReservation = path.join(
+      locations.transactions,
+      `.reservation-${quarantineName}`,
+    );
+    const reservationBytes = stageBytes({
+      contract_version: 1,
+      kind: 'scan-window-prune-reservation',
+      operation_id: operationId,
+      quarantine_name: quarantineName,
+      journal_sha256: expectedJournalSeal.sha256,
+      journal_length: expectedJournalSeal.length,
+    });
     const assertTransactionsOwner = () => {
       if (typeof assertOwner === 'function') assertOwner();
       parents.assertTransactions();
     };
-    const assertOriginalMissing = () => {
+    const inspectReservation = (pathname, expectedIdentity = null, allowMissing = false) => {
       assertTransactionsOwner();
-      if (inspectPhysicalDirectory(
-        locations.transaction,
-        locations.transaction,
-        'scan-window operation directory',
-        true,
-      ) !== null) {
+      let identity;
+      try {
+        identity = regularFileIdentity(fs.lstatSync(pathname, { bigint: true }));
+      } catch (cause) {
+        if (allowMissing && cause.code === 'ENOENT') return null;
         throw scanError(
           'TRANSACTION_RECOVERY_REQUIRED',
-          'terminal transaction path was recreated during journal pruning',
+          'terminal prune reservation is unavailable',
+          cause,
+        );
+      }
+      if (!identity) {
+        throw scanError(
+          'TRANSACTION_RECOVERY_REQUIRED',
+          'terminal prune reservation identity is invalid',
+        );
+      }
+      if (expectedIdentity) assertRegularFileIdentity(pathname, expectedIdentity);
+      const bytes = fs.readFileSync(pathname);
+      assertRegularFileIdentity(pathname, expectedIdentity || identity);
+      if (!bytes.equals(reservationBytes)) {
+        throw scanError(
+          'TRANSACTION_RECOVERY_REQUIRED',
+          'terminal prune reservation bytes are invalid',
         );
       }
       assertTransactionsOwner();
+      return identity;
     };
     const assertQuarantine = (expectedNames) => {
       assertTransactionsOwner();
@@ -541,7 +570,6 @@ function defaultJournalAdapter(wikiRoot, operationId) {
       assertTransactionsOwner();
     };
     const assertSealedJournal = () => {
-      assertOriginalMissing();
       assertQuarantine(['journal.json']);
       assertRegularFileIdentity(quarantinedJournal, expectedJournalIdentity, ageGate);
       const quarantinedBytes = fs.readFileSync(quarantinedJournal);
@@ -561,15 +589,46 @@ function defaultJournalAdapter(wikiRoot, operationId) {
           'quarantined journal changed before pruning',
         );
       }
-      assertOriginalMissing();
       assertQuarantine(['journal.json']);
       assertRegularFileIdentity(quarantinedJournal, expectedJournalIdentity, ageGate);
     };
 
     assertSealedJournal();
+    let retiredIdentity = inspectReservation(retiredReservation, null, true);
+    if (retiredIdentity === null) {
+      let activeIdentity = inspectReservation(locations.transaction, null, true);
+      if (activeIdentity === null) {
+        assertSealedJournal();
+        assertTransactionsOwner();
+        let descriptor;
+        try {
+          descriptor = fs.openSync(locations.transaction, 'wx', 0o600);
+          fs.writeFileSync(descriptor, reservationBytes);
+          fs.fsyncSync(descriptor);
+        } catch (cause) {
+          throw scanError(
+            'TRANSACTION_RECOVERY_REQUIRED',
+            'terminal prune reservation could not be created',
+            cause,
+          );
+        } finally {
+          if (descriptor !== undefined) fs.closeSync(descriptor);
+        }
+        activeIdentity = inspectReservation(locations.transaction);
+      }
+      assertSealedJournal();
+      fs.renameSync(locations.transaction, retiredReservation);
+      retiredIdentity = inspectReservation(retiredReservation, activeIdentity);
+    }
+
+    assertSealedJournal();
+    inspectReservation(retiredReservation, retiredIdentity);
     fs.unlinkSync(quarantinedJournal);
     assertQuarantine([]);
     fs.rmdirSync(quarantine);
+    assertTransactionsOwner();
+    inspectReservation(retiredReservation, retiredIdentity);
+    fs.unlinkSync(retiredReservation);
     assertTransactionsOwner();
   };
   return {
@@ -1309,6 +1368,70 @@ function pruneScanWindowTransactions(options = {}) {
     if (removed.length >= limit || remainingMs(deadline) < PRUNE_RESERVE_MS) {
       complete = false;
       break;
+    }
+    if (entry.isFile() && entry.name.startsWith('.reservation-.prune-')) {
+      const reservation = path.join(transactions, entry.name);
+      let reservationIdentity;
+      let reservationBytes;
+      let reservationValue;
+      let operationId;
+      try {
+        reservationIdentity = regularFileIdentity(
+          fs.lstatSync(reservation, { bigint: true }),
+        );
+        if (!reservationIdentity) continue;
+        reservationBytes = fs.readFileSync(reservation);
+        assertRegularFileIdentity(reservation, reservationIdentity);
+        reservationValue = JSON.parse(reservationBytes.toString('utf8'));
+        if (!hasExactKeys(reservationValue, [
+          'contract_version',
+          'kind',
+          'operation_id',
+          'quarantine_name',
+          'journal_sha256',
+          'journal_length',
+        ]) || reservationValue.contract_version !== 1
+            || reservationValue.kind !== 'scan-window-prune-reservation'
+            || typeof reservationValue.quarantine_name !== 'string'
+            || path.basename(reservationValue.quarantine_name)
+              !== reservationValue.quarantine_name
+            || entry.name !== `.reservation-${reservationValue.quarantine_name}`
+            || typeof reservationValue.journal_sha256 !== 'string'
+            || !SHA256_RE.test(reservationValue.journal_sha256)
+            || !Number.isSafeInteger(reservationValue.journal_length)
+            || reservationValue.journal_length < 1
+            || !reservationBytes.equals(stageBytes(reservationValue))) continue;
+        operationId = validateOperationId(reservationValue.operation_id);
+        try {
+          fs.lstatSync(path.join(transactions, reservationValue.quarantine_name));
+          continue;
+        } catch (cause) {
+          if (cause.code !== 'ENOENT') continue;
+        }
+      } catch {
+        continue;
+      }
+      if (operationId === excludeOperationId) continue;
+      assertOwner();
+      try {
+        assertRegularFileIdentity(reservation, reservationIdentity);
+        const currentBytes = fs.readFileSync(reservation);
+        assertRegularFileIdentity(reservation, reservationIdentity);
+        if (!currentBytes.equals(reservationBytes)) continue;
+        try {
+          fs.lstatSync(path.join(transactions, reservationValue.quarantine_name));
+          continue;
+        } catch (cause) {
+          if (cause.code !== 'ENOENT') continue;
+        }
+        fs.unlinkSync(reservation);
+        assertOwner();
+      } catch (error) {
+        if (error.code === 'ENOENT') continue;
+        throw error;
+      }
+      removed.push(operationId);
+      continue;
     }
     if (!entry.isDirectory() || entry.isSymbolicLink()
         || entry.name === excludeOperationId) continue;

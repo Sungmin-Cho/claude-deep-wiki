@@ -80,7 +80,10 @@ scan-window journals older than the requested age while the caller still owns
 the lock. It atomically moves each complete transaction directory into a fresh
 identity-bound sibling quarantine and revalidates the directory plus journal
 identity, bytes, age, and link count there. An interrupted quarantine remains
-recognizable and is retried by a later bounded pass. The command is
+recognizable and is retried by a later bounded pass. Before deleting the
+journal, the runtime closes the canonical source generation through an
+identity-bound reservation; orphaned retired reservations are also removed by
+a later bounded pass. The command is
 bounded; rerun it while `complete` is `false` when a larger backlog must be
 traversed. `complete: true` means the pass inspected every listed entry, not
 that every ambiguous entry was removed. In-flight, malformed, foreign-kind,

@@ -271,7 +271,7 @@ test('automatic maintenance failure never suppresses the persisted scan window',
   });
   assert.notEqual(first.status, 'deferred');
   fs.rmSync(metaPath(root, '.pending-scan'));
-  const journal = path.join(metaPath(root, '.transactions'), first.operationId, 'journal.json');
+  const transactions = metaPath(root, '.transactions');
   const originalUnlink = fs.unlinkSync;
   fs.unlinkSync = (pathname) => {
     if (path.basename(pathname) === 'journal.json'
@@ -294,8 +294,8 @@ test('automatic maintenance failure never suppresses the persisted scan window',
   }
   assert.equal(second.status, 'created');
   assert.equal(readMaybe(metaPath(root, '.pending-scan')).toString('utf8'), `${T2}\n`);
-  const preservedJournal = fs.readdirSync(path.dirname(journal), { recursive: true })
-    .map((relative) => path.join(path.dirname(journal), relative))
+  const preservedJournal = fs.readdirSync(transactions, { recursive: true })
+    .map((relative) => path.join(transactions, relative))
     .find((pathname) => {
       try {
         const value = JSON.parse(fs.readFileSync(pathname, 'utf8'));
@@ -573,6 +573,7 @@ test('transaction pruning preserves a terminal journal whose mtime becomes young
     metaPath(root, '.transactions'),
     completed.operationId,
   );
+  const transactions = path.dirname(transaction);
   const journal = path.join(transaction, 'journal.json');
   const oldTime = new Date('2026-07-01T00:00:00.000Z');
   const youngTime = new Date('2026-07-27T00:00:00.000Z');
@@ -631,6 +632,7 @@ test('transaction pruning removes an empty quarantine when final eligibility cha
     metaPath(root, '.transactions'),
     completed.operationId,
   );
+  const transactions = path.dirname(transaction);
   const journal = path.join(transaction, 'journal.json');
   const oldTime = new Date('2026-07-01T00:00:00.000Z');
   const youngTime = new Date('2026-07-27T00:00:00.000Z');
@@ -643,7 +645,7 @@ test('transaction pruning removes an empty quarantine when final eligibility cha
   fs.mkdirSync = (pathname, ...args) => {
     const result = originalMkdir(pathname, ...args);
     if (!timestampChanged
-        && path.dirname(pathname) === transaction
+        && path.dirname(pathname) === transactions
         && path.basename(pathname).startsWith('.prune-')) {
       fs.utimesSync(journal, youngTime, youngTime);
       timestampChanged = true;
@@ -691,6 +693,7 @@ test('transaction pruning preserves the journal when a late transaction entry ap
     metaPath(root, '.transactions'),
     completed.operationId,
   );
+  const transactions = path.dirname(transaction);
   const journal = path.join(transaction, 'journal.json');
   const oldTime = new Date('2026-07-01T00:00:00.000Z');
   const pruneNow = new Date('2026-07-28T00:00:00.000Z');
@@ -702,7 +705,7 @@ test('transaction pruning preserves the journal when a late transaction entry ap
   fs.mkdirSync = (pathname, ...args) => {
     const result = originalMkdir(pathname, ...args);
     if (!lateEntryCreated
-        && path.dirname(pathname) === transaction
+        && path.dirname(pathname) === transactions
         && path.basename(pathname).startsWith('.prune-')) {
       fs.writeFileSync(path.join(transaction, 'late-entry'), 'ambiguous\n');
       lateEntryCreated = true;
@@ -727,8 +730,8 @@ test('transaction pruning preserves the journal when a late transaction entry ap
 
   assert.equal(lateEntryCreated, true);
   assert.deepEqual(result.removed, []);
-  const preservedJournal = fs.readdirSync(transaction, { recursive: true })
-    .map((relative) => path.join(transaction, relative))
+  const preservedJournal = fs.readdirSync(transactions, { recursive: true })
+    .map((relative) => path.join(transactions, relative))
     .find((pathname) => {
       try {
         return fs.statSync(pathname).isFile()
@@ -738,6 +741,93 @@ test('transaction pruning preserves the journal when a late transaction entry ap
       }
     });
   assert.ok(preservedJournal);
+});
+
+test('transaction pruning preserves a sibling journal across late removal races and retry', () => {
+  const {
+    acquireLock,
+    createDeadline,
+    ensurePendingScan,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+
+  for (const seam of ['after-journal-move', 'before-transaction-rmdir']) {
+    const root = temporaryWiki(`deep wiki terminal prune ${seam} `);
+    const completed = ensurePendingScan({
+      wikiRoot: root,
+      proposed: T1,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+    assert.notEqual(completed.status, 'deferred');
+    const transactions = metaPath(root, '.transactions');
+    const transaction = path.join(transactions, completed.operationId);
+    const journal = path.join(transaction, 'journal.json');
+    const oldTime = new Date('2026-07-01T00:00:00.000Z');
+    const pruneNow = new Date('2026-07-28T00:00:00.000Z');
+    fs.utimesSync(journal, oldTime, oldTime);
+    const journalBytes = fs.readFileSync(journal);
+
+    const originalRename = fs.renameSync;
+    const originalRmdir = fs.rmdirSync;
+    let seamReached = false;
+    fs.renameSync = (source, destination, ...args) => {
+      const result = originalRename(source, destination, ...args);
+      if (!seamReached
+          && seam === 'after-journal-move'
+          && source === journal
+          && path.basename(path.dirname(destination)).startsWith('.prune-')) {
+        fs.writeFileSync(path.join(transaction, 'late-entry'), 'ambiguous\n');
+        seamReached = true;
+      }
+      return result;
+    };
+    fs.rmdirSync = (pathname, ...args) => {
+      if (!seamReached && seam === 'before-transaction-rmdir' && pathname === transaction) {
+        fs.writeFileSync(path.join(transaction, 'late-entry'), 'ambiguous\n');
+        seamReached = true;
+      }
+      return originalRmdir(pathname, ...args);
+    };
+
+    const owner = acquireLock({ wikiRoot: root, operation: `late-removal-${seam}` });
+    let result;
+    try {
+      result = pruneScanWindowTransactions({
+        wikiRoot: root,
+        token: owner.token,
+        maxAgeDays: 7,
+        limit: 1,
+        now: pruneNow,
+        deadline: createDeadline({ budgetMs: 12_000 }),
+      });
+    } finally {
+      fs.renameSync = originalRename;
+      fs.rmdirSync = originalRmdir;
+      releaseLock({ wikiRoot: root, token: owner.token });
+    }
+
+    assert.equal(seamReached, true, seam);
+    assert.deepEqual(result.removed, [], seam);
+    fs.rmSync(metaPath(root, '.pending-scan'), { force: true });
+    const retry = ensurePendingScan({
+      wikiRoot: root,
+      proposed: T2,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+    assert.notEqual(retry.status, 'deferred', seam);
+    const preservedJournal = fs.readdirSync(transactions, { recursive: true })
+      .map((relative) => path.join(transactions, relative))
+      .find((pathname) => {
+        try {
+          return fs.statSync(pathname).isFile()
+            && fs.readFileSync(pathname).equals(journalBytes);
+        } catch {
+          return false;
+        }
+      });
+    assert.ok(preservedJournal, seam);
+  }
 });
 
 test('transaction pruning quarantines before deletion and preserves a last-check pathname replacement', () => {
@@ -759,6 +849,7 @@ test('transaction pruning quarantines before deletion and preserves a last-check
     metaPath(root, '.transactions'),
     completed.operationId,
   );
+  const transactions = path.dirname(transaction);
   const journal = path.join(transaction, 'journal.json');
   const authentic = path.join(root, 'authenticated-terminal-journal.json');
   const replacement = Buffer.from('replacement must survive\n');
@@ -798,8 +889,8 @@ test('transaction pruning quarantines before deletion and preserves a last-check
   assert.equal(pathnameReplaced, true);
   assert.deepEqual(result.removed, []);
   assert.deepEqual(fs.readFileSync(authentic), authenticBytes);
-  const survivingReplacement = fs.readdirSync(transaction, { recursive: true })
-    .map((relative) => path.join(transaction, relative))
+  const survivingReplacement = fs.readdirSync(transactions, { recursive: true })
+    .map((relative) => path.join(transactions, relative))
     .find((pathname) => {
       try { return fs.statSync(pathname).isFile() && fs.readFileSync(pathname).equals(replacement); }
       catch { return false; }

@@ -617,8 +617,8 @@ function defaultJournalAdapter(wikiRoot, operationId) {
         }
 
         const quarantine = path.join(
-          locations.transaction,
-          `.prune-${process.pid}-${crypto.randomUUID()}`,
+          locations.transactions,
+          `.prune-${operationId}-${process.pid}-${crypto.randomUUID()}`,
         );
         const quarantinedJournal = path.join(quarantine, 'journal.json');
         assertMutation(assertOwner);
@@ -628,7 +628,6 @@ function defaultJournalAdapter(wikiRoot, operationId) {
           quarantine,
           'terminal journal prune quarantine',
         );
-        const quarantineName = path.basename(quarantine);
         const assertTransaction = (expectedNames) => {
           assertMutation(assertOwner);
           const actualNames = fs.readdirSync(locations.transaction).sort();
@@ -642,8 +641,12 @@ function defaultJournalAdapter(wikiRoot, operationId) {
           }
           assertMutation(assertOwner);
         };
+        const assertTransactionsOwner = () => {
+          if (typeof assertOwner === 'function') assertOwner();
+          parents.assertTransactions();
+        };
         const assertQuarantine = (expectedNames) => {
-          assertMutation(assertOwner);
+          assertTransactionsOwner();
           const actual = inspectPhysicalDirectory(
             quarantine,
             quarantine,
@@ -663,11 +666,34 @@ function defaultJournalAdapter(wikiRoot, operationId) {
               'terminal journal prune quarantine contains unexpected entries',
             );
           }
-          assertMutation(assertOwner);
+          assertTransactionsOwner();
+        };
+        const assertSealedQuarantinedJournal = () => {
+          assertQuarantine(['journal.json']);
+          assertRegularFileIdentity(quarantinedJournal, expectedJournalIdentity, ageGate);
+          const quarantinedBytes = fs.readFileSync(quarantinedJournal);
+          assertRegularFileIdentity(quarantinedJournal, expectedJournalIdentity, ageGate);
+          const quarantined = JSON.parse(quarantinedBytes.toString('utf8'));
+          validateJournal(quarantined, operationId, wikiRoot);
+          if (quarantined.transitions.at(-1) !== 'cleaned'
+              || !sealedBytesEqual(
+                quarantinedBytes,
+                expectedJournalBytes,
+                expectedJournalSeal,
+              )
+              || !quarantinedBytes.equals(stageBytes(quarantined))
+              || JSON.stringify(quarantined) !== JSON.stringify(expectedJournal)) {
+            throw scanError(
+              'TRANSACTION_RECOVERY_REQUIRED',
+              'quarantined journal changed before pruning',
+            );
+          }
+          assertQuarantine(['journal.json']);
+          assertRegularFileIdentity(quarantinedJournal, expectedJournalIdentity, ageGate);
         };
 
         try {
-          assertTransaction([quarantineName, 'journal.json']);
+          assertTransaction(['journal.json']);
           assertRegularFileIdentity(locations.journal, expectedJournalIdentity, ageGate);
           fs.renameSync(locations.journal, quarantinedJournal);
         } catch (cause) {
@@ -691,29 +717,8 @@ function defaultJournalAdapter(wikiRoot, operationId) {
         }
 
         try {
-          assertTransaction([quarantineName]);
-          assertQuarantine(['journal.json']);
-          assertRegularFileIdentity(quarantinedJournal, expectedJournalIdentity, ageGate);
-          const quarantinedBytes = fs.readFileSync(quarantinedJournal);
-          assertRegularFileIdentity(quarantinedJournal, expectedJournalIdentity, ageGate);
-          const quarantined = JSON.parse(quarantinedBytes.toString('utf8'));
-          validateJournal(quarantined, operationId, wikiRoot);
-          if (quarantined.transitions.at(-1) !== 'cleaned'
-              || !sealedBytesEqual(
-                quarantinedBytes,
-                expectedJournalBytes,
-                expectedJournalSeal,
-              )
-              || !quarantinedBytes.equals(stageBytes(quarantined))
-              || JSON.stringify(quarantined) !== JSON.stringify(expectedJournal)) {
-            throw scanError(
-              'TRANSACTION_RECOVERY_REQUIRED',
-              'quarantined journal changed before pruning',
-            );
-          }
-          assertTransaction([quarantineName]);
-          assertQuarantine(['journal.json']);
-          assertRegularFileIdentity(quarantinedJournal, expectedJournalIdentity, ageGate);
+          assertTransaction([]);
+          assertSealedQuarantinedJournal();
         } catch (cause) {
           if (typeof cause.code === 'string' && cause.code.startsWith('LOCK_')) throw cause;
           throw scanError(
@@ -723,12 +728,32 @@ function defaultJournalAdapter(wikiRoot, operationId) {
           );
         }
 
+        try {
+          parents.removeEmptyOperation(assertOwner);
+        } catch (cause) {
+          if (typeof cause.code === 'string' && cause.code.startsWith('LOCK_')) throw cause;
+          throw scanError(
+            'TRANSACTION_RECOVERY_REQUIRED',
+            'terminal transaction could not be removed before journal pruning',
+            cause,
+          );
+        }
+
+        try {
+          assertSealedQuarantinedJournal();
+        } catch (cause) {
+          if (typeof cause.code === 'string' && cause.code.startsWith('LOCK_')) throw cause;
+          throw scanError(
+            'TRANSACTION_RECOVERY_REQUIRED',
+            'quarantined journal failed post-removal validation',
+            cause,
+          );
+        }
+
         fs.unlinkSync(quarantinedJournal);
         assertQuarantine([]);
         fs.rmdirSync(quarantine);
-        if (typeof assertOwner === 'function') assertOwner();
-        parents.assertAll();
-        parents.removeEmptyOperation(assertOwner);
+        assertTransactionsOwner();
       },
     },
   };

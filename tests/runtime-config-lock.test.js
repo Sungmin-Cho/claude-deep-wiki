@@ -1813,6 +1813,13 @@ function installOpaqueLock(lockDir, files) {
   for (const [name, bytes] of Object.entries(files)) fs.writeFileSync(path.join(lockDir, name), bytes);
 }
 
+function snapshotFlatDirectory(directory) {
+  return fs.readdirSync(directory).sort().map((name) => ({
+    name,
+    bytes: fs.readFileSync(path.join(directory, name)),
+  }));
+}
+
 function interruptedMismatchRestoreFs(wikiRoot, replacementFiles, boundary) {
   const lockDir = path.join(wikiRoot, '.wiki-meta', '.wiki-lock');
   let seizureInjected = false;
@@ -3359,6 +3366,131 @@ test('lock recovery removes only an abandoned same-host valid owner and treats E
     const error = new Error('not permitted'); error.code = 'EPERM'; throw error;
   } }), false);
   releaseLock({ wikiRoot, token: owner.token });
+});
+
+test('lock acquisition self-heals a dead same-host owner before publishing its successor', () => {
+  const { acquireLock, assertLockOwner, releaseLock } = runtimeModule('lock.js');
+  const wikiRoot = newWikiRoot('deep wiki dead owner self heal ');
+  const immediateNow = new Date('2026-07-10T00:00:00.000Z');
+  const abandoned = acquireLock({
+    wikiRoot,
+    operation: 'abandoned-owner',
+    pid: 424242,
+    now: immediateNow,
+  });
+
+  const successor = acquireLock({
+    wikiRoot,
+    operation: 'successor-owner',
+    now: immediateNow,
+    isPidAlive(pid) {
+      assert.equal(pid, abandoned.pid);
+      return false;
+    },
+  });
+
+  assert.notEqual(successor.token, abandoned.token);
+  assert.equal(assertLockOwner({ wikiRoot, token: successor.token }).operation, 'successor-owner');
+  releaseLock({ wikiRoot, token: successor.token });
+});
+
+test('lock acquisition self-heal preserves every owner it cannot prove is dead and local', () => {
+  const { acquireLock } = runtimeModule('lock.js');
+  const cases = [
+    {
+      name: 'live same-host owner',
+      files: {
+        'owner.json': Buffer.from(`${JSON.stringify({
+          token: 'a'.repeat(64),
+          operation: 'live-owner',
+          pid: 414141,
+          hostname: os.hostname(),
+          acquired_at: '2026-07-10T00:00:00.000Z',
+        })}\n`),
+        marker: Buffer.from('live owner marker\n'),
+      },
+      isPidAlive: () => true,
+    },
+    {
+      name: 'foreign-host owner',
+      files: {
+        'owner.json': Buffer.from(`${JSON.stringify({
+          token: 'b'.repeat(64),
+          operation: 'foreign-owner',
+          pid: 424242,
+          hostname: 'foreign-host.example',
+          acquired_at: '2026-07-10T00:00:00.000Z',
+        })}\n`),
+        marker: Buffer.from('foreign owner marker\n'),
+      },
+      isPidAlive: () => false,
+    },
+    {
+      name: 'malformed owner',
+      files: {
+        'owner.json': Buffer.from('{malformed\n'),
+        marker: Buffer.from('malformed owner marker\n'),
+      },
+      isPidAlive: () => false,
+    },
+    {
+      name: 'ownerless lock',
+      files: {
+        marker: Buffer.from('ownerless marker\n'),
+      },
+      isPidAlive: () => false,
+    },
+  ];
+
+  for (const fixture of cases) {
+    const wikiRoot = newWikiRoot(`deep wiki self heal ${fixture.name} `);
+    const lockDir = path.join(wikiRoot, '.wiki-meta', '.wiki-lock');
+    installOpaqueLock(lockDir, fixture.files);
+    const before = snapshotFlatDirectory(lockDir);
+
+    assert.throws(() => acquireLock({
+      wikiRoot,
+      operation: 'forbidden-successor',
+      isPidAlive: fixture.isPidAlive,
+    }), (error) => error.code === 'LOCK_CONTENDED', fixture.name);
+    assert.deepEqual(snapshotFlatDirectory(lockDir), before, fixture.name);
+  }
+});
+
+test('compensating lock recovery is bound to the terminated owner pid', () => {
+  const { acquireLock, assertLockOwner, recoverLock, releaseLock } = runtimeModule('lock.js');
+  const wikiRoot = newWikiRoot('deep wiki expected recovery pid ');
+  const owner = acquireLock({
+    wikiRoot,
+    operation: 'unrelated-owner',
+    pid: 434343,
+    now: new Date('2026-07-10T00:00:00.000Z'),
+  });
+
+  assert.equal(recoverLock({
+    wikiRoot,
+    staleMs: 0,
+    force: true,
+    expectedPid: 444444,
+    isPidAlive: () => false,
+  }), false);
+  assert.equal(assertLockOwner({ wikiRoot, token: owner.token }).operation, 'unrelated-owner');
+  releaseLock({ wikiRoot, token: owner.token });
+
+  const terminatedOwner = acquireLock({
+    wikiRoot,
+    operation: 'terminated-persistence-owner',
+    pid: 454545,
+    now: new Date('2026-07-10T00:00:00.000Z'),
+  });
+  assert.equal(recoverLock({
+    wikiRoot,
+    staleMs: 0,
+    force: true,
+    expectedPid: terminatedOwner.pid,
+    isPidAlive: () => false,
+  }), true);
+  assert.equal(fs.existsSync(path.join(wikiRoot, '.wiki-meta', '.wiki-lock')), false);
 });
 
 test('force preserves foreign-host, malformed, young live, and invalid-token owners byte-identically', () => {

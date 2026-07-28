@@ -59,11 +59,13 @@ and whose journal age exceeds `--max-age-days`. Before unlinking, the runtime
 atomically moves the complete transaction directory into a fresh identity-bound
 sibling quarantine and revalidates the directory plus journal identity, bytes,
 age, and link count there. An interrupted quarantine remains recognizable and
-is retried by a later bounded pass. An identity-bound reservation closes the
-canonical source generation through quarantine removal, and an exact fsynced
-backup preserves authenticated evidence after the original journal unlink.
-Later bounded passes resume backup-only or empty quarantines and remove
-orphaned active or retired reservations. It preserves in-flight,
+is retried by a later bounded pass. An exact journal-copy reservation closes
+the canonical source generation through quarantine removal, and an exact
+fsynced backup preserves authenticated evidence after the original journal
+unlink. Both use exclusive crash-recoverable pending publication. Later
+bounded passes resume partial publications, backup-only or empty quarantines,
+and orphaned exact reservations, checking the deadline between recoverable
+mutation phases. It preserves in-flight,
 malformed, foreign-kind, linked, young, and otherwise ambiguous entries.
 Repeat the command while `complete` is `false` to traverse more than one bounded
 pass. `complete: true` means every entry listed for that pass was inspected; it

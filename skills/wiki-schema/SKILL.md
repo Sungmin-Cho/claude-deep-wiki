@@ -81,10 +81,12 @@ the lock. It atomically moves each complete transaction directory into a fresh
 identity-bound sibling quarantine and revalidates the directory plus journal
 identity, bytes, age, and link count there. An interrupted quarantine remains
 recognizable and is retried by a later bounded pass. The runtime keeps an
-identity-bound reservation at the canonical source through quarantine removal
-and creates an exact fsynced journal backup before unlinking the original, so a
-later bounded pass can resume from the backup or an empty quarantine. Orphaned
-active and retired reservations are also removed by a later bounded pass. The command is
+exact journal-copy reservation at the canonical source through quarantine
+removal and creates an exact fsynced journal backup before unlinking the
+original. Both use exclusive crash-recoverable pending publication, so a later
+bounded pass can resume partial publication, backup-only, empty-quarantine, or
+orphaned exact-reservation states. Cleanup checks its deadline between
+recoverable mutation phases. The command is
 bounded; rerun it while `complete` is `false` when a larger backlog must be
 traversed. `complete: true` means the pass inspected every listed entry, not
 that every ambiguous entry was removed. In-flight, malformed, foreign-kind,

@@ -168,7 +168,7 @@ function identitiesMatch(actual, expected) {
     && actual.birthtimeNs === expected.birthtimeNs;
 }
 
-function regularFileIdentity(stat) {
+function linkedRegularFileIdentity(stat) {
   const dev = identityComponent(stat?.dev);
   const ino = identityComponent(stat?.ino);
   const mode = identityComponent(stat?.mode);
@@ -177,9 +177,14 @@ function regularFileIdentity(stat) {
   const nlink = identityComponent(stat?.nlink);
   if (dev === null || ino === null || mode === null || birthtimeNs === null
       || mtimeNs === null || nlink === null
-      || dev < 0n || ino <= 0n || birthtimeNs < 0n || mtimeNs < 0n || nlink !== 1n
+      || dev < 0n || ino <= 0n || birthtimeNs < 0n || mtimeNs < 0n || nlink < 1n
       || (mode & FILE_TYPE_MASK) !== REGULAR_FILE_TYPE) return null;
   return { dev, ino, type: mode & FILE_TYPE_MASK, birthtimeNs, mtimeNs, nlink };
+}
+
+function regularFileIdentity(stat) {
+  const identity = linkedRegularFileIdentity(stat);
+  return identity !== null && identity.nlink === 1n ? identity : null;
 }
 
 function terminalJournalIsOldEnough(identity, nowMs, maxAgeDays) {
@@ -512,58 +517,73 @@ function defaultJournalAdapter(wikiRoot, operationId) {
     expectedBackupIdentity,
     assertOwner,
     ageGate,
+    assertBudget,
   ) => {
     const quarantinedJournal = path.join(quarantine, 'journal.json');
     const quarantinedBackup = path.join(quarantine, 'journal.backup');
-    const quarantineName = path.basename(quarantine);
-    const retiredReservation = path.join(
-      locations.transactions,
-      `.reservation-${quarantineName}`,
-    );
-    const reservationBytes = stageBytes({
-      contract_version: 1,
-      kind: 'scan-window-prune-reservation',
-      operation_id: operationId,
-      quarantine_name: quarantineName,
-      journal_sha256: expectedJournalSeal.sha256,
-      journal_length: expectedJournalSeal.length,
-    });
+    const backupPending = path.join(quarantine, 'journal.backup.pending');
+    const reservationPending = path.join(quarantine, 'source.reservation.pending');
+    const allowedNames = new Set([
+      'journal.json',
+      'journal.backup',
+      'journal.backup.pending',
+      'source.reservation.pending',
+    ]);
     const assertTransactionsOwner = () => {
       if (typeof assertOwner === 'function') assertOwner();
       parents.assertTransactions();
     };
-    const inspectReservation = (pathname, expectedIdentity = null, allowMissing = false) => {
-      assertTransactionsOwner();
+    const assertPruneBudget = () => {
+      if (typeof assertBudget === 'function') assertBudget();
+    };
+    const inspectPublication = (pathname, allowMissing = false) => {
       let identity;
       try {
-        identity = regularFileIdentity(fs.lstatSync(pathname, { bigint: true }));
+        identity = linkedRegularFileIdentity(fs.lstatSync(pathname, { bigint: true }));
       } catch (cause) {
         if (allowMissing && cause.code === 'ENOENT') return null;
         throw scanError(
           'TRANSACTION_RECOVERY_REQUIRED',
-          'terminal prune reservation is unavailable',
+          'terminal prune publication is unavailable',
           cause,
         );
       }
       if (!identity) {
         throw scanError(
           'TRANSACTION_RECOVERY_REQUIRED',
-          'terminal prune reservation identity is invalid',
+          'terminal prune publication identity is invalid',
         );
       }
-      if (expectedIdentity) assertRegularFileIdentity(pathname, expectedIdentity);
       const bytes = fs.readFileSync(pathname);
-      assertRegularFileIdentity(pathname, expectedIdentity || identity);
-      if (!bytes.equals(reservationBytes)) {
+      const current = linkedRegularFileIdentity(fs.lstatSync(pathname, { bigint: true }));
+      if (!identitiesMatch(current, identity)
+          || current.mtimeNs !== identity.mtimeNs
+          || current.nlink !== identity.nlink) {
         throw scanError(
           'TRANSACTION_RECOVERY_REQUIRED',
-          'terminal prune reservation bytes are invalid',
+          'terminal prune publication identity changed',
         );
       }
-      assertTransactionsOwner();
-      return identity;
+      return { identity, bytes };
     };
-    const assertQuarantine = (expectedNames) => {
+    const assertExactPublication = (
+      pathname,
+      expectedBytes,
+      expectedIdentity = null,
+      allowedLinks = [1n],
+    ) => {
+      const publication = inspectPublication(pathname);
+      if ((expectedIdentity && !identitiesMatch(publication.identity, expectedIdentity))
+          || !allowedLinks.includes(publication.identity.nlink)
+          || !publication.bytes.equals(expectedBytes)) {
+        throw scanError(
+          'TRANSACTION_RECOVERY_REQUIRED',
+          'terminal prune publication is not the expected exact generation',
+        );
+      }
+      return publication;
+    };
+    const assertQuarantine = (expectedNames = null) => {
       assertTransactionsOwner();
       const actual = inspectPhysicalDirectory(
         quarantine,
@@ -577,8 +597,9 @@ function defaultJournalAdapter(wikiRoot, operationId) {
         );
       }
       const actualNames = fs.readdirSync(quarantine).sort();
-      if (actualNames.length !== expectedNames.length
-          || actualNames.some((name, index) => name !== expectedNames[index])) {
+      if ((expectedNames && (actualNames.length !== expectedNames.length
+          || actualNames.some((name, index) => name !== expectedNames[index])))
+          || (!expectedNames && actualNames.some((name) => !allowedNames.has(name)))) {
         throw scanError(
           'TRANSACTION_RECOVERY_REQUIRED',
           'terminal journal prune quarantine contains unexpected entries',
@@ -618,12 +639,161 @@ function defaultJournalAdapter(wikiRoot, operationId) {
       }
       return identity;
     };
+    const publishExactExclusive = (
+      pendingPath,
+      destination,
+      expectedBytes,
+      label,
+      expectedDestinationIdentity = null,
+    ) => {
+      assertQuarantine();
+      let destinationState = inspectPublication(destination, true);
+      let pendingState = inspectPublication(pendingPath, true);
+      if (destinationState) {
+        if (!destinationState.bytes.equals(expectedBytes)
+            || ![1n, 2n].includes(destinationState.identity.nlink)
+            || (expectedDestinationIdentity
+              && !identitiesMatch(destinationState.identity, expectedDestinationIdentity))) {
+          throw scanError(
+            'TRANSACTION_RECOVERY_REQUIRED',
+            `${label} destination is not the expected generation`,
+          );
+        }
+        if (pendingState) {
+          if (!pendingState.bytes.equals(expectedBytes)
+              || pendingState.identity.nlink !== 2n
+              || destinationState.identity.nlink !== 2n
+              || !identitiesMatch(pendingState.identity, destinationState.identity)) {
+            throw scanError(
+              'TRANSACTION_RECOVERY_REQUIRED',
+              `${label} interrupted publication is ambiguous`,
+            );
+          }
+          assertPruneBudget();
+          assertQuarantine();
+          assertExactPublication(pendingPath, expectedBytes, pendingState.identity, [2n]);
+          assertExactPublication(destination, expectedBytes, destinationState.identity, [2n]);
+          fs.unlinkSync(pendingPath);
+          assertQuarantine();
+          destinationState = assertExactPublication(
+            destination,
+            expectedBytes,
+            destinationState.identity,
+          );
+        } else if (destinationState.identity.nlink !== 1n) {
+          throw scanError(
+            'TRANSACTION_RECOVERY_REQUIRED',
+            `${label} destination link count is ambiguous`,
+          );
+        }
+        return destinationState.identity;
+      }
+
+      if (pendingState && (pendingState.identity.nlink !== 1n
+          || !pendingState.bytes.equals(expectedBytes))) {
+        assertPruneBudget();
+        assertQuarantine();
+        const current = inspectPublication(pendingPath);
+        if (!identitiesMatch(current.identity, pendingState.identity)
+            || current.identity.nlink !== 1n
+            || !current.bytes.equals(pendingState.bytes)) {
+          throw scanError(
+            'TRANSACTION_RECOVERY_REQUIRED',
+            `${label} interrupted publication changed`,
+          );
+        }
+        fs.unlinkSync(pendingPath);
+        assertQuarantine();
+        pendingState = null;
+      }
+
+      if (!pendingState) {
+        assertPruneBudget();
+        assertQuarantine();
+        let descriptor;
+        try {
+          descriptor = fs.openSync(pendingPath, 'wx', 0o600);
+          fs.writeFileSync(descriptor, expectedBytes);
+          fs.fsyncSync(descriptor);
+        } catch (cause) {
+          throw scanError(
+            'TRANSACTION_RECOVERY_REQUIRED',
+            `${label} interrupted publication could not be staged`,
+            cause,
+          );
+        } finally {
+          if (descriptor !== undefined) fs.closeSync(descriptor);
+        }
+        pendingState = assertExactPublication(pendingPath, expectedBytes);
+      } else {
+        assertPruneBudget();
+        assertQuarantine();
+        let descriptor;
+        try {
+          descriptor = fs.openSync(pendingPath, 'r');
+          fs.fsyncSync(descriptor);
+        } catch (cause) {
+          throw scanError(
+            'TRANSACTION_RECOVERY_REQUIRED',
+            `${label} interrupted publication could not be synchronized`,
+            cause,
+          );
+        } finally {
+          if (descriptor !== undefined) fs.closeSync(descriptor);
+        }
+        pendingState = assertExactPublication(
+          pendingPath,
+          expectedBytes,
+          pendingState.identity,
+        );
+      }
+
+      assertPruneBudget();
+      assertQuarantine();
+      assertExactPublication(pendingPath, expectedBytes, pendingState.identity);
+      try {
+        fs.linkSync(pendingPath, destination);
+      } catch (cause) {
+        throw scanError(
+          'TRANSACTION_RECOVERY_REQUIRED',
+          `${label} destination could not be published exclusively`,
+          cause,
+        );
+      }
+      const linkedPending = assertExactPublication(
+        pendingPath,
+        expectedBytes,
+        pendingState.identity,
+        [2n],
+      );
+      const linkedDestination = assertExactPublication(
+        destination,
+        expectedBytes,
+        pendingState.identity,
+        [2n],
+      );
+      if (!identitiesMatch(linkedPending.identity, linkedDestination.identity)) {
+        throw scanError(
+          'TRANSACTION_RECOVERY_REQUIRED',
+          `${label} published hardlink identity differs`,
+        );
+      }
+      assertPruneBudget();
+      assertQuarantine();
+      fs.unlinkSync(pendingPath);
+      assertQuarantine();
+      return assertExactPublication(
+        destination,
+        expectedBytes,
+        linkedDestination.identity,
+      ).identity;
+    };
 
     const initialNames = fs.readdirSync(quarantine).sort();
     const hasJournal = initialNames.includes('journal.json');
     const hasBackup = initialNames.includes('journal.backup');
     if ((!hasJournal && !hasBackup)
-        || initialNames.some((name) => name !== 'journal.json' && name !== 'journal.backup')) {
+        || initialNames.some((name) => !allowedNames.has(name))) {
       throw scanError(
         'TRANSACTION_RECOVERY_REQUIRED',
         'terminal quarantine evidence set is invalid',
@@ -634,82 +804,76 @@ function defaultJournalAdapter(wikiRoot, operationId) {
     }
     let backupIdentity = expectedBackupIdentity;
     if (hasBackup) {
-      backupIdentity = assertSealedEvidence(quarantinedBackup, backupIdentity);
-    }
-
-    if (inspectReservation(retiredReservation, null, true) !== null) {
-      throw scanError(
-        'TRANSACTION_RECOVERY_REQUIRED',
-        'retired reservation coexists with a terminal quarantine',
-      );
-    }
-    let activeIdentity = inspectReservation(locations.transaction, null, true);
-    if (activeIdentity === null) {
-      if (hasJournal) {
-        assertSealedEvidence(quarantinedJournal, expectedJournalIdentity, true);
-      } else {
-        assertSealedEvidence(quarantinedBackup, backupIdentity);
-      }
-      assertTransactionsOwner();
-      let descriptor;
-      try {
-        descriptor = fs.openSync(locations.transaction, 'wx', 0o600);
-        fs.writeFileSync(descriptor, reservationBytes);
-        fs.fsyncSync(descriptor);
-      } catch (cause) {
+      const backupState = inspectPublication(quarantinedBackup);
+      if (!backupState.bytes.equals(expectedJournalBytes)
+          || ![1n, 2n].includes(backupState.identity.nlink)
+          || (backupIdentity && !identitiesMatch(backupState.identity, backupIdentity))) {
         throw scanError(
           'TRANSACTION_RECOVERY_REQUIRED',
-          'terminal prune reservation could not be created',
-          cause,
+          'terminal prune backup generation is invalid',
         );
-      } finally {
-        if (descriptor !== undefined) fs.closeSync(descriptor);
       }
-      activeIdentity = inspectReservation(locations.transaction);
+      backupIdentity = backupState.identity;
     }
 
-    if (!hasBackup) {
-      inspectReservation(locations.transaction, activeIdentity);
-      assertQuarantine(['journal.json']);
-      let descriptor;
-      try {
-        descriptor = fs.openSync(quarantinedBackup, 'wx', 0o600);
-        fs.writeFileSync(descriptor, expectedJournalBytes);
-        fs.fsyncSync(descriptor);
-      } catch (cause) {
-        throw scanError(
-          'TRANSACTION_RECOVERY_REQUIRED',
-          'terminal prune backup could not be created',
-          cause,
-        );
-      } finally {
-        if (descriptor !== undefined) fs.closeSync(descriptor);
-      }
-      backupIdentity = assertSealedEvidence(quarantinedBackup, null);
-    }
+    backupIdentity = publishExactExclusive(
+      backupPending,
+      quarantinedBackup,
+      expectedJournalBytes,
+      'terminal prune backup',
+      backupIdentity,
+    );
+    assertSealedEvidence(quarantinedBackup, backupIdentity);
+    const activeIdentity = publishExactExclusive(
+      reservationPending,
+      locations.transaction,
+      expectedJournalBytes,
+      'terminal prune source reservation',
+    );
 
     assertQuarantine(hasJournal
       ? ['journal.backup', 'journal.json']
       : ['journal.backup']);
-    inspectReservation(locations.transaction, activeIdentity);
+    assertExactPublication(
+      locations.transaction,
+      expectedJournalBytes,
+      activeIdentity,
+    );
     if (hasJournal) {
       assertSealedEvidence(quarantinedJournal, expectedJournalIdentity, true);
+      assertPruneBudget();
       fs.unlinkSync(quarantinedJournal);
-      inspectReservation(locations.transaction, activeIdentity);
+      assertExactPublication(
+        locations.transaction,
+        expectedJournalBytes,
+        activeIdentity,
+      );
     }
     assertQuarantine(['journal.backup']);
     assertSealedEvidence(quarantinedBackup, backupIdentity);
-    inspectReservation(locations.transaction, activeIdentity);
+    assertExactPublication(
+      locations.transaction,
+      expectedJournalBytes,
+      activeIdentity,
+    );
+    assertPruneBudget();
     fs.unlinkSync(quarantinedBackup);
-    inspectReservation(locations.transaction, activeIdentity);
+    assertExactPublication(
+      locations.transaction,
+      expectedJournalBytes,
+      activeIdentity,
+    );
     assertQuarantine([]);
+    assertPruneBudget();
     fs.rmdirSync(quarantine);
     assertTransactionsOwner();
-    inspectReservation(locations.transaction, activeIdentity);
-    fs.renameSync(locations.transaction, retiredReservation);
-    const retiredIdentity = inspectReservation(retiredReservation, activeIdentity);
-    inspectReservation(retiredReservation, retiredIdentity);
-    fs.unlinkSync(retiredReservation);
+    assertExactPublication(
+      locations.transaction,
+      expectedJournalBytes,
+      activeIdentity,
+    );
+    assertPruneBudget();
+    fs.unlinkSync(locations.transaction);
     assertTransactionsOwner();
   };
   const finalizeEmptyTerminalQuarantine = (
@@ -718,12 +882,8 @@ function defaultJournalAdapter(wikiRoot, operationId) {
     expectedReservationBytes,
     expectedReservationIdentity,
     assertOwner,
+    assertBudget,
   ) => {
-    const quarantineName = path.basename(quarantine);
-    const retiredReservation = path.join(
-      locations.transactions,
-      `.reservation-${quarantineName}`,
-    );
     const assertTransactionsOwner = () => {
       if (typeof assertOwner === 'function') assertOwner();
       parents.assertTransactions();
@@ -760,12 +920,12 @@ function defaultJournalAdapter(wikiRoot, operationId) {
 
     assertEmptyQuarantine();
     assertReservation(locations.transaction, expectedReservationIdentity);
+    if (typeof assertBudget === 'function') assertBudget();
     fs.rmdirSync(quarantine);
     assertTransactionsOwner();
     assertReservation(locations.transaction, expectedReservationIdentity);
-    fs.renameSync(locations.transaction, retiredReservation);
-    assertReservation(retiredReservation, expectedReservationIdentity);
-    fs.unlinkSync(retiredReservation);
+    if (typeof assertBudget === 'function') assertBudget();
+    fs.unlinkSync(locations.transaction);
     assertTransactionsOwner();
   };
   return {
@@ -870,6 +1030,7 @@ function defaultJournalAdapter(wikiRoot, operationId) {
         expectedJournalIdentity,
         assertOwner,
         ageGate,
+        assertBudget,
       ) {
         assertMutation(assertOwner);
         const names = fs.readdirSync(locations.transaction).sort();
@@ -917,9 +1078,11 @@ function defaultJournalAdapter(wikiRoot, operationId) {
           }
           assertRegularFileIdentity(locations.journal, expectedJournalIdentity, ageGate);
           assertMutation(assertOwner);
+          if (typeof assertBudget === 'function') assertBudget();
           fs.renameSync(locations.transaction, quarantine);
         } catch (cause) {
-          if (typeof cause.code === 'string' && cause.code.startsWith('LOCK_')) throw cause;
+          if (cause.code === 'DEADLINE_EXCEEDED'
+              || (typeof cause.code === 'string' && cause.code.startsWith('LOCK_'))) throw cause;
           throw scanError(
             'TRANSACTION_RECOVERY_REQUIRED',
             'terminal transaction could not enter quarantine',
@@ -938,9 +1101,11 @@ function defaultJournalAdapter(wikiRoot, operationId) {
             null,
             assertOwner,
             ageGate,
+            assertBudget,
           );
         } catch (cause) {
-          if (typeof cause.code === 'string' && cause.code.startsWith('LOCK_')) throw cause;
+          if (cause.code === 'DEADLINE_EXCEEDED'
+              || (typeof cause.code === 'string' && cause.code.startsWith('LOCK_'))) throw cause;
           throw scanError(
             'TRANSACTION_RECOVERY_REQUIRED',
             'quarantined terminal transaction requires recovery',
@@ -958,6 +1123,7 @@ function defaultJournalAdapter(wikiRoot, operationId) {
         expectedBackupIdentity,
         assertOwner,
         ageGate,
+        assertBudget,
       ) {
         if (path.basename(quarantineName) !== quarantineName
             || !quarantineName.startsWith(`.prune-${operationId.length}-${operationId}-`)) {
@@ -975,9 +1141,11 @@ function defaultJournalAdapter(wikiRoot, operationId) {
             expectedBackupIdentity,
             assertOwner,
             ageGate,
+            assertBudget,
           );
         } catch (cause) {
-          if (typeof cause.code === 'string' && cause.code.startsWith('LOCK_')) throw cause;
+          if (cause.code === 'DEADLINE_EXCEEDED'
+              || (typeof cause.code === 'string' && cause.code.startsWith('LOCK_'))) throw cause;
           throw scanError(
             'TRANSACTION_RECOVERY_REQUIRED',
             'terminal quarantine requires recovery',
@@ -991,6 +1159,7 @@ function defaultJournalAdapter(wikiRoot, operationId) {
         expectedReservationBytes,
         expectedReservationIdentity,
         assertOwner,
+        assertBudget,
       ) {
         if (path.basename(quarantineName) !== quarantineName
             || !quarantineName.startsWith(`.prune-${operationId.length}-${operationId}-`)) {
@@ -1004,9 +1173,11 @@ function defaultJournalAdapter(wikiRoot, operationId) {
             expectedReservationBytes,
             expectedReservationIdentity,
             assertOwner,
+            assertBudget,
           );
         } catch (cause) {
-          if (typeof cause.code === 'string' && cause.code.startsWith('LOCK_')) throw cause;
+          if (cause.code === 'DEADLINE_EXCEEDED'
+              || (typeof cause.code === 'string' && cause.code.startsWith('LOCK_'))) throw cause;
           throw scanError(
             'TRANSACTION_RECOVERY_REQUIRED',
             'empty terminal quarantine requires recovery',
@@ -1514,6 +1685,10 @@ function pruneScanWindowTransactions(options = {}) {
     : validateOperationId(options.excludeOperationId);
 
   const assertOwner = () => assertLockOwner({ wikiRoot: physicalRoot, token });
+  const assertBudget = () => assertBeforeDeadline(
+    deadline,
+    'scan-window-transaction-prune',
+  );
   assertOwner();
   const transactions = path.join(physicalRoot, '.wiki-meta', '.transactions');
   let entries;
@@ -1538,139 +1713,72 @@ function pruneScanWindowTransactions(options = {}) {
       complete = false;
       break;
     }
-    if (entry.isFile() && !entry.name.startsWith('.reservation-.prune-')) {
+    if (entry.isFile()) {
       const reservation = path.join(transactions, entry.name);
       let reservationIdentity;
       let reservationBytes;
-      let reservationValue;
+      let reservationJournal;
       let operationId;
+      let quarantineName = null;
       try {
-        operationId = validateOperationId(entry.name);
+        if (entry.name.startsWith('.reservation-.prune-')) {
+          quarantineName = entry.name.slice('.reservation-'.length);
+          operationId = operationIdFromPruneName(quarantineName);
+        } else {
+          operationId = validateOperationId(entry.name);
+        }
         reservationIdentity = regularFileIdentity(
           fs.lstatSync(reservation, { bigint: true }),
         );
         if (!reservationIdentity) continue;
         reservationBytes = fs.readFileSync(reservation);
         assertRegularFileIdentity(reservation, reservationIdentity);
-        reservationValue = JSON.parse(reservationBytes.toString('utf8'));
-        if (!hasExactKeys(reservationValue, [
-          'contract_version',
-          'kind',
-          'operation_id',
-          'quarantine_name',
-          'journal_sha256',
-          'journal_length',
-        ]) || reservationValue.contract_version !== 1
-            || reservationValue.kind !== 'scan-window-prune-reservation'
-            || reservationValue.operation_id !== operationId
-            || operationIdFromPruneName(reservationValue.quarantine_name) !== operationId
-            || typeof reservationValue.journal_sha256 !== 'string'
-            || !SHA256_RE.test(reservationValue.journal_sha256)
-            || !Number.isSafeInteger(reservationValue.journal_length)
-            || reservationValue.journal_length < 1
-            || !reservationBytes.equals(stageBytes(reservationValue))) continue;
-        try {
-          fs.lstatSync(path.join(transactions, reservationValue.quarantine_name));
-          continue;
-        } catch (cause) {
-          if (cause.code !== 'ENOENT') continue;
-        }
+        reservationJournal = JSON.parse(reservationBytes.toString('utf8'));
+        validateJournal(reservationJournal, operationId, physicalRoot);
+        if (reservationJournal.operation_id !== operationId
+            || reservationJournal.transitions.at(-1) !== 'cleaned'
+            || !reservationBytes.equals(stageBytes(reservationJournal))
+            || (kinds && !kinds.has(reservationJournal.kind))) continue;
       } catch {
         continue;
       }
       if (operationId === excludeOperationId) continue;
-      const retiredReservation = path.join(
-        transactions,
-        `.reservation-${reservationValue.quarantine_name}`,
-      );
-      assertOwner();
+      let matchingQuarantine = false;
       try {
-        try {
-          fs.lstatSync(retiredReservation);
-          continue;
-        } catch (cause) {
-          if (cause.code !== 'ENOENT') continue;
-        }
-        assertRegularFileIdentity(reservation, reservationIdentity);
-        const currentBytes = fs.readFileSync(reservation);
-        assertRegularFileIdentity(reservation, reservationIdentity);
-        if (!currentBytes.equals(reservationBytes)) continue;
-        fs.renameSync(reservation, retiredReservation);
-        assertRegularFileIdentity(retiredReservation, reservationIdentity);
-        if (!fs.readFileSync(retiredReservation).equals(reservationBytes)) continue;
-        assertRegularFileIdentity(retiredReservation, reservationIdentity);
-        fs.unlinkSync(retiredReservation);
-        assertOwner();
-      } catch (error) {
-        if (error.code === 'ENOENT'
-            || error.code === 'TRANSACTION_RECOVERY_REQUIRED'
-            || error.code === 'SCAN_WINDOW_FILESYSTEM') continue;
-        throw error;
-      }
-      removed.push(operationId);
-      continue;
-    }
-    if (entry.isFile() && entry.name.startsWith('.reservation-.prune-')) {
-      const reservation = path.join(transactions, entry.name);
-      let reservationIdentity;
-      let reservationBytes;
-      let reservationValue;
-      let operationId;
-      try {
-        reservationIdentity = regularFileIdentity(
-          fs.lstatSync(reservation, { bigint: true }),
-        );
-        if (!reservationIdentity) continue;
-        reservationBytes = fs.readFileSync(reservation);
-        assertRegularFileIdentity(reservation, reservationIdentity);
-        reservationValue = JSON.parse(reservationBytes.toString('utf8'));
-        if (!hasExactKeys(reservationValue, [
-          'contract_version',
-          'kind',
-          'operation_id',
-          'quarantine_name',
-          'journal_sha256',
-          'journal_length',
-        ]) || reservationValue.contract_version !== 1
-            || reservationValue.kind !== 'scan-window-prune-reservation'
-            || typeof reservationValue.quarantine_name !== 'string'
-            || path.basename(reservationValue.quarantine_name)
-              !== reservationValue.quarantine_name
-            || operationIdFromPruneName(reservationValue.quarantine_name)
-              !== reservationValue.operation_id
-            || entry.name !== `.reservation-${reservationValue.quarantine_name}`
-            || typeof reservationValue.journal_sha256 !== 'string'
-            || !SHA256_RE.test(reservationValue.journal_sha256)
-            || !Number.isSafeInteger(reservationValue.journal_length)
-            || reservationValue.journal_length < 1
-            || !reservationBytes.equals(stageBytes(reservationValue))) continue;
-        operationId = validateOperationId(reservationValue.operation_id);
-        try {
-          fs.lstatSync(path.join(transactions, reservationValue.quarantine_name));
-          continue;
-        } catch (cause) {
-          if (cause.code !== 'ENOENT') continue;
-        }
+        matchingQuarantine = fs.readdirSync(transactions).some((name) => {
+          if (!name.startsWith('.prune-')) return false;
+          try { return operationIdFromPruneName(name) === operationId; }
+          catch { return false; }
+        });
       } catch {
         continue;
       }
-      if (operationId === excludeOperationId) continue;
+      if (matchingQuarantine) continue;
+      if (quarantineName) {
+        try {
+          fs.lstatSync(path.join(transactions, quarantineName));
+          continue;
+        } catch (cause) {
+          if (cause.code !== 'ENOENT') continue;
+        }
+      }
       assertOwner();
       try {
         assertRegularFileIdentity(reservation, reservationIdentity);
         const currentBytes = fs.readFileSync(reservation);
         assertRegularFileIdentity(reservation, reservationIdentity);
         if (!currentBytes.equals(reservationBytes)) continue;
-        try {
-          fs.lstatSync(path.join(transactions, reservationValue.quarantine_name));
-          continue;
-        } catch (cause) {
-          if (cause.code !== 'ENOENT') continue;
-        }
+        assertBudget();
         fs.unlinkSync(reservation);
         assertOwner();
       } catch (error) {
-        if (error.code === 'ENOENT') continue;
+        if (error.code === 'DEADLINE_EXCEEDED') {
+          complete = false;
+          break;
+        }
+        if (error.code === 'ENOENT'
+            || error.code === 'TRANSACTION_RECOVERY_REQUIRED'
+            || error.code === 'SCAN_WINDOW_FILESYSTEM') continue;
         throw error;
       }
       removed.push(operationId);
@@ -1707,23 +1815,12 @@ function pruneScanWindowTransactions(options = {}) {
           if (!reservationIdentity) continue;
           const reservationBytes = fs.readFileSync(reservation);
           assertRegularFileIdentity(reservation, reservationIdentity);
-          const reservationValue = JSON.parse(reservationBytes.toString('utf8'));
-          if (!hasExactKeys(reservationValue, [
-            'contract_version',
-            'kind',
-            'operation_id',
-            'quarantine_name',
-            'journal_sha256',
-            'journal_length',
-          ]) || reservationValue.contract_version !== 1
-              || reservationValue.kind !== 'scan-window-prune-reservation'
-              || reservationValue.operation_id !== operationId
-              || reservationValue.quarantine_name !== entry.name
-              || typeof reservationValue.journal_sha256 !== 'string'
-              || !SHA256_RE.test(reservationValue.journal_sha256)
-              || !Number.isSafeInteger(reservationValue.journal_length)
-              || reservationValue.journal_length < 1
-              || !reservationBytes.equals(stageBytes(reservationValue))) continue;
+          const reservationJournal = JSON.parse(reservationBytes.toString('utf8'));
+          validateJournal(reservationJournal, operationId, physicalRoot);
+          if (reservationJournal.operation_id !== operationId
+              || reservationJournal.transitions.at(-1) !== 'cleaned'
+              || !reservationBytes.equals(stageBytes(reservationJournal))
+              || (kinds && !kinds.has(reservationJournal.kind))) continue;
           assertOwner();
           try {
             adapter[DEFAULT_ADAPTER_CONTROL].removeEmptyCleanedQuarantine(
@@ -1732,8 +1829,13 @@ function pruneScanWindowTransactions(options = {}) {
               reservationBytes,
               reservationIdentity,
               assertOwner,
+              assertBudget,
             );
           } catch (error) {
+            if (error.code === 'DEADLINE_EXCEEDED') {
+              complete = false;
+              break;
+            }
             if (error.code === 'TRANSACTION_RECOVERY_REQUIRED') continue;
             throw error;
           }
@@ -1743,16 +1845,31 @@ function pruneScanWindowTransactions(options = {}) {
         const hasJournal = names.includes('journal.json');
         const hasBackup = names.includes('journal.backup');
         if ((!hasJournal && !hasBackup)
-            || names.some((name) => name !== 'journal.json' && name !== 'journal.backup')) {
+            || names.some((name) => ![
+              'journal.json',
+              'journal.backup',
+              'journal.backup.pending',
+              'source.reservation.pending',
+            ].includes(name))) {
           continue;
         }
         const evidencePath = hasJournal ? quarantinedJournal : quarantinedBackup;
-        const evidenceIdentity = regularFileIdentity(
+        const evidenceIdentity = (hasJournal ? regularFileIdentity : linkedRegularFileIdentity)(
           fs.lstatSync(evidencePath, { bigint: true }),
         );
         if (!evidenceIdentity) continue;
         journalBytes = fs.readFileSync(evidencePath);
-        assertRegularFileIdentity(evidencePath, evidenceIdentity);
+        if (hasJournal) {
+          assertRegularFileIdentity(evidencePath, evidenceIdentity);
+        } else {
+          const currentEvidenceIdentity = linkedRegularFileIdentity(
+            fs.lstatSync(evidencePath, { bigint: true }),
+          );
+          if (!identitiesMatch(currentEvidenceIdentity, evidenceIdentity)
+              || currentEvidenceIdentity.mtimeNs !== evidenceIdentity.mtimeNs
+              || currentEvidenceIdentity.nlink !== evidenceIdentity.nlink
+              || ![1n, 2n].includes(evidenceIdentity.nlink)) continue;
+        }
         if (hasJournal) journalIdentity = evidenceIdentity;
         else {
           journalIdentity = null;
@@ -1760,12 +1877,17 @@ function pruneScanWindowTransactions(options = {}) {
           resumedFromBackup = true;
         }
         if (hasBackup && hasJournal) {
-          backupIdentity = regularFileIdentity(
+          backupIdentity = linkedRegularFileIdentity(
             fs.lstatSync(quarantinedBackup, { bigint: true }),
           );
           if (!backupIdentity) continue;
           const backupBytes = fs.readFileSync(quarantinedBackup);
-          assertRegularFileIdentity(quarantinedBackup, backupIdentity);
+          const currentBackupIdentity = linkedRegularFileIdentity(
+            fs.lstatSync(quarantinedBackup, { bigint: true }),
+          );
+          if (!identitiesMatch(currentBackupIdentity, backupIdentity)
+              || currentBackupIdentity.mtimeNs !== backupIdentity.mtimeNs
+              || currentBackupIdentity.nlink !== backupIdentity.nlink) continue;
           if (!backupBytes.equals(journalBytes)) continue;
         }
         const currentQuarantineIdentity = inspectPhysicalDirectory(
@@ -1808,8 +1930,13 @@ function pruneScanWindowTransactions(options = {}) {
             nowMs: now.getTime(),
             maxAgeDays,
           },
+          assertBudget,
         );
       } catch (error) {
+        if (error.code === 'DEADLINE_EXCEEDED') {
+          complete = false;
+          break;
+        }
         if (error.code === 'TRANSACTION_RECOVERY_REQUIRED') continue;
         throw error;
       }
@@ -1856,8 +1983,13 @@ function pruneScanWindowTransactions(options = {}) {
           nowMs: now.getTime(),
           maxAgeDays,
         },
+        assertBudget,
       );
     } catch (error) {
+      if (error.code === 'DEADLINE_EXCEEDED') {
+        complete = false;
+        break;
+      }
       if (error.code === 'TRANSACTION_RECOVERY_REQUIRED') continue;
       throw error;
     }

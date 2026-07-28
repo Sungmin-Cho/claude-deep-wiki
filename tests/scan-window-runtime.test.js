@@ -619,6 +619,86 @@ test('transaction pruning quarantines before deletion and preserves a last-check
   assert.ok(survivingReplacement);
 });
 
+test('transaction pruning reports incomplete traversal when its reserve expires before a late candidate', () => {
+  const {
+    acquireLock,
+    createDeadline,
+    ensurePendingScan,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki terminal prune incomplete deadline ');
+  const completed = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(completed.status, 'deferred');
+  const transactions = metaPath(root, '.transactions');
+  const source = path.join(transactions, completed.operationId);
+  const youngId = 'a-young-terminal';
+  const oldId = 'z-old-terminal';
+  const young = path.join(transactions, youngId);
+  const old = path.join(transactions, oldId);
+  const youngTime = new Date('2026-07-27T00:00:00.000Z');
+  const oldTime = new Date('2026-07-01T00:00:00.000Z');
+  const pruneNow = new Date('2026-07-28T00:00:00.000Z');
+  for (const [operationId, destination, timestamp] of [
+    [youngId, young, youngTime],
+    [oldId, old, oldTime],
+  ]) {
+    fs.cpSync(source, destination, { recursive: true });
+    const journal = path.join(destination, 'journal.json');
+    const value = JSON.parse(fs.readFileSync(journal, 'utf8'));
+    fs.writeFileSync(journal, `${JSON.stringify({ ...value, operation_id: operationId })}\n`);
+    fs.utimesSync(journal, timestamp, timestamp);
+  }
+  fs.rmSync(source, { recursive: true });
+
+  const clock = makeClock();
+  const originalReadFile = fs.readFileSync;
+  let advanced = false;
+  fs.readFileSync = (pathname, ...args) => {
+    const value = originalReadFile(pathname, ...args);
+    if (!advanced && pathname === path.join(young, 'journal.json')) {
+      clock.advance(800);
+      advanced = true;
+    }
+    return value;
+  };
+  const owner = acquireLock({ wikiRoot: root, operation: 'incomplete-prune' });
+  let first;
+  try {
+    first = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 8,
+      now: pruneNow,
+      deadline: createDeadline({ clock, budgetMs: 1_000 }),
+    });
+  } finally {
+    fs.readFileSync = originalReadFile;
+  }
+  assert.equal(advanced, true);
+  assert.deepEqual(first, { processed: 0, removed: [], complete: false });
+  assert.equal(fs.existsSync(old), true);
+
+  try {
+    const second = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 8,
+      now: pruneNow,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+    assert.deepEqual(second, { processed: 1, removed: [oldId], complete: true });
+  } finally {
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+});
+
 test('transaction prune CLI exposes bounded terminal cleanup under the caller lock', () => {
   const { acquireLock, createDeadline, ensurePendingScan, releaseLock } = modules();
   const root = temporaryWiki('deep wiki transaction prune cli ');

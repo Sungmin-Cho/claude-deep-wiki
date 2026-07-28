@@ -59,7 +59,9 @@ and whose journal age exceeds `--max-age-days`. Before unlinking, the runtime
 atomically moves the candidate into a fresh identity-bound quarantine and
 revalidates its identity, bytes, age, and link count there. It preserves in-flight,
 malformed, foreign-kind, linked, young, and otherwise ambiguous entries.
-Repeat the command until `removed` is empty to drain more than one bounded pass.
+Repeat the command while `complete` is `false` to traverse more than one bounded
+pass. `complete: true` means every entry listed for that pass was inspected; it
+does not claim that ambiguous entries were removed.
 
 ## Scan windows
 

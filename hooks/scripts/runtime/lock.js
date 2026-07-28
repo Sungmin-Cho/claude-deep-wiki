@@ -28,6 +28,7 @@ const TRANSITION_INTENT_KEYS = [
   'contract_version', 'kind', 'purpose', 'reservation_name',
   'reservation_identity', 'seized_identity', 'pid', 'hostname',
 ];
+const RECOVERY_AFTER_RESTORE_SCAN = Symbol('recovery-after-restore-scan');
 const activeSeizures = new Map();
 const utf8Decoder = new TextDecoder('utf-8', { fatal: true });
 
@@ -676,11 +677,12 @@ function resumePendingRestores({ fs, meta, lockDir }) {
         const reservationIdentity = readDirectoryIdentity(fs, reservation);
         const seizedIdentity = readDirectoryIdentity(fs, seized);
         if (!reservationIdentity || !seizedIdentity) {
-          const transitionIsCompleting = intent && transitionIntentIsLive(intent)
-            && (pathIsMissing(fs, reservation) || pathIsMissing(fs, seized));
-          if (transitionIsCompleting
-              && identitiesMatch(reservationIdentity, intent.reservationIdentity)
-              && sameDirectoryIdentity(fs, reservation, intent.reservationIdentity)) {
+          const reservationMissing = pathIsMissing(fs, reservation);
+          const transitionIsCompleting = intent
+            && (reservationMissing || pathIsMissing(fs, seized));
+          if (transitionIsCompleting && (reservationMissing
+              || (identitiesMatch(reservationIdentity, intent.reservationIdentity)
+                && sameDirectoryIdentity(fs, reservation, intent.reservationIdentity)))) {
             throw new LockError(
               'LOCK_CONTENDED',
               'wiki lock transition is completing',
@@ -1007,6 +1009,7 @@ function acquireLock(options = {}) {
           now: options.now,
           hostname: options.hostname,
           isPidAlive: options.isPidAlive,
+          [RECOVERY_AFTER_RESTORE_SCAN]: true,
         });
       } catch (recoveryCause) {
         throw new LockError(
@@ -1119,7 +1122,9 @@ function recoverLock(options = {}) {
   const { wikiRoot } = options;
   const fs = options.fs || nodeFs;
   const { meta, lockDir, ownerPath } = paths(wikiRoot);
-  resumePendingRestores({ fs, meta, lockDir });
+  if (options[RECOVERY_AFTER_RESTORE_SCAN] !== true) {
+    resumePendingRestores({ fs, meta, lockDir });
+  }
   const staleMs = options.staleMs;
   if (!Number.isFinite(staleMs) || staleMs < 0) throw new LockError('LOCK_INVALID', 'staleMs must be nonnegative');
   const candidate = captureRecoveryCandidate({ fs, lockDir, ownerPath });

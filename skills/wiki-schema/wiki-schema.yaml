@@ -17,6 +17,7 @@ runtime_authority:
     terminal_prune_command: transaction prune
     terminal_prune_scope: validated-cleaned-scan-window-only
     terminal_prune_bounded: true
+    terminal_prune_completion_field: complete
     expected_hash_guard: true
   scan_window:
     pending: .wiki-meta/.pending-scan

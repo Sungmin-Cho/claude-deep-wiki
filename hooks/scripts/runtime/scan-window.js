@@ -1175,17 +1175,21 @@ function pruneScanWindowTransactions(options = {}) {
       transactions,
       '.wiki-meta/.transactions',
       true,
-    ) === null) return { processed: 0, removed: [] };
+    ) === null) return { processed: 0, removed: [], complete: true };
     entries = fs.readdirSync(transactions, { withFileTypes: true })
       .sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
   } catch (error) {
-    if (error.code === 'ENOENT') return { processed: 0, removed: [] };
+    if (error.code === 'ENOENT') return { processed: 0, removed: [], complete: true };
     throw error;
   }
 
   const removed = [];
+  let complete = true;
   for (const entry of entries) {
-    if (removed.length >= limit || remainingMs(deadline) < PRUNE_RESERVE_MS) break;
+    if (removed.length >= limit || remainingMs(deadline) < PRUNE_RESERVE_MS) {
+      complete = false;
+      break;
+    }
     if (!entry.isDirectory() || entry.isSymbolicLink()
         || entry.name === excludeOperationId) continue;
     let operationId;
@@ -1228,7 +1232,7 @@ function pruneScanWindowTransactions(options = {}) {
     }
     removed.push(operationId);
   }
-  return { processed: removed.length, removed };
+  return { processed: removed.length, removed, complete };
 }
 
 function deterministicEnsureId(wikiRoot, proposed) {

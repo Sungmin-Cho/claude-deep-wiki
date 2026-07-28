@@ -79,9 +79,10 @@ The operator command `wiki-runtime.js transaction prune` removes only fully vali
 scan-window journals older than the requested age while the caller still owns
 the lock. It moves each candidate into a fresh identity-bound quarantine and
 revalidates identity, bytes, age, and link count before deletion. The command is
-bounded; rerun it until `removed` is empty when a
-larger backlog must be retired. In-flight, malformed, foreign-kind, linked, or
-otherwise ambiguous transaction directories are preserved.
+bounded; rerun it while `complete` is `false` when a larger backlog must be
+traversed. `complete: true` means the pass inspected every listed entry, not
+that every ambiguous entry was removed. In-flight, malformed, foreign-kind,
+linked, or otherwise ambiguous transaction directories are preserved.
 
 Valid lifecycle actions are `ingest`, `ingest-skip`, `ingest-repair`,
 `ingest-fail`, `update`, `lint`, `rebuild`, `delete`, `query-filed`, and

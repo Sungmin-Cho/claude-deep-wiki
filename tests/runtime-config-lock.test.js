@@ -3394,6 +3394,93 @@ test('lock acquisition self-heals a dead same-host owner before publishing its s
   releaseLock({ wikiRoot, token: successor.token });
 });
 
+test('contended lock acquisition does not rescan live restore transitions during dead-owner recovery', () => {
+  const { acquireLock, releaseLock } = runtimeModule('lock.js');
+  const wikiRoot = newWikiRoot('deep wiki contended acquisition single restore scan ');
+  const meta = path.join(wikiRoot, '.wiki-meta');
+  const owner = acquireLock({ wikiRoot, operation: 'live-owner' });
+  let metaScans = 0;
+  const countingFs = new Proxy(fs, {
+    get(target, property) {
+      if (property === 'readdirSync') {
+        return (pathname, options) => {
+          if (pathname === meta) metaScans += 1;
+          return target.readdirSync(pathname, options);
+        };
+      }
+      const value = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+
+  assert.throws(() => acquireLock({
+    wikiRoot,
+    operation: 'contender',
+    fs: countingFs,
+    isPidAlive: () => true,
+  }), (error) => error.code === 'LOCK_CONTENDED');
+  assert.equal(metaScans, 1);
+  releaseLock({ wikiRoot, token: owner.token });
+});
+
+test('live transition stays contended when its reservation disappears during identity capture', () => {
+  const { acquireLock } = runtimeModule('lock.js');
+  const wikiRoot = newWikiRoot('deep wiki live transition disappearing identity ');
+  acquireLock({ wikiRoot, operation: 'live-owner' });
+  const meta = path.join(wikiRoot, '.wiki-meta');
+  const reservation = path.join(
+    meta,
+    `.wiki-lock.release.${process.pid}.${'9'.repeat(32)}`,
+  );
+  const seized = path.join(reservation, 'seized');
+  fs.mkdirSync(reservation);
+  fs.renameSync(path.join(meta, '.wiki-lock'), seized);
+  const serializeIdentity = (pathname) => {
+    const stat = fs.lstatSync(pathname, { bigint: true });
+    return {
+      dev: stat.dev.toString(10),
+      ino: stat.ino.toString(10),
+      type: (stat.mode & 0o170000n).toString(10),
+      birthtime_ns: stat.birthtimeNs.toString(10),
+    };
+  };
+  fs.writeFileSync(path.join(reservation, 'transition.json'), `${JSON.stringify({
+    contract_version: 1,
+    kind: 'lock-seizure-transition',
+    purpose: 'release',
+    reservation_name: path.basename(reservation),
+    reservation_identity: serializeIdentity(reservation),
+    seized_identity: serializeIdentity(seized),
+    pid: process.pid,
+    hostname: os.hostname(),
+  })}\n`);
+
+  let reservationIdentityReads = 0;
+  const disappearingFs = new Proxy(fs, {
+    get(target, property) {
+      if (property === 'lstatSync') {
+        return (pathname, options) => {
+          if (pathname === reservation && options?.bigint === true
+              && ++reservationIdentityReads === 2) {
+            fs.rmSync(reservation, { recursive: true });
+          }
+          return target.lstatSync(pathname, options);
+        };
+      }
+      const value = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+
+  assert.throws(() => acquireLock({
+    wikiRoot,
+    operation: 'transition-contender',
+    fs: disappearingFs,
+  }), (error) => error.code === 'LOCK_CONTENDED');
+  assert.equal(reservationIdentityReads, 2);
+  assert.equal(fs.existsSync(reservation), false);
+});
+
 test('lock acquisition self-heal preserves every owner it cannot prove is dead and local', () => {
   const { acquireLock } = runtimeModule('lock.js');
   const cases = [

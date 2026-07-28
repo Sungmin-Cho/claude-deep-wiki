@@ -72,6 +72,11 @@ catalog refresh, and lifecycle records. The runtime writes a journal intent,
 applies expected-hash-guarded changes, and records terminal state. An
 interruption is resolved with `wiki-runtime.js transaction recover` using the
 same owner token and operation ID; a caller never creates split mutations.
+`wiki-runtime.js transaction prune` removes only fully validated, terminal
+scan-window journals older than the requested age while the caller still owns
+the lock. The command is bounded; rerun it until `removed` is empty when a
+larger backlog must be retired. In-flight, malformed, foreign-kind, linked, or
+otherwise ambiguous transaction directories are preserved.
 
 Valid lifecycle actions are `ingest`, `ingest-skip`, `ingest-repair`,
 `ingest-fail`, `update`, `lint`, `rebuild`, `delete`, `query-filed`, and

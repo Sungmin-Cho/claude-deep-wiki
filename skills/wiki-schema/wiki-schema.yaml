@@ -14,6 +14,9 @@ runtime_authority:
     journal: .wiki-meta/.transactions/<operation_id>/journal.json
     receipt: .wiki-meta/.transaction-receipts/<operation_id>.json
     recovery_command: transaction recover
+    terminal_prune_command: transaction prune
+    terminal_prune_scope: validated-cleaned-scan-window-only
+    terminal_prune_bounded: true
     expected_hash_guard: true
   scan_window:
     pending: .wiki-meta/.pending-scan

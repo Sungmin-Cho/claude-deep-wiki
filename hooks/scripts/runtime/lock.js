@@ -996,8 +996,35 @@ function acquireLock(options = {}) {
   try {
     fs.mkdirSync(lockDir);
   } catch (cause) {
-    if (cause.code === 'EEXIST') throw new LockError('LOCK_CONTENDED', 'wiki lock is contended', readOwner(ownerPath, fs), cause);
-    throw new LockError('LOCK_FILESYSTEM', 'cannot create wiki lock', undefined, cause);
+    if (cause.code === 'EEXIST') {
+      const recovered = recoverLock({
+        wikiRoot,
+        fs,
+        staleMs: 0,
+        force: true,
+        now: options.now,
+        hostname: options.hostname,
+        isPidAlive: options.isPidAlive,
+      });
+      if (!recovered) {
+        throw new LockError('LOCK_CONTENDED', 'wiki lock is contended', readOwner(ownerPath, fs), cause);
+      }
+      try {
+        fs.mkdirSync(lockDir);
+      } catch (retryCause) {
+        if (retryCause.code === 'EEXIST') {
+          throw new LockError(
+            'LOCK_CONTENDED',
+            'wiki lock is contended',
+            readOwner(ownerPath, fs),
+            retryCause,
+          );
+        }
+        throw new LockError('LOCK_FILESYSTEM', 'cannot create wiki lock', undefined, retryCause);
+      }
+    } else {
+      throw new LockError('LOCK_FILESYSTEM', 'cannot create wiki lock', undefined, cause);
+    }
   }
   const acquiredDirectoryIdentity = readDirectoryIdentity(fs, lockDir);
   if (!acquiredDirectoryIdentity) {
@@ -1086,6 +1113,12 @@ function recoverLock(options = {}) {
   const candidate = captureRecoveryCandidate({ fs, lockDir, ownerPath });
   if (!candidate) return false;
   const owner = candidate.ownerRecord.owner;
+  if (options.expectedPid !== undefined) {
+    if (!Number.isSafeInteger(options.expectedPid) || options.expectedPid <= 0) {
+      throw new LockError('LOCK_INVALID', 'expectedPid must be a positive safe integer');
+    }
+    if (owner.pid !== options.expectedPid) return false;
+  }
   const now = options.now instanceof Date ? options.now : new Date(options.now || Date.now());
   const age = now.getTime() - Date.parse(owner.acquired_at);
   if (!Number.isFinite(age) || (options.force !== true && age <= staleMs)) return false;

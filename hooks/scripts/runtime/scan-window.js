@@ -6,13 +6,16 @@ const crypto = require('node:crypto');
 
 const { ISO_UTC_RE } = require('./config.js');
 const { atomicWriteFile, sha256 } = require('./fs-safe.js');
-const { assertBeforeDeadline, createDeadline } = require('./deadline.js');
+const { assertBeforeDeadline, createDeadline, remainingMs } = require('./deadline.js');
 const {
   acquireLock,
   assertLockOwner,
   releaseLock,
 } = require('./lock.js');
-const { sweepTransactionDebris } = require('./transaction-debris.js');
+const {
+  SWEEP_RESERVE_MS,
+  sweepTransactionDebris,
+} = require('./transaction-debris.js');
 
 const sleepArray = new Int32Array(new SharedArrayBuffer(4));
 const STAGES = ['pending-before', 'pending-after', 'last-before', 'last-after'];
@@ -36,6 +39,8 @@ const TRANSITIONS = [
   'scan-window-committed',
   'cleaned',
 ];
+const DAY_MS = 24 * 60 * 60 * 1000;
+const AUTOMATIC_PRUNE_LIMIT = 8;
 
 class ScanWindowError extends Error {
   constructor(code, message, cause) {
@@ -252,6 +257,27 @@ function defaultTransactionParentGuard(locations) {
     assertAll();
     return true;
   };
+  const removeEmptyOperation = (assertOwner) => {
+    if (typeof assertOwner === 'function') assertOwner();
+    assertAll();
+    if (fs.readdirSync(locations.transaction).length !== 0) {
+      throw scanError('TRANSACTION_RECOVERY_REQUIRED', 'terminal transaction directory is not empty');
+    }
+    if (typeof assertOwner === 'function') assertOwner();
+    assertAll();
+    fs.rmdirSync(locations.transaction);
+    if (typeof assertOwner === 'function') assertOwner();
+    assertTransactions();
+    if (inspectPhysicalDirectory(
+      locations.transaction,
+      locations.transaction,
+      'scan-window operation directory',
+      true,
+    ) !== null) {
+      throw scanError('SCAN_WINDOW_FILESYSTEM', 'terminal transaction directory survived removal');
+    }
+    assertTransactions();
+  };
   const createDirectory = (name, assertOwner) => {
     const record = records[name];
     if (typeof assertOwner === 'function') assertOwner();
@@ -287,6 +313,7 @@ function defaultTransactionParentGuard(locations) {
     assertTransactions,
     inspectExistingOperation,
     prepareParent,
+    removeEmptyOperation,
   };
 }
 
@@ -503,6 +530,32 @@ function defaultJournalAdapter(wikiRoot, operationId) {
         assertMutation(assertOwner);
         fs.renameSync(file, tombstone);
         assertMutation(assertOwner);
+      },
+      removeCleanedTransaction(expectedJournal, assertOwner) {
+        assertMutation(assertOwner);
+        const names = fs.readdirSync(locations.transaction).sort();
+        if (names.length !== 1 || names[0] !== 'journal.json') {
+          throw scanError(
+            'TRANSACTION_RECOVERY_REQUIRED',
+            'cleaned transaction contains unexpected entries',
+          );
+        }
+        let current;
+        try {
+          current = JSON.parse(fs.readFileSync(locations.journal, 'utf8'));
+        } catch (cause) {
+          throw scanError('TRANSACTION_RECOVERY_REQUIRED', 'cleaned journal is unreadable', cause);
+        }
+        validateJournal(current, operationId, wikiRoot);
+        if (current.transitions.at(-1) !== 'cleaned'
+            || JSON.stringify(current) !== JSON.stringify(expectedJournal)) {
+          throw scanError('TRANSACTION_RECOVERY_REQUIRED', 'cleaned journal changed before pruning');
+        }
+        assertMutation(assertOwner);
+        fs.unlinkSync(locations.journal);
+        if (typeof assertOwner === 'function') assertOwner();
+        parents.assertAll();
+        parents.removeEmptyOperation(assertOwner);
       },
     },
   };
@@ -981,6 +1034,83 @@ function recoverScanWindowTransaction(options = {}) {
   });
 }
 
+function pruneScanWindowTransactions(options = {}) {
+  const physicalRoot = physicalWikiRoot(options.wikiRoot);
+  const token = options.token;
+  const maxAgeDays = options.maxAgeDays;
+  const limit = options.limit === undefined ? AUTOMATIC_PRUNE_LIMIT : options.limit;
+  const now = options.now instanceof Date ? options.now : new Date(options.now || Date.now());
+  const deadline = options.deadline || createDeadline({ budgetMs: 12_000 });
+  if (!Number.isSafeInteger(maxAgeDays) || maxAgeDays < 0) {
+    throw scanError('SCAN_WINDOW_INVALID', 'maxAgeDays must be a nonnegative integer');
+  }
+  if (!Number.isSafeInteger(limit) || limit < 0) {
+    throw scanError('SCAN_WINDOW_INVALID', 'prune limit must be a nonnegative integer');
+  }
+  if (!Number.isFinite(now.getTime())) throw scanError('SCAN_WINDOW_INVALID', 'prune time is invalid');
+  const kinds = options.kinds === undefined ? null : new Set(options.kinds);
+  if (kinds && [...kinds].some((kind) => !['ensure', 'promote', 'repair'].includes(kind))) {
+    throw scanError('SCAN_WINDOW_INVALID', 'prune kind is invalid');
+  }
+  const excludeOperationId = options.excludeOperationId === undefined
+    ? null
+    : validateOperationId(options.excludeOperationId);
+
+  const assertOwner = () => assertLockOwner({ wikiRoot: physicalRoot, token });
+  assertOwner();
+  const transactions = path.join(physicalRoot, '.wiki-meta', '.transactions');
+  let entries;
+  try {
+    if (inspectPhysicalDirectory(
+      transactions,
+      transactions,
+      '.wiki-meta/.transactions',
+      true,
+    ) === null) return { processed: 0, removed: [] };
+    entries = fs.readdirSync(transactions, { withFileTypes: true })
+      .sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
+  } catch (error) {
+    if (error.code === 'ENOENT') return { processed: 0, removed: [] };
+    throw error;
+  }
+
+  const removed = [];
+  for (const entry of entries) {
+    if (removed.length >= limit || remainingMs(deadline) < SWEEP_RESERVE_MS) break;
+    if (!entry.isDirectory() || entry.isSymbolicLink()
+        || entry.name === excludeOperationId) continue;
+    let operationId;
+    try { operationId = validateOperationId(entry.name); } catch { continue; }
+    const adapter = defaultJournalAdapter(physicalRoot, operationId);
+    const control = adapter[DEFAULT_ADAPTER_CONTROL];
+    let journal;
+    try {
+      journal = adapter.readJournal();
+      if (!journal) continue;
+      validateJournal(journal, operationId, physicalRoot);
+    } catch {
+      continue;
+    }
+    if (journal.transitions.at(-1) !== 'cleaned'
+        || (kinds && !kinds.has(journal.kind))) continue;
+
+    let journalStat;
+    try { journalStat = fs.lstatSync(adapter.locations.journal); } catch { continue; }
+    if (!journalStat.isFile() || journalStat.isSymbolicLink()) continue;
+    const ageMs = now.getTime() - journalStat.mtimeMs;
+    if (!Number.isFinite(ageMs) || ageMs < 0
+        || (maxAgeDays > 0 && ageMs <= maxAgeDays * DAY_MS)) continue;
+    let names;
+    try { names = fs.readdirSync(adapter.locations.transaction).sort(); } catch { continue; }
+    if (names.length !== 1 || names[0] !== 'journal.json') continue;
+
+    assertOwner();
+    control.removeCleanedTransaction(journal, assertOwner);
+    removed.push(operationId);
+  }
+  return { processed: removed.length, removed };
+}
+
 function deterministicEnsureId(wikiRoot, proposed) {
   return `scan-window-ensure-${sha256(Buffer.from(`${wikiRoot}\0${proposed}`)).slice(0, 40)}`;
 }
@@ -1012,12 +1142,22 @@ function ensurePendingScan(options = {}) {
       }
     }
     assertBeforeDeadline(options.deadline, 'scan-window-preflight');
+    const operationId = deterministicEnsureId(physicalRoot, options.proposed);
+    pruneScanWindowTransactions({
+      wikiRoot: physicalRoot,
+      token: owner.token,
+      maxAgeDays: 0,
+      limit: AUTOMATIC_PRUNE_LIMIT,
+      now: options.now,
+      deadline: options.deadline,
+      kinds: ['ensure'],
+      excludeOperationId: operationId,
+    });
     const plan = planScanWindowTransition({
       wikiRoot: physicalRoot,
       kind: 'ensure',
       proposed: options.proposed,
     });
-    const operationId = deterministicEnsureId(physicalRoot, options.proposed);
     const applied = applyScanWindowTransition({
       wikiRoot: physicalRoot,
       token: owner.token,
@@ -1073,6 +1213,7 @@ function promotePendingScan(options = {}) {
 module.exports = {
   ensurePendingScan,
   promotePendingScan,
+  pruneScanWindowTransactions,
   recoverScanWindowTransaction,
   planScanWindowTransition,
   applyScanWindowTransition,

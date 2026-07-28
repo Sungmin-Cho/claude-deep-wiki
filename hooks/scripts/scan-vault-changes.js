@@ -3,9 +3,14 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawn, spawnSync } = require('node:child_process');
+const { once } = require('node:events');
 
-const { createDeadline, assertBeforeDeadline } = require('./runtime/deadline.js');
-const { ensurePendingScan: defaultEnsurePendingScan } = require('./runtime/scan-window.js');
+const {
+  createDeadline,
+  assertBeforeDeadline,
+  remainingMs,
+} = require('./runtime/deadline.js');
+const { recoverLock: defaultRecoverLock } = require('./runtime/lock.js');
 
 const PARENT_BUDGET_MS = 12_000;
 const MAX_CAPTURE_BYTES = 1024 * 1024;
@@ -162,11 +167,102 @@ function formatSessionStartOutput(additionalContext) {
   })}\n`;
 }
 
+function runPersistenceWorker(result, deadline, options = {}) {
+  const workerPath = options.persistWorkerPath
+    || path.join(__dirname, 'scan-window-worker.js');
+  const env = options.env || process.env;
+  const terminate = options.terminateWorkerTree || terminateWorkerTree;
+  const recover = options.recoverLock || defaultRecoverLock;
+  if (typeof workerPath !== 'string' || !path.isAbsolute(workerPath)) {
+    throw new TypeError('persistWorkerPath must be absolute');
+  }
+  assertBeforeDeadline(deadline, 'scanner-supervisor-before-persistence-spawn');
+  const budgetMs = Math.max(1, Math.min(PARENT_BUDGET_MS, Math.floor(remainingMs(deadline))));
+
+  return new Promise((resolve, reject) => {
+    let child;
+    let terminal = false;
+    let timer;
+
+    const recoverBoundLock = () => {
+      try {
+        recover({
+          wikiRoot: result.wiki_root,
+          staleMs: 0,
+          force: true,
+          expectedPid: child.pid,
+        });
+      } catch { /* the original persistence failure remains authoritative */ }
+    };
+
+    const failAfterTermination = async (error) => {
+      if (terminal) return;
+      terminal = true;
+      clearTimeout(timer);
+      const alreadyClosed = child.exitCode !== null || child.signalCode !== null;
+      const closed = alreadyClosed ? Promise.resolve() : once(child, 'close');
+      let terminationConfirmed = false;
+      try {
+        terminationConfirmed = await Promise.resolve(terminate(child, { env }));
+        if (terminationConfirmed) await closed;
+      } catch {
+        terminationConfirmed = false;
+      }
+      if (!terminationConfirmed) {
+        reject(new Error('persistence worker tree termination was not confirmed', { cause: error }));
+        return;
+      }
+      recoverBoundLock();
+      reject(error);
+    };
+
+    try {
+      child = spawn(process.execPath, [
+        workerPath,
+        '--wiki-root', result.wiki_root,
+        '--proposed', result.detected_at,
+        '--budget-ms', String(budgetMs),
+      ], {
+        cwd: path.dirname(workerPath),
+        env,
+        stdio: 'ignore',
+        detached: process.platform !== 'win32',
+        shell: false,
+        windowsHide: true,
+      });
+    } catch (error) {
+      reject(error);
+      return;
+    }
+
+    timer = setTimeout(() => {
+      void failAfterTermination(new Error('scan-window persistence worker timed out'));
+    }, budgetMs);
+    timer.unref?.();
+    child.once('error', (error) => {
+      if (terminal) return;
+      terminal = true;
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once('close', (code, signal) => {
+      if (terminal) return;
+      terminal = true;
+      clearTimeout(timer);
+      if (code === 0 && signal === null) {
+        resolve();
+        return;
+      }
+      recoverBoundLock();
+      reject(new Error('scan-window persistence worker failed'));
+    });
+  });
+}
+
 async function runSupervisor(options = {}) {
   const workerPath = options.workerPath || path.join(__dirname, 'scan-vault-worker.js');
   const timeoutMs = options.timeoutMs === undefined ? PARENT_BUDGET_MS : options.timeoutMs;
   const env = options.env || process.env;
-  const persist = options.ensurePendingScan || defaultEnsurePendingScan;
   if (!Number.isInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > PARENT_BUDGET_MS) {
     throw new RangeError('supervisor timeout must be from 1 through 12_000 milliseconds');
   }
@@ -174,12 +270,7 @@ async function runSupervisor(options = {}) {
     throw new TypeError('workerPath must be absolute');
   }
   const deadline = createDeadline({ budgetMs: timeoutMs });
-  let overallTimer;
-  const overallTimeout = new Promise((resolve, reject) => {
-    overallTimer = setTimeout(() => reject(new Error('scanner supervisor deadline exceeded')), timeoutMs);
-  });
-  const operation = (async () => {
-    const result = await new Promise((resolve, reject) => {
+  const result = await new Promise((resolve, reject) => {
     let child;
     let stdoutBytes = 0;
     let stderrBytes = 0;
@@ -246,22 +337,26 @@ async function runSupervisor(options = {}) {
         resolve(result);
       } catch (error) { fail(error); }
     });
-    });
+  });
 
-    assertBeforeDeadline(deadline, 'scanner-supervisor-before-persistence');
-    const persisted = await Promise.resolve(persist({
+  assertBeforeDeadline(deadline, 'scanner-supervisor-before-persistence');
+  if (Object.hasOwn(options, 'ensurePendingScan')) {
+    if (typeof options.ensurePendingScan !== 'function') {
+      throw new TypeError('ensurePendingScan must be a function');
+    }
+    const persisted = await Promise.resolve(options.ensurePendingScan({
       wikiRoot: result.wiki_root,
       proposed: result.detected_at,
       now: new Date(result.detected_at),
       deadline,
     }));
-    assertBeforeDeadline(deadline, 'scanner-supervisor-after-persistence');
     if (!persisted || persisted.status === 'deferred') throw new Error('scan window persistence deferred');
-    assertBeforeDeadline(deadline, 'scanner-supervisor-before-output');
-    return formatOutput(result);
-  })();
-  try { return await Promise.race([operation, overallTimeout]); }
-  finally { clearTimeout(overallTimer); }
+  } else {
+    await runPersistenceWorker(result, deadline, { ...options, env });
+  }
+  assertBeforeDeadline(deadline, 'scanner-supervisor-after-persistence');
+  assertBeforeDeadline(deadline, 'scanner-supervisor-before-output');
+  return formatOutput(result);
 }
 
 async function hookMain(options = {}) {

@@ -49,6 +49,13 @@ state. `transaction recover` accepts the same operation ID and owner token and
 is idempotent. It either completes the recorded operation or restores the
 pre-operation state; it never invents a new action.
 
+`transaction prune` is the bounded terminal cleanup operation. With the caller's
+current owner token, it removes only structurally valid scan-window journals
+whose final transition is `cleaned`, whose directory contains no other entry,
+and whose journal age exceeds `--max-age-days`. It preserves in-flight,
+malformed, foreign-kind, linked, young, and otherwise ambiguous entries.
+Repeat the command until `removed` is empty to drain more than one bounded pass.
+
 ## Scan windows
 
 `.pending-scan` is the oldest uncommitted detection window. After a successful

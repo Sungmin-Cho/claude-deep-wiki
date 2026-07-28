@@ -274,7 +274,8 @@ test('automatic maintenance failure never suppresses the persisted scan window',
   const journal = path.join(metaPath(root, '.transactions'), first.operationId, 'journal.json');
   const originalUnlink = fs.unlinkSync;
   fs.unlinkSync = (pathname) => {
-    if (pathname === journal) {
+    if (path.basename(pathname) === 'journal.json'
+        && path.basename(path.dirname(pathname)).startsWith('.prune-')) {
       const error = new Error('injected terminal cleanup refusal');
       error.code = 'EPERM';
       throw error;
@@ -293,7 +294,18 @@ test('automatic maintenance failure never suppresses the persisted scan window',
   }
   assert.equal(second.status, 'created');
   assert.equal(readMaybe(metaPath(root, '.pending-scan')).toString('utf8'), `${T2}\n`);
-  assert.equal(fs.existsSync(journal), true);
+  const preservedJournal = fs.readdirSync(path.dirname(journal), { recursive: true })
+    .map((relative) => path.join(path.dirname(journal), relative))
+    .find((pathname) => {
+      try {
+        const value = JSON.parse(fs.readFileSync(pathname, 'utf8'));
+        return value.operation_id === first.operationId
+          && value.transitions.at(-1) === 'cleaned';
+      } catch {
+        return false;
+      }
+    });
+  assert.ok(preservedJournal);
 });
 
 test('transaction pruning is token-fenced, conservative, age-gated, and exactly bounded', () => {
@@ -538,6 +550,73 @@ test('transaction pruning preserves a terminal journal whose mtime becomes young
   assert.deepEqual(result.removed, []);
   assert.deepEqual(fs.readFileSync(journal), before);
   assert.equal(fs.statSync(journal).mtimeMs, youngTime.getTime());
+});
+
+test('transaction pruning quarantines before deletion and preserves a last-check pathname replacement', () => {
+  const {
+    acquireLock,
+    createDeadline,
+    ensurePendingScan,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki terminal prune final identity race ');
+  const completed = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(completed.status, 'deferred');
+  const transaction = path.join(
+    metaPath(root, '.transactions'),
+    completed.operationId,
+  );
+  const journal = path.join(transaction, 'journal.json');
+  const authentic = path.join(root, 'authenticated-terminal-journal.json');
+  const replacement = Buffer.from('replacement must survive\n');
+  const oldTime = new Date('2026-07-01T00:00:00.000Z');
+  const pruneNow = new Date('2026-07-28T00:00:00.000Z');
+  fs.utimesSync(journal, oldTime, oldTime);
+  const authenticBytes = fs.readFileSync(journal);
+
+  const originalLstat = fs.lstatSync;
+  let journalChecks = 0;
+  let pathnameReplaced = false;
+  fs.lstatSync = (pathname, ...args) => {
+    const stat = originalLstat(pathname, ...args);
+    if (pathname === journal && ++journalChecks === 3) {
+      fs.renameSync(journal, authentic);
+      fs.writeFileSync(journal, replacement);
+      pathnameReplaced = true;
+    }
+    return stat;
+  };
+  const owner = acquireLock({ wikiRoot: root, operation: 'final-identity-race-prune' });
+  let result;
+  try {
+    result = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 1,
+      now: pruneNow,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+  } finally {
+    fs.lstatSync = originalLstat;
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+
+  assert.equal(pathnameReplaced, true);
+  assert.deepEqual(result.removed, []);
+  assert.deepEqual(fs.readFileSync(authentic), authenticBytes);
+  const survivingReplacement = fs.readdirSync(transaction, { recursive: true })
+    .map((relative) => path.join(transaction, relative))
+    .find((pathname) => {
+      try { return fs.statSync(pathname).isFile() && fs.readFileSync(pathname).equals(replacement); }
+      catch { return false; }
+    });
+  assert.ok(survivingReplacement);
 });
 
 test('transaction prune CLI exposes bounded terminal cleanup under the caller lock', () => {

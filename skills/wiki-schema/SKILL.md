@@ -77,7 +77,9 @@ interruption is resolved with `wiki-runtime.js transaction recover` using the
 same owner token and operation ID; a caller never creates split mutations.
 The operator command `wiki-runtime.js transaction prune` removes only fully validated, terminal
 scan-window journals older than the requested age while the caller still owns
-the lock. The command is bounded; rerun it until `removed` is empty when a
+the lock. It moves each candidate into a fresh identity-bound quarantine and
+revalidates identity, bytes, age, and link count before deletion. The command is
+bounded; rerun it until `removed` is empty when a
 larger backlog must be retired. In-flight, malformed, foreign-kind, linked, or
 otherwise ambiguous transaction directories are preserved.
 

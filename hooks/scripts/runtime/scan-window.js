@@ -628,6 +628,20 @@ function defaultJournalAdapter(wikiRoot, operationId) {
           quarantine,
           'terminal journal prune quarantine',
         );
+        const quarantineName = path.basename(quarantine);
+        const assertTransaction = (expectedNames) => {
+          assertMutation(assertOwner);
+          const actualNames = fs.readdirSync(locations.transaction).sort();
+          const wantedNames = [...expectedNames].sort();
+          if (actualNames.length !== wantedNames.length
+              || actualNames.some((name, index) => name !== wantedNames[index])) {
+            throw scanError(
+              'TRANSACTION_RECOVERY_REQUIRED',
+              'terminal transaction changed during journal pruning',
+            );
+          }
+          assertMutation(assertOwner);
+        };
         const assertQuarantine = (expectedNames) => {
           assertMutation(assertOwner);
           const actual = inspectPhysicalDirectory(
@@ -653,6 +667,7 @@ function defaultJournalAdapter(wikiRoot, operationId) {
         };
 
         try {
+          assertTransaction([quarantineName, 'journal.json']);
           assertRegularFileIdentity(locations.journal, expectedJournalIdentity, ageGate);
           fs.renameSync(locations.journal, quarantinedJournal);
         } catch (cause) {
@@ -676,6 +691,7 @@ function defaultJournalAdapter(wikiRoot, operationId) {
         }
 
         try {
+          assertTransaction([quarantineName]);
           assertQuarantine(['journal.json']);
           assertRegularFileIdentity(quarantinedJournal, expectedJournalIdentity, ageGate);
           const quarantinedBytes = fs.readFileSync(quarantinedJournal);
@@ -695,6 +711,7 @@ function defaultJournalAdapter(wikiRoot, operationId) {
               'quarantined journal changed before pruning',
             );
           }
+          assertTransaction([quarantineName]);
           assertQuarantine(['journal.json']);
           assertRegularFileIdentity(quarantinedJournal, expectedJournalIdentity, ageGate);
         } catch (cause) {

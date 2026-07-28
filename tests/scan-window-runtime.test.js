@@ -672,6 +672,74 @@ test('transaction pruning removes an empty quarantine when final eligibility cha
   assert.deepEqual(fs.readdirSync(transaction), ['journal.json']);
 });
 
+test('transaction pruning preserves the journal when a late transaction entry appears', () => {
+  const {
+    acquireLock,
+    createDeadline,
+    ensurePendingScan,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki terminal prune late entry ');
+  const completed = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(completed.status, 'deferred');
+  const transaction = path.join(
+    metaPath(root, '.transactions'),
+    completed.operationId,
+  );
+  const journal = path.join(transaction, 'journal.json');
+  const oldTime = new Date('2026-07-01T00:00:00.000Z');
+  const pruneNow = new Date('2026-07-28T00:00:00.000Z');
+  fs.utimesSync(journal, oldTime, oldTime);
+  const journalBytes = fs.readFileSync(journal);
+
+  const originalMkdir = fs.mkdirSync;
+  let lateEntryCreated = false;
+  fs.mkdirSync = (pathname, ...args) => {
+    const result = originalMkdir(pathname, ...args);
+    if (!lateEntryCreated
+        && path.dirname(pathname) === transaction
+        && path.basename(pathname).startsWith('.prune-')) {
+      fs.writeFileSync(path.join(transaction, 'late-entry'), 'ambiguous\n');
+      lateEntryCreated = true;
+    }
+    return result;
+  };
+  const owner = acquireLock({ wikiRoot: root, operation: 'late-entry-prune' });
+  let result;
+  try {
+    result = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 1,
+      now: pruneNow,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+  } finally {
+    fs.mkdirSync = originalMkdir;
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+
+  assert.equal(lateEntryCreated, true);
+  assert.deepEqual(result.removed, []);
+  const preservedJournal = fs.readdirSync(transaction, { recursive: true })
+    .map((relative) => path.join(transaction, relative))
+    .find((pathname) => {
+      try {
+        return fs.statSync(pathname).isFile()
+          && fs.readFileSync(pathname).equals(journalBytes);
+      } catch {
+        return false;
+      }
+    });
+  assert.ok(preservedJournal);
+});
+
 test('transaction pruning quarantines before deletion and preserves a last-check pathname replacement', () => {
   const {
     acquireLock,

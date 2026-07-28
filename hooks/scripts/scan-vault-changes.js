@@ -9,6 +9,7 @@ const {
   createDeadline,
   assertBeforeDeadline,
   remainingMs,
+  DeadlineExceeded,
 } = require('./runtime/deadline.js');
 const { recoverLock: defaultRecoverLock } = require('./runtime/lock.js');
 
@@ -168,6 +169,19 @@ function formatSessionStartOutput(additionalContext) {
   })}\n`;
 }
 
+function persistenceBudgets(deadline) {
+  assertBeforeDeadline(deadline, 'scanner-supervisor-before-persistence-spawn');
+  const budgetMs = Math.min(PARENT_BUDGET_MS, Math.floor(remainingMs(deadline)));
+  if (budgetMs < 2) {
+    throw new DeadlineExceeded('scanner-supervisor-before-persistence-spawn-budget');
+  }
+  const workerBudgetMs = Math.max(1, budgetMs - PERSISTENCE_GRACE_MS);
+  if (workerBudgetMs >= budgetMs) {
+    throw new DeadlineExceeded('scanner-supervisor-before-persistence-spawn-grace');
+  }
+  return { budgetMs, workerBudgetMs };
+}
+
 function runPersistenceWorker(result, deadline, options = {}) {
   const workerPath = options.persistWorkerPath
     || path.join(__dirname, 'scan-window-worker.js');
@@ -177,9 +191,7 @@ function runPersistenceWorker(result, deadline, options = {}) {
   if (typeof workerPath !== 'string' || !path.isAbsolute(workerPath)) {
     throw new TypeError('persistWorkerPath must be absolute');
   }
-  assertBeforeDeadline(deadline, 'scanner-supervisor-before-persistence-spawn');
-  const budgetMs = Math.max(1, Math.min(PARENT_BUDGET_MS, Math.floor(remainingMs(deadline))));
-  const workerBudgetMs = Math.max(1, budgetMs - PERSISTENCE_GRACE_MS);
+  const { budgetMs, workerBudgetMs } = persistenceBudgets(deadline);
 
   return new Promise((resolve, reject) => {
     let child;
@@ -379,6 +391,7 @@ module.exports = {
   PARENT_BUDGET_MS,
   MAX_CAPTURE_BYTES,
   terminateWorkerTree,
+  persistenceBudgets,
   runSupervisor,
   hookMain,
   formatSessionStartOutput,

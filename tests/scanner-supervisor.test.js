@@ -376,6 +376,20 @@ test('worker checks its cooperative deadline after a blocking stat boundary', ()
   }
 });
 
+test('persistence refuses a sub-millisecond remainder instead of dispatching equal budgets', () => {
+  const { createDeadline } = require('../hooks/scripts/runtime/deadline.js');
+  const { persistenceBudgets } = require(supervisorPath);
+  let nowMs = 0;
+  const clock = { nowMs: () => nowMs };
+  const deadline = createDeadline({ clock, budgetMs: 1 });
+  nowMs = 0.5;
+
+  assert.throws(
+    () => persistenceBudgets(deadline),
+    (error) => error.code === 'DEADLINE_EXCEEDED',
+  );
+});
+
 test('parent and worker never write scan-window files directly and child spawn is shell-free', () => {
   for (const file of [supervisorPath, workerPath]) {
     const source = fs.readFileSync(file, 'utf8');

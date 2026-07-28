@@ -862,16 +862,17 @@ test('transaction pruning preserves the journal when its source reservation is r
   const journalBytes = fs.readFileSync(journal);
 
   const originalRename = fs.renameSync;
+  const originalUnlink = fs.unlinkSync;
   let reservationReplaced = false;
-  fs.renameSync = (source, destination, ...args) => {
+  fs.unlinkSync = (pathname, ...args) => {
     if (!reservationReplaced
-        && source === transaction
-        && path.basename(destination).startsWith('.reservation-.prune-')) {
-      originalRename(source, authenticReservation);
-      fs.writeFileSync(source, 'replacement reservation\n');
+        && path.basename(pathname) === 'journal.json'
+        && path.basename(path.dirname(pathname)).startsWith('.prune-')) {
+      originalRename(transaction, authenticReservation);
+      fs.writeFileSync(transaction, 'replacement reservation\n');
       reservationReplaced = true;
     }
-    return originalRename(source, destination, ...args);
+    return originalUnlink(pathname, ...args);
   };
   const owner = acquireLock({ wikiRoot: root, operation: 'replaced-reservation-prune' });
   let result;
@@ -885,7 +886,7 @@ test('transaction pruning preserves the journal when its source reservation is r
       deadline: createDeadline({ budgetMs: 12_000 }),
     });
   } finally {
-    fs.renameSync = originalRename;
+    fs.unlinkSync = originalUnlink;
     releaseLock({ wikiRoot: root, token: owner.token });
   }
 
@@ -903,6 +904,160 @@ test('transaction pruning preserves the journal when its source reservation is r
     });
   assert.ok(preservedJournal);
   assert.equal(fs.statSync(authenticReservation).isFile(), true);
+});
+
+test('transaction pruning resumes when only the sealed quarantine backup remains', () => {
+  const {
+    acquireLock,
+    createDeadline,
+    ensurePendingScan,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki resumable terminal prune backup ');
+  const completed = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(completed.status, 'deferred');
+  const transactions = metaPath(root, '.transactions');
+  const journal = path.join(transactions, completed.operationId, 'journal.json');
+  const oldTime = new Date('2026-07-01T00:00:00.000Z');
+  const pruneNow = new Date('2026-07-28T00:00:00.000Z');
+  fs.utimesSync(journal, oldTime, oldTime);
+  const journalBytes = fs.readFileSync(journal);
+
+  const originalUnlink = fs.unlinkSync;
+  let backupUnlinkRefused = false;
+  fs.unlinkSync = (pathname, ...args) => {
+    if (!backupUnlinkRefused
+        && path.basename(pathname) === 'journal.backup'
+        && path.basename(path.dirname(pathname)).startsWith('.prune-')) {
+      backupUnlinkRefused = true;
+      const error = new Error('injected terminal backup cleanup refusal');
+      error.code = 'EPERM';
+      throw error;
+    }
+    return originalUnlink(pathname, ...args);
+  };
+
+  const owner = acquireLock({ wikiRoot: root, operation: 'resumable-backup-prune' });
+  try {
+    const first = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 1,
+      now: pruneNow,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+    assert.equal(backupUnlinkRefused, true);
+    assert.deepEqual(first.removed, []);
+  } finally {
+    fs.unlinkSync = originalUnlink;
+  }
+
+  const quarantinedBackup = fs.readdirSync(transactions, { recursive: true })
+    .map((relative) => path.join(transactions, relative))
+    .find((pathname) => {
+      try {
+        return path.basename(pathname) === 'journal.backup'
+          && fs.statSync(pathname).isFile()
+          && fs.readFileSync(pathname).equals(journalBytes);
+      } catch {
+        return false;
+      }
+    });
+  assert.ok(quarantinedBackup);
+
+  try {
+    const second = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 1,
+      now: pruneNow,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+    assert.deepEqual(second.removed, [completed.operationId]);
+    assert.equal(fs.existsSync(path.dirname(quarantinedBackup)), false);
+  } finally {
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+});
+
+test('transaction pruning resumes an empty quarantine under its active reservation', () => {
+  const {
+    acquireLock,
+    createDeadline,
+    ensurePendingScan,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki resumable empty terminal quarantine ');
+  const completed = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(completed.status, 'deferred');
+  const transactions = metaPath(root, '.transactions');
+  const journal = path.join(transactions, completed.operationId, 'journal.json');
+  const oldTime = new Date('2026-07-01T00:00:00.000Z');
+  const pruneNow = new Date('2026-07-28T00:00:00.000Z');
+  fs.utimesSync(journal, oldTime, oldTime);
+
+  const originalRmdir = fs.rmdirSync;
+  let quarantineRemovalRefused = false;
+  fs.rmdirSync = (pathname, ...args) => {
+    if (!quarantineRemovalRefused
+        && path.basename(pathname).startsWith('.prune-')) {
+      quarantineRemovalRefused = true;
+      const error = new Error('injected empty quarantine cleanup refusal');
+      error.code = 'EPERM';
+      throw error;
+    }
+    return originalRmdir(pathname, ...args);
+  };
+
+  const owner = acquireLock({ wikiRoot: root, operation: 'resumable-empty-prune' });
+  let emptyQuarantine;
+  try {
+    const first = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 1,
+      now: pruneNow,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+    assert.equal(quarantineRemovalRefused, true);
+    assert.deepEqual(first.removed, []);
+    emptyQuarantine = fs.readdirSync(transactions)
+      .find((name) => name.startsWith('.prune-'));
+    assert.ok(emptyQuarantine);
+    assert.deepEqual(fs.readdirSync(path.join(transactions, emptyQuarantine)), []);
+    assert.equal(fs.statSync(path.join(transactions, completed.operationId)).isFile(), true);
+  } finally {
+    fs.rmdirSync = originalRmdir;
+  }
+
+  try {
+    const second = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 1,
+      now: pruneNow,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+    assert.deepEqual(second.removed, [completed.operationId]);
+    assert.equal(fs.existsSync(path.join(transactions, emptyQuarantine)), false);
+    assert.equal(fs.existsSync(path.join(transactions, completed.operationId)), false);
+  } finally {
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
 });
 
 test('transaction pruning retires an orphaned generation reservation on retry', () => {

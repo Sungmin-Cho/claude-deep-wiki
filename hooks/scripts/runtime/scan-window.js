@@ -161,21 +161,35 @@ function regularFileIdentity(stat) {
   const ino = identityComponent(stat?.ino);
   const mode = identityComponent(stat?.mode);
   const birthtimeNs = identityComponent(stat?.birthtimeNs);
+  const mtimeNs = identityComponent(stat?.mtimeNs);
   const nlink = identityComponent(stat?.nlink);
-  if (dev === null || ino === null || mode === null || birthtimeNs === null || nlink === null
-      || dev < 0n || ino <= 0n || birthtimeNs < 0n || nlink !== 1n
+  if (dev === null || ino === null || mode === null || birthtimeNs === null
+      || mtimeNs === null || nlink === null
+      || dev < 0n || ino <= 0n || birthtimeNs < 0n || mtimeNs < 0n || nlink !== 1n
       || (mode & FILE_TYPE_MASK) !== REGULAR_FILE_TYPE) return null;
-  return { dev, ino, type: mode & FILE_TYPE_MASK, birthtimeNs, nlink };
+  return { dev, ino, type: mode & FILE_TYPE_MASK, birthtimeNs, mtimeNs, nlink };
 }
 
-function assertRegularFileIdentity(pathname, expected) {
+function terminalJournalIsOldEnough(identity, nowMs, maxAgeDays) {
+  const nowNs = BigInt(nowMs) * 1_000_000n;
+  const ageNs = nowNs - identity.mtimeNs;
+  return ageNs >= 0n
+    && (maxAgeDays === 0
+      || ageNs > BigInt(maxAgeDays) * BigInt(DAY_MS) * 1_000_000n);
+}
+
+function assertRegularFileIdentity(pathname, expected, ageGate = null) {
   let actual;
   try { actual = regularFileIdentity(fs.lstatSync(pathname, { bigint: true })); }
   catch (cause) {
     throw scanError('SCAN_WINDOW_FILESYSTEM', 'terminal journal identity is unavailable', cause);
   }
-  if (!identitiesMatch(actual, expected) || actual.nlink !== expected.nlink) {
+  if (!identitiesMatch(actual, expected) || actual.mtimeNs !== expected.mtimeNs
+      || actual.nlink !== expected.nlink) {
     throw scanError('SCAN_WINDOW_FILESYSTEM', 'terminal journal identity changed');
+  }
+  if (ageGate && !terminalJournalIsOldEnough(actual, ageGate.nowMs, ageGate.maxAgeDays)) {
+    throw scanError('SCAN_WINDOW_FILESYSTEM', 'terminal journal is no longer old enough');
   }
 }
 
@@ -553,7 +567,7 @@ function defaultJournalAdapter(wikiRoot, operationId) {
         fs.renameSync(file, tombstone);
         assertMutation(assertOwner);
       },
-      removeCleanedTransaction(expectedJournal, expectedJournalIdentity, assertOwner) {
+      removeCleanedTransaction(expectedJournal, expectedJournalIdentity, assertOwner, ageGate) {
         assertMutation(assertOwner);
         const names = fs.readdirSync(locations.transaction).sort();
         if (names.length !== 1 || names[0] !== 'journal.json') {
@@ -575,7 +589,15 @@ function defaultJournalAdapter(wikiRoot, operationId) {
           throw scanError('TRANSACTION_RECOVERY_REQUIRED', 'cleaned journal changed before pruning');
         }
         assertMutation(assertOwner);
-        assertRegularFileIdentity(locations.journal, expectedJournalIdentity);
+        try {
+          assertRegularFileIdentity(locations.journal, expectedJournalIdentity, ageGate);
+        } catch (cause) {
+          throw scanError(
+            'TRANSACTION_RECOVERY_REQUIRED',
+            'cleaned journal changed before final prune eligibility',
+            cause,
+          );
+        }
         fs.unlinkSync(locations.journal);
         if (typeof assertOwner === 'function') assertOwner();
         parents.assertAll();
@@ -1132,7 +1154,15 @@ function pruneScanWindowTransactions(options = {}) {
     if (names.length !== 1 || names[0] !== 'journal.json') continue;
 
     assertOwner();
-    control.removeCleanedTransaction(journal, journalIdentity, assertOwner);
+    try {
+      control.removeCleanedTransaction(journal, journalIdentity, assertOwner, {
+        nowMs: now.getTime(),
+        maxAgeDays,
+      });
+    } catch (error) {
+      if (error.code === 'TRANSACTION_RECOVERY_REQUIRED') continue;
+      throw error;
+    }
     removed.push(operationId);
   }
   return { processed: removed.length, removed };

@@ -1620,6 +1620,111 @@ test('transaction prune returns incomplete when its deadline expires during owne
   assert.deepEqual(fs.readdirSync(transaction), ['journal.json']);
 });
 
+test('transaction prune does not wrap deadline expiry during final journal validation', () => {
+  const {
+    acquireLock,
+    createDeadline,
+    ensurePendingScan,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki bounded prune final journal validation ');
+  const completed = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(completed.status, 'deferred');
+  const transaction = path.join(
+    metaPath(root, '.transactions'),
+    completed.operationId,
+  );
+  const journal = path.join(transaction, 'journal.json');
+  const oldTime = new Date('2026-07-01T00:00:00.000Z');
+  fs.utimesSync(journal, oldTime, oldTime);
+  const journalBytes = fs.readFileSync(journal);
+  const clock = makeClock();
+  const owner = acquireLock({ wikiRoot: root, operation: 'bounded-final-journal-prune' });
+  const originalRead = fs.readFileSync;
+  fs.readFileSync = (pathname, ...args) => {
+    const value = originalRead(pathname, ...args);
+    if (pathname === journal) clock.advance(500);
+    return value;
+  };
+
+  let result;
+  try {
+    result = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 1,
+      now: new Date('2026-07-28T00:00:00.000Z'),
+      deadline: createDeadline({ clock, budgetMs: 1_000 }),
+    });
+  } finally {
+    fs.readFileSync = originalRead;
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+
+  assert.deepEqual(result, { processed: 0, removed: [], complete: false });
+  assert.equal(clock.nowMs(), 1_000);
+  assert.deepEqual(fs.readFileSync(journal), journalBytes);
+  assert.deepEqual(fs.readdirSync(transaction), ['journal.json']);
+});
+
+test('transaction prune checks its deadline within guarded parent validation', () => {
+  const {
+    acquireLock,
+    createDeadline,
+    ensurePendingScan,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki bounded prune guarded parents ');
+  const completed = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(completed.status, 'deferred');
+  const transactions = metaPath(root, '.transactions');
+  const transaction = path.join(transactions, completed.operationId);
+  const journal = path.join(transaction, 'journal.json');
+  const oldTime = new Date('2026-07-01T00:00:00.000Z');
+  fs.utimesSync(journal, oldTime, oldTime);
+  const journalBytes = fs.readFileSync(journal);
+  const clock = makeClock();
+  const owner = acquireLock({ wikiRoot: root, operation: 'bounded-parent-guard-prune' });
+  const guardedPaths = new Set([path.join(root, '.wiki-meta'), transactions, transaction]);
+  const originalLstat = fs.lstatSync;
+  fs.lstatSync = (pathname, ...args) => {
+    const value = originalLstat(pathname, ...args);
+    if (guardedPaths.has(pathname)) clock.advance(300);
+    return value;
+  };
+
+  let result;
+  try {
+    result = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 1,
+      now: new Date('2026-07-28T00:00:00.000Z'),
+      deadline: createDeadline({ clock, budgetMs: 1_000 }),
+    });
+  } finally {
+    fs.lstatSync = originalLstat;
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+
+  assert.deepEqual(result, { processed: 0, removed: [], complete: false });
+  assert.ok(clock.nowMs() <= 1_500, `guarded validation stopped at ${clock.nowMs()} ms`);
+  assert.deepEqual(fs.readFileSync(journal), journalBytes);
+  assert.deepEqual(fs.readdirSync(transaction), ['journal.json']);
+});
+
 test('transaction prune CLI exposes bounded terminal cleanup under the caller lock', () => {
   const { acquireLock, createDeadline, ensurePendingScan, releaseLock } = modules();
   const root = temporaryWiki('deep wiki transaction prune cli ');

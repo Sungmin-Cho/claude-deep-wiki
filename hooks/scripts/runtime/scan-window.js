@@ -273,11 +273,13 @@ function defaultTransactionParentGuard(locations) {
     },
   };
 
-  const observe = (name, allowMissing = false) => {
+  const observe = (name, allowMissing = false, assertBoundary) => {
     const record = records[name];
+    if (typeof assertBoundary === 'function') assertBoundary();
     const current = inspectPhysicalDirectory(
       record.pathname, record.physical, record.label, allowMissing,
     );
+    if (typeof assertBoundary === 'function') assertBoundary();
     if (current === null) {
       if (record.identity !== null) {
         throw scanError('SCAN_WINDOW_FILESYSTEM', `${record.label} identity changed`);
@@ -291,16 +293,16 @@ function defaultTransactionParentGuard(locations) {
     return current;
   };
 
-  const assertMeta = () => observe('meta');
-  const assertTransactions = () => {
-    assertMeta();
-    observe('transactions');
-    assertMeta();
+  const assertMeta = (assertBoundary) => observe('meta', false, assertBoundary);
+  const assertTransactions = (assertBoundary) => {
+    assertMeta(assertBoundary);
+    observe('transactions', false, assertBoundary);
+    assertMeta(assertBoundary);
   };
-  const assertAll = () => {
-    assertTransactions();
-    observe('transaction');
-    assertTransactions();
+  const assertAll = (assertBoundary) => {
+    assertTransactions(assertBoundary);
+    observe('transaction', false, assertBoundary);
+    assertTransactions(assertBoundary);
   };
   const inspectExistingOperation = () => {
     assertMeta();
@@ -482,17 +484,18 @@ function inputHash(wikiRoot, plan) {
 function defaultJournalAdapter(wikiRoot, operationId) {
   const locations = pathsFor(wikiRoot, operationId);
   const parents = defaultTransactionParentGuard(locations);
-  const assertMutation = (assertOwner) => {
+  const assertMutation = (assertOwner, assertBoundary) => {
+    if (typeof assertBoundary === 'function') assertBoundary();
     if (typeof assertOwner === 'function') assertOwner();
-    parents.assertAll();
+    if (typeof assertBoundary === 'function') assertBoundary();
+    parents.assertAll(assertBoundary);
+    if (typeof assertBoundary === 'function') assertBoundary();
   };
   const readGuarded = (file, assertBoundary) => {
-    parents.assertAll();
-    if (typeof assertBoundary === 'function') assertBoundary();
+    parents.assertAll(assertBoundary);
     const value = readMaybe(file);
     if (typeof assertBoundary === 'function') assertBoundary();
-    parents.assertAll();
-    if (typeof assertBoundary === 'function') assertBoundary();
+    parents.assertAll(assertBoundary);
     return value;
   };
   const writeGuarded = (file, bytes, assertOwner) => {
@@ -539,7 +542,7 @@ function defaultJournalAdapter(wikiRoot, operationId) {
       assertPruneBudget();
       if (typeof assertOwner === 'function') assertOwner();
       assertPruneBudget();
-      parents.assertTransactions();
+      parents.assertTransactions(assertPruneBudget);
       assertPruneBudget();
     };
     const inspectPublication = (pathname, allowMissing = false) => {
@@ -910,7 +913,7 @@ function defaultJournalAdapter(wikiRoot, operationId) {
       assertPruneBudget();
       if (typeof assertOwner === 'function') assertOwner();
       assertPruneBudget();
-      parents.assertTransactions();
+      parents.assertTransactions(assertPruneBudget);
       assertPruneBudget();
     };
     const assertEmptyQuarantine = () => {
@@ -1062,7 +1065,7 @@ function defaultJournalAdapter(wikiRoot, operationId) {
         ageGate,
         assertBudget,
       ) {
-        assertMutation(assertOwner);
+        assertMutation(assertOwner, assertBudget);
         if (typeof assertBudget === 'function') assertBudget();
         const names = fs.readdirSync(locations.transaction).sort();
         if (typeof assertBudget === 'function') assertBudget();
@@ -1083,6 +1086,7 @@ function defaultJournalAdapter(wikiRoot, operationId) {
           if (typeof assertBudget === 'function') assertBudget();
           current = JSON.parse(currentBytes.toString('utf8'));
         } catch (cause) {
+          if (cause.code === 'DEADLINE_EXCEEDED') throw cause;
           throw scanError('TRANSACTION_RECOVERY_REQUIRED', 'cleaned journal is unreadable', cause);
         }
         validateJournal(current, operationId, wikiRoot);
@@ -1104,7 +1108,7 @@ function defaultJournalAdapter(wikiRoot, operationId) {
           `.prune-${operationId.length}-${operationId}-${process.pid}-${crypto.randomUUID()}`,
         );
         try {
-          assertMutation(assertOwner);
+          assertMutation(assertOwner, assertBudget);
           if (typeof assertBudget === 'function') assertBudget();
           const finalNames = fs.readdirSync(locations.transaction).sort();
           if (typeof assertBudget === 'function') assertBudget();
@@ -1116,7 +1120,7 @@ function defaultJournalAdapter(wikiRoot, operationId) {
           }
           assertRegularFileIdentity(locations.journal, expectedJournalIdentity, ageGate);
           if (typeof assertBudget === 'function') assertBudget();
-          assertMutation(assertOwner);
+          assertMutation(assertOwner, assertBudget);
           if (typeof assertBudget === 'function') assertBudget();
           fs.renameSync(locations.transaction, quarantine);
         } catch (cause) {

@@ -13,6 +13,8 @@ const {
   assertLockOwner,
 } = require(path.join(runtimeRoot, 'lock.js'));
 const wikiState = require(path.join(runtimeRoot, 'wiki-state.js'));
+const scanWindow = require(path.join(runtimeRoot, 'scan-window.js'));
+const { createDeadline } = require(path.join(runtimeRoot, 'deadline.js'));
 const { sha256 } = require(path.join(runtimeRoot, 'fs-safe.js'));
 const { probeObsidian, runObsidian } = require(path.join(runtimeRoot, 'obsidian-probe.js'));
 
@@ -32,6 +34,7 @@ Usage:
   node scripts/wiki-runtime.js snapshot --wiki-root <absolute> --json
   node scripts/wiki-runtime.js commit --wiki-root <absolute> --lock-token <token> --manifest-file <absolute-json> --json
   node scripts/wiki-runtime.js transaction recover --wiki-root <absolute> --lock-token <token> --operation-id <id> --json
+  node scripts/wiki-runtime.js transaction prune --wiki-root <absolute> --lock-token <token> --max-age-days <integer> --json
   node scripts/wiki-runtime.js index read --wiki-root <absolute> --json
   node scripts/wiki-runtime.js scan-window promote --wiki-root <absolute> --lock-token <token> --expected <UTC-Z> --json
   node scripts/wiki-runtime.js scan-window fail --wiki-root <absolute> --lock-token <token> --source <slug> --json
@@ -334,28 +337,51 @@ function runCommit(argv) {
 }
 
 function runTransaction(argv) {
-  if (argv[0] !== 'recover') throw new UsageError('transaction requires recover');
-  const flags = wikiFlags(argv.slice(1), { '--lock-token': 'value', '--operation-id': 'value' });
-  const token = requireFlag(flags, '--lock-token');
-  const operationId = requireFlag(flags, '--operation-id');
-  let result;
-  try {
-    result = wikiState.recoverTransaction({
-      wikiRoot: flags['--wiki-root'], token, operationId,
+  const command = argv[0];
+  if (command === 'prune') {
+    const flags = wikiFlags(argv.slice(1), {
+      '--lock-token': 'value',
+      '--max-age-days': 'value',
     });
-  } catch (error) {
-    if (error.code === 'DEADLINE_EXCEEDED') {
-      error.message = `${error.message} — ${recoverHint(flags['--wiki-root'], operationId)}`;
+    const raw = requireFlag(flags, '--max-age-days');
+    const maxAgeDays = Number(raw);
+    if (!/^\d+$/.test(raw) || !Number.isSafeInteger(maxAgeDays)) {
+      throw new UsageError('--max-age-days must be a nonnegative safe integer');
     }
-    throw error;
+    emit(scanWindow.pruneScanWindowTransactions({
+      wikiRoot: flags['--wiki-root'],
+      token: requireFlag(flags, '--lock-token'),
+      maxAgeDays,
+      limit: 64,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    }));
+    return;
   }
-  emit(result);
-  try {
-    cleanupRuntimeManifests(flags['--wiki-root'], token, operationId);
-  } catch (error) {
-    if (error.code !== 'LOCK_TOKEN_MISMATCH') throw error;
-    process.stderr.write(`WARNING: runtime manifest cleanup skipped after lock ownership changed: ${error.message}\n`);
+  if (command === 'recover') {
+    const flags = wikiFlags(argv.slice(1), { '--lock-token': 'value', '--operation-id': 'value' });
+    const token = requireFlag(flags, '--lock-token');
+    const operationId = requireFlag(flags, '--operation-id');
+    let result;
+    try {
+      result = wikiState.recoverTransaction({
+        wikiRoot: flags['--wiki-root'], token, operationId,
+      });
+    } catch (error) {
+      if (error.code === 'DEADLINE_EXCEEDED') {
+        error.message = `${error.message} — ${recoverHint(flags['--wiki-root'], operationId)}`;
+      }
+      throw error;
+    }
+    emit(result);
+    try {
+      cleanupRuntimeManifests(flags['--wiki-root'], token, operationId);
+    } catch (error) {
+      if (error.code !== 'LOCK_TOKEN_MISMATCH') throw error;
+      process.stderr.write(`WARNING: runtime manifest cleanup skipped after lock ownership changed: ${error.message}\n`);
+    }
+    return;
   }
+  throw new UsageError('transaction requires recover or prune');
 }
 
 function runIndex(argv) {

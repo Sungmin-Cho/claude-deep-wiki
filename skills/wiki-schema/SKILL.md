@@ -64,6 +64,9 @@ lock recover` only when the stored owner is structurally valid, the same-host
 process is no longer live, the directory identity still matches, and the age
 policy is met. `--force` bypasses age only. `owner.json` and the owner token are
 capabilities, not informational labels.
+Ordinary acquisition may self-heal without an age delay only after proving the
+existing owner is structurally valid, same-host, and dead; live, foreign,
+malformed, and ownerless states remain contended.
 
 ## Journal and atomic commit
 
@@ -72,6 +75,22 @@ catalog refresh, and lifecycle records. The runtime writes a journal intent,
 applies expected-hash-guarded changes, and records terminal state. An
 interruption is resolved with `wiki-runtime.js transaction recover` using the
 same owner token and operation ID; a caller never creates split mutations.
+The operator command `wiki-runtime.js transaction prune` removes only fully validated, terminal
+scan-window journals older than the requested age while the caller still owns
+the lock. It atomically moves each complete transaction directory into a fresh
+identity-bound sibling quarantine and revalidates the directory plus journal
+identity, bytes, age, and link count there. An interrupted quarantine remains
+recognizable and is retried by a later bounded pass. The runtime keeps an
+exact journal-copy reservation at the canonical source through quarantine
+removal and creates an exact fsynced journal backup before unlinking the
+original. Both use exclusive crash-recoverable pending publication, so a later
+bounded pass can resume partial publication, backup-only, empty-quarantine, or
+orphaned exact-reservation states. Cleanup checks its deadline across
+discovery, validation, and recoverable mutation phases. The command is
+bounded; rerun it while `complete` is `false` when a larger backlog must be
+traversed. `complete: true` means the pass inspected every listed entry, not
+that every ambiguous entry was removed. In-flight, malformed, foreign-kind,
+linked, or otherwise ambiguous transaction directories are preserved.
 
 Valid lifecycle actions are `ingest`, `ingest-skip`, `ingest-repair`,
 `ingest-fail`, `update`, `lint`, `rebuild`, `delete`, `query-filed`, and

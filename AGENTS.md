@@ -61,8 +61,10 @@ even while the behaviour holds (`tests/wiki-state-runtime.test.js` does pin the 
 `contract_version`). Change any of it only when the evidence changes.
 
 - Mutation is governed by a cooperative current writer contract with complete
-  post-seizure owner and directory checks. Ambiguous locks require stopped-host
-  intervention; a concurrent old version is unsupported.
+  post-seizure owner and directory checks. Ordinary acquisition self-heals only
+  a structurally valid, same-host owner whose process is proved dead; ambiguous
+  locks require stopped-host intervention and a concurrent old version is
+  unsupported.
 - The claim is mounted-filesystem and process-termination durability only.
 - The Node 22 SessionStart hook uses Codex's host-owned `%COMSPEC% /C` boundary on
   Windows, where Codex additionally pre-expands the plugin root before that launch

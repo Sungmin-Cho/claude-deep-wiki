@@ -28,6 +28,7 @@ const TRANSITION_INTENT_KEYS = [
   'contract_version', 'kind', 'purpose', 'reservation_name',
   'reservation_identity', 'seized_identity', 'pid', 'hostname',
 ];
+const RECOVERY_AFTER_RESTORE_SCAN = Symbol('recovery-after-restore-scan');
 const activeSeizures = new Map();
 const utf8Decoder = new TextDecoder('utf-8', { fatal: true });
 
@@ -676,11 +677,12 @@ function resumePendingRestores({ fs, meta, lockDir }) {
         const reservationIdentity = readDirectoryIdentity(fs, reservation);
         const seizedIdentity = readDirectoryIdentity(fs, seized);
         if (!reservationIdentity || !seizedIdentity) {
-          const transitionIsCompleting = intent && transitionIntentIsLive(intent)
-            && (pathIsMissing(fs, reservation) || pathIsMissing(fs, seized));
-          if (transitionIsCompleting
-              && identitiesMatch(reservationIdentity, intent.reservationIdentity)
-              && sameDirectoryIdentity(fs, reservation, intent.reservationIdentity)) {
+          const reservationMissing = pathIsMissing(fs, reservation);
+          const transitionIsCompleting = intent
+            && (reservationMissing || pathIsMissing(fs, seized));
+          if (transitionIsCompleting && (reservationMissing
+              || (identitiesMatch(reservationIdentity, intent.reservationIdentity)
+                && sameDirectoryIdentity(fs, reservation, intent.reservationIdentity)))) {
             throw new LockError(
               'LOCK_CONTENDED',
               'wiki lock transition is completing',
@@ -996,8 +998,48 @@ function acquireLock(options = {}) {
   try {
     fs.mkdirSync(lockDir);
   } catch (cause) {
-    if (cause.code === 'EEXIST') throw new LockError('LOCK_CONTENDED', 'wiki lock is contended', readOwner(ownerPath, fs), cause);
-    throw new LockError('LOCK_FILESYSTEM', 'cannot create wiki lock', undefined, cause);
+    if (cause.code === 'EEXIST' && options.recoverDeadOwner !== false) {
+      let recovered = false;
+      try {
+        recovered = recoverLock({
+          wikiRoot,
+          fs,
+          staleMs: 0,
+          force: true,
+          now: options.now,
+          hostname: options.hostname,
+          isPidAlive: options.isPidAlive,
+          [RECOVERY_AFTER_RESTORE_SCAN]: true,
+        });
+      } catch (recoveryCause) {
+        throw new LockError(
+          'LOCK_CONTENDED',
+          'wiki lock is contended',
+          readOwner(ownerPath, fs),
+          recoveryCause,
+        );
+      }
+      if (!recovered) {
+        throw new LockError('LOCK_CONTENDED', 'wiki lock is contended', readOwner(ownerPath, fs), cause);
+      }
+      try {
+        fs.mkdirSync(lockDir);
+      } catch (retryCause) {
+        if (retryCause.code === 'EEXIST') {
+          throw new LockError(
+            'LOCK_CONTENDED',
+            'wiki lock is contended',
+            readOwner(ownerPath, fs),
+            retryCause,
+          );
+        }
+        throw new LockError('LOCK_FILESYSTEM', 'cannot create wiki lock', undefined, retryCause);
+      }
+    } else if (cause.code === 'EEXIST') {
+      throw new LockError('LOCK_CONTENDED', 'wiki lock is contended', readOwner(ownerPath, fs), cause);
+    } else {
+      throw new LockError('LOCK_FILESYSTEM', 'cannot create wiki lock', undefined, cause);
+    }
   }
   const acquiredDirectoryIdentity = readDirectoryIdentity(fs, lockDir);
   if (!acquiredDirectoryIdentity) {
@@ -1080,12 +1122,20 @@ function recoverLock(options = {}) {
   const { wikiRoot } = options;
   const fs = options.fs || nodeFs;
   const { meta, lockDir, ownerPath } = paths(wikiRoot);
-  resumePendingRestores({ fs, meta, lockDir });
+  if (options[RECOVERY_AFTER_RESTORE_SCAN] !== true) {
+    resumePendingRestores({ fs, meta, lockDir });
+  }
   const staleMs = options.staleMs;
   if (!Number.isFinite(staleMs) || staleMs < 0) throw new LockError('LOCK_INVALID', 'staleMs must be nonnegative');
   const candidate = captureRecoveryCandidate({ fs, lockDir, ownerPath });
   if (!candidate) return false;
   const owner = candidate.ownerRecord.owner;
+  if (options.expectedPid !== undefined) {
+    if (!Number.isSafeInteger(options.expectedPid) || options.expectedPid <= 0) {
+      throw new LockError('LOCK_INVALID', 'expectedPid must be a positive safe integer');
+    }
+    if (owner.pid !== options.expectedPid) return false;
+  }
   const now = options.now instanceof Date ? options.now : new Date(options.now || Date.now());
   const age = now.getTime() - Date.parse(owner.acquired_at);
   if (!Number.isFinite(age) || (options.force !== true && age <= staleMs)) return false;

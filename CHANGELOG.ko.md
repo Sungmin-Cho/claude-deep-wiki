@@ -7,6 +7,11 @@ deep-wiki의 주요 변경사항을 기록합니다.
 
 ## [Unreleased]
 
+### 수정
+
+- SessionStart scan-window 영속화를 감독되는 자식 프로세스로 분리했습니다. 시간초과 시 자식 트리 종료 완료를 확인한 뒤 해당 자식 PID와 일치하는 same-host dead lock만 회수하며, 일반 lock 획득도 live·foreign·malformed·ownerless contention을 약화하지 않고 같은 인증된 dead-owner 경우를 자체 복구합니다.
+- 완료된 scan-window journal이 무제한 누적되지 않습니다. 자동 유지보수는 현재 lock 아래에서 오래된 검증 완료 `ensure` terminal을 정리하고, 유계 `transaction prune` 명령은 eligible transaction 디렉터리 전체를 새 identity-bound sibling quarantine으로 원자 이동한 뒤 인증된 journal을 삭제합니다. 중단된 quarantine은 식별 가능한 상태로 남아 이후 유계 pass가 다시 처리합니다. exact journal-copy reservation은 quarantine 제거가 끝날 때까지 canonical source generation을 닫아 두고, 원본 journal unlink 뒤 중단되어도 exact fsynced backup으로 복구할 수 있습니다. 두 파일은 exclusive crash-recoverable pending publication을 사용하며, 이후 유계 pass는 partial publication, backup-only·빈 quarantine, 고아 exact reservation도 마무리합니다. 정리는 discovery·validation·복구 가능한 mutation phase 전반에서 deadline을 다시 검사합니다. age 조건을 충족한 완전 검증 `cleaned` scan-window 디렉터리만 제거하면서 in-flight·malformed·foreign-kind·linked·ambiguous 상태를 보존합니다. 결과의 `complete` 필드는 전체 순회와 deadline·limit로 잘린 pass를 구분합니다.
+
 ## [1.9.2] — 2026-07-27 (컨텍스트 다이어트)
 
 ### 변경

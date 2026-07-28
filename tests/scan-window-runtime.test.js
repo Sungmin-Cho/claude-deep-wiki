@@ -13,6 +13,7 @@ const repoRoot = path.resolve(__dirname, '..');
 const scanWindowPath = path.join(repoRoot, 'hooks', 'scripts', 'runtime', 'scan-window.js');
 const lockPath = path.join(repoRoot, 'hooks', 'scripts', 'runtime', 'lock.js');
 const deadlinePath = path.join(repoRoot, 'hooks', 'scripts', 'runtime', 'deadline.js');
+const cliPath = path.join(repoRoot, 'scripts', 'wiki-runtime.js');
 const racer = path.join(__dirname, 'fixtures', 'scan-window-racer.js');
 const roots = new Set();
 
@@ -227,6 +228,1534 @@ test('ensurePendingScan preserves a valid oldest pending value byte-identically'
   assert.equal(result.status, 'preserved');
   assert.deepEqual(readMaybe(metaPath(root, '.pending-scan')), before);
   assertState(root, { pending: `${T1}\r\n`, last: `${T0}\n` });
+});
+
+test('automatic scan-window maintenance keeps terminal transaction growth bounded', () => {
+  const { ensurePendingScan, createDeadline } = modules();
+  const root = temporaryWiki('deep wiki bounded ensure transactions ');
+  let finalProposal;
+
+  for (let index = 0; index < 16; index += 1) {
+    finalProposal = new Date(Date.parse(T1) + index * 1000)
+      .toISOString().replace('.000Z', 'Z');
+    const result = ensurePendingScan({
+      wikiRoot: root,
+      proposed: finalProposal,
+      deadline: createDeadline({ budgetMs: 3_000 }),
+    });
+    assert.notEqual(result.status, 'deferred');
+  }
+
+  const transactions = metaPath(root, '.transactions');
+  const directories = fs.readdirSync(transactions, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink());
+  assert.ok(directories.length <= 2, `terminal transaction directories: ${directories.length}`);
+
+  const beforeRetry = snapshotTree(transactions);
+  const retry = ensurePendingScan({
+    wikiRoot: root,
+    proposed: finalProposal,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(retry.status, 'deferred');
+  assert.deepEqual(snapshotTree(transactions), beforeRetry);
+});
+
+test('automatic maintenance failure never suppresses the persisted scan window', () => {
+  const { createDeadline, ensurePendingScan } = modules();
+  const root = temporaryWiki('deep wiki nonfatal automatic prune ');
+  const first = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(first.status, 'deferred');
+  fs.rmSync(metaPath(root, '.pending-scan'));
+  const transactions = metaPath(root, '.transactions');
+  const originalUnlink = fs.unlinkSync;
+  fs.unlinkSync = (pathname) => {
+    if (path.basename(pathname) === 'journal.json'
+        && path.basename(path.dirname(pathname)).startsWith('.prune-')) {
+      const error = new Error('injected terminal cleanup refusal');
+      error.code = 'EPERM';
+      throw error;
+    }
+    return originalUnlink(pathname);
+  };
+  let second;
+  try {
+    second = ensurePendingScan({
+      wikiRoot: root,
+      proposed: T2,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+  } finally {
+    fs.unlinkSync = originalUnlink;
+  }
+  assert.equal(second.status, 'created');
+  assert.equal(readMaybe(metaPath(root, '.pending-scan')).toString('utf8'), `${T2}\n`);
+  const preservedJournal = fs.readdirSync(transactions, { recursive: true })
+    .map((relative) => path.join(transactions, relative))
+    .find((pathname) => {
+      try {
+        const value = JSON.parse(fs.readFileSync(pathname, 'utf8'));
+        return value.operation_id === first.operationId
+          && value.transitions.at(-1) === 'cleaned';
+      } catch {
+        return false;
+      }
+    });
+  assert.ok(preservedJournal);
+});
+
+test('transaction pruning is token-fenced, conservative, age-gated, and exactly bounded', () => {
+  const {
+    acquireLock,
+    createDeadline,
+    ensurePendingScan,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki terminal prune ');
+  const transactions = metaPath(root, '.transactions');
+  const oldTime = new Date('2026-07-01T00:00:00.000Z');
+  const youngTime = new Date('2026-07-27T00:00:00.000Z');
+  const pruneNow = new Date('2026-07-28T00:00:00.000Z');
+
+  const interrupted = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+    faultInjector(boundary) {
+      if (boundary === 'after-transaction-activate') throw new Error('interrupt');
+    },
+  });
+  assert.equal(interrupted.status, 'deferred');
+  const inFlightJournalPath = journalFiles(root).find((journalPath) => {
+    const journal = JSON.parse(fs.readFileSync(journalPath, 'utf8'));
+    return journal.transitions.at(-1) !== 'cleaned';
+  });
+  assert.ok(inFlightJournalPath);
+  const inFlightJournal = JSON.parse(fs.readFileSync(inFlightJournalPath, 'utf8'));
+  const inFlightDirectory = path.dirname(inFlightJournalPath);
+  fs.utimesSync(inFlightJournalPath, oldTime, oldTime);
+  fs.utimesSync(inFlightDirectory, oldTime, oldTime);
+
+  const completed = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T2,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(completed.status, 'deferred');
+  const cleanedJournalPath = journalFiles(root).find((journalPath) => {
+    const journal = JSON.parse(fs.readFileSync(journalPath, 'utf8'));
+    return journal.transitions.at(-1) === 'cleaned';
+  });
+  assert.ok(cleanedJournalPath);
+  const cleanedDirectory = path.dirname(cleanedJournalPath);
+  fs.utimesSync(cleanedJournalPath, youngTime, youngTime);
+  fs.utimesSync(cleanedDirectory, youngTime, youngTime);
+
+  function copyCleanedTransaction(operationId, timestamp, destinationParent = transactions) {
+    const destination = path.join(destinationParent, operationId);
+    fs.cpSync(cleanedDirectory, destination, { recursive: true });
+    const journalPath = path.join(destination, 'journal.json');
+    const journal = JSON.parse(fs.readFileSync(journalPath, 'utf8'));
+    fs.writeFileSync(journalPath, `${JSON.stringify({ ...journal, operation_id: operationId })}\n`);
+    fs.utimesSync(journalPath, timestamp, timestamp);
+    fs.utimesSync(destination, timestamp, timestamp);
+    return destination;
+  }
+
+  const removableIds = [
+    'prunable-terminal-a',
+    'prunable-terminal-b',
+    'prunable-terminal-c',
+  ];
+  const removableDirectories = removableIds.map((operationId) =>
+    copyCleanedTransaction(operationId, oldTime));
+
+  const malformedDirectory = path.join(transactions, 'malformed-terminal');
+  fs.mkdirSync(malformedDirectory);
+  fs.writeFileSync(path.join(malformedDirectory, 'journal.json'), '{malformed\n');
+  fs.utimesSync(path.join(malformedDirectory, 'journal.json'), oldTime, oldTime);
+  fs.utimesSync(malformedDirectory, oldTime, oldTime);
+
+  const nonScanDirectory = path.join(transactions, 'foreign-operation');
+  fs.mkdirSync(nonScanDirectory);
+  fs.writeFileSync(path.join(nonScanDirectory, 'journal.json'), `${JSON.stringify({
+    contract_version: 1,
+    kind: 'ingest',
+    operation_id: 'foreign-operation',
+    transitions: ['cleaned'],
+  })}\n`);
+  fs.utimesSync(path.join(nonScanDirectory, 'journal.json'), oldTime, oldTime);
+  fs.utimesSync(nonScanDirectory, oldTime, oldTime);
+
+  const linkedTarget = path.join(root, 'external-linked-terminal');
+  copyCleanedTransaction('linked-terminal', oldTime, root);
+  fs.renameSync(path.join(root, 'linked-terminal'), linkedTarget);
+  const linkedEntry = path.join(transactions, 'linked-terminal');
+  fs.symlinkSync(linkedTarget, linkedEntry, process.platform === 'win32' ? 'junction' : 'dir');
+
+  const preserved = [
+    inFlightDirectory,
+    cleanedDirectory,
+    malformedDirectory,
+    nonScanDirectory,
+  ];
+  const preservedSnapshots = new Map(preserved.map((directory) => [
+    directory,
+    snapshotTree(directory),
+  ]));
+  const linkedTargetBefore = snapshotTree(linkedTarget);
+  const beforeWrongToken = snapshotTree(transactions);
+  const directoryCountBefore = fs.readdirSync(transactions, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink()).length;
+  assert.equal(directoryCountBefore, 7);
+
+  const owner = acquireLock({ wikiRoot: root, operation: 'transaction-prune' });
+  try {
+    assert.throws(() => pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: '0'.repeat(64),
+      maxAgeDays: 7,
+      limit: 2,
+      now: pruneNow,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    }), (error) => error.code === 'LOCK_TOKEN_MISMATCH');
+    assert.deepEqual(snapshotTree(transactions), beforeWrongToken);
+
+    const result = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 2,
+      now: pruneNow,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+    assert.deepEqual(result.removed, removableIds.slice(0, 2));
+  } finally {
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+
+  assert.equal(fs.existsSync(removableDirectories[0]), false);
+  assert.equal(fs.existsSync(removableDirectories[1]), false);
+  assert.equal(fs.existsSync(removableDirectories[2]), true);
+  for (const [directory, before] of preservedSnapshots) {
+    assert.deepEqual(snapshotTree(directory), before, directory);
+  }
+  assert.equal(inFlightJournal.operation_id, path.basename(inFlightDirectory));
+  assert.equal(fs.lstatSync(linkedEntry).isSymbolicLink(), true);
+  assert.deepEqual(snapshotTree(linkedTarget), linkedTargetBefore);
+  const directoryCountAfter = fs.readdirSync(transactions, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink()).length;
+  assert.equal(directoryCountAfter, 5);
+});
+
+test('transaction pruning preserves a hard-linked terminal journal byte-identically', () => {
+  const {
+    acquireLock,
+    createDeadline,
+    ensurePendingScan,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki hard linked terminal ');
+  const completed = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(completed.status, 'deferred');
+  const journal = path.join(
+    metaPath(root, '.transactions'),
+    completed.operationId,
+    'journal.json',
+  );
+  const linked = path.join(root, 'linked-terminal-journal.json');
+  fs.linkSync(journal, linked);
+  const before = fs.readFileSync(journal);
+  const owner = acquireLock({ wikiRoot: root, operation: 'hard-link-prune' });
+  try {
+    const result = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 0,
+      limit: 1,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+    assert.deepEqual(result.removed, []);
+  } finally {
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+  assert.deepEqual(fs.readFileSync(journal), before);
+  assert.deepEqual(fs.readFileSync(linked), before);
+  assert.equal(fs.statSync(journal).nlink, 2);
+  assert.equal(fs.statSync(linked).nlink, 2);
+});
+
+test('transaction pruning preserves noncanonical terminal journal bytes', () => {
+  const {
+    acquireLock,
+    createDeadline,
+    ensurePendingScan,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki noncanonical terminal journal ');
+  const completed = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(completed.status, 'deferred');
+  const transactions = metaPath(root, '.transactions');
+  const source = path.join(transactions, completed.operationId);
+  const oldTime = new Date('2026-07-01T00:00:00.000Z');
+  const pruneNow = new Date('2026-07-28T00:00:00.000Z');
+  const candidates = new Map();
+
+  for (const [operationId, mutate] of [
+    ['noncanonical-trailing-whitespace', (bytes) => bytes.replace(/\n$/, ' \n')],
+    ['noncanonical-duplicate-key', (bytes, journal) =>
+      bytes.replace(/^\{/, `{"kind":${JSON.stringify(journal.kind)},`)],
+  ]) {
+    const transaction = path.join(transactions, operationId);
+    fs.cpSync(source, transaction, { recursive: true });
+    const journalPath = path.join(transaction, 'journal.json');
+    const journal = JSON.parse(fs.readFileSync(journalPath, 'utf8'));
+    const canonical = `${JSON.stringify({ ...journal, operation_id: operationId })}\n`;
+    const noncanonical = Buffer.from(mutate(canonical, journal));
+    fs.writeFileSync(journalPath, noncanonical);
+    fs.utimesSync(journalPath, oldTime, oldTime);
+    fs.utimesSync(transaction, oldTime, oldTime);
+    candidates.set(journalPath, noncanonical);
+  }
+  fs.rmSync(source, { recursive: true });
+
+  const owner = acquireLock({ wikiRoot: root, operation: 'noncanonical-prune' });
+  try {
+    const result = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 8,
+      now: pruneNow,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+    assert.deepEqual(result, { processed: 0, removed: [], complete: true });
+  } finally {
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+
+  for (const [journalPath, before] of candidates) {
+    assert.deepEqual(fs.readFileSync(journalPath), before);
+  }
+});
+
+test('transaction pruning preserves a terminal journal whose mtime becomes young after eligibility', () => {
+  const {
+    acquireLock,
+    createDeadline,
+    ensurePendingScan,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki terminal prune mtime race ');
+  const completed = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(completed.status, 'deferred');
+  const transaction = path.join(
+    metaPath(root, '.transactions'),
+    completed.operationId,
+  );
+  const transactions = path.dirname(transaction);
+  const journal = path.join(transaction, 'journal.json');
+  const oldTime = new Date('2026-07-01T00:00:00.000Z');
+  const youngTime = new Date('2026-07-27T00:00:00.000Z');
+  const pruneNow = new Date('2026-07-28T00:00:00.000Z');
+  fs.utimesSync(journal, oldTime, oldTime);
+  const before = fs.readFileSync(journal);
+
+  const originalReaddir = fs.readdirSync;
+  let timestampChanged = false;
+  fs.readdirSync = (pathname, ...args) => {
+    if (!timestampChanged && pathname === transaction) {
+      fs.utimesSync(journal, youngTime, youngTime);
+      timestampChanged = true;
+    }
+    return originalReaddir(pathname, ...args);
+  };
+  const owner = acquireLock({ wikiRoot: root, operation: 'mtime-race-prune' });
+  let result;
+  try {
+    result = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 1,
+      now: pruneNow,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+  } finally {
+    fs.readdirSync = originalReaddir;
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+
+  assert.equal(timestampChanged, true);
+  assert.deepEqual(result.removed, []);
+  assert.deepEqual(fs.readFileSync(journal), before);
+  assert.equal(fs.statSync(journal).mtimeMs, youngTime.getTime());
+  assert.deepEqual(fs.readdirSync(transaction), ['journal.json']);
+});
+
+test('transaction pruning preserves the whole quarantine when identity changes at rename', () => {
+  const {
+    acquireLock,
+    createDeadline,
+    ensurePendingScan,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki terminal prune empty quarantine ');
+  const completed = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(completed.status, 'deferred');
+  const transaction = path.join(
+    metaPath(root, '.transactions'),
+    completed.operationId,
+  );
+  const transactions = path.dirname(transaction);
+  const journal = path.join(transaction, 'journal.json');
+  const oldTime = new Date('2026-07-01T00:00:00.000Z');
+  const youngTime = new Date('2026-07-27T00:00:00.000Z');
+  const pruneNow = new Date('2026-07-28T00:00:00.000Z');
+  fs.utimesSync(journal, oldTime, oldTime);
+  const before = fs.readFileSync(journal);
+
+  const originalRename = fs.renameSync;
+  let timestampChanged = false;
+  fs.renameSync = (source, destination, ...args) => {
+    if (!timestampChanged
+        && source === transaction
+        && path.dirname(destination) === transactions
+        && path.basename(destination).startsWith('.prune-')) {
+      fs.utimesSync(journal, youngTime, youngTime);
+      timestampChanged = true;
+    }
+    return originalRename(source, destination, ...args);
+  };
+  const owner = acquireLock({ wikiRoot: root, operation: 'identity-rename-prune' });
+  let result;
+  try {
+    result = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 1,
+      now: pruneNow,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+  } finally {
+    fs.renameSync = originalRename;
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+
+  assert.equal(timestampChanged, true);
+  assert.deepEqual(result.removed, []);
+  const preservedJournal = fs.readdirSync(transactions, { recursive: true })
+    .map((relative) => path.join(transactions, relative))
+    .find((pathname) => {
+      try { return fs.statSync(pathname).isFile() && fs.readFileSync(pathname).equals(before); }
+      catch { return false; }
+    });
+  assert.ok(preservedJournal);
+});
+
+test('transaction pruning preserves the journal when a late transaction entry appears', () => {
+  const {
+    acquireLock,
+    createDeadline,
+    ensurePendingScan,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki terminal prune late entry ');
+  const completed = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(completed.status, 'deferred');
+  const transaction = path.join(
+    metaPath(root, '.transactions'),
+    completed.operationId,
+  );
+  const transactions = path.dirname(transaction);
+  const journal = path.join(transaction, 'journal.json');
+  const oldTime = new Date('2026-07-01T00:00:00.000Z');
+  const pruneNow = new Date('2026-07-28T00:00:00.000Z');
+  fs.utimesSync(journal, oldTime, oldTime);
+  const journalBytes = fs.readFileSync(journal);
+
+  const originalRename = fs.renameSync;
+  let lateEntryCreated = false;
+  fs.renameSync = (source, destination, ...args) => {
+    if (!lateEntryCreated
+        && source === transaction
+        && path.dirname(destination) === transactions
+        && path.basename(destination).startsWith('.prune-')) {
+      fs.writeFileSync(path.join(transaction, 'late-entry'), 'ambiguous\n');
+      lateEntryCreated = true;
+    }
+    return originalRename(source, destination, ...args);
+  };
+  const owner = acquireLock({ wikiRoot: root, operation: 'late-entry-prune' });
+  let result;
+  try {
+    result = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 1,
+      now: pruneNow,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+  } finally {
+    fs.renameSync = originalRename;
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+
+  assert.equal(lateEntryCreated, true);
+  assert.deepEqual(result.removed, []);
+  fs.rmSync(metaPath(root, '.pending-scan'), { force: true });
+  const retry = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T2,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(retry.status, 'deferred');
+  const preservedJournal = fs.readdirSync(transactions, { recursive: true })
+    .map((relative) => path.join(transactions, relative))
+    .find((pathname) => {
+      try {
+        return fs.statSync(pathname).isFile()
+          && fs.readFileSync(pathname).equals(journalBytes);
+      } catch {
+        return false;
+      }
+    });
+  assert.ok(preservedJournal);
+});
+
+test('transaction pruning resumes an interrupted whole-directory quarantine', () => {
+  const {
+    acquireLock,
+    createDeadline,
+    ensurePendingScan,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki resumable terminal quarantine ');
+  const completed = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(completed.status, 'deferred');
+  const transactions = metaPath(root, '.transactions');
+  const transaction = path.join(transactions, completed.operationId);
+  const journal = path.join(transaction, 'journal.json');
+  const oldTime = new Date('2026-07-01T00:00:00.000Z');
+  const pruneNow = new Date('2026-07-28T00:00:00.000Z');
+  fs.utimesSync(journal, oldTime, oldTime);
+  const journalBytes = fs.readFileSync(journal);
+
+  const originalUnlink = fs.unlinkSync;
+  let unlinkRefused = false;
+  fs.unlinkSync = (pathname, ...args) => {
+    if (!unlinkRefused
+        && path.basename(pathname) === 'journal.json'
+        && path.basename(path.dirname(pathname)).startsWith('.prune-')) {
+      unlinkRefused = true;
+      const error = new Error('injected terminal quarantine interruption');
+      error.code = 'EPERM';
+      throw error;
+    }
+    return originalUnlink(pathname, ...args);
+  };
+
+  const owner = acquireLock({ wikiRoot: root, operation: 'resumable-quarantine-prune' });
+  try {
+    const first = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 1,
+      now: pruneNow,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+    assert.equal(unlinkRefused, true);
+    assert.deepEqual(first.removed, []);
+  } finally {
+    fs.unlinkSync = originalUnlink;
+  }
+
+  const quarantinedJournal = fs.readdirSync(transactions, { recursive: true })
+    .map((relative) => path.join(transactions, relative))
+    .find((pathname) => {
+      try {
+        return path.basename(path.dirname(pathname)).startsWith('.prune-')
+          && fs.statSync(pathname).isFile()
+          && fs.readFileSync(pathname).equals(journalBytes);
+      } catch {
+        return false;
+      }
+    });
+  assert.ok(quarantinedJournal);
+
+  try {
+    const second = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 1,
+      now: pruneNow,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+    assert.deepEqual(second.removed, [completed.operationId]);
+    assert.equal(fs.existsSync(path.dirname(quarantinedJournal)), false);
+  } finally {
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+});
+
+test('transaction pruning preserves the journal when its source reservation is replaced', () => {
+  const {
+    acquireLock,
+    createDeadline,
+    ensurePendingScan,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki replaced terminal prune reservation ');
+  const completed = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(completed.status, 'deferred');
+  const transactions = metaPath(root, '.transactions');
+  const transaction = path.join(transactions, completed.operationId);
+  const journal = path.join(transaction, 'journal.json');
+  const authenticReservation = path.join(root, 'authentic-prune-reservation');
+  const oldTime = new Date('2026-07-01T00:00:00.000Z');
+  const pruneNow = new Date('2026-07-28T00:00:00.000Z');
+  fs.utimesSync(journal, oldTime, oldTime);
+  const journalBytes = fs.readFileSync(journal);
+
+  const originalRename = fs.renameSync;
+  const originalUnlink = fs.unlinkSync;
+  let reservationReplaced = false;
+  fs.unlinkSync = (pathname, ...args) => {
+    if (!reservationReplaced
+        && path.basename(pathname) === 'journal.json'
+        && path.basename(path.dirname(pathname)).startsWith('.prune-')) {
+      originalRename(transaction, authenticReservation);
+      fs.writeFileSync(transaction, 'replacement reservation\n');
+      reservationReplaced = true;
+    }
+    return originalUnlink(pathname, ...args);
+  };
+  const owner = acquireLock({ wikiRoot: root, operation: 'replaced-reservation-prune' });
+  let result;
+  try {
+    result = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 1,
+      now: pruneNow,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+  } finally {
+    fs.unlinkSync = originalUnlink;
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+
+  assert.equal(reservationReplaced, true);
+  assert.deepEqual(result.removed, []);
+  const preservedJournal = fs.readdirSync(transactions, { recursive: true })
+    .map((relative) => path.join(transactions, relative))
+    .find((pathname) => {
+      try {
+        return fs.statSync(pathname).isFile()
+          && fs.readFileSync(pathname).equals(journalBytes);
+      } catch {
+        return false;
+      }
+    });
+  assert.ok(preservedJournal);
+  assert.equal(fs.statSync(authenticReservation).isFile(), true);
+});
+
+test('transaction pruning preserves exact evidence when its reservation is replaced during backup unlink', () => {
+  const {
+    acquireLock,
+    createDeadline,
+    ensurePendingScan,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki replaced reservation at backup unlink ');
+  const completed = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(completed.status, 'deferred');
+  const transactions = metaPath(root, '.transactions');
+  const transaction = path.join(transactions, completed.operationId);
+  const journal = path.join(transaction, 'journal.json');
+  const authenticReservation = path.join(transactions, '.authentic-prune-reservation');
+  const oldTime = new Date('2026-07-01T00:00:00.000Z');
+  const pruneNow = new Date('2026-07-28T00:00:00.000Z');
+  fs.utimesSync(journal, oldTime, oldTime);
+  const journalBytes = fs.readFileSync(journal);
+
+  const originalRename = fs.renameSync;
+  const originalUnlink = fs.unlinkSync;
+  let reservationReplaced = false;
+  fs.unlinkSync = (pathname, ...args) => {
+    if (!reservationReplaced
+        && path.basename(pathname) === 'journal.backup'
+        && path.basename(path.dirname(pathname)).startsWith('.prune-')) {
+      originalRename(transaction, authenticReservation);
+      fs.writeFileSync(transaction, 'replacement reservation\n');
+      reservationReplaced = true;
+    }
+    return originalUnlink(pathname, ...args);
+  };
+  const owner = acquireLock({ wikiRoot: root, operation: 'backup-unlink-replacement-prune' });
+  let result;
+  try {
+    result = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 1,
+      now: pruneNow,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+  } finally {
+    fs.unlinkSync = originalUnlink;
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+
+  assert.equal(reservationReplaced, true);
+  assert.deepEqual(result.removed, []);
+  assert.deepEqual(fs.readFileSync(authenticReservation), journalBytes);
+});
+
+test('transaction pruning resumes every interrupted reservation and backup publication phase', async (t) => {
+  const scenarios = [
+    ['source.reservation.pending', 'after-open'],
+    ['source.reservation.pending', 'partial-write'],
+    ['source.reservation.pending', 'before-fsync'],
+    ['journal.backup.pending', 'after-open'],
+    ['journal.backup.pending', 'partial-write'],
+    ['journal.backup.pending', 'before-fsync'],
+  ];
+  for (const [targetName, phase] of scenarios) {
+    await t.test(`${targetName}:${phase}`, () => {
+      const {
+        acquireLock,
+        createDeadline,
+        ensurePendingScan,
+        pruneScanWindowTransactions,
+        releaseLock,
+      } = modules();
+      const root = temporaryWiki(`deep wiki interrupted ${targetName} ${phase} `);
+      const completed = ensurePendingScan({
+        wikiRoot: root,
+        proposed: T1,
+        deadline: createDeadline({ budgetMs: 12_000 }),
+      });
+      assert.notEqual(completed.status, 'deferred');
+      const transactions = metaPath(root, '.transactions');
+      const journal = path.join(transactions, completed.operationId, 'journal.json');
+      const oldTime = new Date('2026-07-01T00:00:00.000Z');
+      const pruneNow = new Date('2026-07-28T00:00:00.000Z');
+      fs.utimesSync(journal, oldTime, oldTime);
+
+      const originalOpen = fs.openSync;
+      const originalWrite = fs.writeFileSync;
+      const originalFsync = fs.fsyncSync;
+      const tracked = new Set();
+      let interrupted = false;
+      fs.openSync = (pathname, ...args) => {
+        const descriptor = originalOpen(pathname, ...args);
+        if (!interrupted && path.basename(pathname) === targetName) {
+          tracked.add(descriptor);
+          if (phase === 'after-open') {
+            fs.closeSync(descriptor);
+            interrupted = true;
+            const error = new Error('injected interruption after publication open');
+            error.code = 'EIO';
+            throw error;
+          }
+        }
+        return descriptor;
+      };
+      fs.writeFileSync = (target, bytes, ...args) => {
+        if (!interrupted && tracked.has(target) && phase === 'partial-write') {
+          originalWrite(target, Buffer.from(bytes).subarray(0, Math.max(1, bytes.length >> 1)));
+          interrupted = true;
+          const error = new Error('injected partial publication write');
+          error.code = 'EIO';
+          throw error;
+        }
+        return originalWrite(target, bytes, ...args);
+      };
+      fs.fsyncSync = (descriptor, ...args) => {
+        if (!interrupted && tracked.has(descriptor) && phase === 'before-fsync') {
+          interrupted = true;
+          const error = new Error('injected interruption before publication fsync');
+          error.code = 'EIO';
+          throw error;
+        }
+        return originalFsync(descriptor, ...args);
+      };
+
+      const owner = acquireLock({ wikiRoot: root, operation: 'publication-interruption-prune' });
+      try {
+        const first = pruneScanWindowTransactions({
+          wikiRoot: root,
+          token: owner.token,
+          maxAgeDays: 7,
+          limit: 1,
+          now: pruneNow,
+          deadline: createDeadline({ budgetMs: 12_000 }),
+        });
+        assert.equal(interrupted, true);
+        assert.deepEqual(first.removed, []);
+      } finally {
+        fs.openSync = originalOpen;
+        fs.writeFileSync = originalWrite;
+        fs.fsyncSync = originalFsync;
+      }
+
+      try {
+        const second = pruneScanWindowTransactions({
+          wikiRoot: root,
+          token: owner.token,
+          maxAgeDays: 7,
+          limit: 1,
+          now: pruneNow,
+          deadline: createDeadline({ budgetMs: 12_000 }),
+        });
+        assert.deepEqual(second.removed, [completed.operationId]);
+        assert.equal(fs.readdirSync(transactions).length, 0);
+      } finally {
+        releaseLock({ wikiRoot: root, token: owner.token });
+      }
+    });
+  }
+});
+
+test('transaction pruning resumes when only the sealed quarantine backup remains', () => {
+  const {
+    acquireLock,
+    createDeadline,
+    ensurePendingScan,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki resumable terminal prune backup ');
+  const completed = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(completed.status, 'deferred');
+  const transactions = metaPath(root, '.transactions');
+  const journal = path.join(transactions, completed.operationId, 'journal.json');
+  const oldTime = new Date('2026-07-01T00:00:00.000Z');
+  const pruneNow = new Date('2026-07-28T00:00:00.000Z');
+  fs.utimesSync(journal, oldTime, oldTime);
+  const journalBytes = fs.readFileSync(journal);
+
+  const originalUnlink = fs.unlinkSync;
+  let backupUnlinkRefused = false;
+  fs.unlinkSync = (pathname, ...args) => {
+    if (!backupUnlinkRefused
+        && path.basename(pathname) === 'journal.backup'
+        && path.basename(path.dirname(pathname)).startsWith('.prune-')) {
+      backupUnlinkRefused = true;
+      const error = new Error('injected terminal backup cleanup refusal');
+      error.code = 'EPERM';
+      throw error;
+    }
+    return originalUnlink(pathname, ...args);
+  };
+
+  const owner = acquireLock({ wikiRoot: root, operation: 'resumable-backup-prune' });
+  try {
+    const first = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 1,
+      now: pruneNow,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+    assert.equal(backupUnlinkRefused, true);
+    assert.deepEqual(first.removed, []);
+  } finally {
+    fs.unlinkSync = originalUnlink;
+  }
+
+  const quarantinedBackup = fs.readdirSync(transactions, { recursive: true })
+    .map((relative) => path.join(transactions, relative))
+    .find((pathname) => {
+      try {
+        return path.basename(pathname) === 'journal.backup'
+          && fs.statSync(pathname).isFile()
+          && fs.readFileSync(pathname).equals(journalBytes);
+      } catch {
+        return false;
+      }
+    });
+  assert.ok(quarantinedBackup);
+
+  try {
+    const second = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 1,
+      now: pruneNow,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+    assert.deepEqual(second.removed, [completed.operationId]);
+    assert.equal(fs.existsSync(path.dirname(quarantinedBackup)), false);
+  } finally {
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+});
+
+test('transaction pruning resumes an empty quarantine under its active reservation', () => {
+  const {
+    acquireLock,
+    createDeadline,
+    ensurePendingScan,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki resumable empty terminal quarantine ');
+  const completed = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(completed.status, 'deferred');
+  const transactions = metaPath(root, '.transactions');
+  const journal = path.join(transactions, completed.operationId, 'journal.json');
+  const oldTime = new Date('2026-07-01T00:00:00.000Z');
+  const pruneNow = new Date('2026-07-28T00:00:00.000Z');
+  fs.utimesSync(journal, oldTime, oldTime);
+
+  const originalRmdir = fs.rmdirSync;
+  let quarantineRemovalRefused = false;
+  fs.rmdirSync = (pathname, ...args) => {
+    if (!quarantineRemovalRefused
+        && path.basename(pathname).startsWith('.prune-')) {
+      quarantineRemovalRefused = true;
+      const error = new Error('injected empty quarantine cleanup refusal');
+      error.code = 'EPERM';
+      throw error;
+    }
+    return originalRmdir(pathname, ...args);
+  };
+
+  const owner = acquireLock({ wikiRoot: root, operation: 'resumable-empty-prune' });
+  let emptyQuarantine;
+  try {
+    const first = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 1,
+      now: pruneNow,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+    assert.equal(quarantineRemovalRefused, true);
+    assert.deepEqual(first.removed, []);
+    emptyQuarantine = fs.readdirSync(transactions)
+      .find((name) => name.startsWith('.prune-'));
+    assert.ok(emptyQuarantine);
+    assert.deepEqual(fs.readdirSync(path.join(transactions, emptyQuarantine)), []);
+    assert.equal(fs.statSync(path.join(transactions, completed.operationId)).isFile(), true);
+  } finally {
+    fs.rmdirSync = originalRmdir;
+  }
+
+  try {
+    const second = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 1,
+      now: pruneNow,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+    assert.deepEqual(second.removed, [completed.operationId]);
+    assert.equal(fs.existsSync(path.join(transactions, emptyQuarantine)), false);
+    assert.equal(fs.existsSync(path.join(transactions, completed.operationId)), false);
+  } finally {
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+});
+
+test('transaction pruning removes an orphaned exact source reservation on retry', () => {
+  const {
+    acquireLock,
+    createDeadline,
+    ensurePendingScan,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki orphaned exact prune reservation ');
+  const completed = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(completed.status, 'deferred');
+  const transactions = metaPath(root, '.transactions');
+  const transaction = path.join(transactions, completed.operationId);
+  const journal = path.join(transaction, 'journal.json');
+  const oldTime = new Date('2026-07-01T00:00:00.000Z');
+  const pruneNow = new Date('2026-07-28T00:00:00.000Z');
+  fs.utimesSync(journal, oldTime, oldTime);
+
+  const originalUnlink = fs.unlinkSync;
+  let reservationUnlinkRefused = false;
+  fs.unlinkSync = (pathname, ...args) => {
+    if (!reservationUnlinkRefused
+        && pathname === transaction
+        && fs.statSync(pathname).isFile()) {
+      reservationUnlinkRefused = true;
+      const error = new Error('injected exact reservation cleanup refusal');
+      error.code = 'EPERM';
+      throw error;
+    }
+    return originalUnlink(pathname, ...args);
+  };
+  const owner = acquireLock({ wikiRoot: root, operation: 'exact-reservation-prune' });
+  try {
+    const first = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 1,
+      now: pruneNow,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+    assert.equal(reservationUnlinkRefused, true);
+    assert.deepEqual(first.removed, []);
+  } finally {
+    fs.unlinkSync = originalUnlink;
+  }
+
+  assert.equal(fs.statSync(transaction).isFile(), true);
+  try {
+    const second = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 1,
+      now: pruneNow,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+    assert.deepEqual(second.removed, [completed.operationId]);
+    assert.equal(fs.existsSync(transaction), false);
+  } finally {
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+});
+
+test('transaction pruning quarantines before deletion and preserves a last-check pathname replacement', () => {
+  const {
+    acquireLock,
+    createDeadline,
+    ensurePendingScan,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki terminal prune final identity race ');
+  const completed = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(completed.status, 'deferred');
+  const transaction = path.join(
+    metaPath(root, '.transactions'),
+    completed.operationId,
+  );
+  const transactions = path.dirname(transaction);
+  const journal = path.join(transaction, 'journal.json');
+  const authentic = path.join(root, 'authenticated-terminal-journal.json');
+  const replacement = Buffer.from('replacement must survive\n');
+  const oldTime = new Date('2026-07-01T00:00:00.000Z');
+  const pruneNow = new Date('2026-07-28T00:00:00.000Z');
+  fs.utimesSync(journal, oldTime, oldTime);
+  const authenticBytes = fs.readFileSync(journal);
+
+  const originalLstat = fs.lstatSync;
+  let journalChecks = 0;
+  let pathnameReplaced = false;
+  fs.lstatSync = (pathname, ...args) => {
+    const stat = originalLstat(pathname, ...args);
+    if (pathname === journal && ++journalChecks === 3) {
+      fs.renameSync(journal, authentic);
+      fs.writeFileSync(journal, replacement);
+      pathnameReplaced = true;
+    }
+    return stat;
+  };
+  const owner = acquireLock({ wikiRoot: root, operation: 'final-identity-race-prune' });
+  let result;
+  try {
+    result = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 1,
+      now: pruneNow,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+  } finally {
+    fs.lstatSync = originalLstat;
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+
+  assert.equal(pathnameReplaced, true);
+  assert.deepEqual(result.removed, []);
+  assert.deepEqual(fs.readFileSync(authentic), authenticBytes);
+  const survivingReplacement = fs.readdirSync(transactions, { recursive: true })
+    .map((relative) => path.join(transactions, relative))
+    .find((pathname) => {
+      try { return fs.statSync(pathname).isFile() && fs.readFileSync(pathname).equals(replacement); }
+      catch { return false; }
+    });
+  assert.ok(survivingReplacement);
+});
+
+test('transaction pruning reports incomplete traversal when its reserve expires before a late candidate', () => {
+  const {
+    acquireLock,
+    createDeadline,
+    ensurePendingScan,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki terminal prune incomplete deadline ');
+  const completed = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(completed.status, 'deferred');
+  const transactions = metaPath(root, '.transactions');
+  const source = path.join(transactions, completed.operationId);
+  const youngId = 'a-young-terminal';
+  const oldId = 'z-old-terminal';
+  const young = path.join(transactions, youngId);
+  const old = path.join(transactions, oldId);
+  const youngTime = new Date('2026-07-27T00:00:00.000Z');
+  const oldTime = new Date('2026-07-01T00:00:00.000Z');
+  const pruneNow = new Date('2026-07-28T00:00:00.000Z');
+  for (const [operationId, destination, timestamp] of [
+    [youngId, young, youngTime],
+    [oldId, old, oldTime],
+  ]) {
+    fs.cpSync(source, destination, { recursive: true });
+    const journal = path.join(destination, 'journal.json');
+    const value = JSON.parse(fs.readFileSync(journal, 'utf8'));
+    fs.writeFileSync(journal, `${JSON.stringify({ ...value, operation_id: operationId })}\n`);
+    fs.utimesSync(journal, timestamp, timestamp);
+  }
+  fs.rmSync(source, { recursive: true });
+
+  const clock = makeClock();
+  const originalReadFile = fs.readFileSync;
+  let advanced = false;
+  fs.readFileSync = (pathname, ...args) => {
+    const value = originalReadFile(pathname, ...args);
+    if (!advanced && pathname === path.join(young, 'journal.json')) {
+      clock.advance(800);
+      advanced = true;
+    }
+    return value;
+  };
+  const owner = acquireLock({ wikiRoot: root, operation: 'incomplete-prune' });
+  let first;
+  try {
+    first = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 8,
+      now: pruneNow,
+      deadline: createDeadline({ clock, budgetMs: 1_000 }),
+    });
+  } finally {
+    fs.readFileSync = originalReadFile;
+  }
+  assert.equal(advanced, true);
+  assert.deepEqual(first, { processed: 0, removed: [], complete: false });
+  assert.equal(fs.existsSync(old), true);
+
+  try {
+    const second = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 8,
+      now: pruneNow,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+    assert.deepEqual(second, { processed: 1, removed: [oldId], complete: true });
+  } finally {
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+});
+
+test('transaction prune stops between recoverable cleanup phases when cumulative work expires', () => {
+  const {
+    acquireLock,
+    createDeadline,
+    ensurePendingScan,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki cumulative prune deadline ');
+  const completed = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(completed.status, 'deferred');
+  const transactions = metaPath(root, '.transactions');
+  const journal = path.join(transactions, completed.operationId, 'journal.json');
+  const oldTime = new Date('2026-07-01T00:00:00.000Z');
+  const pruneNow = new Date('2026-07-28T00:00:00.000Z');
+  fs.utimesSync(journal, oldTime, oldTime);
+  const journalBytes = fs.readFileSync(journal);
+  let clockValue = -150;
+  const clock = { nowMs: () => { clockValue += 150; return clockValue; } };
+
+  const owner = acquireLock({ wikiRoot: root, operation: 'cumulative-deadline-prune' });
+  try {
+    const first = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 1,
+      now: pruneNow,
+      deadline: createDeadline({ clock, budgetMs: 1_000 }),
+    });
+    assert.deepEqual(first, { processed: 0, removed: [], complete: false });
+    const preserved = fs.readdirSync(transactions, { recursive: true })
+      .map((relative) => path.join(transactions, relative))
+      .some((pathname) => {
+        try {
+          return fs.statSync(pathname).isFile()
+            && fs.readFileSync(pathname).equals(journalBytes);
+        } catch {
+          return false;
+        }
+      });
+    assert.equal(preserved, true);
+
+    const second = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 1,
+      now: pruneNow,
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+    assert.deepEqual(second, {
+      processed: 1,
+      removed: [completed.operationId],
+      complete: true,
+    });
+  } finally {
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+});
+
+test('transaction prune bounds cumulative filesystem discovery after its deadline expires', () => {
+  const {
+    acquireLock,
+    createDeadline,
+    ensurePendingScan,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki bounded prune discovery ');
+  const completed = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(completed.status, 'deferred');
+  const transaction = path.join(
+    metaPath(root, '.transactions'),
+    completed.operationId,
+  );
+  const journal = path.join(transaction, 'journal.json');
+  const oldTime = new Date('2026-07-01T00:00:00.000Z');
+  const pruneNow = new Date('2026-07-28T00:00:00.000Z');
+  fs.utimesSync(journal, oldTime, oldTime);
+  const journalBytes = fs.readFileSync(journal);
+  const clock = makeClock();
+  const owner = acquireLock({ wikiRoot: root, operation: 'bounded-discovery-prune' });
+  const methods = ['lstatSync', 'readFileSync', 'readdirSync'];
+  const originals = new Map(methods.map((name) => [name, fs[name]]));
+  for (const name of methods) {
+    fs[name] = (...args) => {
+      const value = originals.get(name)(...args);
+      clock.advance(90);
+      return value;
+    };
+  }
+
+  let result;
+  try {
+    result = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 1,
+      now: pruneNow,
+      deadline: createDeadline({ clock, budgetMs: 1_000 }),
+    });
+  } finally {
+    for (const [name, original] of originals) fs[name] = original;
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+
+  assert.deepEqual(result, { processed: 0, removed: [], complete: false });
+  assert.ok(clock.nowMs() <= 2_000, `discovery stopped at ${clock.nowMs()} ms`);
+  assert.deepEqual(fs.readFileSync(journal), journalBytes);
+  assert.deepEqual(fs.readdirSync(transaction), ['journal.json']);
+});
+
+test('transaction prune returns incomplete when its deadline expires during owner preflight', () => {
+  const {
+    acquireLock,
+    createDeadline,
+    ensurePendingScan,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki bounded prune owner preflight ');
+  const completed = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(completed.status, 'deferred');
+  const transaction = path.join(
+    metaPath(root, '.transactions'),
+    completed.operationId,
+  );
+  const journal = path.join(transaction, 'journal.json');
+  const journalBytes = fs.readFileSync(journal);
+  const clock = makeClock();
+  const owner = acquireLock({ wikiRoot: root, operation: 'bounded-owner-preflight-prune' });
+  const originalRealpath = fs.realpathSync.native;
+  const originalRead = fs.readFileSync;
+  fs.realpathSync.native = (...args) => {
+    const value = originalRealpath(...args);
+    clock.advance(700);
+    return value;
+  };
+  fs.readFileSync = (...args) => {
+    const value = originalRead(...args);
+    clock.advance(700);
+    return value;
+  };
+
+  let result;
+  try {
+    result = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 1,
+      now: new Date('2026-07-28T00:00:00.000Z'),
+      deadline: createDeadline({ clock, budgetMs: 1_000 }),
+    });
+  } finally {
+    fs.realpathSync.native = originalRealpath;
+    fs.readFileSync = originalRead;
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+
+  assert.deepEqual(result, { processed: 0, removed: [], complete: false });
+  assert.equal(clock.nowMs(), 1_400);
+  assert.deepEqual(fs.readFileSync(journal), journalBytes);
+  assert.deepEqual(fs.readdirSync(transaction), ['journal.json']);
+});
+
+test('transaction prune does not wrap deadline expiry during final journal validation', () => {
+  const {
+    acquireLock,
+    createDeadline,
+    ensurePendingScan,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki bounded prune final journal validation ');
+  const completed = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(completed.status, 'deferred');
+  const transaction = path.join(
+    metaPath(root, '.transactions'),
+    completed.operationId,
+  );
+  const journal = path.join(transaction, 'journal.json');
+  const oldTime = new Date('2026-07-01T00:00:00.000Z');
+  fs.utimesSync(journal, oldTime, oldTime);
+  const journalBytes = fs.readFileSync(journal);
+  const clock = makeClock();
+  const owner = acquireLock({ wikiRoot: root, operation: 'bounded-final-journal-prune' });
+  const originalRead = fs.readFileSync;
+  fs.readFileSync = (pathname, ...args) => {
+    const value = originalRead(pathname, ...args);
+    if (pathname === journal) clock.advance(500);
+    return value;
+  };
+
+  let result;
+  try {
+    result = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 1,
+      now: new Date('2026-07-28T00:00:00.000Z'),
+      deadline: createDeadline({ clock, budgetMs: 1_000 }),
+    });
+  } finally {
+    fs.readFileSync = originalRead;
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+
+  assert.deepEqual(result, { processed: 0, removed: [], complete: false });
+  assert.equal(clock.nowMs(), 1_000);
+  assert.deepEqual(fs.readFileSync(journal), journalBytes);
+  assert.deepEqual(fs.readdirSync(transaction), ['journal.json']);
+});
+
+test('transaction prune checks its deadline within guarded parent validation', () => {
+  const {
+    acquireLock,
+    createDeadline,
+    ensurePendingScan,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki bounded prune guarded parents ');
+  const completed = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(completed.status, 'deferred');
+  const transactions = metaPath(root, '.transactions');
+  const transaction = path.join(transactions, completed.operationId);
+  const journal = path.join(transaction, 'journal.json');
+  const oldTime = new Date('2026-07-01T00:00:00.000Z');
+  fs.utimesSync(journal, oldTime, oldTime);
+  const journalBytes = fs.readFileSync(journal);
+  const clock = makeClock();
+  const owner = acquireLock({ wikiRoot: root, operation: 'bounded-parent-guard-prune' });
+  const guardedPaths = new Set([path.join(root, '.wiki-meta'), transactions, transaction]);
+  const originalLstat = fs.lstatSync;
+  fs.lstatSync = (pathname, ...args) => {
+    const value = originalLstat(pathname, ...args);
+    if (guardedPaths.has(pathname)) clock.advance(300);
+    return value;
+  };
+
+  let result;
+  try {
+    result = pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 7,
+      limit: 1,
+      now: new Date('2026-07-28T00:00:00.000Z'),
+      deadline: createDeadline({ clock, budgetMs: 1_000 }),
+    });
+  } finally {
+    fs.lstatSync = originalLstat;
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+
+  assert.deepEqual(result, { processed: 0, removed: [], complete: false });
+  assert.ok(clock.nowMs() <= 1_500, `guarded validation stopped at ${clock.nowMs()} ms`);
+  assert.deepEqual(fs.readFileSync(journal), journalBytes);
+  assert.deepEqual(fs.readdirSync(transaction), ['journal.json']);
+});
+
+test('transaction prune CLI exposes bounded terminal cleanup under the caller lock', () => {
+  const { acquireLock, createDeadline, ensurePendingScan, releaseLock } = modules();
+  const root = temporaryWiki('deep wiki transaction prune cli ');
+  const completed = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  const completedDirectory = path.dirname(journalFiles(root)[0]);
+  const oldTime = new Date('2026-07-01T00:00:00.000Z');
+  fs.utimesSync(path.join(completedDirectory, 'journal.json'), oldTime, oldTime);
+  fs.utimesSync(completedDirectory, oldTime, oldTime);
+  const owner = acquireLock({ wikiRoot: root, operation: 'transaction-prune-cli' });
+  try {
+    const result = spawnSync(process.execPath, [
+      cliPath,
+      'transaction', 'prune',
+      '--wiki-root', root,
+      '--lock-token', owner.token,
+      '--max-age-days', '0',
+      '--json',
+    ], {
+      encoding: 'utf8',
+      shell: false,
+      timeout: 5_000,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout).removed, [completed.operationId]);
+  } finally {
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
 });
 
 test('ensurePendingScan is stale at or before last-scan and repairs corrupt pending only for a newer proposal', () => {

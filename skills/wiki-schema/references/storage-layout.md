@@ -38,7 +38,10 @@ The supported operation catalog is:
 
 Callers never use shell traps or direct directory removal. They release in a
 guaranteed final step. A crash intentionally leaves authenticated state for
-`lock recover` rather than risking release of a replacement owner's lock.
+recovery rather than risking release of a replacement owner's lock. The next
+ordinary acquisition may reclaim that state without an age delay only after
+the complete owner is structurally valid, same-host, and proved dead;
+otherwise `lock recover` remains the explicit operator route.
 
 ## Journal protocol
 
@@ -48,6 +51,25 @@ version, provenance, catalog, and lifecycle changes, then records a terminal
 state. `transaction recover` accepts the same operation ID and owner token and
 is idempotent. It either completes the recorded operation or restores the
 pre-operation state; it never invents a new action.
+
+The operator-only `transaction prune` command is the bounded terminal cleanup operation. With the caller's
+current owner token, it removes only structurally valid scan-window journals
+whose final transition is `cleaned`, whose directory contains no other entry,
+and whose journal age exceeds `--max-age-days`. Before unlinking, the runtime
+atomically moves the complete transaction directory into a fresh identity-bound
+sibling quarantine and revalidates the directory plus journal identity, bytes,
+age, and link count there. An interrupted quarantine remains recognizable and
+is retried by a later bounded pass. An exact journal-copy reservation closes
+the canonical source generation through quarantine removal, and an exact
+fsynced backup preserves authenticated evidence after the original journal
+unlink. Both use exclusive crash-recoverable pending publication. Later
+bounded passes resume partial publications, backup-only or empty quarantines,
+and orphaned exact reservations, checking the deadline across discovery,
+validation, and recoverable mutation phases. It preserves in-flight,
+malformed, foreign-kind, linked, young, and otherwise ambiguous entries.
+Repeat the command while `complete` is `false` to traverse more than one bounded
+pass. `complete: true` means every entry listed for that pass was inspected; it
+does not claim that ambiguous entries were removed.
 
 ## Scan windows
 

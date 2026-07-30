@@ -231,6 +231,23 @@ const ANY_ROOT = String.raw`(?:(?:${ANCHOR})${SEP}|${REL}|(?:${PLUGIN_DIRS})${SE
 // Each pattern captures the path token in group 1, so anchoring and containment
 // are judged per token rather than per line — a line mixing an anchored and a bare
 // path must still fail on the bare one.
+// Extensions are asked of the shipped index, not listed. The listed version missed
+// what the plugin actually ships: deep-wiki ships a `.py`, and all three ship a
+// `.yml` that no list held. A new file type added tomorrow joins these sets by
+// existing, which is the point.
+const SHIPPED_EXTS = [...new Set([...PLUGIN_FILES]
+  .map((k) => (k.match(/\.([A-Za-z0-9]+)$/) || [])[1]).filter(Boolean))].sort();
+// For "is this token an instruction to RUN something", the list is INVERTED. Naming
+// the executable extensions is fail-open — the extension nobody thought of is
+// silently inert. Naming the inert ones is fail-closed: an unfamiliar extension is
+// treated as runnable and gets flagged, and the cost of being wrong is a review
+// conversation instead of a miss.
+const INERT_EXTS = new Set(['md', 'json', 'jsonl', 'yaml', 'yml', 'txt', 'lock',
+  'png', 'svg', 'gif', 'ico', 'csv', 'gitkeep', 'gitignore', 'gitattributes']);
+const EXEC_EXTS = SHIPPED_EXTS.filter((e) => !INERT_EXTS.has(e));
+const RESOLVABLE_EXT = SHIPPED_EXTS.join('|');
+const EXECUTABLE_EXT = EXEC_EXTS.join('|');
+
 const FORMS = [
   // 1. interpreter exec: `node X`, `bash X`, `sh X`, `python X`
   ['interpreter-exec', new RegExp(String.raw`\b(?:bash|sh|zsh|node|python3?)\s+["'\`]?(${ANY_ROOT}${PATH_BODY})`, 'g')],
@@ -243,7 +260,7 @@ const FORMS = [
   //    `hooks.json` — a real file here — and the guard reports a path that never
   //    existed. The lookbehind keeps `/` and `\` in its class so an already-matched
   //    anchored prefix does not also produce a bare hit on its own tail.
-  ['executable-token', new RegExp(String.raw`(?<![A-Za-z0-9._/\\{}<>$-])((?:${ANCHOR})${SEP}|${REL}|(?:${PLUGIN_DIRS})${SEP})([A-Za-z0-9._/\\-]*\.(?:js|cjs|mjs|sh)(?![A-Za-z0-9]))`, 'g')],
+  ['executable-token', new RegExp(String.raw`(?<![A-Za-z0-9._/\\{}<>$-])((?:${ANCHOR})${SEP}|${REL}|(?:${PLUGIN_DIRS})${SEP})([A-Za-z0-9._/\\-]*\.(?:${EXECUTABLE_EXT})(?![A-Za-z0-9]))`, 'g')],
 ];
 
 // DENY BY DEFAULT.
@@ -1155,7 +1172,7 @@ test('no undeclared path under a maintainer-only directory is named', () => {
   // `**docs/X.md**` and `[docs/Y.md](…)` are ordinary markdown and slip past a
   // space/backtick/quote/paren list.
   const escaped = MAINTAINER_ONLY_DIRS.map((d) => d.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
-  const re = new RegExp(String.raw`(?<![A-Za-z0-9._\\/-])((?:${escaped})[\\/][A-Za-z0-9._\\/-]+)`, 'g');
+  const re = new RegExp(String.raw`(?<![A-Za-z0-9._\\/-])(?:\.[\\/])?((?:${escaped})[\\/][A-Za-z0-9._\\/-]+)`, 'g');
 
   // Both spellings and both prefix shapes, pinned on the axis rather than left to
   // whatever the corpus happens to contain today.
@@ -1533,7 +1550,7 @@ test('every referenced plugin path resolves inside the root', () => {
     // Trailing boundary, same reason as the guard: without it `.js` matches the
     // prefix of `.json` — and `hooks/hooks.json` is a real file here — so the
     // resolver would report paths that never existed.
-    [new RegExp(String.raw`${ANCHOR}[\\/]([A-Za-z0-9._\\/-]+\.(?:md|js|cjs|mjs|sh|json|yaml|yml)(?![A-Za-z0-9]))`, 'g'), false],
+    [new RegExp(String.raw`${ANCHOR}[\\/]([A-Za-z0-9._\\/-]+\.(?:${RESOLVABLE_EXT})(?![A-Za-z0-9]))`, 'g'), false],
     [/`(\.\.[\\/][A-Za-z0-9._\\/-]+\.md)(?:#[a-z0-9-]+)?`/g, true],
     [/\]\((\.\.?[\\/][A-Za-z0-9._\\/-]+\.md)\)/g, true],
     // Read("../x/y.md") — the double-quoted call form. Outside the backtick pattern.

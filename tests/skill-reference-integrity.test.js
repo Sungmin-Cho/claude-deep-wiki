@@ -242,15 +242,27 @@ const SHIPPED_EXTS = [...new Set([...PLUGIN_FILES]
 // silently inert. Naming the inert ones is fail-closed: an unfamiliar extension is
 // treated as runnable and gets flagged, and the cost of being wrong is a review
 // conversation instead of a miss.
-const INERT_EXTS = new Set(['md', 'json', 'jsonl', 'yaml', 'yml', 'txt', 'lock',
-  'png', 'svg', 'gif', 'ico', 'csv', 'gitkeep', 'gitignore', 'gitattributes']);
+const INERT_EXTS = new Set(['md', 'mdx', 'json', 'jsonl', 'yaml', 'yml', 'toml', 'txt',
+  'csv', 'tsv', 'lock', 'html', 'css', 'xml', 'map', 'snap', 'png', 'svg', 'gif', 'ico',
+  'gitkeep', 'gitignore', 'gitattributes', 'nvmrc', 'editorconfig']);
 const EXEC_EXTS = SHIPPED_EXTS.filter((e) => !INERT_EXTS.has(e));
+// The EXISTENCE sweep deliberately takes ANY extension. Deriving it from what the repo
+// ships made it blind exactly where the reference is certainly broken: an anchored
+// `…/missing-config.toml` went unchecked BECAUSE no `.toml` is shipped. The derived set
+// earns its keep in EXECUTABLE_EXT below, where the question is "would this be run".
 const RESOLVABLE_EXT = SHIPPED_EXTS.join('|');
 const EXECUTABLE_EXT = EXEC_EXTS.join('|');
 
+// One list, used by both rules that decide "is this token in command position".
+// They had drifted: `BARE_EXEC_BASENAME` accepted `deno` and `bun`, `interpreter-exec`
+// did not, in this same file — so `bun scripts/missing-tool` was silent while
+// `bun missing-tool.js` was caught. This is still an enumeration and still fail-open on
+// the interpreter nobody added; sharing it does not settle that, it only stops the two
+// halves from disagreeing about the same question.
+const INTERPRETERS = 'bash|sh|zsh|node|python3?|deno|bun|npx|pnpm|yarn|tsx|ts-node';
 const FORMS = [
   // 1. interpreter exec: `node X`, `bash X`, `sh X`, `python X`
-  ['interpreter-exec', new RegExp(String.raw`\b(?:bash|sh|zsh|node|python3?)\s+["'\`]?(${ANY_ROOT}${PATH_BODY})`, 'g')],
+  ['interpreter-exec', new RegExp(String.raw`\b(?:${INTERPRETERS})\s+["'\`]?(${ANY_ROOT}${PATH_BODY})`, 'g')],
   // 2. read verb: `Read X`, `Follow X`, `Read("X")`
   ['read-verb', new RegExp(String.raw`\b(?:Read|Follow|read|follow)\s*\(?\s*["'\`]?(${ANY_ROOT}${PATH_BODY}\.md)`, 'g')],
   // 3. direct exec / source
@@ -413,7 +425,7 @@ const BARE_BASENAME = /\b(?:Read|Follow|read|follow)\s*\(?\s*["'`]([A-Za-z0-9][A
 // Membership in the shipped set is still required, so prose that merely names a
 // script is untouched; it is the interpreter that makes it an instruction.
 const BARE_EXEC_BASENAME =
-  /\b(?:node|python3?|deno|bun|bash|sh|zsh)\s+["'`]?([A-Za-z0-9][A-Za-z0-9._-]*\.(?:js|cjs|mjs|py|sh))["'`]?/g;
+  new RegExp(String.raw`\b(?:${INTERPRETERS})\s+["'\`]?([A-Za-z0-9][A-Za-z0-9._-]*\.(?:${EXECUTABLE_EXT}))["'\`]?`, 'g');
 
 function bareBasenameHits(line) {
   const out = [];
@@ -557,6 +569,50 @@ test('every skill and always-loaded markdown file has balanced code fences', () 
     'an indented fence pair must be counted, or a truncated list block reads as balanced');
   assert.equal(fenceCount('1. step\n   ```bash\n   x\n'), 1,
     'and its truncated form must read as odd');
+
+  // Parity is a proxy, and it detects neither real failure. `skills/deep-report/SKILL.md`
+  // carried fourteen markers — even, so this sweep passed — while a ```bash with an info
+  // string failed to close the ```markdown template above it, a later bare marker closed
+  // that template instead, and the final block was never closed at all. Half the document
+  // rendered as code. So the parity count stays (it catches a truncating split cheaply)
+  // and CommonMark's own rule is asserted beside it: a closer matches the opener's
+  // character, is at least as long, and carries NO info string.
+  //
+  // CARVE-OUT, deliberate: `fenceRegions()` must NOT be made CommonMark-correct. It
+  // answers a different question — whether a reader copying from a binding to its use
+  // crosses a boundary, because two fenced blocks are two shell invocations — and
+  // marker counting is the right model for that. The two differing readings are not an
+  // inconsistency to tidy away.
+  const openAtEof = (body) => {
+    let open = null;
+    for (const line of body.split('\n')) {
+      const m = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+      if (!m) continue;
+      const ch = m[1][0];
+      const len = m[1].length;
+      if (open === null) { open = { ch, len }; continue; }
+      if (ch === open.ch && len >= open.len && !m[2].trim()) open = null;
+    }
+    return open !== null;
+  };
+  assert.equal(openAtEof('```js\nx\n```\n'), false, 'a closed block is closed');
+  assert.equal(openAtEof('```js\nx\n'), true, 'a truncated block is open at EOF');
+  // The real shape, not a shorthand for it: an info-string marker cannot close, so the
+  // bare marker meant to end the NESTED block ends the outer one instead, and every
+  // later marker is off by one until the last opens a block nothing closes. A
+  // two-marker fixture does not reproduce this — it just closes the outer early.
+  assert.equal(openAtEof('```markdown\n```bash\nx\n```\nmore\n```\n'), true,
+    'same-length nesting shifts every later marker and leaves the last block open');
+  assert.equal(openAtEof('````markdown\n```bash\nx\n```\nmore\n````\n'), false,
+    'and a longer outer fence nests correctly, which is the fix applied to deep-report');
+
+  const truncated = [];
+  for (const file of markdownFiles()) {
+    if (openAtEof(fs.readFileSync(file, 'utf8'))) truncated.push(path.relative(ROOT, file));
+  }
+  assert.deepEqual(truncated, [],
+    'a code fence is still open at end of file — the rest of the document renders as '
+    + `code:\n  ${truncated.join('\n  ')}`);
 
   const unbalanced = [];
   for (const file of markdownFiles()) {
@@ -1550,7 +1606,7 @@ test('every referenced plugin path resolves inside the root', () => {
     // Trailing boundary, same reason as the guard: without it `.js` matches the
     // prefix of `.json` — and `hooks/hooks.json` is a real file here — so the
     // resolver would report paths that never existed.
-    [new RegExp(String.raw`${ANCHOR}[\\/]([A-Za-z0-9._\\/-]+\.(?:${RESOLVABLE_EXT})(?![A-Za-z0-9]))`, 'g'), false],
+    [new RegExp(String.raw`${ANCHOR}[\\/]([A-Za-z0-9._\\/-]+\.(?:[A-Za-z0-9]+)(?![A-Za-z0-9]))`, 'g'), false],
     [/`(\.\.[\\/][A-Za-z0-9._\\/-]+\.md)(?:#[a-z0-9-]+)?`/g, true],
     [/\]\((\.\.?[\\/][A-Za-z0-9._\\/-]+\.md)\)/g, true],
     // Read("../x/y.md") — the double-quoted call form. Outside the backtick pattern.

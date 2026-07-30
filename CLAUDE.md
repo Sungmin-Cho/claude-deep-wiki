@@ -13,4 +13,4 @@ what the plugin is and why. Only Claude Code-specific behaviour belongs here.
   `deep-wiki:wiki-synthesizer-worker`, `deep-wiki:wiki-page-writer` — and a
   named-agent resolution error must fail that work rather than fall back to a generic
   agent. Codex performs the same work sequentially in its main caller. See
-  `skills/wiki-ingest/SKILL.md` §2.
+  `<plugin_root>/skills/wiki-ingest/SKILL.md` §2.

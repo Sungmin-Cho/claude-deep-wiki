@@ -3,28 +3,33 @@
 LLM-managed markdown wiki for persistent knowledge accumulation, exposing skills,
 hooks and agents to both Claude Code and Codex.
 
-Read the version with `jq -r .version .claude-plugin/plugin.json` — it is triple-synced
-across `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json` and `package.json`.
+Read the version with `jq -r .version <plugin_root>/.claude-plugin/plugin.json` — anchored,
+because unanchored that command reads the *analysed* project's manifest, and every
+plugin checkout has one. It is triple-synced across `<plugin_root>/.claude-plugin/plugin.json`,
+`<plugin_root>/.codex-plugin/plugin.json` and `<plugin_root>/package.json`.
 Never hardcode it in a doc. Dev setup, tests and PR rules live in `CONTRIBUTING.md`;
-documentation rules in `docs/DOCS_RULE.md` (local-only, gitignored).
+documentation rules in `docs/DOCS_RULE.md` — a maintainer rulebook that is gitignored and
+ships with nothing. It exists only in a maintainer's own checkout; never try to open it at
+runtime, because the only place that path can resolve in an installed plugin is the project
+being analysed.
 
 ## Where the contracts live
 
 | Concern | Authority | Gate |
 |---|---|---|
 | Wiki state — storage layout, page + provenance schema, invariants, lock and journal protocol, lifecycle `action` vocabulary | `skills/wiki-schema/`: `SKILL.md` (LLM-readable), `wiki-schema.yaml` (machine-readable), `references/storage-layout.md` (operation catalog) | `npm test` |
-| Per-skill runtime routes | `skills/wiki-*/SKILL.md`; every argv is allowlisted in `scripts/lib/executable-contract.js` | `npm run lint:commands` |
+| Per-skill runtime routes | `<plugin_root>/skills/wiki-*/SKILL.md`; every argv is allowlisted in `<plugin_root>/scripts/lib/executable-contract.js` | `npm run lint:commands` |
 | Subagent roles and tool grants | `agents/*.md` | `npm run lint:agents` |
-| SessionStart vault scan | `hooks/hooks.json` (15-second timeout) → `hooks/scripts/` | `npm run lint:hook-command` |
-| Emitted `index.json` envelope | `hooks/scripts/envelope.js` | `npm run validate-fixture` |
+| SessionStart vault scan | `<plugin_root>/hooks/hooks.json` (15-second timeout) → `<plugin_root>/hooks/scripts/` | `npm run lint:hook-command` |
+| Emitted `index.json` envelope | `<plugin_root>/hooks/scripts/envelope.js` | `npm run validate-fixture` |
 
-`scripts/wiki-runtime.js` is the sole authority for configuration, lock ownership,
+`<plugin_root>/scripts/wiki-runtime.js` is the sole authority for configuration, lock ownership,
 versioning, journaled mutation, derived state and scan-window transitions. Skills and
 agents describe intent; they never mutate wiki state directly.
 
 A new entry skill is auto-discovered on both hosts from `skills/<name>/SKILL.md` with
 `user-invocable: true` and `runtime_hosts: [claude, codex]` frontmatter. Register it in
-`SKILL_COMMAND_CONTRACTS` (`scripts/lib/executable-contract.js`) in the same change: the
+`SKILL_COMMAND_CONTRACTS` (`<plugin_root>/scripts/lib/executable-contract.js`) in the same change: the
 linters iterate that map, so a skill missing from it is never argv-validated by anything.
 
 ## Invariants that bite
@@ -52,12 +57,12 @@ linters iterate that map, so a skill missing from it is never argv-validated by 
 
 ## Runtime safety boundary
 
-`tests/plugin-contract.test.js` pins fourteen phrases drawn from the bullets below across
+`<plugin_root>/tests/plugin-contract.test.js` pins fourteen phrases drawn from the bullets below across
 `README.md`, this file, `CONTRIBUTING.md` and `SECURITY.md` (with a Korean mirror in
 `README.ko.md`). That covers the load-bearing wording, not every clause: the
 version-specific detail — `contract_version` 2, the 1.8 → 1.7.1 and 1.9 → 1.8.2 pairs, the
 Windows plugin-root pre-expansion — is asserted by **no doc test**, so the prose can rot
-even while the behaviour holds (`tests/wiki-state-runtime.test.js` does pin the journal's
+even while the behaviour holds (`<plugin_root>/tests/wiki-state-runtime.test.js` does pin the journal's
 `contract_version`). Change any of it only when the evidence changes.
 
 - Mutation is governed by a cooperative current writer contract with complete
@@ -101,7 +106,7 @@ The plugin repo owns its own release: bump the version triple, add the entry to
 `CHANGELOG.md` **and** `CHANGELOG.ko.md`, then merge to `main`.
 
 Re-pinning the suite happens in `claude-deep-suite` and takes four steps, because
-`scripts/release-bump.js` writes `.claude-plugin/marketplace.json` only while the
+deep-suite's own release-bump script writes its marketplace manifest only while the
 `preflight` it runs checks the Codex mirror and the workflow guides too:
 
 1. `npm run release:bump -- deep-wiki <sha40> --description="<new headline>"`. The
@@ -116,7 +121,7 @@ Re-pinning the suite happens in `claude-deep-suite` and takes four steps, becaus
    `check-guide-version.js` inside `docs:sync`. That narrative is hand-curated prose
    outside the auto-generated markers, so `docs:write` never regenerates it.
 3. Sync `.agents/plugins/marketplace.json` by hand — the next failure, from
-   `tests/codex-marketplace-contract.test.js`, which only becomes reachable once
+   deep-suite's Codex marketplace contract test, which only becomes reachable once
    `docs:sync` passes. Copy all three fields the bump touched: the `source` object, the
    redundant top-level `sha` mirror, and `description`. The contract test compares only
    `source`, so a stale top-level `sha` or blurb in the mirror passes every gate and

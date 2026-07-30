@@ -14,6 +14,28 @@ const fixturePath = path.join(__dirname, 'fixtures', 'scanner-worker-fixture.js'
 const persistFixturePath = path.join(__dirname, 'fixtures', 'scan-window-persist-fixture.js');
 const roots = new Set();
 
+// SIGKILL is asynchronous: the signal is delivered, then the kernel reaps. A fixed sleep
+// bets that the reap fits in it, and on a loaded CI runner that bet loses — these tests
+// were red on `macos-15-intel` and green on three other runners. Poll for the reap
+// instead. The contract is that the process dies, not that it dies inside 50 ms.
+async function awaitReaped(pid, budgetMs = 10_000) {
+  const deadline = Date.now() + budgetMs;
+  for (;;) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if (error.code === 'ESRCH') return;
+      throw error;
+    }
+    if (Date.now() >= deadline) {
+      throw new assert.AssertionError({
+        message: `pid ${pid} still alive after ${budgetMs} ms — the worker tree was not killed`,
+      });
+    }
+    await new Promise((resolve) => { setTimeout(resolve, 10); });
+  }
+}
+
 function temporaryRoot(prefix) {
   const value = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
   roots.add(value);
@@ -86,14 +108,14 @@ test('parent deadline remains authoritative through persistence and before outpu
   await assert.rejects(
     runSupervisor({
       workerPath: fixturePath,
-      timeoutMs: 100,
+      timeoutMs: 1_000,
       env: {
         ...process.env,
         SCANNER_FIXTURE_MODE: 'valid',
         SCANNER_RESULT_JSON: JSON.stringify(validResult(base)),
       },
       ensurePendingScan() {
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 150);
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1_500);
         return { status: 'created' };
       },
     }),
@@ -133,7 +155,7 @@ test('timeout kills the complete POSIX worker tree', { skip: process.platform ==
   const pidFile = path.join(base, 'grandchild.pid');
   await hookMain({
     workerPath: fixturePath,
-    timeoutMs: 100,
+    timeoutMs: 1_000,
     env: {
       ...process.env,
       SCANNER_FIXTURE_MODE: 'grandchild-hang',
@@ -145,8 +167,7 @@ test('timeout kills the complete POSIX worker tree', { skip: process.platform ==
   });
   assert.equal(fs.existsSync(pidFile), true);
   const pid = Number(fs.readFileSync(pidFile, 'utf8'));
-  await new Promise((resolve) => setTimeout(resolve, 50));
-  assert.throws(() => process.kill(pid, 0), (error) => error.code === 'ESRCH');
+  await awaitReaped(pid);
 });
 
 test('persistence timeout kills its worker and reclaims only that worker lock', async () => {
@@ -266,7 +287,7 @@ for (const mode of ['malformed-grandchild-hang', 'missing-grandchild-hang', 'non
     const pidFile = path.join(base, 'grandchild.pid');
     await hookMain({
       workerPath: fixturePath,
-      timeoutMs: 150,
+      timeoutMs: 1_000,
       env: {
         ...process.env,
         SCANNER_FIXTURE_MODE: mode,
@@ -278,8 +299,7 @@ for (const mode of ['malformed-grandchild-hang', 'missing-grandchild-hang', 'non
     });
     assert.equal(fs.existsSync(pidFile), true);
     const pid = Number(fs.readFileSync(pidFile, 'utf8'));
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    assert.throws(() => process.kill(pid, 0), (error) => error.code === 'ESRCH');
+    await awaitReaped(pid);
   });
 }
 

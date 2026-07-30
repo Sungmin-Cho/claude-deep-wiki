@@ -31,6 +31,14 @@ envelope-aware catalog, lifecycle state, provenance, and pending scan window.
 {"executable":"node","argv":["<plugin_root>/scripts/wiki-runtime.js","snapshot","--wiki-root","ABSOLUTE_WIKI_ROOT","--json"]}
 ```
 
+If snapshot exits `DEADLINE_EXCEEDED` or `TRANSACTION_RECOVERY_REQUIRED`
+while inspecting transaction state, do not delete or rewrite that evidence.
+The timeout result states whether worker-tree termination was requested but
+unconfirmed, or could not be requested or confirmed. Never infer that either
+result means the worker or its descendants have exited. Stop all hosts, restore
+filesystem readability, rerun snapshot, and only then recover any authenticated
+nonterminal operation reported by the runtime.
+
 Normalize each input into a source record. Preserve its origin, type, title,
 content hash, and exact excerpts used. Reject secrets, unsupported binary data,
 or a source that cannot be read. An unchanged hash may be skipped only when its

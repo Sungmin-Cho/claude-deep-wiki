@@ -75,9 +75,13 @@ catalog refresh, and lifecycle records. The runtime writes a journal intent,
 applies expected-hash-guarded changes, and records terminal state. An
 interruption is resolved with `wiki-runtime.js transaction recover` using the
 same owner token and operation ID; a caller never creates split mutations.
-The operator command `wiki-runtime.js transaction prune` removes only fully validated, terminal
+The shared terminal pruner has three callers: `scan-window ensure`,
+`wiki-lint --fix`, and the singular operator command `wiki-runtime.js
+transaction prune`. Ordinary selection removes only fully validated, terminal
 scan-window journals older than the requested age while the caller still owns
-the lock. It atomically moves each complete transaction directory into a fresh
+the lock. The lint recovery pass may bypass that ordinary age test only for
+authenticated residue from an already-started prune; it does not broaden
+ordinary directory selection. The pruner atomically moves each complete transaction directory into a fresh
 identity-bound sibling quarantine and revalidates the directory plus journal
 identity, bytes, age, and link count there. An interrupted quarantine remains
 recognizable and is retried by a later bounded pass. The runtime keeps an
@@ -91,6 +95,22 @@ bounded; rerun it while `complete` is `false` when a larger backlog must be
 traversed. `complete: true` means the pass inspected every listed entry, not
 that every ambiguous entry was removed. In-flight, malformed, foreign-kind,
 linked, or otherwise ambiguous transaction directories are preserved.
+For ensure journals, accepted scan-window markers are exact canonical UTC-Z
+plus LF, one-link regular non-symlinks; lstat `ENOENT` alone means absent. Either
+initial-invalid marker suppresses every `created`, `preserved`, and `stale`
+ensure deletion for the pass, including authenticated already-started residue.
+Authenticated already-started residue remains protected until a later pass
+begins with both markers accepted or absent. Both physical marker seals for
+accepted-or-absent state are revalidated before every destructive boundary; unreadable or
+physically ambiguous state remains protected. `created` is reclaimable only when pending
+does not match and exact `.last-scan >= input.proposed`; `preserved` and `stale`
+are no-op evidence. A raw `.reservation-.prune-*` basename has no supported
+producer and is rejected before type or content parsing with stopped-host
+guidance.
+Manifest transaction recovery remains the separate `transaction recover`
+authority. If terminal-prune residue is not accepted by the shared pruner,
+stop all hosts before stopped-host manual intervention; never reinterpret it
+as manifest recovery.
 
 Valid lifecycle actions are `ingest`, `ingest-skip`, `ingest-repair`,
 `ingest-fail`, `update`, `lint`, `rebuild`, `delete`, `query-filed`, and

@@ -92,6 +92,30 @@ function emit(value) {
   process.stdout.write(`${JSON.stringify(value)}\n`);
 }
 
+function emitError(error) {
+  const code = error.code || 'FILESYSTEM';
+  const hasStructuredEvidence = error.lint_result !== undefined
+    || error.terminal_prune !== undefined
+    || error.release_error !== undefined;
+  if (!hasStructuredEvidence) {
+    process.stderr.write(`${code}: ${error.message}\n`);
+    return;
+  }
+  const payload = {
+    code,
+    message: error.message,
+  };
+  if (error.lint_result !== undefined) payload.lint_result = error.lint_result;
+  if (error.terminal_prune !== undefined) payload.terminal_prune = error.terminal_prune;
+  if (error.release_error !== undefined) {
+    payload.release_error = {
+      code: error.release_error.code || 'FILESYSTEM',
+      message: error.release_error.message,
+    };
+  }
+  process.stderr.write(`${JSON.stringify(payload)}\n`);
+}
+
 function lockOwner(wikiRoot) {
   const ownerPath = path.join(wikiRoot, '.wiki-meta', '.wiki-lock', 'owner.json');
   try {
@@ -709,7 +733,7 @@ function exitCode(error) {
 }
 
 function reportMainError(error) {
-  process.stderr.write(`${error.code || 'FILESYSTEM'}: ${error.message}\n`);
+  emitError(error);
   return exitCode(error);
 }
 

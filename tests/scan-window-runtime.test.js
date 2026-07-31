@@ -93,6 +93,32 @@ function promote(root, expected, operationId, extra = {}) {
   }));
 }
 
+function certifyEnsurePromotion(root, expected, completed) {
+  const operationId = `prune-proof-${completed.operationId}`;
+  const result = promote(root, expected, operationId);
+  assert.equal(result.status, 'promoted');
+  const {
+    acquireLock,
+    createDeadline,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+  const owner = acquireLock({ wikiRoot: root, operation: 'prune-proof-cleanup' });
+  try {
+    assert.deepEqual(pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 0,
+      limit: 1,
+      kinds: ['promote'],
+      now: pruneClock(root),
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    }).removed, [operationId]);
+  } finally {
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+}
+
 function journalFiles(root) {
   const transactions = metaPath(root, '.transactions');
   return fs.readdirSync(transactions, { withFileTypes: true })
@@ -100,6 +126,190 @@ function journalFiles(root) {
     .map((entry) => path.join(transactions, entry.name, 'journal.json'))
     .filter((file) => fs.existsSync(file));
 }
+
+function applyEnsure(root, token, proposed, operationId) {
+  const { applyScanWindowTransition, createDeadline, planScanWindowTransition } = modules();
+  const plan = planScanWindowTransition({ wikiRoot: root, kind: 'ensure', proposed });
+  const result = applyScanWindowTransition({
+    wikiRoot: root,
+    token,
+    plan,
+    operationId,
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  return { plan, result };
+}
+
+function pruneClock(root) {
+  const newestMtimeNs = journalFiles(root).reduce((latest, journalPath) => {
+    const { mtimeNs } = fs.lstatSync(journalPath, { bigint: true });
+    return mtimeNs > latest ? mtimeNs : latest;
+  }, 0n);
+  return new Date(Number(newestMtimeNs / 1_000_000_000n + 1n) * 1000);
+}
+
+function createEnsurePruneCandidate(root, resultStatus) {
+  const suffix = crypto.createHash('sha256')
+    .update(`${root}\0${resultStatus}`)
+    .digest('hex')
+    .slice(0, 16);
+  const operationId = `a-prune-${resultStatus}-${suffix}`;
+  if (resultStatus === 'created') {
+    const completed = withOwner(root, 'prune-created-fixture', (owner) =>
+      applyEnsure(root, owner.token, T1, operationId).result);
+    assert.equal(completed.status, 'created');
+    assert.equal(promote(root, T1, `z-promote-created-${suffix}`).status, 'promoted');
+    return { operationId, markerName: '.last-scan' };
+  }
+  if (resultStatus === 'preserved') {
+    withOwner(root, 'prune-preserved-fixture', (owner) => {
+      assert.equal(applyEnsure(root, owner.token, T1, `z-seed-preserved-${suffix}`).result.status,
+        'created');
+      assert.equal(applyEnsure(root, owner.token, T2, operationId).result.status, 'preserved');
+    });
+    return { operationId, markerName: '.pending-scan' };
+  }
+  if (resultStatus === 'stale') {
+    withOwner(root, 'prune-stale-seed', (owner) => {
+      assert.equal(applyEnsure(root, owner.token, T1, `z-seed-stale-${suffix}`).result.status,
+        'created');
+    });
+    assert.equal(promote(root, T1, `z-promote-stale-${suffix}`).status, 'promoted');
+    withOwner(root, 'prune-stale-fixture', (owner) => {
+      assert.equal(applyEnsure(root, owner.token, T0, operationId).result.status, 'stale');
+    });
+    return { operationId, markerName: '.last-scan' };
+  }
+  throw new Error(`unsupported ensure prune status: ${resultStatus}`);
+}
+
+function runEnsurePruneWithFault(root, token, boundary, options = {}) {
+  let reached = false;
+  const result = modules().pruneScanWindowTransactions({
+    wikiRoot: root,
+    token,
+    maxAgeDays: 0,
+    limit: 1,
+    kinds: ['ensure'],
+    now: pruneClock(root),
+    deadline: modules().createDeadline({ budgetMs: 12_000 }),
+    resumableOnly: options.resumableOnly === true,
+    faultInjector(actualBoundary) {
+      if (actualBoundary !== boundary) return;
+      reached = true;
+      if (options.mutate) options.mutate();
+      if (options.throwError) throw new Error(`injected prune boundary: ${boundary}`);
+    },
+  });
+  return { reached, result };
+}
+
+function prunePendingPublication(root, basename) {
+  const transactions = metaPath(root, '.transactions');
+  const relative = fs.readdirSync(transactions, { recursive: true })
+    .find((name) => path.basename(String(name)) === basename);
+  assert.ok(relative, `expected ${basename} publication residue`);
+  return path.join(transactions, String(relative));
+}
+
+function seedPruneBoundaryResidue(root, token, boundary) {
+  const seeds = new Map([
+    ['before-backup-pending-hardlink-unlink', {
+      boundary: 'before-backup-staged-unlink',
+    }],
+    ['before-backup-pending-discard', {
+      boundary: 'before-backup-destination-link',
+      corrupt: 'journal.backup.pending',
+    }],
+    ['before-reservation-pending-hardlink-unlink', {
+      boundary: 'before-reservation-staged-unlink',
+    }],
+    ['before-reservation-pending-discard', {
+      boundary: 'before-reservation-destination-link',
+      corrupt: 'source.reservation.pending',
+    }],
+    ['before-empty-quarantine-rmdir', {
+      boundary: 'before-quarantine-rmdir',
+    }],
+    ['before-empty-quarantine-reservation-unlink', {
+      boundary: 'before-quarantine-rmdir',
+    }],
+    ['before-canonical-reservation-only-unlink', {
+      boundary: 'before-final-canonical-reservation-unlink',
+    }],
+  ]);
+  const seed = seeds.get(boundary);
+  if (!seed) return false;
+  const first = runEnsurePruneWithFault(root, token, seed.boundary, { throwError: true });
+  assert.equal(first.reached, true, `seed boundary was not reached: ${seed.boundary}`);
+  assert.deepEqual(first.result.removed, []);
+  if (seed.corrupt) fs.writeFileSync(prunePendingPublication(root, seed.corrupt), 'corrupt\n');
+  return true;
+}
+
+function replaceMarkerWithSameBytes(root, markerName) {
+  const marker = metaPath(root, markerName);
+  const held = metaPath(root, `.held-${markerName.slice(1)}-${crypto.randomUUID()}`);
+  const bytes = fs.readFileSync(marker);
+  fs.renameSync(marker, held);
+  fs.writeFileSync(marker, bytes);
+}
+
+const ensurePruneDestructiveBoundaries = [
+  'before-transaction-quarantine-rename',
+  'before-backup-destination-link',
+  'before-backup-pending-hardlink-unlink',
+  'before-backup-pending-discard',
+  'before-backup-staged-unlink',
+  'before-reservation-destination-link',
+  'before-reservation-pending-hardlink-unlink',
+  'before-reservation-pending-discard',
+  'before-reservation-staged-unlink',
+  'before-quarantined-journal-unlink',
+  'before-quarantined-backup-unlink',
+  'before-quarantine-rmdir',
+  'before-final-canonical-reservation-unlink',
+  'before-empty-quarantine-rmdir',
+  'before-empty-quarantine-reservation-unlink',
+  'before-canonical-reservation-only-unlink',
+];
+
+test('every ensure prune destructive boundary rejects same-byte marker inode drift', async (t) => {
+  for (const resultStatus of ['created', 'preserved', 'stale']) {
+    for (const boundary of ensurePruneDestructiveBoundaries) {
+      await t.test(`${resultStatus}: ${boundary}`, () => {
+        const root = temporaryWiki(`deep wiki ${resultStatus} ${boundary} `);
+        const candidate = createEnsurePruneCandidate(root, resultStatus);
+        const owner = modules().acquireLock({
+          wikiRoot: root,
+          operation: `prune-boundary-${resultStatus}`,
+          now: new Date(T3),
+        });
+        try {
+          const resumableOnly = seedPruneBoundaryResidue(root, owner.token, boundary);
+          let reached = false;
+          let boundarySnapshot;
+          assert.throws(() => {
+            runEnsurePruneWithFault(root, owner.token, boundary, {
+              resumableOnly,
+              mutate() {
+                reached = true;
+                boundarySnapshot = snapshotTree(metaPath(root, '.transactions'));
+                replaceMarkerWithSameBytes(root, candidate.markerName);
+              },
+            });
+          }, (error) => error.code === 'TRANSACTION_RECOVERY_REQUIRED'
+            && error.ensurePruneProtected === true
+            && /marker seal changed/.test(error.message));
+          assert.equal(reached, true, `destructive boundary was not reached: ${boundary}`);
+          assert.deepEqual(snapshotTree(metaPath(root, '.transactions')), boundarySnapshot);
+        } finally {
+          modules().releaseLock({ wikiRoot: root, token: owner.token });
+        }
+      });
+    }
+  }
+});
 
 test('standalone scan-window activation converges a genuine v1.8.2 pre-journal crash residue', (t) => {
   const listing = spawnSync('git', [
@@ -182,6 +392,329 @@ test('planScanWindowTransition validates canonical UTC-Z input and preserves the
   assert.equal(plan.last.after.toString(), `${T0}\n`);
   assert.throws(() => planScanWindowTransition({ kind: 'ensure', proposed: '2026-07-11T02:00:00.000Z' }),
     (error) => error.code === 'SCAN_WINDOW_INVALID');
+});
+
+test('resumable-only pruning validates its selector and preserves ordinary cleaned directories', () => {
+  const {
+    acquireLock,
+    createDeadline,
+    ensurePendingScan,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki resumable-only ordinary preservation ');
+  const result = ensurePendingScan({
+    wikiRoot: root,
+    proposed: T1,
+    now: new Date(T2),
+    deadline: createDeadline({ budgetMs: 12_000 }),
+  });
+  assert.notEqual(result.status, 'deferred');
+  const directory = path.dirname(journalFiles(root)[0]);
+  const before = snapshotTree(directory);
+  const owner = acquireLock({ wikiRoot: root, operation: 'resumable-only-test', now: new Date(T3) });
+  try {
+    assert.throws(() => pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 0,
+      limit: 8,
+      now: new Date(T3),
+      deadline: createDeadline({ budgetMs: 12_000 }),
+      resumableOnly: 'yes',
+    }), (error) => error.code === 'SCAN_WINDOW_INVALID');
+    assert.deepEqual(pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 0,
+      limit: 8,
+      now: new Date(T3),
+      deadline: createDeadline({ budgetMs: 12_000 }),
+      resumableOnly: true,
+    }), { processed: 0, removed: [], complete: true });
+  } finally {
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+  assert.deepEqual(snapshotTree(directory), before);
+});
+
+test('generic transaction debris sweep never consumes a terminal-prune phase directory', () => {
+  const { acquireLock, createDeadline, releaseLock } = modules();
+  const { sweepTransactionDebris } = require('../hooks/scripts/runtime/transaction-debris.js');
+  const root = temporaryWiki('deep wiki prune debris preservation ');
+  const transactions = metaPath(root, '.transactions');
+  const quarantine = path.join(transactions, '.prune-5-phase-debris');
+  fs.mkdirSync(quarantine);
+  const owner = acquireLock({ wikiRoot: root, operation: 'debris-preservation', now: new Date(T3) });
+  try {
+    assert.deepEqual(sweepTransactionDebris(root, owner.token, {
+      deadline: createDeadline({ budgetMs: 12_000 }),
+      classes: ['plain'],
+    }), { processed: 0, removed: [] });
+  } finally {
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+  assert.equal(fs.existsSync(quarantine), true);
+});
+
+test('ensure pruning reclaims no-op evidence but requires exact promotion proof for created evidence', () => {
+  const {
+    acquireLock,
+    createDeadline,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki semantic ensure prune ');
+  const createdId = 'semantic-created-ensure';
+  const preservedId = 'semantic-preserved-ensure';
+  const owner = acquireLock({ wikiRoot: root, operation: 'semantic-ensure-fixture' });
+  try {
+    assert.equal(applyEnsure(root, owner.token, T1, createdId).result.status, 'created');
+    assert.equal(applyEnsure(root, owner.token, T2, preservedId).result.status, 'preserved');
+  } finally {
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+
+  const firstOwner = acquireLock({ wikiRoot: root, operation: 'semantic-ensure-first-prune' });
+  try {
+    assert.deepEqual(pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: firstOwner.token,
+      maxAgeDays: 0,
+      limit: 8,
+      kinds: ['ensure'],
+      now: pruneClock(root),
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    }).removed, [preservedId]);
+  } finally {
+    releaseLock({ wikiRoot: root, token: firstOwner.token });
+  }
+  assert.equal(fs.existsSync(path.join(metaPath(root, '.transactions'), createdId)), true);
+
+  assert.equal(promote(root, T1, 'semantic-created-promotion').status, 'promoted');
+  const secondOwner = acquireLock({ wikiRoot: root, operation: 'semantic-ensure-second-prune' });
+  try {
+    assert.deepEqual(pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: secondOwner.token,
+      maxAgeDays: 0,
+      limit: 8,
+      kinds: ['ensure'],
+      now: pruneClock(root),
+      deadline: createDeadline({ budgetMs: 12_000 }),
+    }).removed, [createdId]);
+  } finally {
+    releaseLock({ wikiRoot: root, token: secondOwner.token });
+  }
+});
+
+test('either invalid scan-window marker suppresses every ensure status for the whole prune invocation', () => {
+  const {
+    acquireLock,
+    createDeadline,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+  for (const invalidMarker of ['pending', 'last']) {
+    const root = temporaryWiki(`deep wiki invalid ${invalidMarker} ensure suppression `);
+    const owner = acquireLock({ wikiRoot: root, operation: `invalid-${invalidMarker}-fixture` });
+    try {
+      assert.equal(applyEnsure(
+        root, owner.token, T1, `${invalidMarker}-created-ensure`,
+      ).result.status, 'created');
+      assert.equal(applyEnsure(
+        root, owner.token, T2, `${invalidMarker}-preserved-ensure`,
+      ).result.status, 'preserved');
+    } finally {
+      releaseLock({ wikiRoot: root, token: owner.token });
+    }
+    fs.writeFileSync(metaPath(root, `.${invalidMarker}-scan`), 'invalid\n');
+    const before = snapshotTree(metaPath(root, '.transactions'));
+    const pruneOwner = acquireLock({
+      wikiRoot: root, operation: `invalid-${invalidMarker}-prune`,
+    });
+    try {
+      assert.deepEqual(pruneScanWindowTransactions({
+        wikiRoot: root,
+        token: pruneOwner.token,
+        maxAgeDays: 0,
+        limit: 8,
+        kinds: ['ensure'],
+        now: pruneClock(root),
+        deadline: createDeadline({ budgetMs: 12_000 }),
+      }), { processed: 0, removed: [], complete: true });
+    } finally {
+      releaseLock({ wikiRoot: root, token: pruneOwner.token });
+    }
+    assert.deepEqual(snapshotTree(metaPath(root, '.transactions')), before);
+  }
+});
+
+test('scan-window prune marker classification accepts only canonical one-link regular files', async (t) => {
+  const representations = [
+    ['invalid UTF-8', (marker) => fs.writeFileSync(marker, Buffer.from([0xff, 0x0a]))],
+    ['leading whitespace', (marker) => fs.writeFileSync(marker, ` ${T1}\n`)],
+    ['CRLF', (marker) => fs.writeFileSync(marker, `${T1}\r\n`)],
+    ['directory', (marker) => fs.mkdirSync(marker)],
+    ['hardlink', (marker, root) => {
+      fs.writeFileSync(marker, `${T1}\n`);
+      fs.linkSync(marker, path.join(root, 'marker-hardlink'));
+    }],
+    ['symlink', (marker, root) => {
+      const target = path.join(root, 'marker-target');
+      fs.writeFileSync(target, `${T1}\n`);
+      fs.symlinkSync(target, marker);
+    }],
+    ['dangling symlink', (marker, root) =>
+      fs.symlinkSync(path.join(root, 'missing-marker-target'), marker)],
+  ];
+  for (const [name, create] of representations) {
+    await t.test(name, () => {
+      const { inspectPruneMarkers } = modules();
+      const root = temporaryWiki(`deep wiki invalid marker ${name} `);
+      const marker = metaPath(root, '.pending-scan');
+      create(marker, root);
+      const markers = inspectPruneMarkers({ wikiRoot: root });
+      assert.equal(markers.pending.invalid, true);
+      assert.equal(markers.last.invalid, false);
+    });
+  }
+
+  await t.test('unreadable', () => {
+    const { inspectPruneMarkers } = modules();
+    const root = temporaryWiki('deep wiki unreadable marker ');
+    const marker = metaPath(root, '.pending-scan');
+    fs.writeFileSync(marker, `${T1}\n`);
+    const originalRead = fs.readFileSync;
+    fs.readFileSync = (pathname, ...args) => {
+      if (pathname === marker) throw Object.assign(new Error('unreadable marker'), { code: 'EACCES' });
+      return originalRead(pathname, ...args);
+    };
+    try {
+      assert.equal(inspectPruneMarkers({ wikiRoot: root }).pending.invalid, true);
+    } finally {
+      fs.readFileSync = originalRead;
+    }
+  });
+
+  await t.test('post-read identity failure is physical ambiguity, not syntactic invalidity', () => {
+    const { inspectPruneMarkers } = modules();
+    const root = temporaryWiki('deep wiki post-read marker identity failure ');
+    const marker = metaPath(root, '.pending-scan');
+    fs.writeFileSync(marker, 'invalid\n');
+    const originalLstat = fs.lstatSync;
+    let markerLstats = 0;
+    fs.lstatSync = (pathname, ...args) => {
+      if (pathname === marker && ++markerLstats === 2) {
+        throw Object.assign(new Error('post-read marker identity unavailable'), {
+          code: 'EACCES',
+        });
+      }
+      return originalLstat(pathname, ...args);
+    };
+    try {
+      const inspected = inspectPruneMarkers({ wikiRoot: root }).pending;
+      assert.equal(inspected.state, 'invalid');
+      assert.equal(Object.hasOwn(inspected, 'bytes'), false);
+      assert.equal(Object.hasOwn(inspected, 'identity'), false);
+    } finally {
+      fs.lstatSync = originalLstat;
+    }
+  });
+
+  const { inspectPruneMarkers } = modules();
+  const acceptedRoot = temporaryWiki('deep wiki accepted marker ');
+  fs.writeFileSync(metaPath(acceptedRoot, '.pending-scan'), `${T1}\n`);
+  const accepted = inspectPruneMarkers({ wikiRoot: acceptedRoot });
+  assert.equal(accepted.pending.invalid, false);
+  assert.equal(accepted.pending.state, 'accepted');
+  assert.equal(accepted.last.invalid, false);
+  assert.equal(accepted.last.state, 'absent');
+});
+
+test('raw reservation-prune compatibility names fail before type parsing or sibling mutation', async (t) => {
+  const representations = [
+    ['directory', (entry) => fs.mkdirSync(entry)],
+    ['regular', (entry) => fs.writeFileSync(entry, 'legacy\n')],
+    ['symlink', (entry, root) => {
+      const target = path.join(root, 'legacy-target');
+      fs.writeFileSync(target, 'legacy\n');
+      fs.symlinkSync(target, entry);
+    }],
+    ['dangling symlink', (entry, root) =>
+      fs.symlinkSync(path.join(root, 'missing-legacy-target'), entry)],
+  ];
+  for (const [name, create] of representations) {
+    await t.test(name, () => {
+      const {
+        acquireLock,
+        assertPruneTransactionNamesSupported,
+        createDeadline,
+        releaseLock,
+      } = modules();
+      const root = temporaryWiki(`deep wiki raw compatibility ${name} `);
+      const transactions = metaPath(root, '.transactions');
+      const raw = path.join(transactions, `.reservation-.prune-malformed-${name}`);
+      const sibling = path.join(transactions, '.activate-removable-sibling');
+      fs.mkdirSync(sibling);
+      fs.writeFileSync(path.join(sibling, 'evidence'), 'preserve all siblings\n');
+      create(raw, root);
+      const before = snapshotTree(transactions);
+      const owner = acquireLock({ wikiRoot: root, operation: `raw-compatibility-${name}` });
+      try {
+        assert.throws(() => assertPruneTransactionNamesSupported({
+          wikiRoot: root,
+          token: owner.token,
+          deadline: createDeadline({ budgetMs: 12_000 }),
+        }), (error) => error.code === 'TRANSACTION_RECOVERY_REQUIRED'
+          && /stopped-host/i.test(error.message));
+      } finally {
+        releaseLock({ wikiRoot: root, token: owner.token });
+      }
+      assert.deepEqual(snapshotTree(transactions), before);
+    });
+  }
+});
+
+test('ensurePendingScan rejects every raw reservation-prune representation before debris mutation', async (t) => {
+  const representations = [
+    ['directory', (entry) => fs.mkdirSync(entry)],
+    ['regular', (entry) => fs.writeFileSync(entry, 'legacy\n')],
+    ['symlink', (entry, root) => {
+      const target = path.join(root, 'legacy-target');
+      fs.writeFileSync(target, 'legacy\n');
+      fs.symlinkSync(target, entry);
+    }],
+    ['dangling symlink', (entry, root) =>
+      fs.symlinkSync(path.join(root, 'missing-legacy-target'), entry)],
+  ];
+  for (const [name, create] of representations) {
+    await t.test(name, () => {
+      const { createDeadline, ensurePendingScan } = modules();
+      const root = temporaryWiki(`deep wiki ensure raw compatibility ${name} `);
+      const transactions = metaPath(root, '.transactions');
+      const raw = path.join(transactions, `.reservation-.prune-malformed-${name}`);
+      const sibling = path.join(transactions, '.activate-removable-sibling');
+      fs.mkdirSync(sibling);
+      fs.writeFileSync(path.join(sibling, 'evidence'), 'preserve every sibling\n');
+      create(raw, root);
+      const before = snapshotTree(transactions);
+
+      const result = ensurePendingScan({
+        wikiRoot: root,
+        proposed: T1,
+        now: new Date(T1),
+        deadline: createDeadline({ budgetMs: 12_000 }),
+      });
+
+      assert.deepEqual(result, {
+        status: 'deferred',
+        reason: 'TRANSACTION_RECOVERY_REQUIRED',
+      });
+      assert.deepEqual(snapshotTree(transactions), before);
+      assertState(root, { pending: null, last: null });
+    });
+  }
 });
 
 test('ensurePendingScan creates one canonical line and a committed transaction', () => {
@@ -347,6 +880,7 @@ test('transaction pruning is token-fenced, conservative, age-gated, and exactly 
     deadline: createDeadline({ budgetMs: 12_000 }),
   });
   assert.notEqual(completed.status, 'deferred');
+  certifyEnsurePromotion(root, T2, completed);
   const cleanedJournalPath = journalFiles(root).find((journalPath) => {
     const journal = JSON.parse(fs.readFileSync(journalPath, 'utf8'));
     return journal.transitions.at(-1) === 'cleaned';
@@ -468,6 +1002,7 @@ test('transaction pruning preserves a hard-linked terminal journal byte-identica
     deadline: createDeadline({ budgetMs: 12_000 }),
   });
   assert.notEqual(completed.status, 'deferred');
+  certifyEnsurePromotion(root, T1, completed);
   const journal = path.join(
     metaPath(root, '.transactions'),
     completed.operationId,
@@ -510,6 +1045,7 @@ test('transaction pruning preserves noncanonical terminal journal bytes', () => 
     deadline: createDeadline({ budgetMs: 12_000 }),
   });
   assert.notEqual(completed.status, 'deferred');
+  certifyEnsurePromotion(root, T1, completed);
   const transactions = metaPath(root, '.transactions');
   const source = path.join(transactions, completed.operationId);
   const oldTime = new Date('2026-07-01T00:00:00.000Z');
@@ -569,6 +1105,7 @@ test('transaction pruning preserves a terminal journal whose mtime becomes young
     deadline: createDeadline({ budgetMs: 12_000 }),
   });
   assert.notEqual(completed.status, 'deferred');
+  certifyEnsurePromotion(root, T1, completed);
   const transaction = path.join(
     metaPath(root, '.transactions'),
     completed.operationId,
@@ -628,6 +1165,7 @@ test('transaction pruning preserves the whole quarantine when identity changes a
     deadline: createDeadline({ budgetMs: 12_000 }),
   });
   assert.notEqual(completed.status, 'deferred');
+  certifyEnsurePromotion(root, T1, completed);
   const transaction = path.join(
     metaPath(root, '.transactions'),
     completed.operationId,
@@ -694,6 +1232,7 @@ test('transaction pruning preserves the journal when a late transaction entry ap
     deadline: createDeadline({ budgetMs: 12_000 }),
   });
   assert.notEqual(completed.status, 'deferred');
+  certifyEnsurePromotion(root, T1, completed);
   const transaction = path.join(
     metaPath(root, '.transactions'),
     completed.operationId,
@@ -770,6 +1309,7 @@ test('transaction pruning resumes an interrupted whole-directory quarantine', ()
     deadline: createDeadline({ budgetMs: 12_000 }),
   });
   assert.notEqual(completed.status, 'deferred');
+  certifyEnsurePromotion(root, T1, completed);
   const transactions = metaPath(root, '.transactions');
   const transaction = path.join(transactions, completed.operationId);
   const journal = path.join(transaction, 'journal.json');
@@ -852,6 +1392,7 @@ test('transaction pruning preserves the journal when its source reservation is r
     deadline: createDeadline({ budgetMs: 12_000 }),
   });
   assert.notEqual(completed.status, 'deferred');
+  certifyEnsurePromotion(root, T1, completed);
   const transactions = metaPath(root, '.transactions');
   const transaction = path.join(transactions, completed.operationId);
   const journal = path.join(transaction, 'journal.json');
@@ -921,6 +1462,7 @@ test('transaction pruning preserves exact evidence when its reservation is repla
     deadline: createDeadline({ budgetMs: 12_000 }),
   });
   assert.notEqual(completed.status, 'deferred');
+  certifyEnsurePromotion(root, T1, completed);
   const transactions = metaPath(root, '.transactions');
   const transaction = path.join(transactions, completed.operationId);
   const journal = path.join(transaction, 'journal.json');
@@ -989,6 +1531,7 @@ test('transaction pruning resumes every interrupted reservation and backup publi
         deadline: createDeadline({ budgetMs: 12_000 }),
       });
       assert.notEqual(completed.status, 'deferred');
+      certifyEnsurePromotion(root, T1, completed);
       const transactions = metaPath(root, '.transactions');
       const journal = path.join(transactions, completed.operationId, 'journal.json');
       const oldTime = new Date('2026-07-01T00:00:00.000Z');
@@ -1085,6 +1628,7 @@ test('transaction pruning resumes when only the sealed quarantine backup remains
     deadline: createDeadline({ budgetMs: 12_000 }),
   });
   assert.notEqual(completed.status, 'deferred');
+  certifyEnsurePromotion(root, T1, completed);
   const transactions = metaPath(root, '.transactions');
   const journal = path.join(transactions, completed.operationId, 'journal.json');
   const oldTime = new Date('2026-07-01T00:00:00.000Z');
@@ -1166,6 +1710,7 @@ test('transaction pruning resumes an empty quarantine under its active reservati
     deadline: createDeadline({ budgetMs: 12_000 }),
   });
   assert.notEqual(completed.status, 'deferred');
+  certifyEnsurePromotion(root, T1, completed);
   const transactions = metaPath(root, '.transactions');
   const journal = path.join(transactions, completed.operationId, 'journal.json');
   const oldTime = new Date('2026-07-01T00:00:00.000Z');
@@ -1239,6 +1784,7 @@ test('transaction pruning removes an orphaned exact source reservation on retry'
     deadline: createDeadline({ budgetMs: 12_000 }),
   });
   assert.notEqual(completed.status, 'deferred');
+  certifyEnsurePromotion(root, T1, completed);
   const transactions = metaPath(root, '.transactions');
   const transaction = path.join(transactions, completed.operationId);
   const journal = path.join(transaction, 'journal.json');
@@ -1307,6 +1853,7 @@ test('transaction pruning quarantines before deletion and preserves a last-check
     deadline: createDeadline({ budgetMs: 12_000 }),
   });
   assert.notEqual(completed.status, 'deferred');
+  certifyEnsurePromotion(root, T1, completed);
   const transaction = path.join(
     metaPath(root, '.transactions'),
     completed.operationId,
@@ -1375,6 +1922,7 @@ test('transaction pruning reports incomplete traversal when its reserve expires 
     deadline: createDeadline({ budgetMs: 12_000 }),
   });
   assert.notEqual(completed.status, 'deferred');
+  certifyEnsurePromotion(root, T1, completed);
   const transactions = metaPath(root, '.transactions');
   const source = path.join(transactions, completed.operationId);
   const youngId = 'a-young-terminal';
@@ -1455,6 +2003,7 @@ test('transaction prune stops between recoverable cleanup phases when cumulative
     deadline: createDeadline({ budgetMs: 12_000 }),
   });
   assert.notEqual(completed.status, 'deferred');
+  certifyEnsurePromotion(root, T1, completed);
   const transactions = metaPath(root, '.transactions');
   const journal = path.join(transactions, completed.operationId, 'journal.json');
   const oldTime = new Date('2026-07-01T00:00:00.000Z');
@@ -1520,6 +2069,7 @@ test('transaction prune bounds cumulative filesystem discovery after its deadlin
     deadline: createDeadline({ budgetMs: 12_000 }),
   });
   assert.notEqual(completed.status, 'deferred');
+  certifyEnsurePromotion(root, T1, completed);
   const transaction = path.join(
     metaPath(root, '.transactions'),
     completed.operationId,
@@ -1577,6 +2127,7 @@ test('transaction prune returns incomplete when its deadline expires during owne
     deadline: createDeadline({ budgetMs: 12_000 }),
   });
   assert.notEqual(completed.status, 'deferred');
+  certifyEnsurePromotion(root, T1, completed);
   const transaction = path.join(
     metaPath(root, '.transactions'),
     completed.operationId,
@@ -1635,6 +2186,7 @@ test('transaction prune does not wrap deadline expiry during final journal valid
     deadline: createDeadline({ budgetMs: 12_000 }),
   });
   assert.notEqual(completed.status, 'deferred');
+  certifyEnsurePromotion(root, T1, completed);
   const transaction = path.join(
     metaPath(root, '.transactions'),
     completed.operationId,
@@ -1688,6 +2240,7 @@ test('transaction prune checks its deadline within guarded parent validation', (
     deadline: createDeadline({ budgetMs: 12_000 }),
   });
   assert.notEqual(completed.status, 'deferred');
+  certifyEnsurePromotion(root, T1, completed);
   const transactions = metaPath(root, '.transactions');
   const transaction = path.join(transactions, completed.operationId);
   const journal = path.join(transaction, 'journal.json');
@@ -1733,6 +2286,8 @@ test('transaction prune CLI exposes bounded terminal cleanup under the caller lo
     proposed: T1,
     deadline: createDeadline({ budgetMs: 12_000 }),
   });
+  assert.notEqual(completed.status, 'deferred');
+  certifyEnsurePromotion(root, T1, completed);
   const completedDirectory = path.dirname(journalFiles(root)[0]);
   const oldTime = new Date('2026-07-01T00:00:00.000Z');
   fs.utimesSync(path.join(completedDirectory, 'journal.json'), oldTime, oldTime);
@@ -2760,4 +3315,85 @@ test('caller-owned journal adapters are token-fenced at write, transition, remov
       releaseLock({ wikiRoot: root, token: successor.token });
     });
   }
+});
+
+test('recovery safely reuses one tombstone across interrupted last and pending removals', () => {
+  const {
+    acquireLock,
+    applyScanWindowTransition,
+    planScanWindowTransition,
+    recoverScanWindowTransaction,
+    releaseLock,
+  } = modules();
+  const root = temporaryWiki('deep wiki sequential tombstone recovery ');
+  const operationId = 'sequential-tombstone-recovery';
+  const tombstone = metaPath(
+    root,
+    path.join('.transactions', operationId, 'pending.removed'),
+  );
+  setState(root, { pending: `${T2}\n`, last: `${T1}\n` });
+  const plan = planScanWindowTransition({
+    wikiRoot: root,
+    kind: 'repair',
+    pendingAfter: null,
+    lastAfter: null,
+  });
+
+  let owner = acquireLock({ wikiRoot: root, operation: 'remove-last-first' });
+  try {
+    assert.throws(() => applyScanWindowTransition({
+      wikiRoot: root,
+      token: owner.token,
+      operationId,
+      plan,
+      faultInjector(stage) {
+        if (stage !== 'after-last-scan-remove') return;
+        const error = new Error('stop after last marker entered tombstone');
+        error.code = 'INJECTED_CRASH';
+        throw error;
+      },
+    }), (error) => error.code === 'INJECTED_CRASH');
+  } finally {
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+  assertState(root, { pending: `${T2}\n`, last: null });
+  assert.equal(fs.readFileSync(tombstone, 'utf8'), `${T1}\n`);
+
+  owner = acquireLock({ wikiRoot: root, operation: 'replace-tombstone-with-pending' });
+  try {
+    assert.throws(() => recoverScanWindowTransaction({
+      wikiRoot: root,
+      token: owner.token,
+      operationId,
+      faultInjector(stage) {
+        if (stage !== 'before-matching-pending-destination-rename') return;
+        const error = new Error('stop after obsolete tombstone removal');
+        error.code = 'INJECTED_CRASH';
+        throw error;
+      },
+    }), (error) => error.code === 'INJECTED_CRASH');
+  } finally {
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+  assertState(root, { pending: `${T2}\n`, last: null });
+  assert.equal(fs.existsSync(tombstone), false);
+  let journal = JSON.parse(fs.readFileSync(journalFiles(root)[0], 'utf8'));
+  assert.equal(journal.transitions.includes('last-scan-written'), true);
+  assert.equal(journal.transitions.includes('pending-scan-written'), false);
+
+  owner = acquireLock({ wikiRoot: root, operation: 'finish-pending-removal' });
+  try {
+    const recovered = recoverScanWindowTransaction({
+      wikiRoot: root,
+      token: owner.token,
+      operationId,
+    });
+    assert.equal(recovered.status, 'repaired');
+  } finally {
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+  assertState(root, { pending: null, last: null });
+  assert.equal(fs.existsSync(tombstone), false);
+  journal = JSON.parse(fs.readFileSync(journalFiles(root)[0], 'utf8'));
+  assert.equal(journal.transitions.at(-1), 'cleaned');
 });

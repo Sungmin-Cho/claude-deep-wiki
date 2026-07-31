@@ -326,6 +326,12 @@ function inspectTransactions(root, allowedOperationId = null, deadline = operati
     if (!entry.isDirectory() || entry.isSymbolicLink()) {
       throw stateError('TRANSACTION_RECOVERY_REQUIRED', 'transaction store contains a non-directory entry');
     }
+    if (entry.name.startsWith('.prune-')) {
+      throw stateError(
+        'TRANSACTION_RECOVERY_REQUIRED',
+        'a terminal scan-window prune quarantine requires recovery; run wiki-lint --fix, and if it makes no progress stop all hosts and follow the stopped-host procedure',
+      );
+    }
     const transaction = path.join(directory, entry.name);
     const journalPath = path.join(transaction, 'journal.json');
     let journal;
@@ -1505,7 +1511,8 @@ function fixWiki(options = {}) {
   const deadline = operationDeadline(options);
   const root = physicalRoot(options.wikiRoot);
   const now = options.now instanceof Date ? options.now : new Date(options.now || Date.now());
-  const timestamp = now.toISOString().replace('.000Z', 'Z');
+  const manifestNow = new Date(Math.floor(now.getTime() / 1000) * 1000);
+  const timestamp = manifestNow.toISOString().replace('.000Z', 'Z');
   let owner;
   try {
     owner = acquireLock({ wikiRoot: root, operation: 'lint-fix', now });
@@ -1513,25 +1520,120 @@ function fixWiki(options = {}) {
     if (error.code === 'LOCK_CONTENDED') return { status: 'skipped', reason: 'LOCK_CONTENDED' };
     throw error;
   }
+  let operationError;
+  let completedResult;
   try {
     assertLockOwner({ wikiRoot: root, token: owner.token });
+    scanWindow.assertPruneTransactionNamesSupported({
+      wikiRoot: root,
+      token: owner.token,
+      deadline,
+    });
+    const entryMarkers = scanWindow.inspectPruneMarkers({ wikiRoot: root });
+    const suppressEnsurePrune = entryMarkers.pending.invalid || entryMarkers.last.invalid;
     sweepTransactionDebris(root, owner.token, {
       deadline, classes: ['activation', 'plain', 'cancelled'],
     });
-    const before = inspectWiki({ wikiRoot: root, deadline });
+    const prune = (mode, limit) => {
+      const request = {
+        wikiRoot: root,
+        token: owner.token,
+        maxAgeDays: 0,
+        now,
+        deadline,
+        limit,
+      };
+      if (mode === 'recovery') request.resumableOnly = true;
+      else {
+        request.kinds = ['ensure'];
+        request.suppressEnsurePrune = suppressEnsurePrune;
+      }
+      return scanWindow.pruneScanWindowTransactions(request);
+    };
+    let recovery = { processed: 0, removed: [], complete: true };
+    let before;
+    try {
+      before = inspectWiki({ wikiRoot: root, deadline });
+    } catch (initial) {
+      if (initial.code !== 'TRANSACTION_RECOVERY_REQUIRED') throw initial;
+      try {
+        recovery = prune('recovery', 64);
+      } catch (recoveryError) {
+        const wrapped = stateError(
+          recoveryError.code || 'FILESYSTEM',
+          `scan-window prune residue recovery failed: ${recoveryError.message}`,
+          initial,
+        );
+        if (recoveryError.terminal_prune) {
+          wrapped.terminal_prune = recoveryError.terminal_prune;
+        }
+        throw wrapped;
+      }
+      if (recovery.processed === 0 && recovery.complete === true) throw initial;
+      if (recovery.processed === 0 && recovery.complete === false) {
+        const wrapped = stateError(
+          initial.code || 'FILESYSTEM',
+          `scan-window prune residue recovery pass incomplete before inspection failed: ${initial.message}`,
+          initial,
+        );
+        wrapped.terminal_prune = recovery;
+        throw wrapped;
+      }
+      if (typeof recovery.complete !== 'boolean') {
+        const wrapped = stateError(
+          'FILESYSTEM',
+          'scan-window prune residue recovery returned an invalid completion result',
+          initial,
+        );
+        wrapped.terminal_prune = recovery;
+        throw wrapped;
+      }
+      try {
+        before = inspectWiki({ wikiRoot: root, deadline });
+      } catch (retryError) {
+        const prefix = recovery.complete === false
+          ? 'scan-window prune residue recovery pass incomplete before inspection failed: '
+          : 'scan-window prune residue recovery pass completed before inspection failed: ';
+        const wrapped = stateError(
+          retryError.code || 'FILESYSTEM',
+          `${prefix}${retryError.message}`,
+          retryError,
+        );
+        wrapped.terminal_prune = recovery;
+        throw wrapped;
+      }
+    }
     const pendingBytes = readMaybe(path.join(root, '.wiki-meta', '.pending-scan'));
     const lastBytes = readMaybe(path.join(root, '.wiki-meta', '.last-scan'));
     const parseScan = (bytes) => {
       if (bytes === null) return { valid: true, value: null };
-      const value = bytes.toString('utf8').trim();
-      try { canonicalTimestamp(value, 'scan window'); return { valid: true, value }; }
+      const text = bytes.toString('utf8');
+      if (!Buffer.from(text, 'utf8').equals(bytes) || !text.endsWith('\n')) {
+        return { valid: false, value: null };
+      }
+      const value = text.slice(0, -1);
+      try {
+        canonicalTimestamp(value, 'scan window');
+        if (!Buffer.from(`${value}\n`, 'utf8').equals(bytes)) {
+          return { valid: false, value: null };
+        }
+        return { valid: true, value };
+      }
       catch { return { valid: false, value: null }; }
     };
     const pending = parseScan(pendingBytes);
     const last = parseScan(lastBytes);
-    const pendingAfter = !pending.valid || (pending.value !== null && last.valid
-      && last.value !== null && pending.value <= last.value) ? null : pendingBytes;
-    const lastAfter = last.valid ? lastBytes : null;
+    const markerRepairable = (marker) => (
+      marker.state !== 'invalid'
+      || (Buffer.isBuffer(marker.bytes) && marker.identity !== undefined)
+    );
+    const pendingAfter = !markerRepairable(entryMarkers.pending)
+      ? pendingBytes
+      : (!pending.valid || (pending.value !== null && last.valid
+        && last.value !== null && pending.value <= last.value) ? null : pendingBytes);
+    const lastAfter = !markerRepairable(entryMarkers.last)
+      ? lastBytes
+      : (last.valid ? lastBytes : null);
     if (!bytesEqual(pendingBytes, pendingAfter) || !bytesEqual(lastBytes, lastAfter)) {
       const repairPlan = scanWindow.planScanWindowTransition({
         wikiRoot: root,
@@ -1555,11 +1657,14 @@ function fixWiki(options = {}) {
       now,
       manifest: {
         operation: 'lint',
-        operation_id: deterministicUlid(timestamp, 'lint-fix-operation'),
+        operation_id: deterministicUlid(
+          timestamp,
+          `lint-fix-operation\0${owner.token}`,
+        ),
         pages: [],
         sources: [],
         events: [{
-          event_id: deterministicUlid(timestamp, 'lint-fix-event'),
+          event_id: deterministicUlid(timestamp, `lint-fix-event\0${owner.token}`),
           ts: timestamp,
           action: 'lint',
           source: null,
@@ -1572,9 +1677,66 @@ function fixWiki(options = {}) {
       deadline,
     });
     const after = inspectWiki({ wikiRoot: root, deadline });
-    return { status: after.ok ? 'fixed' : 'partial', before, after, committed };
+    const primary = {
+      status: after.ok ? 'fixed' : 'partial',
+      before,
+      after,
+      committed,
+    };
+    let tail;
+    try {
+      tail = prune('tail', 64 - recovery.processed);
+    } catch (tailError) {
+      const wrapped = stateError(
+        'LINT_MAINTENANCE_FAILED_AFTER_COMMIT',
+        `lint repair committed before terminal maintenance failed: ${tailError.message}`,
+        tailError,
+      );
+      wrapped.lint_result = primary;
+      if (!tailError.terminal_prune) {
+        wrapped.terminal_prune = {
+          processed: recovery.processed,
+          removed: [...recovery.removed],
+          complete: false,
+        };
+      }
+      else {
+        wrapped.terminal_prune = {
+          processed: recovery.processed + tailError.terminal_prune.processed,
+          removed: recovery.removed.concat(tailError.terminal_prune.removed),
+          complete: false,
+        };
+      }
+      throw wrapped;
+    }
+    const terminalPrune = {
+      processed: recovery.processed + tail.processed,
+      removed: recovery.removed.concat(tail.removed),
+      complete: recovery.complete && tail.complete,
+    };
+    if (suppressEnsurePrune) {
+      terminalPrune.suppressed_reason = 'initial-invalid-scan-marker';
+    }
+    completedResult = Object.assign(primary, { terminal_prune: terminalPrune });
+    return completedResult;
+  } catch (error) {
+    operationError = error;
+    throw error;
+  } finally {
+    try {
+      releaseLock({ wikiRoot: root, token: owner.token });
+    } catch (releaseError) {
+      if (operationError) {
+        operationError.release_error = releaseError;
+      } else {
+        if (completedResult) {
+          releaseError.lint_result = completedResult;
+          releaseError.terminal_prune = completedResult.terminal_prune;
+        }
+        throw releaseError;
+      }
+    }
   }
-  finally { releaseLock({ wikiRoot: root, token: owner.token }); }
 }
 
 module.exports = {

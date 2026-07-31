@@ -1,0 +1,53 @@
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+
+const root = path.resolve(__dirname, '..');
+const read = (relative) => fs.readFileSync(path.join(root, relative), 'utf8');
+
+test('public contracts name every terminal-prune caller and preserve recovery authority', () => {
+  const lint = read('skills/wiki-lint/SKILL.md');
+  const schema = read('skills/wiki-schema/SKILL.md');
+  const storage = read('skills/wiki-schema/references/storage-layout.md');
+  const machine = read('skills/wiki-schema/wiki-schema.yaml');
+  for (const source of [schema, storage, machine]) {
+    assert.match(source, /wiki-lint --fix/);
+    assert.match(source, /scan-window ensure/);
+    assert.match(source, /transaction prune/);
+    assert.match(source, /authenticated.*residue|residue.*authenticated/i);
+    assert.match(source, /created.*last-scan.*proposed|last-scan.*proposed.*created/is);
+    assert.match(source, /preserved.*stale|stale.*preserved/is);
+    assert.match(source, /initial-invalid|initially invalid/i);
+    assert.match(
+      source,
+      /initial-invalid.*(?:suppresses|protects).*every.*(?:created.*preserved.*stale|created.*stale.*preserved)/is,
+    );
+    assert.match(source, /already-started.*residue.*(?:remains|is).*protected/is);
+    assert.doesNotMatch(source, /may finish despite an initial-invalid/i);
+    assert.match(source, /physical.*seal|seal.*physical/i);
+    assert.match(source, /reservation-\.prune|reservation.*prune/i);
+    assert.match(source, /stopped-host/i);
+    assert.match(source, /ordinary.*age|age.*ordinary/i);
+  }
+  assert.match(lint, /terminal_prune\.complete/);
+  assert.strictEqual(lint.includes('recovery pass incomplete'), true);
+  assert.strictEqual(lint.includes('recovery pass completed'), true);
+  assert.match(lint, /TRANSACTION_RECOVERY_REQUIRED/);
+  assert.match(lint, /WIKI_STATE_INVALID/);
+  assert.match(lint, /created.*last-scan.*proposed|last-scan.*proposed.*created/is);
+  assert.match(lint, /initial-invalid|initially invalid/i);
+  assert.match(lint, /physical.*seal|seal.*physical/i);
+  assert.match(
+    lint,
+    /Physically ambiguous scan-marker representations are not repaired by this pass/,
+  );
+  assert.match(lint, /stop all hosts and correct the marker before rerunning/i);
+  assert.match(lint, /reservation-\.prune|reservation.*prune/i);
+  assert.equal((lint.match(/^```deep-wiki-exec$/gm) || []).length, 4);
+  assert.equal((lint.match(/^<!-- deep-wiki:exec -->$/gm) || []).length, 4);
+  assert.match(storage, /transaction recover/);
+  assert.match(storage, /stopped-host/);
+});

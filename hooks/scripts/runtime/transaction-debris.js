@@ -121,6 +121,8 @@ function sweepTransactionDebris(root, token, options = {}) {
   const removed = [];
   for (const entry of entries) {
     if (processed >= limit || !entry.isDirectory() || entry.isSymbolicLink()) continue;
+    if (entry.name.startsWith('.prune-')
+        || entry.name.startsWith('.reservation-.prune-')) continue;
     const transaction = path.join(transactions, entry.name);
     const journal = path.join(transaction, 'journal.json');
 

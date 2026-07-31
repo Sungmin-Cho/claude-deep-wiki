@@ -7,13 +7,23 @@ deep-wiki의 주요 변경사항을 기록합니다.
 
 ## [Unreleased]
 
+## [1.9.4] — 2026-07-31 (lint repair 회수)
+
+### 수정
+
+- 완료된 scan-window `ensure` journal은 인증된 scan-window 상태가 회수 가능함을 증명한 뒤 더 이상 무제한 누적되지 않습니다. 명시적 `wiki-lint --fix`가 현재 lock 아래에서 자체 복구 회수를 수행하고, 유계 `transaction prune` 명령은 eligible transaction 디렉터리 전체를 새 identity-bound sibling quarantine으로 원자 이동한 뒤 인증된 journal을 삭제합니다. 중단된 quarantine은 식별 가능한 상태로 남아 이후 유계 pass가 다시 처리합니다. exact journal-copy reservation은 quarantine 제거가 끝날 때까지 canonical source generation을 닫아 두고, 원본 journal unlink 뒤 중단되어도 exact fsynced backup으로 복구할 수 있습니다. 두 파일은 exclusive crash-recoverable pending publication을 사용하며, 이후 유계 pass는 partial publication, backup-only·빈 quarantine, 고아 exact reservation도 마무리합니다. 정리는 discovery·validation·복구 가능한 mutation phase 전반에서 deadline을 다시 검사합니다. age 조건을 충족한 완전 검증 `cleaned` scan-window 디렉터리만 제거하면서 증명되지 않은 created 상태와 in-flight·malformed·foreign-kind·linked·ambiguous 상태를 보존합니다. 결과의 `complete` 필드는 전체 순회와 deadline·limit로 잘린 pass를 구분합니다.
+- Fractional-clock `lint fix` 작업은 이제 commit 전에 manifest event timestamp를 정초 단위 UTC-Z로 canonicalize하므로, 성공한 repair가 더 이상 `MANIFEST_INVALID`로 끝나지 않습니다.
+
+### 변경
+
+- 이 runtime 변경은 두 plugin manifest와 package metadata 모두에서 별도 1.9.4 설치 식별자로 배포됩니다.
+
 ## [1.9.3] — 2026-07-30
 
 ### 수정
 
 - 이제 sync-drive 트랜잭션 journal이 파일시스템 메타데이터 호출 안에서 멈춰도 `wiki-runtime snapshot`이 무기한 기다리지 않습니다([#39](https://github.com/Sungmin-Cho/claude-deep-wiki/issues/39)). Snapshot 실행을 감독되는 read-only 자식 프로세스로 분리하고, 잠재적으로 멈춘 syscall 바깥에 parent timer를 둡니다. 12초 timer가 발화하면 parent가 worker tree 종료를 요청하고 pipe와 child handle을 분리한 뒤, worker `close`를 기다리거나 복구 증거를 변경하지 않고 실행 가능한 `DEADLINE_EXCEEDED` 안내를 반환합니다. POSIX와 native Windows 모두 실행된 종료 요청을 보수적으로 unconfirmed로 보고하며, launch 또는 요청 실패는 requested도 confirmed도 아닌 상태로 보고합니다. 즉시 읽을 수 없는 journal은 같은 stopped-host/readability 복구 경계와 함께 `TRANSACTION_RECOVERY_REQUIRED`로 fail closed합니다.
 - SessionStart scan-window 영속화를 감독되는 자식 프로세스로 분리했습니다. 시간초과 시 자식 트리 종료 완료를 확인한 뒤 해당 자식 PID와 일치하는 same-host dead lock만 회수하며, 일반 lock 획득도 live·foreign·malformed·ownerless contention을 약화하지 않고 같은 인증된 dead-owner 경우를 자체 복구합니다.
-- 완료된 scan-window journal이 무제한 누적되지 않습니다. 자동 유지보수는 현재 lock 아래에서 오래된 검증 완료 `ensure` terminal을 정리하고, 유계 `transaction prune` 명령은 eligible transaction 디렉터리 전체를 새 identity-bound sibling quarantine으로 원자 이동한 뒤 인증된 journal을 삭제합니다. 중단된 quarantine은 식별 가능한 상태로 남아 이후 유계 pass가 다시 처리합니다. exact journal-copy reservation은 quarantine 제거가 끝날 때까지 canonical source generation을 닫아 두고, 원본 journal unlink 뒤 중단되어도 exact fsynced backup으로 복구할 수 있습니다. 두 파일은 exclusive crash-recoverable pending publication을 사용하며, 이후 유계 pass는 partial publication, backup-only·빈 quarantine, 고아 exact reservation도 마무리합니다. 정리는 discovery·validation·복구 가능한 mutation phase 전반에서 deadline을 다시 검사합니다. age 조건을 충족한 완전 검증 `cleaned` scan-window 디렉터리만 제거하면서 in-flight·malformed·foreign-kind·linked·ambiguous 상태를 보존합니다. 결과의 `complete` 필드는 전체 순회와 deadline·limit로 잘린 pass를 구분합니다.
 
 ## [1.9.2] — 2026-07-27 (컨텍스트 다이어트)
 

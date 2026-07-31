@@ -18,6 +18,15 @@ runtime_authority:
     terminal_prune_scope: validated-cleaned-scan-window-only
     terminal_prune_bounded: true
     terminal_prune_completion_field: complete
+    terminal_prune_callers: ["scan-window ensure", "wiki-lint --fix", "transaction prune"]
+    terminal_prune_ordinary_age_policy: "Only ordinary cleaned directories old enough for the caller policy are selected."
+    terminal_prune_residue_policy: "Authenticated residue from an already-started prune may bypass the ordinary age gate, but authenticated already-started ensure residue remains protected when either marker was initially invalid; ordinary directories remain excluded in resumable-only mode."
+    terminal_prune_recovery_authority: "Distinct from manifest transaction recover; ambiguous residue requires stopped-host manual intervention."
+    terminal_prune_marker_acceptance: "Only exact canonical UTC-Z plus LF, one-link regular non-symlink .pending-scan and .last-scan files are accepted; lstat ENOENT alone is absent."
+    terminal_prune_initial_invalid_policy: "Either initial-invalid marker suppresses every created, preserved, and stale ensure deletion for the whole pass, including authenticated already-started residue; authenticated already-started residue remains protected until a later pass begins with both markers accepted or absent."
+    terminal_prune_physical_seal_policy: "Both accepted-or-absent marker physical seals are revalidated before every destructive boundary."
+    terminal_prune_created_policy: "A created ensure is reclaimable only when pending does not match and exact .last-scan >= input.proposed; preserved and stale are no-op evidence."
+    terminal_prune_compatibility_name_policy: "Every raw .reservation-.prune-* basename is rejected before type, suffix, or content parsing and requires stopped-host intervention."
     expected_hash_guard: true
   scan_window:
     pending: .wiki-meta/.pending-scan

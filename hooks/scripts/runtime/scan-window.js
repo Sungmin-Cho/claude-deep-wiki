@@ -210,6 +210,165 @@ function assertRegularFileIdentity(pathname, expected, ageGate = null) {
   }
 }
 
+function regularIdentitiesMatch(actual, expected) {
+  return actual !== null && expected !== null
+    && identitiesMatch(actual, expected)
+    && actual.mtimeNs === expected.mtimeNs
+    && actual.nlink === expected.nlink;
+}
+
+function inspectPruneMarker(pathname) {
+  let identity;
+  try {
+    identity = regularFileIdentity(fs.lstatSync(pathname, { bigint: true }));
+  } catch (cause) {
+    if (cause.code === 'ENOENT') {
+      return { state: 'absent', invalid: false, pathname };
+    }
+    return { state: 'invalid', invalid: true, pathname };
+  }
+  if (!identity) return { state: 'invalid', invalid: true, pathname };
+
+  let bytes;
+  try {
+    bytes = fs.readFileSync(pathname);
+    const current = regularFileIdentity(fs.lstatSync(pathname, { bigint: true }));
+    if (!regularIdentitiesMatch(current, identity)) {
+      return { state: 'invalid', invalid: true, pathname };
+    }
+  } catch {
+    return {
+      state: 'invalid',
+      invalid: true,
+      pathname,
+    };
+  }
+
+  let timestamp;
+  try {
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    if (!text.endsWith('\n')) throw new Error('missing canonical newline');
+    timestamp = canonicalTimestamp(text.slice(0, -1), 'scan-window prune marker');
+    if (!bytes.equals(Buffer.from(`${timestamp}\n`))) {
+      throw new Error('noncanonical marker bytes');
+    }
+  } catch {
+    return {
+      state: 'invalid',
+      invalid: true,
+      pathname,
+      bytes,
+      identity,
+    };
+  }
+  return {
+    state: 'accepted',
+    invalid: false,
+    pathname,
+    timestamp,
+    bytes,
+    identity,
+  };
+}
+
+function inspectPruneMarkers(options = {}) {
+  const root = physicalWikiRoot(options.wikiRoot);
+  return {
+    pending: inspectPruneMarker(path.join(root, '.wiki-meta', '.pending-scan')),
+    last: inspectPruneMarker(path.join(root, '.wiki-meta', '.last-scan')),
+  };
+}
+
+function assertPruneMarkerSeals(markers) {
+  for (const marker of [markers.pending, markers.last]) {
+    if (marker.state === 'absent') {
+      try {
+        fs.lstatSync(marker.pathname);
+      } catch (cause) {
+        if (cause.code === 'ENOENT') continue;
+        throw scanError(
+          'TRANSACTION_RECOVERY_REQUIRED',
+          'scan-window prune marker absence could not be revalidated',
+          cause,
+        );
+      }
+      throw scanError(
+        'TRANSACTION_RECOVERY_REQUIRED',
+        'scan-window prune marker appeared after authorization',
+      );
+    }
+    if (marker.state !== 'accepted') {
+      throw scanError(
+        'TRANSACTION_RECOVERY_REQUIRED',
+        'scan-window prune marker was initially invalid',
+      );
+    }
+    let current;
+    let bytes;
+    try {
+      current = regularFileIdentity(fs.lstatSync(marker.pathname, { bigint: true }));
+      bytes = fs.readFileSync(marker.pathname);
+      const after = regularFileIdentity(fs.lstatSync(marker.pathname, { bigint: true }));
+      if (!regularIdentitiesMatch(current, marker.identity)
+          || !regularIdentitiesMatch(after, marker.identity)
+          || !bytes.equals(marker.bytes)) {
+        throw scanError(
+          'TRANSACTION_RECOVERY_REQUIRED',
+          'scan-window prune marker physical seal changed',
+        );
+      }
+    } catch (cause) {
+      if (cause instanceof ScanWindowError) throw cause;
+      throw scanError(
+        'TRANSACTION_RECOVERY_REQUIRED',
+        'scan-window prune marker physical seal is unavailable',
+        cause,
+      );
+    }
+  }
+}
+
+function ensureDeletionAllowed(journal, markers, suppressEnsurePrune) {
+  if (journal.kind !== 'ensure') return true;
+  if (suppressEnsurePrune || markers.pending.invalid || markers.last.invalid) return false;
+  if (journal.result_status === 'preserved' || journal.result_status === 'stale') return true;
+  if (journal.result_status !== 'created') return false;
+  const proposed = journal.input.proposed;
+  const pendingDoesNotMatch = markers.pending.state !== 'accepted'
+    || markers.pending.timestamp !== proposed;
+  return pendingDoesNotMatch
+    && markers.last.state === 'accepted'
+    && markers.last.timestamp >= proposed;
+}
+
+function assertPruneTransactionNamesSupported(options = {}) {
+  const root = physicalWikiRoot(options.wikiRoot);
+  const deadline = options.deadline || createDeadline({ budgetMs: 12_000 });
+  const assertBudget = () => assertBeforeDeadline(
+    deadline,
+    'scan-window-prune-name-preflight',
+  );
+  assertBudget();
+  assertLockOwner({ wikiRoot: root, token: options.token });
+  assertBudget();
+  const transactions = path.join(root, '.wiki-meta', '.transactions');
+  if (inspectPhysicalDirectory(
+    transactions,
+    transactions,
+    '.wiki-meta/.transactions',
+    true,
+  ) === null) return;
+  assertBudget();
+  const names = fs.readdirSync(transactions);
+  assertBudget();
+  if (names.some((name) => name.startsWith('.reservation-.prune-'))) {
+    throw scanError(
+      'TRANSACTION_RECOVERY_REQUIRED',
+      'unsupported .reservation-.prune-* entry requires stopped-host intervention',
+    );
+  }
+}
+
 function samePhysicalPath(actual, expected) {
   return path.relative(expected, actual) === '';
 }
@@ -524,6 +683,8 @@ function defaultJournalAdapter(wikiRoot, operationId) {
     assertOwner,
     ageGate,
     assertBudget,
+    assertEnsureBoundary,
+    onCommitted,
   ) => {
     const quarantinedJournal = path.join(quarantine, 'journal.json');
     const quarantinedBackup = path.join(quarantine, 'journal.backup');
@@ -664,6 +825,7 @@ function defaultJournalAdapter(wikiRoot, operationId) {
       destination,
       expectedBytes,
       label,
+      boundaryKey,
       expectedDestinationIdentity = null,
     ) => {
       assertQuarantine();
@@ -693,6 +855,7 @@ function defaultJournalAdapter(wikiRoot, operationId) {
           assertQuarantine();
           assertExactPublication(pendingPath, expectedBytes, pendingState.identity, [2n]);
           assertExactPublication(destination, expectedBytes, destinationState.identity, [2n]);
+          assertEnsureBoundary(`before-${boundaryKey}-pending-hardlink-unlink`);
           fs.unlinkSync(pendingPath);
           assertQuarantine();
           destinationState = assertExactPublication(
@@ -722,6 +885,7 @@ function defaultJournalAdapter(wikiRoot, operationId) {
             `${label} interrupted publication changed`,
           );
         }
+        assertEnsureBoundary(`before-${boundaryKey}-pending-discard`);
         fs.unlinkSync(pendingPath);
         assertQuarantine();
         pendingState = null;
@@ -771,6 +935,7 @@ function defaultJournalAdapter(wikiRoot, operationId) {
       assertPruneBudget();
       assertQuarantine();
       assertExactPublication(pendingPath, expectedBytes, pendingState.identity);
+      assertEnsureBoundary(`before-${boundaryKey}-destination-link`);
       try {
         fs.linkSync(pendingPath, destination);
       } catch (cause) {
@@ -800,6 +965,7 @@ function defaultJournalAdapter(wikiRoot, operationId) {
       }
       assertPruneBudget();
       assertQuarantine();
+      assertEnsureBoundary(`before-${boundaryKey}-staged-unlink`);
       fs.unlinkSync(pendingPath);
       assertQuarantine();
       return assertExactPublication(
@@ -843,6 +1009,7 @@ function defaultJournalAdapter(wikiRoot, operationId) {
       quarantinedBackup,
       expectedJournalBytes,
       'terminal prune backup',
+      'backup',
       backupIdentity,
     );
     assertSealedEvidence(quarantinedBackup, backupIdentity);
@@ -851,6 +1018,7 @@ function defaultJournalAdapter(wikiRoot, operationId) {
       locations.transaction,
       expectedJournalBytes,
       'terminal prune source reservation',
+      'reservation',
     );
 
     assertQuarantine(hasJournal
@@ -864,6 +1032,7 @@ function defaultJournalAdapter(wikiRoot, operationId) {
     if (hasJournal) {
       assertSealedEvidence(quarantinedJournal, expectedJournalIdentity, true);
       assertPruneBudget();
+      assertEnsureBoundary('before-quarantined-journal-unlink');
       fs.unlinkSync(quarantinedJournal);
       assertExactPublication(
         locations.transaction,
@@ -879,6 +1048,7 @@ function defaultJournalAdapter(wikiRoot, operationId) {
       activeIdentity,
     );
     assertPruneBudget();
+    assertEnsureBoundary('before-quarantined-backup-unlink');
     fs.unlinkSync(quarantinedBackup);
     assertExactPublication(
       locations.transaction,
@@ -887,6 +1057,7 @@ function defaultJournalAdapter(wikiRoot, operationId) {
     );
     assertQuarantine([]);
     assertPruneBudget();
+    assertEnsureBoundary('before-quarantine-rmdir');
     fs.rmdirSync(quarantine);
     assertTransactionsOwner();
     assertExactPublication(
@@ -895,7 +1066,9 @@ function defaultJournalAdapter(wikiRoot, operationId) {
       activeIdentity,
     );
     assertPruneBudget();
+    assertEnsureBoundary('before-final-canonical-reservation-unlink');
     fs.unlinkSync(locations.transaction);
+    if (typeof onCommitted === 'function') onCommitted();
     assertTransactionsOwner();
   };
   const finalizeEmptyTerminalQuarantine = (
@@ -905,6 +1078,8 @@ function defaultJournalAdapter(wikiRoot, operationId) {
     expectedReservationIdentity,
     assertOwner,
     assertBudget,
+    assertEnsureBoundary,
+    onCommitted,
   ) => {
     const assertPruneBudget = () => {
       if (typeof assertBudget === 'function') assertBudget();
@@ -954,11 +1129,14 @@ function defaultJournalAdapter(wikiRoot, operationId) {
     assertEmptyQuarantine();
     assertReservation(locations.transaction, expectedReservationIdentity);
     assertPruneBudget();
+    assertEnsureBoundary('before-empty-quarantine-rmdir');
     fs.rmdirSync(quarantine);
     assertTransactionsOwner();
     assertReservation(locations.transaction, expectedReservationIdentity);
     assertPruneBudget();
+    assertEnsureBoundary('before-empty-quarantine-reservation-unlink');
     fs.unlinkSync(locations.transaction);
+    if (typeof onCommitted === 'function') onCommitted();
     assertTransactionsOwner();
   };
   return {
@@ -1046,7 +1224,8 @@ function defaultJournalAdapter(wikiRoot, operationId) {
         removeGuarded(file, assertOwner);
       },
       movePendingToTombstone(file, tombstone, assertOwner) {
-        if (file !== locations.pending || tombstone !== locations.tombstone) {
+        if ((file !== locations.pending && file !== locations.last)
+            || tombstone !== locations.tombstone) {
           throw scanError('SCAN_WINDOW_FILESYSTEM', 'default adapter tombstone move escapes bound parents');
         }
         assertMutation(assertOwner);
@@ -1064,6 +1243,8 @@ function defaultJournalAdapter(wikiRoot, operationId) {
         assertOwner,
         ageGate,
         assertBudget,
+        assertEnsureBoundary,
+        onCommitted,
       ) {
         assertMutation(assertOwner, assertBudget);
         if (typeof assertBudget === 'function') assertBudget();
@@ -1122,15 +1303,18 @@ function defaultJournalAdapter(wikiRoot, operationId) {
           if (typeof assertBudget === 'function') assertBudget();
           assertMutation(assertOwner, assertBudget);
           if (typeof assertBudget === 'function') assertBudget();
+          assertEnsureBoundary('before-transaction-quarantine-rename');
           fs.renameSync(locations.transaction, quarantine);
         } catch (cause) {
           if (cause.code === 'DEADLINE_EXCEEDED'
               || (typeof cause.code === 'string' && cause.code.startsWith('LOCK_'))) throw cause;
-          throw scanError(
+          if (cause.ensurePruneProtected) throw cause;
+          const error = scanError(
             'TRANSACTION_RECOVERY_REQUIRED',
             'terminal transaction could not enter quarantine',
             cause,
           );
+          throw error;
         }
 
         try {
@@ -1145,15 +1329,19 @@ function defaultJournalAdapter(wikiRoot, operationId) {
             assertOwner,
             ageGate,
             assertBudget,
+            assertEnsureBoundary,
+            onCommitted,
           );
         } catch (cause) {
           if (cause.code === 'DEADLINE_EXCEEDED'
               || (typeof cause.code === 'string' && cause.code.startsWith('LOCK_'))) throw cause;
-          throw scanError(
+          if (cause.ensurePruneProtected) throw cause;
+          const error = scanError(
             'TRANSACTION_RECOVERY_REQUIRED',
             'quarantined terminal transaction requires recovery',
             cause,
           );
+          throw error;
         }
       },
       removeCleanedQuarantine(
@@ -1167,6 +1355,8 @@ function defaultJournalAdapter(wikiRoot, operationId) {
         assertOwner,
         ageGate,
         assertBudget,
+        assertEnsureBoundary,
+        onCommitted,
       ) {
         if (path.basename(quarantineName) !== quarantineName
             || !quarantineName.startsWith(`.prune-${operationId.length}-${operationId}-`)) {
@@ -1185,15 +1375,19 @@ function defaultJournalAdapter(wikiRoot, operationId) {
             assertOwner,
             ageGate,
             assertBudget,
+            assertEnsureBoundary,
+            onCommitted,
           );
         } catch (cause) {
           if (cause.code === 'DEADLINE_EXCEEDED'
               || (typeof cause.code === 'string' && cause.code.startsWith('LOCK_'))) throw cause;
-          throw scanError(
+          if (cause.ensurePruneProtected) throw cause;
+          const error = scanError(
             'TRANSACTION_RECOVERY_REQUIRED',
             'terminal quarantine requires recovery',
             cause,
           );
+          throw error;
         }
       },
       removeEmptyCleanedQuarantine(
@@ -1203,6 +1397,8 @@ function defaultJournalAdapter(wikiRoot, operationId) {
         expectedReservationIdentity,
         assertOwner,
         assertBudget,
+        assertEnsureBoundary,
+        onCommitted,
       ) {
         if (path.basename(quarantineName) !== quarantineName
             || !quarantineName.startsWith(`.prune-${operationId.length}-${operationId}-`)) {
@@ -1217,15 +1413,19 @@ function defaultJournalAdapter(wikiRoot, operationId) {
             expectedReservationIdentity,
             assertOwner,
             assertBudget,
+            assertEnsureBoundary,
+            onCommitted,
           );
         } catch (cause) {
           if (cause.code === 'DEADLINE_EXCEEDED'
               || (typeof cause.code === 'string' && cause.code.startsWith('LOCK_'))) throw cause;
-          throw scanError(
+          if (cause.ensurePruneProtected) throw cause;
+          const error = scanError(
             'TRANSACTION_RECOVERY_REQUIRED',
             'empty terminal quarantine requires recovery',
             cause,
           );
+          throw error;
         }
       },
     },
@@ -1267,8 +1467,8 @@ function appendTransition(adapter, journal, transition, options) {
   }
 }
 
-function invokeFault(faultInjector, stage) {
-  if (typeof faultInjector === 'function') faultInjector(stage);
+function invokeFault(faultInjector, stage, context) {
+  if (typeof faultInjector === 'function') faultInjector(stage, context);
 }
 
 function makeJournal({ operationId, ownerToken, plan, wikiRoot }) {
@@ -1580,10 +1780,15 @@ function applyDestination(adapter, journal, options, target) {
   const state = destinationState(adapter, file, before, after);
   if (state === 'conflict') throw scanError('TRANSACTION_RECOVERY_REQUIRED', `${target} destination diverged from staged bytes`);
   if (!journal.transitions.includes(transition) && state === 'before') {
-    if (target === 'last') {
+    if (target === 'last' && after !== null) {
       writeDestination({
         ...options, adapter, file, bytes: after,
         beforeFault: 'before-last-scan-rename', afterFault: 'after-last-scan-rename',
+      });
+    } else if (target === 'last') {
+      removePending({
+        ...options, adapter, file, tombstone: adapter.tombstonePath,
+        beforeFault: 'before-last-scan-remove', afterFault: 'after-last-scan-remove',
       });
     } else if (after === null) {
       removePending({
@@ -1638,9 +1843,16 @@ function applyScanWindowTransition(options = {}) {
   const control = adapter[DEFAULT_ADAPTER_CONTROL];
   if (control) {
     const assertOwner = () => assertLockOwner({ wikiRoot: physicalRoot, token });
+    const maintenanceDeadline = options.deadline
+      || createDeadline({ budgetMs: 12_000 });
+    assertPruneTransactionNamesSupported({
+      wikiRoot: physicalRoot,
+      token,
+      deadline: maintenanceDeadline,
+    });
     control.prepareDebrisSweep(assertOwner);
     sweepTransactionDebris(physicalRoot, token, {
-      deadline: options.deadline || createDeadline({ budgetMs: 12_000 }),
+      deadline: maintenanceDeadline,
       classes: ['activation', 'plain'],
     });
   }
@@ -1712,11 +1924,25 @@ function pruneScanWindowTransactions(options = {}) {
   const limit = options.limit === undefined ? AUTOMATIC_PRUNE_LIMIT : options.limit;
   const now = options.now instanceof Date ? options.now : new Date(options.now || Date.now());
   const deadline = options.deadline || createDeadline({ budgetMs: 12_000 });
+  const resumableOnly = options.resumableOnly === undefined ? false : options.resumableOnly;
+  const suppressEnsurePrune = options.suppressEnsurePrune === undefined
+    ? false
+    : options.suppressEnsurePrune;
+  const faultInjector = options.faultInjector;
   if (!Number.isSafeInteger(maxAgeDays) || maxAgeDays < 0) {
     throw scanError('SCAN_WINDOW_INVALID', 'maxAgeDays must be a nonnegative integer');
   }
   if (!Number.isSafeInteger(limit) || limit < 0) {
     throw scanError('SCAN_WINDOW_INVALID', 'prune limit must be a nonnegative integer');
+  }
+  if (typeof resumableOnly !== 'boolean') {
+    throw scanError('SCAN_WINDOW_INVALID', 'resumableOnly must be a boolean');
+  }
+  if (typeof suppressEnsurePrune !== 'boolean') {
+    throw scanError('SCAN_WINDOW_INVALID', 'suppressEnsurePrune must be a boolean');
+  }
+  if (faultInjector !== undefined && typeof faultInjector !== 'function') {
+    throw scanError('SCAN_WINDOW_INVALID', 'faultInjector must be a function');
   }
   if (!Number.isFinite(now.getTime())) throw scanError('SCAN_WINDOW_INVALID', 'prune time is invalid');
   const kinds = options.kinds === undefined ? null : new Set(options.kinds);
@@ -1734,9 +1960,18 @@ function pruneScanWindowTransactions(options = {}) {
   );
   const transactions = path.join(physicalRoot, '.wiki-meta', '.transactions');
   let entries;
+  let pruneMarkers;
   try {
     assertBudget();
     assertOwner();
+    assertBudget();
+    assertPruneTransactionNamesSupported({
+      wikiRoot: physicalRoot,
+      token,
+      deadline,
+    });
+    assertBudget();
+    pruneMarkers = inspectPruneMarkers({ wikiRoot: physicalRoot });
     assertBudget();
     if (inspectPhysicalDirectory(
       transactions,
@@ -1757,6 +1992,65 @@ function pruneScanWindowTransactions(options = {}) {
   }
 
   const removed = [];
+  const recordCommittedPrune = (operationId, boundary) => {
+    removed.push(operationId);
+    invokeFault(faultInjector, boundary, { operationId });
+  };
+  const protectedEnsureResidue = (message, cause) => {
+    const error = scanError(
+      'TRANSACTION_RECOVERY_REQUIRED',
+      `${message}; preserve it and use stopped-host intervention`,
+      cause,
+    );
+    error.ensurePruneProtected = true;
+    return error;
+  };
+  const ensureDeletionAuthorized = (journal) => (
+    ensureDeletionAllowed(journal, pruneMarkers, suppressEnsurePrune)
+  );
+  const assertEnsureBoundaryFor = (journal) => {
+    return (boundary) => {
+      assertBudget();
+      assertOwner();
+      invokeFault(faultInjector, boundary, {
+        operationId: journal.operation_id,
+      });
+      assertOwner();
+      assertBudget();
+      if (journal.kind !== 'ensure') return;
+      try {
+        if (!ensureDeletionAuthorized(journal)) {
+          throw protectedEnsureResidue('ensure transaction lost semantic deletion authority');
+        }
+        assertPruneMarkerSeals(pruneMarkers);
+      } catch (cause) {
+        if (cause.ensurePruneProtected) throw cause;
+        throw protectedEnsureResidue('ensure transaction marker seal changed', cause);
+      }
+      assertOwner();
+      assertBudget();
+    };
+  };
+  const throwWithTerminalPrune = (error) => {
+    if (!error.terminal_prune) {
+      error.terminal_prune = {
+        processed: removed.length,
+        removed: [...removed],
+        complete: false,
+      };
+    }
+    throw error;
+  };
+  const throwIfEnsureProtected = (error) => {
+    if (!error.ensurePruneProtected) return;
+    throwWithTerminalPrune(error);
+  };
+  const assertResidueReclaimable = (journal) => {
+    if (!ensureDeletionAuthorized(journal)) {
+      throw protectedEnsureResidue('protected ensure prune residue requires recovery');
+    }
+  };
+
   let complete = true;
   for (const entry of entries) {
     if (removed.length >= limit || remainingMs(deadline) < PRUNE_RESERVE_MS) {
@@ -1769,14 +2063,8 @@ function pruneScanWindowTransactions(options = {}) {
       let reservationBytes;
       let reservationJournal;
       let operationId;
-      let quarantineName = null;
       try {
-        if (entry.name.startsWith('.reservation-.prune-')) {
-          quarantineName = entry.name.slice('.reservation-'.length);
-          operationId = operationIdFromPruneName(quarantineName);
-        } else {
-          operationId = validateOperationId(entry.name);
-        }
+        operationId = validateOperationId(entry.name);
         reservationIdentity = regularFileIdentity(
           fs.lstatSync(reservation, { bigint: true }),
         );
@@ -1792,14 +2080,16 @@ function pruneScanWindowTransactions(options = {}) {
             || reservationJournal.transitions.at(-1) !== 'cleaned'
             || !reservationBytes.equals(stageBytes(reservationJournal))
             || (kinds && !kinds.has(reservationJournal.kind))) continue;
+        if (operationId === excludeOperationId) continue;
+        assertResidueReclaimable(reservationJournal);
       } catch (error) {
+        throwIfEnsureProtected(error);
         if (error.code === 'DEADLINE_EXCEEDED') {
           complete = false;
           break;
         }
         continue;
       }
-      if (operationId === excludeOperationId) continue;
       let matchingQuarantine = false;
       try {
         matchingQuarantine = fs.readdirSync(transactions).some((name) => {
@@ -1816,20 +2106,18 @@ function pruneScanWindowTransactions(options = {}) {
         continue;
       }
       if (matchingQuarantine) continue;
-      if (quarantineName) {
-        try {
-          fs.lstatSync(path.join(transactions, quarantineName));
-          continue;
-        } catch (cause) {
-          if (cause.code !== 'ENOENT') continue;
-        }
-      }
-      assertOwner();
       try {
+        invokeFault(faultInjector, 'before-canonical-reservation-only-owner-check', {
+          operationId,
+        });
+        assertOwner();
         assertBudget();
       } catch (error) {
-        complete = false;
-        break;
+        if (error.code === 'DEADLINE_EXCEEDED') {
+          complete = false;
+          break;
+        }
+        throwWithTerminalPrune(error);
       }
       try {
         assertRegularFileIdentity(reservation, reservationIdentity);
@@ -1837,19 +2125,26 @@ function pruneScanWindowTransactions(options = {}) {
         assertRegularFileIdentity(reservation, reservationIdentity);
         if (!currentBytes.equals(reservationBytes)) continue;
         assertBudget();
+        assertEnsureBoundaryFor(reservationJournal)(
+          'before-canonical-reservation-only-unlink',
+        );
         fs.unlinkSync(reservation);
+        recordCommittedPrune(
+          operationId,
+          'after-canonical-reservation-only-unlink',
+        );
         assertOwner();
       } catch (error) {
         if (error.code === 'DEADLINE_EXCEEDED') {
           complete = false;
           break;
         }
+        throwIfEnsureProtected(error);
         if (error.code === 'ENOENT'
             || error.code === 'TRANSACTION_RECOVERY_REQUIRED'
             || error.code === 'SCAN_WINDOW_FILESYSTEM') continue;
-        throw error;
+        throwWithTerminalPrune(error);
       }
-      removed.push(operationId);
       continue;
     }
     if (!entry.isDirectory() || entry.isSymbolicLink()
@@ -1894,8 +2189,20 @@ function pruneScanWindowTransactions(options = {}) {
               || reservationJournal.transitions.at(-1) !== 'cleaned'
               || !reservationBytes.equals(stageBytes(reservationJournal))
               || (kinds && !kinds.has(reservationJournal.kind))) continue;
-          assertOwner();
-          assertBudget();
+          assertResidueReclaimable(reservationJournal);
+          try {
+            invokeFault(faultInjector, 'before-empty-quarantine-owner-check', {
+              operationId,
+            });
+            assertOwner();
+            assertBudget();
+          } catch (error) {
+            if (error.code === 'DEADLINE_EXCEEDED') {
+              complete = false;
+              break;
+            }
+            throwWithTerminalPrune(error);
+          }
           try {
             adapter[DEFAULT_ADAPTER_CONTROL].removeEmptyCleanedQuarantine(
               entry.name,
@@ -1904,16 +2211,21 @@ function pruneScanWindowTransactions(options = {}) {
               reservationIdentity,
               assertOwner,
               assertBudget,
+              assertEnsureBoundaryFor(reservationJournal),
+              () => recordCommittedPrune(
+                operationId,
+                'after-empty-quarantine-reservation-unlink',
+              ),
             );
           } catch (error) {
             if (error.code === 'DEADLINE_EXCEEDED') {
               complete = false;
               break;
             }
+            throwIfEnsureProtected(error);
             if (error.code === 'TRANSACTION_RECOVERY_REQUIRED') continue;
-            throw error;
+            throwWithTerminalPrune(error);
           }
-          removed.push(operationId);
           continue;
         }
         const hasJournal = names.includes('journal.json');
@@ -1985,6 +2297,8 @@ function pruneScanWindowTransactions(options = {}) {
         validateJournal(journal, operationId, physicalRoot);
         if (!journalBytes.equals(stageBytes(journal))) continue;
       } catch (error) {
+        if (error.terminal_prune) throw error;
+        throwIfEnsureProtected(error);
         if (error.code === 'DEADLINE_EXCEEDED') {
           complete = false;
           break;
@@ -1993,20 +2307,28 @@ function pruneScanWindowTransactions(options = {}) {
       }
       if (journal.transitions.at(-1) !== 'cleaned'
           || (kinds && !kinds.has(journal.kind))
-          || (!resumedFromBackup && !terminalJournalIsOldEnough(
+          || (!(resumedFromBackup || resumableOnly) && !terminalJournalIsOldEnough(
             journalIdentity,
             now.getTime(),
-            maxAgeDays,
+          maxAgeDays,
           ))) continue;
+      try { assertResidueReclaimable(journal); }
+      catch (error) { throwIfEnsureProtected(error); }
 
       const adapter = defaultJournalAdapter(physicalRoot, operationId);
       const control = adapter[DEFAULT_ADAPTER_CONTROL];
-      assertOwner();
       try {
+        invokeFault(faultInjector, 'before-quarantine-owner-check', {
+          operationId,
+        });
+        assertOwner();
         assertBudget();
       } catch (error) {
-        complete = false;
-        break;
+        if (error.code === 'DEADLINE_EXCEEDED') {
+          complete = false;
+          break;
+        }
+        throwWithTerminalPrune(error);
       }
       try {
         control.removeCleanedQuarantine(
@@ -2018,23 +2340,29 @@ function pruneScanWindowTransactions(options = {}) {
           journalIdentity,
           backupIdentity,
           assertOwner,
-          {
+          resumableOnly ? null : {
             nowMs: now.getTime(),
             maxAgeDays,
           },
           assertBudget,
+          assertEnsureBoundaryFor(journal),
+          () => recordCommittedPrune(
+            operationId,
+            'after-final-canonical-reservation-unlink',
+          ),
         );
       } catch (error) {
         if (error.code === 'DEADLINE_EXCEEDED') {
           complete = false;
           break;
         }
+        throwIfEnsureProtected(error);
         if (error.code === 'TRANSACTION_RECOVERY_REQUIRED') continue;
-        throw error;
+        throwWithTerminalPrune(error);
       }
-      removed.push(operationId);
       continue;
     }
+    if (resumableOnly) continue;
     let operationId;
     try { operationId = validateOperationId(entry.name); } catch { continue; }
     const adapter = defaultJournalAdapter(physicalRoot, operationId);
@@ -2063,6 +2391,7 @@ function pruneScanWindowTransactions(options = {}) {
     }
     if (journal.transitions.at(-1) !== 'cleaned'
         || (kinds && !kinds.has(journal.kind))) continue;
+    if (!ensureDeletionAllowed(journal, pruneMarkers, suppressEnsurePrune)) continue;
 
     if (!terminalJournalIsOldEnough(journalIdentity, now.getTime(), maxAgeDays)) continue;
     let names;
@@ -2078,12 +2407,18 @@ function pruneScanWindowTransactions(options = {}) {
     }
     if (names.length !== 1 || names[0] !== 'journal.json') continue;
 
-    assertOwner();
     try {
+      invokeFault(faultInjector, 'before-cleaned-transaction-owner-check', {
+        operationId,
+      });
+      assertOwner();
       assertBudget();
     } catch (error) {
-      complete = false;
-      break;
+      if (error.code === 'DEADLINE_EXCEEDED') {
+        complete = false;
+        break;
+      }
+      throwWithTerminalPrune(error);
     }
     try {
       control.removeCleanedTransaction(
@@ -2097,16 +2432,21 @@ function pruneScanWindowTransactions(options = {}) {
           maxAgeDays,
         },
         assertBudget,
+        assertEnsureBoundaryFor(journal),
+        () => recordCommittedPrune(
+          operationId,
+          'after-final-canonical-reservation-unlink',
+        ),
       );
     } catch (error) {
       if (error.code === 'DEADLINE_EXCEEDED') {
         complete = false;
         break;
       }
+      throwIfEnsureProtected(error);
       if (error.code === 'TRANSACTION_RECOVERY_REQUIRED') continue;
-      throw error;
+      throwWithTerminalPrune(error);
     }
-    removed.push(operationId);
   }
   return { processed: removed.length, removed, complete };
 }
@@ -2221,7 +2561,9 @@ function promotePendingScan(options = {}) {
 }
 
 module.exports = {
+  assertPruneTransactionNamesSupported,
   ensurePendingScan,
+  inspectPruneMarkers,
   promotePendingScan,
   pruneScanWindowTransactions,
   recoverScanWindowTransaction,

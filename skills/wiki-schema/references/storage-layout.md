@@ -52,10 +52,14 @@ state. `transaction recover` accepts the same operation ID and owner token and
 is idempotent. It either completes the recorded operation or restores the
 pre-operation state; it never invents a new action.
 
-The operator-only `transaction prune` command is the bounded terminal cleanup operation. With the caller's
-current owner token, it removes only structurally valid scan-window journals
-whose final transition is `cleaned`, whose directory contains no other entry,
-and whose journal age exceeds `--max-age-days`. Before unlinking, the runtime
+The shared bounded terminal cleanup operation is called by
+`scan-window ensure`, `wiki-lint --fix`, and the singular operator
+`transaction prune` command. With the caller's current owner token, ordinary selection removes only
+structurally valid scan-window journals whose final transition is `cleaned`,
+whose directory contains no other entry, and whose journal age exceeds the
+caller's age policy. A lint recovery pass bypasses that ordinary age gate only
+for authenticated residue from an already-started prune and skips every
+ordinary transaction directory. Before unlinking, the runtime
 atomically moves the complete transaction directory into a fresh identity-bound
 sibling quarantine and revalidates the directory plus journal identity, bytes,
 age, and link count there. An interrupted quarantine remains recognizable and
@@ -70,6 +74,23 @@ malformed, foreign-kind, linked, young, and otherwise ambiguous entries.
 Repeat the command while `complete` is `false` to traverse more than one bounded
 pass. `complete: true` means every entry listed for that pass was inspected; it
 does not claim that ambiguous entries were removed.
+Ensure deletion additionally requires strict marker authority. Exact canonical
+UTC-Z plus LF, one-link regular non-symlink marker files are accepted; lstat
+`ENOENT` alone is absent. Either initial-invalid marker suppresses every
+`created`, `preserved`, and `stale` ensure deletion for the pass, including
+authenticated already-started residue. Authenticated already-started residue
+remains protected until a later pass begins with both markers accepted or
+absent. Both physical marker seals for accepted-or-absent state are revalidated at every
+destructive boundary; unreadable or physically ambiguous state stays
+protected. A `created` ensure needs
+nonmatching pending plus exact `.last-scan >= input.proposed`; `preserved` and
+`stale` are no-op evidence. Raw
+`.reservation-.prune-*` basenames are rejected before type, suffix, or content
+parsing and require stopped-host intervention.
+This terminal-prune recovery authority is distinct from manifest `transaction
+recover`. Unaccepted or ambiguous residue requires stopped-host manual
+intervention rather than a broader deletion rule. Terminal-prune residue blocks
+snapshot and commit inspection until the shared lint repair path completes it.
 
 ## Scan windows
 

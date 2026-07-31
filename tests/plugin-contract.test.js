@@ -144,13 +144,53 @@ test('portable npm test cannot discover the native installed-Codex release smoke
   assert.match(smoke, /windowsHide: true/);
 });
 
-test('1.9.3 release keeps every package version exact', () => {
+test('1.9.4 release keeps package identity and bilingual changelogs exact', () => {
   const packageFiles = [
     '.claude-plugin/plugin.json',
     '.codex-plugin/plugin.json',
     'package.json',
   ];
-  for (const file of packageFiles) assert.equal(readJson(file).version, '1.9.3', file);
+  for (const file of packageFiles) assert.equal(readJson(file).version, '1.9.4', file);
+
+  const releaseSection = (text, heading) => {
+    const start = text.indexOf(heading);
+    assert.notEqual(start, -1, heading);
+    const next = text.indexOf('\n## [', start + heading.length);
+    return text.slice(start, next === -1 ? undefined : next);
+  };
+  const changelog = readText('CHANGELOG.md');
+  const changelogKo = readText('CHANGELOG.ko.md');
+  assert.equal(releaseSection(changelog, '## [Unreleased]').trim(), '## [Unreleased]');
+  assert.equal(releaseSection(changelogKo, '## [Unreleased]').trim(), '## [Unreleased]');
+
+  const english = releaseSection(
+    changelog,
+    '## [1.9.4] — 2026-07-31 (lint repair reclamation)',
+  );
+  assert.match(english, /Completed scan-window `ensure` journals/);
+  assert.match(english, /self-healing reclamation/);
+  assert.match(english, /Fractional-clock `lint fix` operations/);
+  assert.match(english, /MANIFEST_INVALID/);
+  assert.match(english, /distinct 1\.9\.4 installation identity/);
+
+  const korean = releaseSection(
+    changelogKo,
+    '## [1.9.4] — 2026-07-31 (lint repair 회수)',
+  );
+  assert.match(korean, /완료된 scan-window `ensure` journal/);
+  assert.match(korean, /자체 복구 회수/);
+  assert.match(korean, /Fractional-clock `lint fix` 작업/);
+  assert.match(korean, /MANIFEST_INVALID/);
+  assert.match(korean, /별도 1\.9\.4 설치 식별자/);
+
+  assert.match(
+    releaseSection(changelog, '## [1.9.3] — 2026-07-30'),
+    /wiki-runtime snapshot/,
+  );
+  assert.match(
+    releaseSection(changelogKo, '## [1.9.3] — 2026-07-30'),
+    /wiki-runtime snapshot/,
+  );
 });
 
 test('1.8.0 release documents the reviewed runtime and evidence boundary', () => {

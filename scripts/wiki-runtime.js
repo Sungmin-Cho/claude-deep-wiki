@@ -3,6 +3,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { spawn } = require('node:child_process');
 
 const runtimeRoot = path.resolve(__dirname, '..', 'hooks', 'scripts', 'runtime');
 const { resolveConfig } = require(path.join(runtimeRoot, 'config.js'));
@@ -15,8 +16,19 @@ const {
 const wikiState = require(path.join(runtimeRoot, 'wiki-state.js'));
 const scanWindow = require(path.join(runtimeRoot, 'scan-window.js'));
 const { createDeadline } = require(path.join(runtimeRoot, 'deadline.js'));
-const { sha256 } = require(path.join(runtimeRoot, 'fs-safe.js'));
+const { sha256, stateError } = require(path.join(runtimeRoot, 'fs-safe.js'));
 const { probeObsidian, runObsidian } = require(path.join(runtimeRoot, 'obsidian-probe.js'));
+const { terminateWorkerTree } = require(path.resolve(
+  __dirname,
+  '..',
+  'hooks',
+  'scripts',
+  'scan-vault-changes.js',
+));
+
+const SNAPSHOT_TIMEOUT_MS = 12_000;
+const SNAPSHOT_WORKER_GRACE_MS = 250;
+const SNAPSHOT_MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
 
 const HELP = `deep-wiki portable runtime
 
@@ -232,9 +244,264 @@ function runObsidianBridge(argv) {
   }));
 }
 
-function runSnapshot(argv) {
+function parseSnapshotWorkerOutput(stdout, status) {
+  if (typeof stdout !== 'string' || !stdout.endsWith('\n')
+      || stdout.slice(0, -1).includes('\n') || stdout.includes('\r')) {
+    throw stateError('WIKI_STATE_FILESYSTEM', 'snapshot worker returned an invalid result');
+  }
+  let envelope;
+  try { envelope = JSON.parse(stdout.slice(0, -1)); }
+  catch (cause) {
+    throw stateError('WIKI_STATE_FILESYSTEM', 'snapshot worker returned invalid JSON', cause);
+  }
+  const keys = Object.keys(envelope || {}).sort();
+  if (envelope?.contract_version !== 1 || !['ok', 'error'].includes(envelope.status)) {
+    throw stateError('WIKI_STATE_FILESYSTEM', 'snapshot worker result violates its contract');
+  }
+  if (envelope.status === 'ok') {
+    if (status !== 0
+        || JSON.stringify(keys) !== JSON.stringify(['contract_version', 'snapshot', 'status'])) {
+      throw stateError('WIKI_STATE_FILESYSTEM', 'snapshot worker result violates its contract');
+    }
+    return envelope.snapshot;
+  }
+  if (status !== 1
+      || JSON.stringify(keys) !== JSON.stringify(['contract_version', 'error', 'status'])
+      || !envelope.error || typeof envelope.error !== 'object' || Array.isArray(envelope.error)
+      || JSON.stringify(Object.keys(envelope.error).sort()) !== JSON.stringify(['code', 'message'])
+      || typeof envelope.error.code !== 'string' || !/^[A-Z][A-Z0-9_]*$/.test(envelope.error.code)
+      || typeof envelope.error.message !== 'string' || envelope.error.message.length === 0) {
+    throw stateError('WIKI_STATE_FILESYSTEM', 'snapshot worker error violates its contract');
+  }
+  throw stateError(envelope.error.code, envelope.error.message);
+}
+
+function abandonSnapshotWorker(child) {
+  for (const stream of [child?.stdin, child?.stdout, child?.stderr]) {
+    if (!stream) continue;
+    stream.removeAllListeners();
+    stream.once('error', () => {});
+    stream.destroy();
+    stream.unref?.();
+  }
+  child?.removeAllListeners();
+  child?.once('error', () => {});
+  child?.unref?.();
+}
+
+function validatedSnapshotTaskkillPath(env) {
+  const systemRoot = typeof env.SystemRoot === 'string' ? env.SystemRoot.trim() : '';
+  if (!systemRoot || !path.win32.isAbsolute(systemRoot) || systemRoot.includes('\0')) {
+    throw new Error('SystemRoot is unavailable');
+  }
+  const executable = path.win32.normalize(path.win32.join(systemRoot, 'System32', 'taskkill.exe'));
+  const expected = path.win32.normalize(`${systemRoot}\\System32\\taskkill.exe`);
+  if (executable.toLowerCase() !== expected.toLowerCase()) {
+    throw new Error('taskkill path is invalid');
+  }
+  return executable;
+}
+
+function snapshotTerminationState(
+  child,
+  env,
+  platform,
+  terminate = terminateWorkerTree,
+  spawnWindowsTerminator = spawn,
+) {
+  if (!child || !Number.isSafeInteger(child.pid) || child.pid <= 0) {
+    return 'termination could not be requested or confirmed';
+  }
+  if (platform === 'win32') {
+    try {
+      const terminator = spawnWindowsTerminator(
+        validatedSnapshotTaskkillPath(env),
+        ['/PID', String(child.pid), '/T', '/F'],
+        {
+          stdio: 'ignore',
+          shell: false,
+          windowsHide: true,
+        },
+      );
+      if (!terminator || typeof terminator.once !== 'function'
+          || typeof terminator.unref !== 'function') {
+        return 'termination could not be requested or confirmed';
+      }
+      terminator.once('error', () => {});
+      terminator.unref();
+      return 'termination requested but unconfirmed';
+    } catch {
+      return 'termination could not be requested or confirmed';
+    }
+  }
+  try {
+    const requested = terminate(child, { env, platform });
+    if (!requested) return 'termination could not be requested or confirmed';
+    return 'termination requested but unconfirmed';
+  } catch {
+    return 'termination could not be requested or confirmed';
+  }
+}
+
+function snapshotDeadlineError(wikiRoot, timeoutMs, terminationState) {
+  const transactions = path.join(path.normalize(wikiRoot), '.wiki-meta', '.transactions');
+  return stateError(
+    'DEADLINE_EXCEEDED',
+    `snapshot transaction inspection exceeded ${timeoutMs}ms at ${transactions}; `
+      + `worker tree ${terminationState}; stop all hosts, restore filesystem readability, `
+      + 'then rerun snapshot before recovery',
+  );
+}
+
+function runSnapshotWorker(options = {}) {
+  const wikiRoot = options.wikiRoot;
+  const timeoutMs = options.timeoutMs === undefined ? SNAPSHOT_TIMEOUT_MS : options.timeoutMs;
+  const maxOutputBytes = options.maxOutputBytes === undefined
+    ? SNAPSHOT_MAX_OUTPUT_BYTES
+    : options.maxOutputBytes;
+  const platform = options.platform === undefined ? process.platform : options.platform;
+  const workerPath = options.workerPath
+    || path.resolve(__dirname, '..', 'hooks', 'scripts', 'wiki-snapshot-worker.js');
+  if (typeof wikiRoot !== 'string' || !path.isAbsolute(wikiRoot)) {
+    throw stateError('WIKI_STATE_INVALID', 'wikiRoot must be absolute');
+  }
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= SNAPSHOT_WORKER_GRACE_MS
+      || timeoutMs > SNAPSHOT_TIMEOUT_MS) {
+    throw new RangeError('snapshot timeout must be from 251 through 12_000 milliseconds');
+  }
+  if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes <= 0
+      || maxOutputBytes > SNAPSHOT_MAX_OUTPUT_BYTES) {
+    throw new RangeError('snapshot output cap must be from 1 through 67_108_864 bytes');
+  }
+  if (typeof platform !== 'string' || platform.length === 0) {
+    throw new TypeError('snapshot platform must be a non-empty string');
+  }
+  if (typeof workerPath !== 'string' || !path.isAbsolute(workerPath)) {
+    throw new TypeError('snapshot worker path must be absolute');
+  }
+  const env = options.env || process.env;
+  const spawnWorker = options.spawn || spawn;
+  const terminate = options.terminateWorkerTree || terminateWorkerTree;
+  const spawnWindowsTerminator = options.spawnWindowsTerminator || spawn;
+
+  return new Promise((resolve, reject) => {
+    let child;
+    let timer;
+    let terminal = false;
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let sawStdoutNewline = false;
+    const stdout = [];
+
+    const fail = (error, { requestTermination = true, deadline = false } = {}) => {
+      if (terminal) return;
+      terminal = true;
+      clearTimeout(timer);
+      let terminationState;
+      if (requestTermination) {
+        terminationState = snapshotTerminationState(
+          child,
+          env,
+          platform,
+          terminate,
+          spawnWindowsTerminator,
+        );
+      }
+      abandonSnapshotWorker(child);
+      reject(deadline
+        ? snapshotDeadlineError(wikiRoot, timeoutMs, terminationState)
+        : error);
+    };
+
+    try {
+      child = spawnWorker(process.execPath, [
+        workerPath,
+        '--wiki-root', path.normalize(wikiRoot),
+        '--budget-ms', String(timeoutMs - SNAPSHOT_WORKER_GRACE_MS),
+      ], {
+        cwd: path.dirname(workerPath),
+        env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        detached: platform !== 'win32',
+        shell: false,
+        windowsHide: true,
+      });
+    } catch (error) {
+      fail(stateError(
+        'WIKI_STATE_FILESYSTEM',
+        `snapshot worker failed to run: ${error.message}`,
+        error,
+      ), { requestTermination: false });
+      return;
+    }
+
+    timer = setTimeout(() => {
+      fail(null, { deadline: true });
+    }, timeoutMs);
+    timer.unref?.();
+
+    child.stdout.on('data', (chunk) => {
+      if (terminal) return;
+      stdoutBytes += chunk.length;
+      if (stdoutBytes > maxOutputBytes) {
+        fail(stateError('WIKI_STATE_FILESYSTEM', 'snapshot worker stdout exceeded its cap'));
+        return;
+      }
+      for (let index = 0; index < chunk.length; index += 1) {
+        if (sawStdoutNewline) {
+          fail(stateError('WIKI_STATE_FILESYSTEM', 'snapshot worker returned multiple result lines'));
+          return;
+        }
+        if (chunk[index] === 0x0a) {
+          sawStdoutNewline = true;
+          if (index !== chunk.length - 1) {
+            fail(stateError('WIKI_STATE_FILESYSTEM', 'snapshot worker returned multiple result lines'));
+            return;
+          }
+        }
+      }
+      stdout.push(chunk);
+    });
+    child.stderr.on('data', (chunk) => {
+      if (terminal) return;
+      stderrBytes += chunk.length;
+      if (stderrBytes > maxOutputBytes) {
+        fail(stateError('WIKI_STATE_FILESYSTEM', 'snapshot worker stderr exceeded its cap'));
+        return;
+      }
+      fail(stateError('WIKI_STATE_FILESYSTEM', 'snapshot worker wrote stderr'));
+    });
+    child.once('error', (error) => {
+      fail(stateError(
+        'WIKI_STATE_FILESYSTEM',
+        `snapshot worker failed to run: ${error.message}`,
+        error,
+      ), { requestTermination: false });
+    });
+    child.once('close', (code, signal) => {
+      if (terminal) return;
+      clearTimeout(timer);
+      if (signal !== null) {
+        fail(
+          stateError('WIKI_STATE_FILESYSTEM', `snapshot worker terminated by ${signal}`),
+          { requestTermination: false },
+        );
+        return;
+      }
+      try {
+        const snapshot = parseSnapshotWorkerOutput(Buffer.concat(stdout).toString('utf8'), code);
+        terminal = true;
+        resolve(snapshot);
+      } catch (error) {
+        fail(error);
+      }
+    });
+  });
+}
+
+async function runSnapshot(argv) {
   const flags = wikiFlags(argv, {});
-  emit(wikiState.snapshotWiki({ wikiRoot: flags['--wiki-root'] }));
+  emit(await runSnapshotWorker({ wikiRoot: flags['--wiki-root'] }));
 }
 
 function cleanupRuntimeManifests(wikiRoot, token, operationId) {
@@ -441,18 +708,32 @@ function exitCode(error) {
   return 5;
 }
 
+function reportMainError(error) {
+  process.stderr.write(`${error.code || 'FILESYSTEM'}: ${error.message}\n`);
+  return exitCode(error);
+}
+
+async function snapshotMain(argv) {
+  try {
+    await runSnapshot(argv);
+    return 0;
+  } catch (error) {
+    return reportMainError(error);
+  }
+}
+
 function main(argv = process.argv.slice(2)) {
   if (argv.length === 1 && ['--help', '-h'].includes(argv[0])) {
     process.stdout.write(HELP);
     return 0;
   }
+  if (argv[0] === 'snapshot') return snapshotMain(argv.slice(1));
   try {
     if (argv[0] === 'config') runConfig(argv.slice(1));
     else if (argv[0] === 'lock') runLock(argv.slice(1));
     else if (argv[0] === 'setup') runSetup(argv.slice(1));
     else if (argv[0] === 'probe') runProbe(argv.slice(1));
     else if (argv[0] === 'obsidian') runObsidianBridge(argv.slice(1));
-    else if (argv[0] === 'snapshot') runSnapshot(argv.slice(1));
     else if (argv[0] === 'commit') runCommit(argv.slice(1));
     else if (argv[0] === 'transaction') runTransaction(argv.slice(1));
     else if (argv[0] === 'index') runIndex(argv.slice(1));
@@ -462,11 +743,23 @@ function main(argv = process.argv.slice(2)) {
     else throw new UsageError('unsupported command family');
     return 0;
   } catch (error) {
-    process.stderr.write(`${error.code || 'FILESYSTEM'}: ${error.message}\n`);
-    return exitCode(error);
+    return reportMainError(error);
   }
 }
 
-if (require.main === module) process.exitCode = main();
+if (require.main === module) {
+  const status = main();
+  if (status && typeof status.then === 'function') {
+    status.then((code) => { process.exitCode = code; });
+  } else {
+    process.exitCode = status;
+  }
+}
 
-module.exports = { main, recoverHint, commitRetryHint, cleanupRuntimeManifests };
+module.exports = {
+  main,
+  recoverHint,
+  commitRetryHint,
+  cleanupRuntimeManifests,
+  runSnapshotWorker,
+};

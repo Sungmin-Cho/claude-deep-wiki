@@ -327,7 +327,18 @@ function inspectTransactions(root, allowedOperationId = null, deadline = operati
       throw stateError('TRANSACTION_RECOVERY_REQUIRED', 'transaction store contains a non-directory entry');
     }
     const transaction = path.join(directory, entry.name);
-    const journal = readJournal(path.join(transaction, 'journal.json'));
+    const journalPath = path.join(transaction, 'journal.json');
+    let journal;
+    try { journal = readJournal(journalPath); }
+    catch (error) {
+      if (error.code === 'DEADLINE_EXCEEDED' || error.code === 'TRANSACTION_RECOVERY_REQUIRED') throw error;
+      throw stateError(
+        'TRANSACTION_RECOVERY_REQUIRED',
+        `transaction journal is unreadable at ${journalPath}; `
+          + 'stop all hosts, restore filesystem readability, then rerun snapshot before recovery',
+        error,
+      );
+    }
     if (!journal) {
       const tombstoneBytes = readMaybe(path.join(transaction, 'cancelled.json'));
       if (tombstoneBytes === null) continue;

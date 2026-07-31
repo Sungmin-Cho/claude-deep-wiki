@@ -7,13 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.4] — 2026-07-31 (lint repair reclamation)
+
+### Fixed
+
+- Completed scan-window `ensure` journals no longer accumulate without bound after authenticated scan-window state proves them reclaimable. Explicit `wiki-lint --fix` performs self-healing reclamation under the current lock, and the bounded `transaction prune` command atomically moves each eligible transaction directory into a fresh identity-bound sibling quarantine before deleting its authenticated journal. Interrupted quarantines remain recognizable and are retried by a later bounded pass. An exact journal-copy reservation closes the canonical source generation until quarantine removal finishes, while an exact fsynced backup makes an interruption after the original journal unlink resumable. Both files use exclusive, crash-recoverable pending publication, and later bounded passes also finish partial publications, backup-only or empty quarantines, and orphaned exact reservations. Cleanup rechecks its deadline across discovery, validation, and recoverable mutation phases. It removes only age-eligible, fully validated `cleaned` scan-window directories while preserving unproved created state, in-flight, malformed, foreign-kind, linked, or ambiguous state. Its `complete` result distinguishes full traversal from a deadline- or limit-truncated pass.
+- Fractional-clock `lint fix` operations now canonicalize manifest event timestamps to whole-second UTC-Z before commit, so a successful repair no longer ends with `MANIFEST_INVALID`.
+
+### Changed
+
+- These runtime changes ship under a distinct 1.9.4 installation identity across both plugin manifests and package metadata.
+
 ## [1.9.3] — 2026-07-30
 
 ### Fixed
 
 - `wiki-runtime snapshot` no longer waits indefinitely for a sync-drive transaction journal blocked inside a filesystem metadata call ([#39](https://github.com/Sungmin-Cho/claude-deep-wiki/issues/39)). Snapshot execution now runs in a supervised read-only child, with the parent timer outside the potentially blocked syscall. When the 12-second timer fires, the parent requests whole-tree termination, detaches the worker pipes and handle, and returns actionable `DEADLINE_EXCEEDED` guidance without awaiting worker close or changing recovery evidence. POSIX and native Windows both report an issued termination request conservatively as unconfirmed; a launch or request failure is reported as neither requested nor confirmed. An immediately unreadable journal fails closed as `TRANSACTION_RECOVERY_REQUIRED` with the same stopped-host/readability recovery boundary.
 - SessionStart scan-window persistence now runs in a supervised child process. A timeout confirms child-tree termination before reclaiming only a same-host dead lock whose recorded PID matches that child, and normal lock acquisition self-heals the same authenticated dead-owner case without weakening live, foreign, malformed, or ownerless contention.
-- Completed scan-window journals no longer accumulate without bound. Automatic maintenance retires old validated `ensure` terminals under the current lock, and the bounded `transaction prune` command atomically moves each eligible transaction directory into a fresh identity-bound sibling quarantine before deleting its authenticated journal. Interrupted quarantines remain recognizable and are retried by a later bounded pass. An exact journal-copy reservation closes the canonical source generation until quarantine removal finishes, while an exact fsynced backup makes an interruption after the original journal unlink resumable. Both files use exclusive, crash-recoverable pending publication, and later bounded passes also finish partial publications, backup-only or empty quarantines, and orphaned exact reservations. Cleanup rechecks its deadline across discovery, validation, and recoverable mutation phases. It removes only age-eligible, fully validated `cleaned` scan-window directories while preserving in-flight, malformed, foreign-kind, linked, or ambiguous state. Its `complete` result distinguishes full traversal from a deadline- or limit-truncated pass.
 
 ## [1.9.2] — 2026-07-27 (context diet)
 

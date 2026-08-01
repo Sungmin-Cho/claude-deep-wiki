@@ -7,6 +7,16 @@ deep-wiki의 주요 변경사항을 기록합니다.
 
 ## [Unreleased]
 
+## [1.9.5] — 2026-08-01 (lock 경합 관측성)
+
+### 수정
+
+- 이제 `wiki-runtime lock acquire --json`의 모든 `LOCK_CONTENDED` 결과가 exit code 3, 빈 stdout, 단일한 안정적 JSON stderr envelope로 보고됩니다. 완전하고 canonical한 owner는 token을 제외한 `operation`, `pid`, `hostname`, `acquired_at` 필드의 `holder`로 투영하고, malformed·incomplete·extra-field·ownerless 증거는 `holder: null`로 fail closed합니다. 활성 release transition에서 발생한 경합까지 공개 메시지를 항상 `wiki lock is contended`로 정규화하며, lock 획득·dead-owner 자체 복구·recovery·release·liveness 동작은 변경하지 않습니다([#40](https://github.com/Sungmin-Cho/claude-deep-wiki/issues/40)).
+
+### 변경
+
+- 이 공개 CLI 계약은 두 plugin manifest와 package metadata 모두에서 별도 1.9.5 설치 식별자로 배포됩니다.
+
 ## [1.9.4] — 2026-07-31 (lint repair 회수)
 
 ### 수정

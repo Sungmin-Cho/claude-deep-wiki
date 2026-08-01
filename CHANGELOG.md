@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.5] — 2026-08-01 (lock contention observability)
+
+### Fixed
+
+- `wiki-runtime lock acquire --json` now reports every `LOCK_CONTENDED` result as one stable JSON stderr envelope with exit code 3 and empty stdout. A complete canonical owner is projected to the token-free `holder` fields `operation`, `pid`, `hostname`, and `acquired_at`; malformed, incomplete, extra-field, or ownerless evidence fails closed as `holder: null`. The public message is always `wiki lock is contended`, including contention caused by an active release transition, while lock acquisition, dead-owner self-healing, recovery, release, and liveness behavior remain unchanged ([#40](https://github.com/Sungmin-Cho/claude-deep-wiki/issues/40)).
+
+### Changed
+
+- This public CLI contract ships under a distinct 1.9.5 installation identity across both plugin manifests and package metadata.
+
 ## [1.9.4] — 2026-07-31 (lint repair reclamation)
 
 ### Fixed

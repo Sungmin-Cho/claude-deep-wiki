@@ -3953,3 +3953,182 @@ test('runtime lock status rejects a relative wiki root independently of cwd', ()
     assert.match(result.stderr, /^LOCK_INVALID:/);
   }
 });
+
+test('Issue #40 CLI contention emits an exact token-redacted holder', () => {
+  const { acquireLock, releaseLock } = runtimeModule('lock.js');
+  const wikiRoot = newWikiRoot('deep wiki issue 40 cli holder ');
+  const owner = acquireLock({
+    wikiRoot,
+    operation: 'scan-window-ensure',
+    now: new Date('2026-07-30T07:24:36.000Z'),
+  });
+  const result = spawnSync(process.execPath, [
+    cli, 'lock', 'acquire', '--wiki-root', wikiRoot,
+    '--operation', 'issue-40-contender', '--json',
+  ], { cwd: repoRoot, encoding: 'utf8', shell: false });
+
+  try {
+    assert.equal(result.status, 3, result.stderr);
+    assert.equal(result.stdout, '');
+    assert.equal(result.stderr.split('\n').length, 2);
+    assert.match(result.stderr, /\n$/);
+    const envelope = JSON.parse(result.stderr);
+    assert.deepEqual(Object.keys(envelope), ['code', 'message', 'holder']);
+    assert.deepEqual(Object.keys(envelope.holder), [
+      'operation', 'pid', 'hostname', 'acquired_at',
+    ]);
+    assert.deepEqual(envelope, {
+      code: 'LOCK_CONTENDED',
+      message: 'wiki lock is contended',
+      holder: {
+        operation: owner.operation,
+        pid: owner.pid,
+        hostname: owner.hostname,
+        acquired_at: owner.acquired_at,
+      },
+    });
+    assert.equal(result.stderr.includes(owner.token), false);
+    assert.equal(Object.hasOwn(envelope.holder, 'token'), false);
+  } finally {
+    releaseLock({ wikiRoot, token: owner.token });
+  }
+});
+
+test('Issue #40 CLI contention degrades ambiguous owners to null without mutation', () => {
+  const ownerTemplate = {
+    token: 'b'.repeat(64),
+    operation: 'scan-window-ensure',
+    pid: process.pid,
+    hostname: os.hostname(),
+    acquired_at: '2026-07-30T07:24:36.000Z',
+  };
+  const cases = [
+    {
+      name: 'malformed owner',
+      files: {
+        'owner.json': Buffer.from(`{"token":"${ownerTemplate.token}",\n`),
+        marker: Buffer.from('malformed owner marker\n'),
+      },
+    },
+    {
+      name: 'incomplete owner',
+      files: {
+        'owner.json': Buffer.from(`${JSON.stringify({
+          token: ownerTemplate.token,
+          operation: ownerTemplate.operation,
+          pid: ownerTemplate.pid,
+          hostname: ownerTemplate.hostname,
+        })}\n`),
+        marker: Buffer.from('incomplete owner marker\n'),
+      },
+    },
+    {
+      name: 'extra owner key',
+      files: {
+        'owner.json': Buffer.from(`${JSON.stringify({
+          ...ownerTemplate,
+          extra: 'adversarial-owner-field',
+        })}\n`),
+        marker: Buffer.from('extra owner marker\n'),
+      },
+    },
+    {
+      name: 'ownerless lock',
+      files: {
+        marker: Buffer.from('ownerless marker\n'),
+      },
+    },
+  ];
+
+  for (const fixture of cases) {
+    const wikiRoot = newWikiRoot(`deep wiki issue 40 cli ${fixture.name} `);
+    const lockDir = path.join(wikiRoot, '.wiki-meta', '.wiki-lock');
+    installOpaqueLock(lockDir, fixture.files);
+    const beforeIdentity = directoryIdentity(lockDir);
+    const before = snapshotFlatDirectory(lockDir);
+    const result = spawnSync(process.execPath, [
+      cli, 'lock', 'acquire', '--wiki-root', wikiRoot,
+      '--operation', 'issue-40-contender', '--json',
+    ], { cwd: repoRoot, encoding: 'utf8', shell: false });
+
+    assert.equal(result.status, 3, `${fixture.name}: ${result.stderr}`);
+    assert.equal(result.stdout, '', fixture.name);
+    assert.equal(result.stderr.split('\n').length, 2, fixture.name);
+    const envelope = JSON.parse(result.stderr);
+    assert.deepEqual(envelope, {
+      code: 'LOCK_CONTENDED',
+      message: 'wiki lock is contended',
+      holder: null,
+    }, fixture.name);
+    assert.equal(result.stderr.includes(ownerTemplate.token), false, fixture.name);
+    assert.equal(directoryIdentity(lockDir), beforeIdentity, fixture.name);
+    assert.deepEqual(snapshotFlatDirectory(lockDir), before, fixture.name);
+  }
+});
+
+test('Issue #40 CLI contention emits the exact message for an active release transition', async () => {
+  const { acquireLock } = runtimeModule('lock.js');
+  const wikiRoot = newWikiRoot('deep wiki issue 40 cli active transition ');
+  const owner = acquireLock({ wikiRoot, operation: 'active-transition-owner' });
+  const pausedFile = path.join(wikiRoot, 'active-transition.paused');
+  const continueFile = path.join(wikiRoot, 'active-transition.continue');
+  const resultFile = path.join(wikiRoot, 'active-transition.result.json');
+  const child = spawnPausedReleaseChild(
+    wikiRoot, owner.token, pausedFile, continueFile, resultFile,
+  );
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (chunk) => { stdout += chunk; });
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+  let childError;
+
+  try {
+    waitForPathSync(pausedFile);
+    const reservationNames = lockQuarantines(wikiRoot);
+    assert.equal(reservationNames.length, 1);
+    const reservation = path.join(wikiRoot, '.wiki-meta', reservationNames[0]);
+    const transitionPath = path.join(reservation, 'transition.json');
+    const seizedOwnerPath = path.join(reservation, 'seized', 'owner.json');
+    const before = {
+      reservationIdentity: directoryIdentity(reservation),
+      transition: fs.readFileSync(transitionPath),
+      seizedOwner: fs.readFileSync(seizedOwnerPath),
+    };
+    const result = spawnSync(process.execPath, [
+      cli, 'lock', 'acquire', '--wiki-root', wikiRoot,
+      '--operation', 'issue-40-active-transition-contender', '--json',
+    ], { cwd: repoRoot, encoding: 'utf8', shell: false });
+
+    assert.equal(result.status, 3, result.stderr);
+    assert.equal(result.stdout, '');
+    assert.equal(result.stderr.split('\n').length, 2);
+    assert.match(result.stderr, /\n$/);
+    const envelope = JSON.parse(result.stderr);
+    assert.deepEqual(Object.keys(envelope), ['code', 'message', 'holder']);
+    assert.deepEqual(Object.keys(envelope.holder), [
+      'operation', 'pid', 'hostname', 'acquired_at',
+    ]);
+    assert.deepEqual(envelope, {
+      code: 'LOCK_CONTENDED',
+      message: 'wiki lock is contended',
+      holder: {
+        operation: owner.operation,
+        pid: owner.pid,
+        hostname: owner.hostname,
+        acquired_at: owner.acquired_at,
+      },
+    });
+    assert.equal(result.stderr.includes(owner.token), false);
+    assert.equal(Object.hasOwn(envelope.holder, 'token'), false);
+    assert.deepEqual(lockQuarantines(wikiRoot), reservationNames);
+    assert.equal(directoryIdentity(reservation), before.reservationIdentity);
+    assert.deepEqual(fs.readFileSync(transitionPath), before.transition);
+    assert.deepEqual(fs.readFileSync(seizedOwnerPath), before.seizedOwner);
+  } finally {
+    fs.writeFileSync(continueFile, 'continue\n');
+    try { await waitForChild(child); } catch (error) { childError = error; }
+  }
+
+  assert.equal(childError, undefined, `${stdout}\n${stderr}`);
+  assert.deepEqual(JSON.parse(fs.readFileSync(resultFile, 'utf8')), { ok: true, released: true });
+});

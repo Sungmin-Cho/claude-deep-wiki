@@ -144,13 +144,13 @@ test('portable npm test cannot discover the native installed-Codex release smoke
   assert.match(smoke, /windowsHide: true/);
 });
 
-test('1.9.4 release keeps package identity and bilingual changelogs exact', () => {
+test('1.9.5 release keeps package identity and bilingual changelogs exact', () => {
   const packageFiles = [
     '.claude-plugin/plugin.json',
     '.codex-plugin/plugin.json',
     'package.json',
   ];
-  for (const file of packageFiles) assert.equal(readJson(file).version, '1.9.4', file);
+  for (const file of packageFiles) assert.equal(readJson(file).version, '1.9.5', file);
 
   const releaseSection = (text, heading) => {
     const start = text.indexOf(heading);
@@ -162,6 +162,24 @@ test('1.9.4 release keeps package identity and bilingual changelogs exact', () =
   const changelogKo = readText('CHANGELOG.ko.md');
   assert.equal(releaseSection(changelog, '## [Unreleased]').trim(), '## [Unreleased]');
   assert.equal(releaseSection(changelogKo, '## [Unreleased]').trim(), '## [Unreleased]');
+
+  const english195 = releaseSection(
+    changelog,
+    '## [1.9.5] — 2026-08-01 (lock contention observability)',
+  );
+  assert.match(english195, /every `LOCK_CONTENDED` result/);
+  assert.match(english195, /holder: null/);
+  assert.match(english195, /active release transition/);
+  assert.match(english195, /distinct 1\.9\.5 installation identity/);
+
+  const korean195 = releaseSection(
+    changelogKo,
+    '## [1.9.5] — 2026-08-01 (lock 경합 관측성)',
+  );
+  assert.match(korean195, /모든 `LOCK_CONTENDED` 결과/);
+  assert.match(korean195, /holder: null/);
+  assert.match(korean195, /활성 release transition/);
+  assert.match(korean195, /별도 1\.9\.5 설치 식별자/);
 
   const english = releaseSection(
     changelog,

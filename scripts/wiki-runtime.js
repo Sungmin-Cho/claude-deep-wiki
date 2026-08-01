@@ -92,8 +92,39 @@ function emit(value) {
   process.stdout.write(`${JSON.stringify(value)}\n`);
 }
 
+function redactedContentionHolder(value) {
+  const ownerKeys = ['token', 'operation', 'pid', 'hostname', 'acquired_at'];
+  const timestampPattern = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+      || Object.keys(value).length !== ownerKeys.length
+      || ownerKeys.some((key) => !Object.hasOwn(value, key))) return null;
+  if (typeof value.token !== 'string' || !/^[a-f0-9]{32,}$/.test(value.token)
+      || typeof value.operation !== 'string' || value.operation.length === 0
+      || !Number.isInteger(value.pid) || value.pid <= 0
+      || typeof value.hostname !== 'string' || value.hostname.length === 0
+      || typeof value.acquired_at !== 'string' || !timestampPattern.test(value.acquired_at)) {
+    return null;
+  }
+  const timestamp = Date.parse(value.acquired_at);
+  if (!Number.isFinite(timestamp) || new Date(timestamp).toISOString() !== value.acquired_at) return null;
+  return {
+    operation: value.operation,
+    pid: value.pid,
+    hostname: value.hostname,
+    acquired_at: value.acquired_at,
+  };
+}
+
 function emitError(error) {
   const code = error.code || 'FILESYSTEM';
+  if (code === 'LOCK_CONTENDED') {
+    process.stderr.write(`${JSON.stringify({
+      code,
+      message: 'wiki lock is contended',
+      holder: redactedContentionHolder(error.owner),
+    })}\n`);
+    return;
+  }
   const hasStructuredEvidence = error.lint_result !== undefined
     || error.terminal_prune !== undefined
     || error.release_error !== undefined;

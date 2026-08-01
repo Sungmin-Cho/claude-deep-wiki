@@ -13,7 +13,7 @@ const versions = [
   readJson('.claude-plugin/plugin.json').version,
   readJson('.codex-plugin/plugin.json').version,
   readJson('package.json').version];
-test('1.9.4 release keeps every package version and changelog heading exact', () => { assert.strictEqual(versions.join(','), '1.9.4,1.9.4,1.9.4');
-  assert.match(readText('CHANGELOG.md'), /^## \[1\.9\.4\] — 2026-07-31 \(lint repair reclamation\)$/m);
-  assert.match(readText('CHANGELOG.ko.md'), /^## \[1\.9\.4\] — 2026-07-31 \(lint repair 회수\)$/m);
+test('1.9.5 release keeps every package version and changelog heading exact', () => { assert.strictEqual(versions.join(','), '1.9.5,1.9.5,1.9.5');
+  assert.match(readText('CHANGELOG.md'), /^## \[1\.9\.5\] — 2026-08-01 \(lock contention observability\)$/m);
+  assert.match(readText('CHANGELOG.ko.md'), /^## \[1\.9\.5\] — 2026-08-01 \(lock 경합 관측성\)$/m);
 });

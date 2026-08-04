@@ -20,6 +20,8 @@ WIKI_ROOT/
     └── .last-scan                 monotonic committed window
 ```
 
+Regular OS-metadata files in content catalogs (`pages/`, `.wiki-meta/sources/`, and `.wiki-meta/.versions/`) are skipped by readers and reported in `ignored_os_metadata`; content-catalog files are never deleted or reclaimed. Junk-named symlinks, directories, and entries whose type cannot be resolved remain fail-closed. `removed_junk` remains transaction-store-only.
+
 ## Concurrency Lock Protocol
 
 The portable Node runtime uses atomic directory creation as the mutual-

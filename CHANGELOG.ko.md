@@ -7,6 +7,22 @@ deep-wiki의 주요 변경사항을 기록합니다.
 
 ## [Unreleased]
 
+## [1.9.6] — 2026-08-04 (transaction store 잡파일 내성)
+
+### 수정
+
+- 데스크톱 셸이나 동기화 클라이언트가 `<wiki_root>/.wiki-meta/.transactions/`에 자체 메타데이터 파일을 남겨도 더 이상 위키 전체가 잠기지 않습니다. 기존에는 그 안의 디렉토리가 아닌 항목 하나 — 클라우드 스토리지에 둔 Obsidian vault에서 흔한 macOS `.DS_Store`가 대표적입니다 — 만으로 transaction 상태를 검사하는 모든 경로(`snapshot`, `commit`, `index read`, `transaction recover`, `lint inspect`, `lint fix`)가 `TRANSACTION_RECOVERY_REQUIRED`로 실패했고, bounded debris sweep은 non-directory를 건너뛰었기 때문에 배포된 어떤 명령으로도 해소할 수 없었습니다. 이제 인식된 OS 메타데이터는 무해한 debris로 처리합니다. lock 없이 동작하는 reader는 이를 건너뛰고, lock을 보유한 debris sweep이 `commit`, `lint --fix`, scan-window 유지보수 중에 회수합니다. 인식은 정확한 이름 일치와 AppleDouble `._` 접두사에 한정되며, 제거 직전에 타입을 다시 증명한 일반 regular file에만 적용됩니다. 인식되지 않은 잔여 항목과 인식된 이름을 쓴 symlink는 여전히 recovery를 요구하고, 따라가지도 제거하지도 않습니다. 회수는 recursive 삭제가 아닌 `unlink`입니다. 이 클래스는 본래 외부 프로세스가 만들고 붙잡고 있는 파일이므로, unlink가 거부되면(`EPERM`, `EACCES`, `EBUSY`, `EROFS`, `ETXTBSY`) 파일을 그대로 두고 감싸는 route를 raw errno로 실패시키지 않고 계속 진행합니다. reader가 이미 그 파일을 관용하고 이후 pass가 재시도합니다. 이 관용은 unlink에만 적용됩니다 — owner token이나 store anchor를 증명하는 도중 발생한 실패는 errno가 무엇이든 fail closed입니다. `wiki-runtime lint fix`는 작업 전후의 store를 비교해 실제로 회수한 항목만 `removed_junk`로 보고하므로 nested commit sweep의 회수까지 포함하며, 인식된 메타데이터가 남아 있는지는 `removed_junk_complete`로 알립니다.
+- 이제 transaction 클래스 debris를 모두 정리한 뒤에야 OS 메타데이터를 처리합니다. 무해한 파일이 reader에 치명적인 유일한 클래스인 `cancelled` 정리를 밀어내거나 앞질러 소진하지 못하게 하는 것은 두 번째 예산이 아니라 순서입니다. 따라서 한 pass의 변경 상한은 여전히 총 `limit`이며, 제거 불가능한 파일이 무한 재시도되지 않도록 junk 회수는 성공이 아닌 **시도**마다 예산을 소비합니다.
+
+### 보안
+
+- bounded transaction debris sweep이 열거·삭제 전에 자기 저장소를 먼저 anchor합니다. `readdirSync`는 디렉토리 symlink를 따라가므로, 기존에는 `.wiki-meta` 또는 `.wiki-meta/.transactions`가 symlink일 때 sweep이 위키 바깥 항목을 삭제할 수 있었고, symlink된 `.wiki-meta` 아래에 `.transactions`가 없으면 `commit`이 위키 바깥에 transaction 디렉토리와 journal을 생성할 수 있었습니다. lock 소유권은 "누가 쓸 수 있는가"만 증명할 뿐 "어디에 쓰는가"는 증명하지 않습니다. 이제 `.wiki-meta`와 `.wiki-meta/.transactions` 모두 실제 경로와 기대 경로가 일치하는 물리 디렉토리임을 증명하고, 그 identity(device·inode·birth time — 재사용된 inode가 위장할 수 없도록)를 모든 제거 직전마다 owner token과 함께 재증명하므로 sweep 도중 부모가 교체되는 경우도 잡아냅니다. `lint --fix`와 scan-window 유지보수는 scan-window preflight로 이미 anchor하고 있었지만 `commit` 경로에는 그 가드가 없었고, 이제 무엇도 생성하거나 삭제하기 전에 `WIKI_STATE_FILESYSTEM`으로 fail closed합니다. sweep의 anchor는 sweep이 반환되면 수명이 끝나므로, transaction 생성 경로가 `.transactions` 생성 직전과 activation 디렉토리를 제자리로 rename하기 직전에 anchor를 다시 증명합니다.
+- 알려진 잔여 위험: anchor와 그것이 보호하는 제거를 이 런타임에서 원자적으로 묶을 수 없습니다. Node에는 handle 기반 `unlinkat`이 없고 이 플러그인은 native binary를 배포하지 않으므로, 마지막 검사와 syscall 사이의 명령 구간에서 상위 경로가 교체되면 예방이 아니라 사후 탐지가 됩니다. 이는 기존 위협 모델의 범위 안입니다 — mutation은 cooperative current writer contract로 통제되며, 협조하지 않는 적대적 로컬 프로세스는 애초에 그 계약의 대상이 아니었습니다. 어떤 durability·recovery 주장도 이 간극에 의존하지 않습니다.
+
+### 변경
+
+- 이 런타임 변경은 두 plugin manifest와 package metadata 모두에서 별도 1.9.6 설치 식별자로 배포됩니다.
+
 ## [1.9.5] — 2026-08-01 (lock 경합 관측성)
 
 ### 수정

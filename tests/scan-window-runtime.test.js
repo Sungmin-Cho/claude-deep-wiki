@@ -450,11 +450,23 @@ test('generic transaction debris sweep never consumes a terminal-prune phase dir
     assert.deepEqual(sweepTransactionDebris(root, owner.token, {
       deadline: createDeadline({ budgetMs: 12_000 }),
       classes: ['plain'],
-    }), { processed: 0, removed: [] });
+    }), { processed: 0, removed: [], removed_junk: [] });
   } finally {
     releaseLock({ wikiRoot: root, token: owner.token });
   }
   assert.equal(fs.existsSync(quarantine), true);
+});
+
+test('scan-window maintenance reclaims OS metadata from the transaction store', () => {
+  // Drives the real route rather than the library, so the `junk` class at the
+  // `applyScanWindowTransition` call site is what is actually pinned.
+  const root = temporaryWiki('deep wiki scan window junk sweep ');
+  const transactions = metaPath(root, '.transactions');
+  fs.writeFileSync(path.join(transactions, '.DS_Store'), 'finder metadata\n');
+  setState(root, { pending: T2, last: T1 });
+  const result = promote(root, T2, 'scan-window-junk-route-op');
+  assert.equal(result.status, 'promoted');
+  assert.equal(fs.existsSync(path.join(transactions, '.DS_Store')), false);
 });
 
 test('ensure pruning reclaims no-op evidence but requires exact promotion proof for created evidence', () => {

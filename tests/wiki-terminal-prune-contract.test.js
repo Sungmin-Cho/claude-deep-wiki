@@ -33,6 +33,8 @@ test('public contracts name every terminal-prune caller and preserve recovery au
     assert.match(source, /ordinary.*age|age.*ordinary/i);
   }
   assert.match(lint, /terminal_prune\.complete/);
+  assert.match(lint, /removed_junk_complete/);
+  assert.match(lint, /Rerun while\s*\n?`removed_junk_complete` is `false`/);
   assert.strictEqual(lint.includes('recovery pass incomplete'), true);
   assert.strictEqual(lint.includes('recovery pass completed'), true);
   assert.match(lint, /TRANSACTION_RECOVERY_REQUIRED/);

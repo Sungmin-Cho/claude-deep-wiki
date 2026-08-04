@@ -144,13 +144,13 @@ test('portable npm test cannot discover the native installed-Codex release smoke
   assert.match(smoke, /windowsHide: true/);
 });
 
-test('1.9.5 release keeps package identity and bilingual changelogs exact', () => {
+test('1.9.6 release keeps package identity and bilingual changelogs exact', () => {
   const packageFiles = [
     '.claude-plugin/plugin.json',
     '.codex-plugin/plugin.json',
     'package.json',
   ];
-  for (const file of packageFiles) assert.equal(readJson(file).version, '1.9.5', file);
+  for (const file of packageFiles) assert.equal(readJson(file).version, '1.9.6', file);
 
   const releaseSection = (text, heading) => {
     const start = text.indexOf(heading);
@@ -162,6 +162,42 @@ test('1.9.5 release keeps package identity and bilingual changelogs exact', () =
   const changelogKo = readText('CHANGELOG.ko.md');
   assert.equal(releaseSection(changelog, '## [Unreleased]').trim(), '## [Unreleased]');
   assert.equal(releaseSection(changelogKo, '## [Unreleased]').trim(), '## [Unreleased]');
+
+  const english196 = releaseSection(
+    changelog,
+    '## [1.9.6] — 2026-08-04 (transaction store junk tolerance)',
+  );
+  assert.match(english196, /no longer wedges the wiki/);
+  assert.match(english196, /TRANSACTION_RECOVERY_REQUIRED/);
+  assert.match(english196, /AppleDouble `\._` prefix/);
+  assert.match(english196, /never followed or removed/);
+  assert.match(english196, /anchors its own store before it enumerates or deletes/);
+  assert.match(english196, /fails closed with `WIKI_STATE_FILESYSTEM`/);
+  assert.match(english196, /a refused unlink/);
+  assert.match(english196, /device, inode, and birth time/);
+  assert.match(english196, /swept to completion before any OS metadata is considered/);
+  assert.match(english196, /still fails closed, whatever its errno/);
+  assert.match(english196, /Known residual/);
+  assert.match(english196, /no handle-relative `unlinkat`/);
+  assert.match(english196, /distinct 1\.9\.6 installation identity/);
+
+  const korean196 = releaseSection(
+    changelogKo,
+    '## [1.9.6] — 2026-08-04 (transaction store 잡파일 내성)',
+  );
+  assert.match(korean196, /위키 전체가 잠기지 않습니다/);
+  assert.match(korean196, /TRANSACTION_RECOVERY_REQUIRED/);
+  assert.match(korean196, /AppleDouble `\._` 접두사/);
+  assert.match(korean196, /따라가지도 제거하지도 않습니다/);
+  assert.match(korean196, /열거·삭제 전에 자기 저장소를 먼저 anchor합니다/);
+  assert.match(korean196, /`WIKI_STATE_FILESYSTEM`으로 fail closed합니다/);
+  assert.match(korean196, /unlink가 거부되면/);
+  assert.match(korean196, /device·inode·birth time/);
+  assert.match(korean196, /모두 정리한 뒤에야 OS 메타데이터를 처리합니다/);
+  assert.match(korean196, /errno가 무엇이든 fail closed입니다/);
+  assert.match(korean196, /알려진 잔여 위험/);
+  assert.match(korean196, /handle 기반 `unlinkat`이 없고/);
+  assert.match(korean196, /별도 1\.9\.6 설치 식별자/);
 
   const english195 = releaseSection(
     changelog,

@@ -395,6 +395,7 @@ function readDirectoryFiles(directory, suffix = null, deadline = operationDeadli
   entries.sort((left, right) => left.name.localeCompare(right.name, 'en'));
   for (const entry of entries) {
     assertBeforeDeadline(deadline, `wiki-state:read-directory:${entry.name}`);
+    if (isReclaimableJunkEntry(entry, directory)) continue;
     if (entry.isSymbolicLink() || !entry.isFile()) {
       throw stateError('WIKI_STATE_FILESYSTEM', `${directory} contains a non-regular entry`);
     }

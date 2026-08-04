@@ -24,7 +24,10 @@ const SWEEP_CLASSES = new Set(['activation', 'plain', 'cancelled', 'junk']);
 // `.reservation-.prune-*`, and `fs-safe`'s `.<name>.tmp.<pid>.<uuid>`) is disjoint from the junk
 // namespace (exact name ∪ the AppleDouble `._` prefix). Widening either set must preserve that
 // disjointness — `no engine-generated transaction store name is classified as junk` pins it.
-// Anything unrecognized still demands recovery rather than being silently discarded.
+// Anything unrecognized still demands recovery rather than being silently discarded. The same
+// disjointness also covers the lock-free readers of pages/, .wiki-meta/sources/, and
+// .wiki-meta/.versions/: the classifier may identify inert metadata there, but it never grants
+// unlink authority outside .wiki-meta/.transactions/.
 const OS_METADATA_NAMES = new Set([
   '.DS_Store', '.localized', '.apdisk', '.VolumeIcon.icns', 'Icon\r',
   'Thumbs.db', 'ehthumbs.db', 'desktop.ini',
@@ -42,7 +45,9 @@ function isTransactionStoreJunkName(name) {
 }
 
 // Junk is reclaimable only as a plain regular file. A symlink wearing a junk name is still an
-// unrecognized entry: it is refused, never followed and never removed.
+// unrecognized entry: it is refused, never followed and never removed. This predicate is shared
+// by lock-free catalog readers and the transaction-store sweep; `true` authorizes classification,
+// not removal anywhere outside .wiki-meta/.transactions/.
 function isReclaimableJunkEntry(entry, directory = null) {
   if (!isTransactionStoreJunkName(entry.name)) return false;
   if (entry.isFile() && !entry.isSymbolicLink()) return true;

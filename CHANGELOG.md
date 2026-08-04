@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Content readers now skip regular AppleDouble and exact OS-metadata files in `pages/`, `.wiki-meta/sources/`, and `.wiki-meta/.versions/`, report them in `ignored_os_metadata`, and never delete them; junk-named symlinks/directories remain fail-closed, and `removed_junk` remains transaction-store-only.
+
 ## [1.9.6] — 2026-08-04 (transaction store junk tolerance)
 
 ### Fixed

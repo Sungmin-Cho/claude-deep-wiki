@@ -7,6 +7,10 @@ deep-wiki의 주요 변경사항을 기록합니다.
 
 ## [Unreleased]
 
+### 수정
+
+- `pages/`, `.wiki-meta/sources/`, `.wiki-meta/.versions/`의 regular AppleDouble 및 정확한 OS 메타데이터 파일은 content reader가 건너뛰고 `ignored_os_metadata`에 보고하며 삭제하지 않습니다. junk 이름의 symlink/directory는 fail-closed로 유지되고, `removed_junk`는 transaction store에만 해당합니다.
+
 ## [1.9.6] — 2026-08-04 (transaction store 잡파일 내성)
 
 ### 수정

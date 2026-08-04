@@ -160,8 +160,18 @@ test('1.9.6 release keeps package identity and bilingual changelogs exact', () =
   };
   const changelog = readText('CHANGELOG.md');
   const changelogKo = readText('CHANGELOG.ko.md');
-  assert.equal(releaseSection(changelog, '## [Unreleased]').trim(), '## [Unreleased]');
-  assert.equal(releaseSection(changelogKo, '## [Unreleased]').trim(), '## [Unreleased]');
+  assert.equal(
+    releaseSection(changelog, '## [Unreleased]').includes(
+      '- Content readers now skip regular AppleDouble and exact OS-metadata files in `pages/`, `.wiki-meta/sources/`, and `.wiki-meta/.versions/`, report them in `ignored_os_metadata`, and never delete them; junk-named symlinks/directories remain fail-closed, and `removed_junk` remains transaction-store-only.',
+    ),
+    true,
+  );
+  assert.equal(
+    releaseSection(changelogKo, '## [Unreleased]').includes(
+      '- `pages/`, `.wiki-meta/sources/`, `.wiki-meta/.versions/`의 regular AppleDouble 및 정확한 OS 메타데이터 파일은 content reader가 건너뛰고 `ignored_os_metadata`에 보고하며 삭제하지 않습니다. junk 이름의 symlink/directory는 fail-closed로 유지되고, `removed_junk`는 transaction store에만 해당합니다.',
+    ),
+    true,
+  );
 
   const english196 = releaseSection(
     changelog,

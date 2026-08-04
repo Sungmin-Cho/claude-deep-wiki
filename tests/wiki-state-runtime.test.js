@@ -1601,16 +1601,658 @@ test('debris removal is interruptible between entries when the clock advances mi
       deadline,
       faultInjector(boundary) { if (boundary === 'sweep-remove:1') clock.now = 2_001; },
     });
-    assert.deepEqual(result, { processed: 0, removed: [] });
+    assert.deepEqual(result, { processed: 0, removed: [], removed_junk: [] });
   });
   assert.equal(fs.existsSync(transaction), true);
   assert.equal(fs.readdirSync(transaction).length, 3);
 
   withLock(root, (token) => {
     const result = sweepTransactionDebris(root, token, { deadline: createDeadline({ budgetMs: 12_000 }) });
-    assert.deepEqual(result, { processed: 1, removed: ['plain-large'] });
+    assert.deepEqual(result, { processed: 1, removed: ['plain-large'], removed_junk: [] });
   });
   assert.equal(fs.existsSync(transaction), false);
+});
+
+test('readers tolerate an OS metadata file dropped into the transaction store', () => {
+  const { snapshotWiki } = require(statePath);
+  const root = fixture('deep wiki transaction store junk ');
+  const transactions = path.join(root, '.wiki-meta', '.transactions');
+  fs.mkdirSync(transactions, { recursive: true });
+  for (const name of ['.DS_Store', '._topic.md', 'Thumbs.db', 'desktop.ini']) {
+    fs.writeFileSync(path.join(transactions, name), 'sync-client metadata\n');
+  }
+  const snapshot = snapshotWiki({ wikiRoot: root });
+  assert.deepEqual(snapshot.pages, []);
+});
+
+test('an unrecognized non-directory transaction entry still demands recovery', () => {
+  const { snapshotWiki } = require(statePath);
+  const root = fixture('deep wiki transaction store stray ');
+  const transactions = path.join(root, '.wiki-meta', '.transactions');
+  fs.mkdirSync(transactions, { recursive: true });
+  fs.writeFileSync(path.join(transactions, '01JZ7P9Q6MD7S5PB8H4Y40HJ86'), 'not a transaction\n');
+  assert.throws(
+    () => snapshotWiki({ wikiRoot: root }),
+    (error) => error.code === 'TRANSACTION_RECOVERY_REQUIRED',
+  );
+});
+
+test('a symlink wearing an OS metadata name still demands recovery', () => {
+  const { snapshotWiki } = require(statePath);
+  const root = fixture('deep wiki transaction store symlink ');
+  const transactions = path.join(root, '.wiki-meta', '.transactions');
+  fs.mkdirSync(transactions, { recursive: true });
+  fs.writeFileSync(path.join(root, 'pages', 'target.md'), pageContent('Target', ['source-a']));
+  fs.symlinkSync(path.join(root, 'pages', 'target.md'), path.join(transactions, '.DS_Store'));
+  assert.throws(
+    () => snapshotWiki({ wikiRoot: root }),
+    (error) => error.code === 'TRANSACTION_RECOVERY_REQUIRED',
+  );
+  assert.equal(fs.existsSync(path.join(root, 'pages', 'target.md')), true);
+});
+
+test('transaction debris sweep reclaims OS metadata files under the owner token', () => {
+  const { sweepTransactionDebris } = require('../hooks/scripts/runtime/transaction-debris.js');
+  const root = fixture('deep wiki sweep os metadata ');
+  const transactions = path.join(root, '.wiki-meta', '.transactions');
+  fs.mkdirSync(transactions, { recursive: true });
+  fs.writeFileSync(path.join(transactions, '.DS_Store'), 'finder metadata\n');
+  fs.writeFileSync(path.join(transactions, 'Thumbs.db'), 'explorer metadata\n');
+  const deadline = createDeadline({ budgetMs: 12_000 });
+  withLock(root, (token) => {
+    const result = sweepTransactionDebris(root, token, { deadline });
+    assert.deepEqual(result.removed, []);
+    assert.deepEqual([...result.removed_junk].sort(), ['.DS_Store', 'Thumbs.db']);
+  });
+  assert.deepEqual(fs.readdirSync(transactions), []);
+});
+
+test('transaction debris sweep never removes an unrecognized non-directory entry', () => {
+  const { sweepTransactionDebris } = require('../hooks/scripts/runtime/transaction-debris.js');
+  const root = fixture('deep wiki sweep stray file ');
+  const transactions = path.join(root, '.wiki-meta', '.transactions');
+  fs.mkdirSync(transactions, { recursive: true });
+  fs.writeFileSync(path.join(transactions, 'evidence.json'), 'preserve exactly\n');
+  const deadline = createDeadline({ budgetMs: 12_000 });
+  withLock(root, (token) => {
+    assert.deepEqual(
+      sweepTransactionDebris(root, token, { deadline }),
+      { processed: 0, removed: [], removed_junk: [] },
+    );
+  });
+  assert.equal(fs.readFileSync(path.join(transactions, 'evidence.json'), 'utf8'), 'preserve exactly\n');
+});
+
+test('a symlinked transaction store is refused before the sweep deletes anything outside the wiki', () => {
+  const { sweepTransactionDebris } = require('../hooks/scripts/runtime/transaction-debris.js');
+  const root = fixture('deep wiki sweep anchored store ');
+  const outside = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'deep wiki outside store ')));
+  roots.add(outside);
+  fs.writeFileSync(path.join(outside, '.DS_Store'), 'external bytes\n');
+  fs.mkdirSync(path.join(outside, 'plain-debris'));
+  fs.mkdirSync(path.join(root, '.wiki-meta'), { recursive: true });
+  fs.symlinkSync(outside, path.join(root, '.wiki-meta', '.transactions'));
+  const deadline = createDeadline({ budgetMs: 12_000 });
+  withLock(root, (token) => {
+    assert.throws(
+      () => sweepTransactionDebris(root, token, { deadline }),
+      (error) => error.code === 'WIKI_STATE_FILESYSTEM',
+    );
+  });
+  assert.equal(fs.readFileSync(path.join(outside, '.DS_Store'), 'utf8'), 'external bytes\n');
+  assert.equal(fs.existsSync(path.join(outside, 'plain-debris')), true);
+});
+
+test('junk never consumes the budget that reader-fatal cancelled debris needs', () => {
+  const { sweepTransactionDebris } = require('../hooks/scripts/runtime/transaction-debris.js');
+  const { snapshotWiki } = require(statePath);
+  const root = fixture('deep wiki sweep junk starvation ');
+  const transactions = path.join(root, '.wiki-meta', '.transactions');
+  fs.mkdirSync(transactions, { recursive: true });
+  for (let index = 0; index < 12; index += 1) {
+    fs.writeFileSync(path.join(transactions, `._junk-${index}`), 'appledouble\n');
+  }
+  const operationId = '01JZ7P9Q6MD7S5PB8H4Y40HJ87';
+  const cancelled = path.join(transactions, operationId);
+  fs.mkdirSync(cancelled);
+  fs.writeFileSync(path.join(cancelled, 'cancelled.json'), `${JSON.stringify({
+    contract_version: 1,
+    operation_id: operationId,
+    reason: 'catalog-drift',
+    drift: ['pages/topic.md'],
+  })}\n`);
+  const deadline = createDeadline({ budgetMs: 12_000 });
+  withLock(root, (token) => {
+    const result = sweepTransactionDebris(root, token, { deadline });
+    assert.deepEqual(result.removed, [operationId]);
+  });
+  assert.equal(fs.existsSync(cancelled), false);
+  assert.deepEqual(snapshotWiki({ wikiRoot: root }).pages, []);
+});
+
+test('junk removal publishes the same interruption boundary as directory debris', () => {
+  const { sweepTransactionDebris } = require('../hooks/scripts/runtime/transaction-debris.js');
+  const root = fixture('deep wiki sweep junk boundary ');
+  const transactions = path.join(root, '.wiki-meta', '.transactions');
+  fs.mkdirSync(transactions, { recursive: true });
+  fs.writeFileSync(path.join(transactions, '.DS_Store'), 'finder metadata\n');
+  const boundaries = [];
+  const deadline = createDeadline({ budgetMs: 12_000 });
+  withLock(root, (token) => sweepTransactionDebris(root, token, {
+    deadline,
+    faultInjector: (boundary) => { boundaries.push(boundary); },
+  }));
+  assert.deepEqual(boundaries, ['junk-remove:0', 'junk-validated:0', 'junk-removed:0']);
+  assert.equal(fs.existsSync(path.join(transactions, '.DS_Store')), false);
+});
+
+test('a symlinked .wiki-meta is refused before any transaction state is created outside the wiki', () => {
+  const { applyCommit } = require(statePath);
+  const { sweepTransactionDebris } = require('../hooks/scripts/runtime/transaction-debris.js');
+  const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'deep wiki meta escape ')));
+  roots.add(base);
+  const root = path.join(base, 'wiki');
+  const outside = path.join(base, 'outside');
+  fs.mkdirSync(path.join(root, 'pages'), { recursive: true });
+  fs.mkdirSync(path.join(outside, 'sources'), { recursive: true });
+  fs.mkdirSync(path.join(outside, '.versions'));
+  fs.writeFileSync(path.join(root, 'log.jsonl'), '');
+  fs.symlinkSync(outside, path.join(root, '.wiki-meta'));
+  const deadline = createDeadline({ budgetMs: 12_000 });
+  withLock(root, (token) => {
+    assert.throws(
+      () => sweepTransactionDebris(root, token, { deadline }),
+      (error) => error.code === 'WIKI_STATE_FILESYSTEM',
+    );
+    assert.throws(
+      () => applyCommit({ wikiRoot: root, token, manifest: manifest(), now: new Date(TS) }),
+      (error) => error.code === 'WIKI_STATE_FILESYSTEM',
+    );
+  });
+  assert.equal(fs.existsSync(path.join(outside, '.transactions')), false);
+});
+
+test('reader-fatal cancelled debris is reclaimed before junk can exhaust the sweep reserve', () => {
+  const { sweepTransactionDebris } = require('../hooks/scripts/runtime/transaction-debris.js');
+  const root = fixture('deep wiki sweep order ');
+  const transactions = path.join(root, '.wiki-meta', '.transactions');
+  fs.mkdirSync(transactions, { recursive: true });
+  const operationId = '01JZ7P9Q6MD7S5PB8H4Y40HJ88';
+  const cancelled = path.join(transactions, operationId);
+  fs.mkdirSync(cancelled);
+  fs.writeFileSync(path.join(cancelled, 'cancelled.json'), `${JSON.stringify({
+    contract_version: 1,
+    operation_id: operationId,
+    reason: 'catalog-drift',
+    drift: ['pages/topic.md'],
+  })}\n`);
+  fs.writeFileSync(path.join(transactions, '.DS_Store'), 'finder metadata\n');
+  const clock = { now: 0, nowMs() { return this.now; } };
+  const deadline = createDeadline({ clock, budgetMs: 12_000 });
+  const seen = [];
+  withLock(root, (token) => sweepTransactionDebris(root, token, {
+    deadline,
+    // Burn the reserve the moment junk reclamation is first reached. `readdirSync` order is
+    // filesystem dependent, so this asserts the ordering guarantee itself: whatever the order,
+    // the cancelled teardown must already be done by the time any junk boundary fires.
+    faultInjector: (boundary) => {
+      seen.push(boundary);
+      if (boundary.startsWith('junk-')) clock.now = 11_000;
+    },
+  }));
+  assert.equal(seen.some((boundary) => boundary.startsWith('junk-')), true, 'junk was never reached');
+  assert.equal(fs.existsSync(cancelled), false, 'cancelled teardown did not run before junk');
+  assert.equal(fs.existsSync(path.join(transactions, '.DS_Store')), true);
+});
+
+test('a junk entry swapped for a symlink at the removal boundary is neither followed nor removed', () => {
+  const { sweepTransactionDebris } = require('../hooks/scripts/runtime/transaction-debris.js');
+  const root = fixture('deep wiki sweep junk swap ');
+  const transactions = path.join(root, '.wiki-meta', '.transactions');
+  fs.mkdirSync(transactions, { recursive: true });
+  const junk = path.join(transactions, '.DS_Store');
+  fs.writeFileSync(junk, 'finder metadata\n');
+  fs.writeFileSync(path.join(root, 'pages', 'victim.md'), pageContent('Victim', ['source-a']));
+  let swapped = false;
+  const deadline = createDeadline({ budgetMs: 12_000 });
+  withLock(root, (token) => sweepTransactionDebris(root, token, {
+    deadline,
+    faultInjector: (boundary) => {
+      if (boundary === 'junk-remove:0' && !swapped) {
+        swapped = true;
+        fs.rmSync(junk, { force: true });
+        fs.symlinkSync(path.join(root, 'pages', 'victim.md'), junk);
+      }
+    },
+  }));
+  assert.equal(swapped, true);
+  assert.equal(fs.lstatSync(junk).isSymbolicLink(), true);
+  assert.equal(fs.existsSync(path.join(root, 'pages', 'victim.md')), true);
+});
+
+test('a transaction store swapped for a symlink mid-sweep is caught before the next removal', () => {
+  const { sweepTransactionDebris } = require('../hooks/scripts/runtime/transaction-debris.js');
+  const root = fixture('deep wiki sweep midswap ');
+  const transactions = path.join(root, '.wiki-meta', '.transactions');
+  fs.mkdirSync(transactions, { recursive: true });
+  fs.writeFileSync(path.join(transactions, '.DS_Store'), 'finder metadata\n');
+  fs.writeFileSync(path.join(transactions, '._decoy'), 'appledouble\n');
+  const outside = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'deep wiki midswap outside ')));
+  roots.add(outside);
+  fs.writeFileSync(path.join(outside, '.DS_Store'), 'EXTERNAL VICTIM\n');
+  let swapped = false;
+  const deadline = createDeadline({ budgetMs: 12_000 });
+  withLock(root, (token) => {
+    assert.throws(() => sweepTransactionDebris(root, token, {
+      deadline,
+      faultInjector: (boundary) => {
+        if (boundary === 'junk-remove:0' && !swapped) {
+          swapped = true;
+          fs.renameSync(transactions, `${transactions}.real`);
+          fs.symlinkSync(outside, transactions);
+        }
+      },
+    }), (error) => error.code === 'WIKI_STATE_FILESYSTEM');
+  });
+  assert.equal(swapped, true);
+  assert.equal(fs.readFileSync(path.join(outside, '.DS_Store'), 'utf8'), 'EXTERNAL VICTIM\n');
+});
+
+test('the sweep never follows or removes a symlink wearing an OS metadata name', () => {
+  const { sweepTransactionDebris } = require('../hooks/scripts/runtime/transaction-debris.js');
+  const root = fixture('deep wiki sweep junk symlink ');
+  const transactions = path.join(root, '.wiki-meta', '.transactions');
+  fs.mkdirSync(transactions, { recursive: true });
+  fs.writeFileSync(path.join(root, 'pages', 'victim.md'), pageContent('Victim', ['source-a']));
+  const link = path.join(transactions, '.DS_Store');
+  fs.symlinkSync(path.join(root, 'pages', 'victim.md'), link);
+  const deadline = createDeadline({ budgetMs: 12_000 });
+  withLock(root, (token) => {
+    assert.deepEqual(
+      sweepTransactionDebris(root, token, { deadline }),
+      { processed: 0, removed: [], removed_junk: [] },
+    );
+  });
+  assert.equal(fs.lstatSync(link).isSymbolicLink(), true);
+  assert.equal(fs.existsSync(path.join(root, 'pages', 'victim.md')), true);
+});
+
+test('junk a foreign process refuses to release never fails the enclosing mutation route', {
+  skip: process.platform === 'win32' ? 'POSIX directory permissions' : false,
+}, () => {
+  const { sweepTransactionDebris } = require('../hooks/scripts/runtime/transaction-debris.js');
+  const { snapshotWiki } = require(statePath);
+  const root = fixture('deep wiki sweep held junk ');
+  const transactions = path.join(root, '.wiki-meta', '.transactions');
+  fs.mkdirSync(transactions, { recursive: true });
+  fs.writeFileSync(path.join(transactions, 'Thumbs.db'), 'held by explorer\n');
+  // Read+execute still satisfies every validation step; only the unlink itself is refused.
+  fs.chmodSync(transactions, 0o555);
+  const deadline = createDeadline({ budgetMs: 12_000 });
+  try {
+    withLock(root, (token) => {
+      const result = sweepTransactionDebris(root, token, { deadline });
+      assert.deepEqual(result.removed_junk, []);
+    });
+    assert.equal(fs.existsSync(path.join(transactions, 'Thumbs.db')), true);
+    assert.deepEqual(snapshotWiki({ wikiRoot: root }).pages, []);
+  } finally {
+    fs.chmodSync(transactions, 0o755);
+  }
+});
+
+test('an anchor re-proof that fails with a hold code still fails closed', () => {
+  const { sweepTransactionDebris } = require('../hooks/scripts/runtime/transaction-debris.js');
+  const root = fixture('deep wiki sweep anchor failopen ');
+  const transactions = path.join(root, '.wiki-meta', '.transactions');
+  fs.mkdirSync(transactions, { recursive: true });
+  fs.writeFileSync(path.join(transactions, '._a'), 'appledouble\n');
+  fs.writeFileSync(path.join(transactions, '._b'), 'appledouble\n');
+  const realLstat = fs.lstatSync;
+  let armed = false;
+  fs.lstatSync = function patched(target, ...rest) {
+    if (armed && String(target).endsWith('.transactions')) {
+      throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+    }
+    return realLstat.call(this, target, ...rest);
+  };
+  try {
+    withLock(root, (token) => {
+      assert.throws(() => sweepTransactionDebris(root, token, {
+        deadline: createDeadline({ budgetMs: 12_000 }),
+        faultInjector: () => { armed = true; },
+      }), (error) => error.code === 'WIKI_STATE_FILESYSTEM');
+    });
+  } finally {
+    fs.lstatSync = realLstat;
+  }
+  assert.equal(fs.existsSync(path.join(transactions, '._a')), true);
+  assert.equal(fs.existsSync(path.join(transactions, '._b')), true);
+});
+
+test('one sweep pass never mutates more entries than its documented limit', () => {
+  const { sweepTransactionDebris } = require('../hooks/scripts/runtime/transaction-debris.js');
+  const root = fixture('deep wiki sweep budget cap ');
+  const transactions = path.join(root, '.wiki-meta', '.transactions');
+  fs.mkdirSync(transactions, { recursive: true });
+  for (let index = 0; index < 6; index += 1) {
+    fs.mkdirSync(path.join(transactions, `plain-${index}`));
+  }
+  for (let index = 0; index < 6; index += 1) {
+    fs.writeFileSync(path.join(transactions, `._junk-${index}`), 'appledouble\n');
+  }
+  const deadline = createDeadline({ budgetMs: 12_000 });
+  withLock(root, (token) => {
+    const result = sweepTransactionDebris(root, token, { deadline, limit: 8 });
+    assert.equal(result.processed + result.removed_junk.length <= 8, true,
+      `${result.processed} + ${result.removed_junk.length} exceeded the pass limit`);
+    assert.equal(result.processed, 6);
+    assert.equal(result.removed_junk.length, 2);
+  });
+});
+
+test('lint fix reports the OS metadata it reclaimed', () => {
+  const { fixWiki } = require(statePath);
+  const root = fixture('deep wiki lint fix junk report ');
+  const transactions = path.join(root, '.wiki-meta', '.transactions');
+  fs.mkdirSync(transactions, { recursive: true });
+  fs.writeFileSync(path.join(transactions, '.DS_Store'), 'finder metadata\n');
+  const result = fixWiki({ wikiRoot: root, now: new Date(TS) });
+  assert.deepEqual(result.removed_junk, ['.DS_Store']);
+  assert.equal(result.removed_junk_complete, true);
+});
+
+test('lint fix never reports junk reclamation as complete while junk remains', () => {
+  const { fixWiki } = require(statePath);
+  const root = fixture('deep wiki lint fix junk partial ');
+  const transactions = path.join(root, '.wiki-meta', '.transactions');
+  fs.mkdirSync(transactions, { recursive: true });
+  for (let index = 0; index < 12; index += 1) {
+    fs.writeFileSync(path.join(transactions, `._junk-${index}`), 'appledouble\n');
+  }
+  const result = fixWiki({ wikiRoot: root, now: new Date(TS) });
+  const remaining = fs.readdirSync(transactions).filter((name) => name.startsWith('._')).length;
+  assert.equal(result.removed_junk_complete, remaining === 0);
+  assert.equal(result.removed_junk.length + remaining, 12);
+});
+
+test('transaction creation re-proves the store anchor after the sweep has released it', () => {
+  const { applyCommit } = require(statePath);
+  const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'deep wiki activate swap ')));
+  roots.add(base);
+  const root = path.join(base, 'wiki');
+  const outside = path.join(base, 'outside');
+  fs.mkdirSync(path.join(root, 'pages'), { recursive: true });
+  fs.mkdirSync(path.join(root, '.wiki-meta', 'sources'), { recursive: true });
+  fs.mkdirSync(path.join(root, '.wiki-meta', '.versions'));
+  fs.mkdirSync(outside);
+  fs.writeFileSync(path.join(root, 'log.jsonl'), '');
+  fs.writeFileSync(path.join(root, 'log.md'), '# Wiki Log\n');
+  fs.writeFileSync(path.join(root, 'index.md'), '# Wiki Index\n');
+  const transactions = path.join(root, '.wiki-meta', '.transactions');
+  let swapped = false;
+  withLock(root, (token) => {
+    assert.throws(() => applyCommit({
+      wikiRoot: root,
+      token,
+      manifest: manifest(),
+      now: new Date(TS),
+      // The sweep's anchor has already been released by this boundary, and the lock still lives in
+      // a physical `.wiki-meta`, so only the creation-time re-proof can catch this swap.
+      faultInjector: (boundary) => {
+        if (boundary === 'before-transaction-activate' && !swapped) {
+          swapped = true;
+          fs.rmSync(transactions, { recursive: true, force: true });
+          fs.symlinkSync(outside, transactions);
+        }
+      },
+    }), (error) => error.code === 'WIKI_STATE_FILESYSTEM');
+  });
+  assert.equal(swapped, true);
+  assert.deepEqual(fs.readdirSync(outside), []);
+});
+
+test('recovery refuses a transaction store that escapes the wiki', () => {
+  const { recoverTransaction } = require(statePath);
+  const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'deep wiki recover anchor ')));
+  roots.add(base);
+  const root = path.join(base, 'wiki');
+  const outside = path.join(base, 'outside');
+  const operationId = '01JZ7P9Q6MD7S5PB8H4Y40HJ89';
+  fs.mkdirSync(path.join(root, 'pages'), { recursive: true });
+  fs.mkdirSync(path.join(root, '.wiki-meta'), { recursive: true });
+  fs.mkdirSync(path.join(outside, operationId), { recursive: true });
+  fs.writeFileSync(path.join(outside, operationId, 'cancelled.json'), `${JSON.stringify({
+    contract_version: 1,
+    operation_id: operationId,
+    reason: 'catalog-drift',
+    drift: ['pages/topic.md'],
+  })}\n`);
+  fs.writeFileSync(path.join(outside, operationId, 'evidence.txt'), 'EXTERNAL\n');
+  // `.wiki-meta` stays physical so the lock is genuinely held; only `.transactions` escapes.
+  fs.symlinkSync(outside, path.join(root, '.wiki-meta', '.transactions'));
+  withLock(root, (token) => {
+    assert.throws(
+      () => recoverTransaction({ wikiRoot: root, token, operationId }),
+      (error) => error.code === 'WIKI_STATE_FILESYSTEM',
+    );
+  });
+  assert.equal(
+    fs.readFileSync(path.join(outside, operationId, 'evidence.txt'), 'utf8'),
+    'EXTERNAL\n',
+  );
+});
+
+test('readers refuse a transaction store that escapes the wiki', () => {
+  const { snapshotWiki } = require(statePath);
+  const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'deep wiki reader anchor ')));
+  roots.add(base);
+  const root = path.join(base, 'wiki');
+  const outside = path.join(base, 'outside');
+  fs.mkdirSync(path.join(root, 'pages'), { recursive: true });
+  fs.mkdirSync(path.join(root, '.wiki-meta'), { recursive: true });
+  fs.mkdirSync(outside);
+  // Recognized junk only: without the reader anchor this store would pass inspection outright.
+  fs.writeFileSync(path.join(outside, '.DS_Store'), 'finder metadata\n');
+  fs.symlinkSync(outside, path.join(root, '.wiki-meta', '.transactions'));
+  assert.throws(
+    () => snapshotWiki({ wikiRoot: root }),
+    (error) => error.code === 'WIKI_STATE_FILESYSTEM',
+  );
+  assert.equal(fs.existsSync(path.join(outside, '.DS_Store')), true);
+});
+
+test('every junk reclamation attempt consumes the pass budget, not only the successful ones', {
+  skip: process.platform === 'win32' ? 'POSIX directory permissions' : false,
+}, () => {
+  const { sweepTransactionDebris } = require('../hooks/scripts/runtime/transaction-debris.js');
+  const root = fixture('deep wiki sweep attempt budget ');
+  const transactions = path.join(root, '.wiki-meta', '.transactions');
+  fs.mkdirSync(transactions, { recursive: true });
+  for (let index = 0; index < 12; index += 1) {
+    fs.writeFileSync(path.join(transactions, `._junk-${index}`), 'appledouble\n');
+  }
+  fs.chmodSync(transactions, 0o555);
+  const attempts = [];
+  try {
+    withLock(root, (token) => sweepTransactionDebris(root, token, {
+      deadline: createDeadline({ budgetMs: 12_000 }),
+      limit: 4,
+      faultInjector: (boundary) => {
+        if (boundary.startsWith('junk-remove:')) attempts.push(boundary);
+      },
+    }));
+  } finally {
+    fs.chmodSync(transactions, 0o755);
+  }
+  // Nothing can be unlinked, so a success-only counter would retry all twelve.
+  assert.equal(attempts.length, 4);
+  assert.equal(fs.readdirSync(transactions).length, 12);
+});
+
+function escapeFixture(prefix) {
+  const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
+  roots.add(base);
+  const root = path.join(base, 'wiki');
+  const outside = path.join(base, 'outside');
+  fs.mkdirSync(path.join(root, 'pages'), { recursive: true });
+  fs.mkdirSync(path.join(root, '.wiki-meta', 'sources'), { recursive: true });
+  fs.mkdirSync(path.join(root, '.wiki-meta', '.versions'));
+  fs.mkdirSync(outside);
+  fs.writeFileSync(path.join(outside, 'EXTERNAL.txt'), 'EXTERNAL\n');
+  fs.writeFileSync(path.join(root, 'log.jsonl'), '');
+  fs.writeFileSync(path.join(root, 'log.md'), '# Wiki Log\n');
+  fs.writeFileSync(path.join(root, 'index.md'), '# Wiki Index\n');
+  return { root, outside, transactions: path.join(root, '.wiki-meta', '.transactions') };
+}
+
+function swapStoreForSymlink(transactions, outside) {
+  fs.rmSync(transactions, { recursive: true, force: true });
+  fs.symlinkSync(outside, transactions);
+}
+
+for (const boundary of ['precreate-transaction-store', 'postcreate-transaction-store']) {
+  test(`transaction creation proves the store anchor at ${boundary}`, () => {
+    const { applyCommit } = require(statePath);
+    const { root, outside, transactions } = escapeFixture(`deep wiki anchor ${boundary} `);
+    let swapped = false;
+    withLock(root, (token) => {
+      assert.throws(() => applyCommit({
+        wikiRoot: root,
+        token,
+        manifest: manifest(),
+        now: new Date(TS),
+        faultInjector: (seen) => {
+          if (seen === boundary && !swapped) {
+            swapped = true;
+            swapStoreForSymlink(transactions, outside);
+          }
+        },
+      }), (error) => error.code === 'WIKI_STATE_FILESYSTEM');
+    });
+    assert.equal(swapped, true);
+    assert.deepEqual(fs.readdirSync(outside), ['EXTERNAL.txt']);
+  });
+}
+
+test('junk reclamation re-checks the reserve after its validation syscalls', () => {
+  const { sweepTransactionDebris } = require('../hooks/scripts/runtime/transaction-debris.js');
+  const root = fixture('deep wiki junk validated reserve ');
+  const transactions = path.join(root, '.wiki-meta', '.transactions');
+  fs.mkdirSync(transactions, { recursive: true });
+  fs.writeFileSync(path.join(transactions, '.DS_Store'), 'finder metadata\n');
+  const clock = { now: 0, nowMs() { return this.now; } };
+  const deadline = createDeadline({ clock, budgetMs: 12_000 });
+  let validated = false;
+  withLock(root, (token) => {
+    const result = sweepTransactionDebris(root, token, {
+      deadline,
+      // Validation itself burned the budget; the unlink must not start.
+      faultInjector: (boundary) => {
+        if (boundary === 'junk-validated:0') { validated = true; clock.now = 11_000; }
+      },
+    });
+    assert.deepEqual(result.removed_junk, []);
+  });
+  assert.equal(validated, true);
+  assert.equal(fs.existsSync(path.join(transactions, '.DS_Store')), true);
+});
+
+test('a store swapped after a junk unlink is caught by the post-removal proof', () => {
+  const { sweepTransactionDebris } = require('../hooks/scripts/runtime/transaction-debris.js');
+  const { root, outside, transactions } = escapeFixture('deep wiki junk post proof ');
+  fs.mkdirSync(transactions, { recursive: true });
+  fs.writeFileSync(path.join(transactions, '.DS_Store'), 'finder metadata\n');
+  let swapped = false;
+  withLock(root, (token) => {
+    assert.throws(() => sweepTransactionDebris(root, token, {
+      deadline: createDeadline({ budgetMs: 12_000 }),
+      faultInjector: (boundary) => {
+        if (boundary === 'junk-removed:0' && !swapped) {
+          swapped = true;
+          swapStoreForSymlink(transactions, outside);
+        }
+      },
+    }), (error) => error.code === 'WIKI_STATE_FILESYSTEM');
+  });
+  assert.equal(swapped, true);
+  assert.deepEqual(fs.readdirSync(outside), ['EXTERNAL.txt']);
+});
+
+test('a transaction directory swapped mid-teardown is caught before its children are followed', () => {
+  const { sweepTransactionDebris } = require('../hooks/scripts/runtime/transaction-debris.js');
+  const { root, outside, transactions } = escapeFixture('deep wiki subtree seal ');
+  fs.mkdirSync(transactions, { recursive: true });
+  const transaction = path.join(transactions, 'plain-debris');
+  fs.mkdirSync(path.join(transaction, 'before'), { recursive: true });
+  fs.writeFileSync(path.join(transaction, 'before', '0000.json'), 'staged\n');
+  fs.writeFileSync(path.join(transaction, 'stray.json'), 'staged\n');
+  let swapped = false;
+  withLock(root, (token) => {
+    assert.throws(() => sweepTransactionDebris(root, token, {
+      deadline: createDeadline({ budgetMs: 12_000 }),
+      faultInjector: (boundary) => {
+        if (boundary === 'sweep-remove:0' && !swapped) {
+          swapped = true;
+          fs.rmSync(transaction, { recursive: true, force: true });
+          fs.symlinkSync(outside, transaction);
+        }
+      },
+    }), (error) => error.code === 'WIKI_STATE_FILESYSTEM');
+  });
+  assert.equal(swapped, true);
+  assert.deepEqual(fs.readdirSync(outside), ['EXTERNAL.txt']);
+});
+
+test('no engine-generated transaction store name is classified as junk', () => {
+  const {
+    isTransactionStoreJunkName,
+  } = require('../hooks/scripts/runtime/transaction-debris.js');
+  const engineNames = [
+    '01JZ7P9Q6MD7S5PB8H4Y40HJ83',
+    '01JZ7P9Q6MD7S5PB8H4Y40HJ83.json',
+    `.activate-${process.pid}-${crypto.randomUUID()}`,
+    '.prune-5-phase-debris',
+    '.reservation-.prune-5-phase-debris',
+    'scan-window-ensure-45e46792a84a6967587d4d0ff06640920c78f9ff',
+    `.${'01JZ7P9Q6MD7S5PB8H4Y40HJ83'}.tmp.${process.pid}.${crypto.randomUUID()}`,
+    'journal.json',
+    'cancelled.json',
+  ];
+  for (const name of engineNames) {
+    assert.equal(isTransactionStoreJunkName(name), false, name);
+  }
+  const junkNames = [
+    '.DS_Store', '.localized', '.apdisk', '.VolumeIcon.icns', 'Icon\r',
+    'Thumbs.db', 'ehthumbs.db', 'desktop.ini',
+    '.directory', '.dropbox', '.dropbox.attr',
+    '._topic.md', '._',
+  ];
+  for (const name of junkNames) assert.equal(isTransactionStoreJunkName(name), true, name);
+});
+
+test('an ingest commit reclaims OS metadata left in the transaction store', () => {
+  const { applyCommit } = require(statePath);
+  const root = fixture('deep wiki commit junk reclaim ');
+  const transactions = path.join(root, '.wiki-meta', '.transactions');
+  fs.mkdirSync(transactions, { recursive: true });
+  fs.writeFileSync(path.join(transactions, '.DS_Store'), 'finder metadata\n');
+  withLock(root, (token) => applyCommit({
+    wikiRoot: root, token, manifest: manifest(), now: new Date(TS),
+  }));
+  assert.equal(fs.existsSync(path.join(root, 'pages', 'topic.md')), true);
+  assert.equal(fs.existsSync(path.join(transactions, '.DS_Store')), false);
+});
+
+test('lint fix self-heals a transaction store wedged by an OS metadata file', () => {
+  const { fixWiki } = require(statePath);
+  const root = fixture('deep wiki lint fix junk ');
+  const transactions = path.join(root, '.wiki-meta', '.transactions');
+  fs.mkdirSync(transactions, { recursive: true });
+  fs.writeFileSync(path.join(transactions, '.DS_Store'), 'finder metadata\n');
+  const result = fixWiki({ wikiRoot: root, now: new Date(TS) });
+  assert.equal(result.status, 'fixed');
+  assert.equal(fs.existsSync(path.join(transactions, '.DS_Store')), false);
 });
 
 test('setup refuses a nonempty incompatible target before creating wiki state', () => {

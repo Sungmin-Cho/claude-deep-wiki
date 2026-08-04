@@ -15,7 +15,10 @@ const {
 } = require('./deadline.js');
 const { acquireLock, assertLockOwner, releaseLock } = require('./lock.js');
 const scanWindow = require('./scan-window.js');
-const { sweepTransactionDebris, validateTombstoneV1 } = require('./transaction-debris.js');
+const {
+  sweepTransactionDebris, validateTombstoneV1, isReclaimableJunkEntry,
+  assertTransactionStoreAnchored,
+} = require('./transaction-debris.js');
 
 const { promotePendingScan } = scanWindow;
 const ULID_RE = envelope.ULID_RE;
@@ -298,6 +301,7 @@ function readReceipt(locations, manifestHash) {
 
 function compactReceiptTransaction(root, token, locations, receipt) {
   if (!fs.existsSync(locations.transaction)) return;
+  assertTransactionStoreAnchored(root);
   const journal = readJournal(locations.journal);
   if (!journal) {
     assertLockOwner({ wikiRoot: root, token });
@@ -317,6 +321,10 @@ function compactReceiptTransaction(root, token, locations, receipt) {
 
 function inspectTransactions(root, allowedOperationId = null, deadline = operationDeadline()) {
   const directory = path.join(root, '.wiki-meta', '.transactions');
+  // Readers are lock-free and never mutate, but `readdirSync` still follows a symlinked store, and
+  // the junk skip below would let an escaped store pass inspection outright. Proving the anchor is
+  // itself read-only, so it costs the reader nothing it is not allowed to do.
+  assertTransactionStoreAnchored(root);
   let entries;
   try { entries = fs.readdirSync(directory, { withFileTypes: true }); }
   catch (error) { if (error.code === 'ENOENT') return; throw error; }
@@ -324,6 +332,9 @@ function inspectTransactions(root, allowedOperationId = null, deadline = operati
     assertBeforeDeadline(deadline, `wiki-state:inspect-transaction:${entry.name}`);
     if (entry.name.startsWith('.activate-') && entry.isDirectory() && !entry.isSymbolicLink()) continue;
     if (!entry.isDirectory() || entry.isSymbolicLink()) {
+      // Recognized OS/sync-client metadata is inert debris, not lost transaction state. Readers
+      // run lock-free and cannot remove it; the lock-held debris sweep reclaims it.
+      if (isReclaimableJunkEntry(entry, directory)) continue;
       throw stateError('TRANSACTION_RECOVERY_REQUIRED', 'transaction store contains a non-directory entry');
     }
     if (entry.name.startsWith('.prune-')) {
@@ -712,7 +723,14 @@ function stageTransaction(root, token, locations, journal, faultInjector, deadli
 
 function prepareTransaction(root, token, locations, journal, faultInjector, deadline) {
   assertLockOwner({ wikiRoot: root, token });
+  // The debris sweep's anchor expires when the sweep returns, so creation re-proves it here: the
+  // lock says who may write, never where, and `ensureDirectory` alone would happily build the
+  // store inside a `.wiki-meta` that became a symlink after the sweep.
+  invokeFault(faultInjector, 'precreate-transaction-store');
+  assertTransactionStoreAnchored(root);
   ensureDirectory(locations.transactions);
+  invokeFault(faultInjector, 'postcreate-transaction-store');
+  assertTransactionStoreAnchored(root);
   const activation = path.join(
     locations.transactions,
     `.activate-${process.pid}-${crypto.randomUUID()}`,
@@ -738,6 +756,7 @@ function prepareTransaction(root, token, locations, journal, faultInjector, dead
   assertOwner();
   invokeFault(faultInjector, 'before-transaction-activate');
   assertOwner();
+  assertTransactionStoreAnchored(root);
   fs.renameSync(activation, locations.transaction);
   invokeFault(faultInjector, 'after-transaction-activate');
   assertOwner();
@@ -1067,7 +1086,7 @@ function applyCommit(options = {}) {
   const root = physicalRoot(options.wikiRoot);
   assertLockOwner({ wikiRoot: root, token: options.token });
   sweepTransactionDebris(root, options.token, {
-    deadline, classes: ['activation', 'plain', 'cancelled'],
+    deadline, classes: ['activation', 'plain', 'cancelled', 'junk'],
   });
   const manifest = validateManifestSchema(options.manifest);
   const manifestHash = sha256(Buffer.from(JSON.stringify(manifest)));
@@ -1144,6 +1163,9 @@ function recoverTransaction(options = {}) {
   const deadline = operationDeadline(options);
   const root = physicalRoot(options.wikiRoot);
   assertLockOwner({ wikiRoot: root, token: options.token });
+  // Cancelled-tombstone teardown removes a tree, so recovery must prove the store is anchored
+  // before it reads anything from it — the token says who may write, never where.
+  assertTransactionStoreAnchored(root);
   if (!ULID_RE.test(options.operationId)) throw stateError('WIKI_STATE_INVALID', 'operationId is invalid');
   const locations = transactionPaths(root, options.operationId);
   const journal = readJournal(locations.journal);
@@ -1507,6 +1529,15 @@ function inspectWiki(options = {}) {
   };
 }
 
+function transactionStoreJunkNames(root) {
+  assertTransactionStoreAnchored(root);
+  const transactions = path.join(root, '.wiki-meta', '.transactions');
+  let entries;
+  try { entries = fs.readdirSync(transactions, { withFileTypes: true }); }
+  catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+  return entries.filter((entry) => isReclaimableJunkEntry(entry, transactions)).map((entry) => entry.name);
+}
+
 function fixWiki(options = {}) {
   const deadline = operationDeadline(options);
   const root = physicalRoot(options.wikiRoot);
@@ -1531,8 +1562,11 @@ function fixWiki(options = {}) {
     });
     const entryMarkers = scanWindow.inspectPruneMarkers({ wikiRoot: root });
     const suppressEnsurePrune = entryMarkers.pending.invalid || entryMarkers.last.invalid;
+    // Snapshot before any sweep: this route runs its own sweep and then a nested commit sweep, so
+    // only a before/after diff of the store reports reclamation exactly.
+    const junkBefore = new Set(transactionStoreJunkNames(root));
     sweepTransactionDebris(root, owner.token, {
-      deadline, classes: ['activation', 'plain', 'cancelled'],
+      deadline, classes: ['activation', 'plain', 'cancelled', 'junk'],
     });
     const prune = (mode, limit) => {
       const request = {
@@ -1717,7 +1751,12 @@ function fixWiki(options = {}) {
     if (suppressEnsurePrune) {
       terminalPrune.suppressed_reason = 'initial-invalid-scan-marker';
     }
-    completedResult = Object.assign(primary, { terminal_prune: terminalPrune });
+    const junkAfter = transactionStoreJunkNames(root);
+    completedResult = Object.assign(primary, {
+      terminal_prune: terminalPrune,
+      removed_junk: [...junkBefore].filter((name) => !junkAfter.includes(name)).sort(),
+      removed_junk_complete: junkAfter.length === 0,
+    });
     return completedResult;
   } catch (error) {
     operationError = error;

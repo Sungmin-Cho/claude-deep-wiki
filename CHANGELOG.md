@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.6] — 2026-08-04 (transaction store junk tolerance)
+
+### Fixed
+
+- A desktop shell or sync client writing its own metadata file into `<wiki_root>/.wiki-meta/.transactions/` no longer wedges the wiki. Previously any non-directory entry there — a macOS `.DS_Store` being the common case on an Obsidian vault held in cloud storage — failed every route that inspects transaction state (`snapshot`, `commit`, `index read`, `transaction recover`, `lint inspect`, and `lint fix`) with `TRANSACTION_RECOVERY_REQUIRED`, and the bounded debris sweep skipped non-directories, so no shipped command could clear it. Recognized OS metadata is now treated as inert debris: lock-free readers step over it, and the lock-held debris sweep reclaims it during `commit`, `lint --fix`, and scan-window maintenance. Recognition is by exact name plus the AppleDouble `._` prefix, and only for a plain regular file whose type is re-proved immediately before removal — an unrecognized stray entry, and a symlink wearing a recognized name, still demand recovery and are never followed or removed. Reclamation is an `unlink`, never a recursive delete. Because this class is by definition written and held by a foreign process, a refused unlink (`EPERM`, `EACCES`, `EBUSY`, `EROFS`, `ETXTBSY`) leaves the file in place and lets the enclosing route continue rather than failing it with a raw errno; readers already tolerate the file and a later pass retries. That tolerance is scoped to the unlink alone — a failure while proving the owner token or the store anchor still fails closed, whatever its errno. `wiki-runtime lint fix` reports exactly what it reclaimed as `removed_junk`, computed by diffing the store across the whole operation so a nested commit sweep is included, plus `removed_junk_complete` for whether any recognized metadata remains.
+- Transaction-class debris is now swept to completion before any OS metadata is considered. Ordering, not a second budget, is what keeps inert files from displacing or outrunning a cancelled-transaction teardown — the only debris class fatal to a lock-free reader — so one pass still mutates at most `limit` entries in total, and every junk reclamation *attempt* counts against it so an unremovable file cannot be retried without bound.
+
+### Security
+
+- The bounded transaction debris sweep now anchors its own store before it enumerates or deletes anything. `readdirSync` follows a directory symlink, so a `.wiki-meta` or `.wiki-meta/.transactions` symlink previously let the sweep delete entries outside the wiki, and a missing `.transactions` under a symlinked `.wiki-meta` let `commit` go on to create a transaction directory and journal outside it; lock ownership proves who may write, never where. Both `.wiki-meta` and `.wiki-meta/.transactions` are now proved to be physical directories whose real path equals their expected path, and that identity — device, inode, and birth time, so a recycled inode cannot impersonate it — is re-proved alongside the owner token immediately before every removal, catching a parent replaced mid-sweep. `lint --fix` and scan-window maintenance already anchored through their scan-window preflight; `commit` did not, and now fails closed with `WIKI_STATE_FILESYSTEM` before creating or deleting anything. Because the sweep's anchor expires when the sweep returns, transaction creation re-proves it before `.transactions` is created and again immediately before the activation directory is renamed into place.
+- Known residual: the anchor and the removal it guards cannot be made atomic on this runtime. Node exposes no handle-relative `unlinkat`, and this plugin ships no native binary, so an ancestor replaced in the instructions between the final check and the syscall is detected afterwards rather than prevented. This is bounded by the existing threat model — mutation is governed by a cooperative current writer contract, and a hostile non-cooperating local process was never covered by it — and no durability or recovery claim depends on closing it.
+
+### Changed
+
+- These runtime changes ship under a distinct 1.9.6 installation identity across both plugin manifests and package metadata.
+
 ## [1.9.5] — 2026-08-01 (lock contention observability)
 
 ### Fixed

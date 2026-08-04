@@ -48,6 +48,12 @@ intervention before generic transaction cleanup mutates a sibling.
 {"executable":"node","argv":["<plugin_root>/scripts/wiki-runtime.js","lint","fix","--wiki-root","ABSOLUTE_WIKI_ROOT","--json"]}
 ```
 
+The JSON result also carries `removed_junk` — the OS/sync-client metadata files this invocation
+reclaimed from the transaction store — and `removed_junk_complete`. Rerun while
+`removed_junk_complete` is `false`: recognized metadata remains, either because one bounded pass
+reached its limit or because a foreign process still holds a file. Remaining metadata never blocks
+readers, so this is reclamation progress, not a repair failure.
+
 The JSON result includes `terminal_prune` for every non-skipped invocation. A
 `suppressed_reason` of `initial-invalid-scan-marker` means the invocation
 finished no recovery residue and preserved all ensure-journal evidence selected

@@ -1853,7 +1853,7 @@ function applyScanWindowTransition(options = {}) {
     control.prepareDebrisSweep(assertOwner);
     sweepTransactionDebris(physicalRoot, token, {
       deadline: maintenanceDeadline,
-      classes: ['activation', 'plain'],
+      classes: ['activation', 'plain', 'junk'],
     });
   }
   const transactionOptions = { ...options, wikiRoot: physicalRoot, token };

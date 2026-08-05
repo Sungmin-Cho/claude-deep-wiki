@@ -160,8 +160,14 @@ test('1.9.6 release keeps package identity and bilingual changelogs exact', () =
   };
   const changelog = readText('CHANGELOG.md');
   const changelogKo = readText('CHANGELOG.ko.md');
-  assert.equal(releaseSection(changelog, '## [Unreleased]').trim(), '## [Unreleased]');
-  assert.equal(releaseSection(changelogKo, '## [Unreleased]').trim(), '## [Unreleased]');
+  const englishUnreleased = releaseSection(changelog, '## [Unreleased]');
+  const koreanUnreleased = releaseSection(changelogKo, '## [Unreleased]');
+  assert.match(englishUnreleased, /nested terminal and quarantine metadata/i);
+  assert.match(englishUnreleased, /parent-first `\.wiki-meta` anchor/);
+  assert.match(englishUnreleased, /non-regular recognized names remain recovery conditions/);
+  assert.match(koreanUnreleased, /중첩 terminal·quarantine 메타데이터/);
+  assert.match(koreanUnreleased, /parent-first `\.wiki-meta` anchor/);
+  assert.match(koreanUnreleased, /non-regular 인식 이름은 recovery 조건/);
 
   const english196 = releaseSection(
     changelog,

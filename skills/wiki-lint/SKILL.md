@@ -54,6 +54,16 @@ reclaimed from the transaction store — and `removed_junk_complete`. Rerun whil
 reached its limit or because a foreign process still holds a file. Remaining metadata never blocks
 readers, so this is reclamation progress, not a repair failure.
 
+Nested terminal and quarantine regular metadata is different: the terminal
+pruner reclaims it only while the current owner and the complete directory
+identity chain remain proved. Nested cleanup is internal prerequisite work and
+is never added to `removed_junk`; its public progress is
+`terminal_prune.complete`. A held regular metadata file leaves
+`terminal_prune.complete` false and preserves every later journal, backup,
+reservation, operation, and quarantine boundary for a fresh retry. A
+non-regular recognized name remains a recovery condition and is never followed
+or removed.
+
 The JSON result includes `terminal_prune` for every non-skipped invocation. A
 `suppressed_reason` of `initial-invalid-scan-marker` means the invocation
 finished no recovery residue and preserved all ensure-journal evidence selected

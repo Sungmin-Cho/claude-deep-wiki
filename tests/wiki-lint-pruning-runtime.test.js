@@ -160,6 +160,35 @@ test('lint fix reports only reclaimed no-op ensure evidence and preserves unprom
   assert.equal(fs.existsSync(path.join(root, '.wiki-meta', '.wiki-lock')), false);
 });
 
+test('lint fix aggregates ordinary and quarantined terminal cleanup without widening removed_junk', () => {
+  const root = wiki();
+  const interrupted = createQuarantineOnlyResidue(root, 'repair');
+  fs.writeFileSync(path.join(interrupted.quarantine, '._finder'), 'appledouble\n');
+  const ensureJournals = createCompletedEnsurePair(root);
+  const ordinaryJournal = ensureJournals.find((journalPath) => (
+    JSON.parse(fs.readFileSync(journalPath, 'utf8')).result_status === 'preserved'
+  ));
+  assert.ok(ordinaryJournal);
+  const ordinaryId = path.basename(path.dirname(ordinaryJournal));
+  fs.writeFileSync(path.join(path.dirname(ordinaryJournal), '.DS_Store'), 'finder\n');
+  const now = repairClockFromJournal([...ensureJournals, path.join(
+    interrupted.quarantine,
+    'journal.json',
+  )]);
+  const result = fixWiki({ wikiRoot: root, now });
+  assert.equal(result.status, 'fixed');
+  assert.deepEqual([...result.terminal_prune.removed].sort(), [
+    ordinaryId,
+    interrupted.operationId,
+  ].sort());
+  assert.equal(result.terminal_prune.processed, 2);
+  assert.equal(result.terminal_prune.complete, true);
+  assert.deepEqual(result.removed_junk, []);
+  assert.equal(result.removed_junk_complete, true);
+  assert.equal(fs.existsSync(path.dirname(ordinaryJournal)), false);
+  assert.equal(fs.existsSync(interrupted.quarantine), false);
+});
+
 test('lint repair carries either initially invalid marker as whole-pass ensure suppression', async (t) => {
   for (const markerName of ['.pending-scan', '.last-scan']) {
     await t.test(markerName, () => {

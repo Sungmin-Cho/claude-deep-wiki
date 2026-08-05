@@ -7,6 +7,11 @@ deep-wiki의 주요 변경사항을 기록합니다.
 
 ## [Unreleased]
 
+### 수정
+
+- 데스크톱 셸이나 동기화 클라이언트가 남긴 중첩 terminal·quarantine 메타데이터를 현재 owner와 전체 디렉터리 identity chain 아래에서 bounded scan-window 내부 선행 작업으로 회수합니다. regular file이 다른 프로세스에 잡혀 있으면 이후의 인증된 journal·backup·reservation·operation·quarantine 증거를 제거하기 전에 `terminal_prune.complete: false`를 보고하며, non-regular 인식 이름은 recovery 조건으로 남고 중첩 정리는 top-level `removed_junk`를 넓히지 않습니다.
+- scan-window prune-name preflight가 missing `.transactions` child를 benign으로 처리하기 전에 parent-first `.wiki-meta` anchor를 수행하므로, symlink된 metadata parent는 `SCAN_WINDOW_FILESYSTEM`으로 fail closed합니다.
+
 ## [1.9.6] — 2026-08-04 (transaction store 잡파일 내성)
 
 ### 수정

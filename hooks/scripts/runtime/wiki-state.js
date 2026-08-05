@@ -395,6 +395,7 @@ function readDirectoryFiles(directory, suffix = null, deadline = operationDeadli
   entries.sort((left, right) => left.name.localeCompare(right.name, 'en'));
   for (const entry of entries) {
     assertBeforeDeadline(deadline, `wiki-state:read-directory:${entry.name}`);
+    if (isReclaimableJunkEntry(entry, directory)) continue;
     if (entry.isSymbolicLink() || !entry.isFile()) {
       throw stateError('WIKI_STATE_FILESYSTEM', `${directory} contains a non-regular entry`);
     }
@@ -1477,6 +1478,17 @@ function cleanupInbox(options = {}) {
   return { moved };
 }
 
+function collectIgnoredOsMetadata(directory, catalog, deadline) {
+  let entries;
+  try { entries = fs.readdirSync(directory, { withFileTypes: true }); }
+  catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+  entries.sort((left, right) => left.name.localeCompare(right.name, 'en'));
+  return entries.filter((entry) => {
+    assertBeforeDeadline(deadline, `wiki-state:ignored-os-metadata:${catalog}:${entry.name}`);
+    return isReclaimableJunkEntry(entry, directory);
+  }).map((entry) => entry.name);
+}
+
 function inspectWiki(options = {}) {
   const deadline = operationDeadline(options);
   const snapshot = snapshotWiki({ ...options, deadline });
@@ -1521,11 +1533,17 @@ function inspectWiki(options = {}) {
   if (snapshot.pages.some((file) => !indexed.has(file)) || indexed.size !== snapshot.pages.length) {
     issues.push({ code: 'INDEX_DRIFT', path: '.wiki-meta/index.json' });
   }
+  const ignored_os_metadata = {
+    pages: collectIgnoredOsMetadata(path.join(root, 'pages'), 'pages', deadline),
+    sources: collectIgnoredOsMetadata(path.join(root, '.wiki-meta', 'sources'), 'sources', deadline),
+    versions: collectIgnoredOsMetadata(path.join(root, '.wiki-meta', '.versions'), 'versions', deadline),
+  };
   return {
     ok: issues.length === 0,
     pages: snapshot.pages.length,
     events: snapshot.events.length,
     issues,
+    ignored_os_metadata,
   };
 }
 

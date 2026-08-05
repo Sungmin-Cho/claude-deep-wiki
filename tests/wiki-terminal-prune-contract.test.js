@@ -8,6 +8,32 @@ const path = require('node:path');
 const root = path.resolve(__dirname, '..');
 const read = (relative) => fs.readFileSync(path.join(root, relative), 'utf8');
 
+function ignoredMetadataParagraph(source) {
+  const marker = source.indexOf('ignored_os_metadata');
+  assert.notEqual(marker, -1, 'ignored_os_metadata paragraph is missing');
+  const start = source.lastIndexOf('\n\n', marker) + 2;
+  const nextBlank = source.indexOf('\n\n', marker);
+  const nextHeading = source.indexOf('\n#', marker);
+  const endCandidates = [nextBlank, nextHeading].filter((value) => value !== -1);
+  const end = endCandidates.length > 0 ? Math.min(...endCandidates) : source.length;
+  return source.slice(start, end).trim();
+}
+
+function assertIgnoredMetadataParagraph(paragraph) {
+  assert.match(
+    paragraph,
+    /Regular OS-metadata files in content catalogs .* are skipped by readers and reported in `ignored_os_metadata`/s,
+  );
+  assert.match(paragraph, /`pages\/`, `\.wiki-meta\/sources\/`, and `\.wiki-meta\/.versions\/`/);
+  assert.match(paragraph, /content-catalog files are never deleted or reclaimed/);
+  assert.match(paragraph, /Junk-named symlinks, directories, and entries whose type cannot be resolved remain fail-closed/);
+  assert.match(paragraph, /`removed_junk` remains transaction-store-only/);
+  assert.doesNotMatch(
+    paragraph,
+    /(?:content catalogs|pages\/|\.wiki-meta\/sources\/|\.wiki-meta\/.versions\/)[^.;\n]*(?:are|is) (?:deleted|reclaimed)\b/i,
+  );
+}
+
 test('public contracts name every terminal-prune caller and preserve recovery authority', () => {
   const lint = read('skills/wiki-lint/SKILL.md');
   const schema = read('skills/wiki-schema/SKILL.md');
@@ -58,4 +84,14 @@ test('public contracts name every terminal-prune caller and preserve recovery au
   assert.match(storage, /stopped-host/);
   assert.match(storage, /direct-child.*metadata.*owner.*directory\s+identity/is);
   assert.match(storage, /non-regular.*recovery/i);
+});
+
+test('content catalog metadata documentation is bounded and fail-closed', () => {
+  const lint = read('skills/wiki-lint/SKILL.md');
+  const storage = read('skills/wiki-schema/references/storage-layout.md');
+  const lintParagraph = ignoredMetadataParagraph(lint);
+  const storageParagraph = ignoredMetadataParagraph(storage);
+  assert.match(lint, /Remaining metadata never blocks\nreaders, so this is reclamation progress, not a repair failure\./);
+  assertIgnoredMetadataParagraph(lintParagraph);
+  assertIgnoredMetadataParagraph(storageParagraph);
 });

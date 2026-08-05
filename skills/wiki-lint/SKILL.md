@@ -64,6 +64,8 @@ reservation, operation, and quarantine boundary for a fresh retry. A
 non-regular recognized name remains a recovery condition and is never followed
 or removed.
 
+Regular OS-metadata files in content catalogs (`pages/`, `.wiki-meta/sources/`, and `.wiki-meta/.versions/`) are skipped by readers and reported in `ignored_os_metadata`; content-catalog files are never deleted or reclaimed. Junk-named symlinks, directories, and entries whose type cannot be resolved remain fail-closed. `removed_junk` remains transaction-store-only.
+
 The JSON result includes `terminal_prune` for every non-skipped invocation. A
 `suppressed_reason` of `initial-invalid-scan-marker` means the invocation
 finished no recovery residue and preserved all ensure-journal evidence selected

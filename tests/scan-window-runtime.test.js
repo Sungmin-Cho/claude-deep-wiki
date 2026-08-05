@@ -700,6 +700,7 @@ test('prune-name preflight proves .wiki-meta before accepting a missing transact
     acquireLock,
     assertPruneTransactionNamesSupported,
     createDeadline,
+    pruneScanWindowTransactions,
     releaseLock,
   } = modules();
 
@@ -761,6 +762,236 @@ test('prune-name preflight proves .wiki-meta before accepting a missing transact
     } finally {
       releaseLock({ wikiRoot: root, token: owner.token });
     }
+  });
+
+  const replaceMetaAfterChildObservation = (root, { replacementHasTransactions }) => {
+    const meta = path.join(root, '.wiki-meta');
+    const displaced = path.join(root, '.wiki-meta.displaced');
+    fs.renameSync(meta, displaced);
+    fs.mkdirSync(meta);
+    fs.cpSync(
+      path.join(displaced, '.wiki-lock'),
+      path.join(meta, '.wiki-lock'),
+      { recursive: true },
+    );
+    if (replacementHasTransactions) fs.mkdirSync(path.join(meta, '.transactions'));
+  };
+
+  for (const childState of ['missing', 'present']) {
+    await t.test(`revalidates .wiki-meta after observing a ${childState} child`, () => {
+      const root = fs.realpathSync.native(fs.mkdtempSync(path.join(
+        os.tmpdir(),
+        `deep wiki replaced meta ${childState} child `,
+      )));
+      roots.add(root);
+      const meta = path.join(root, '.wiki-meta');
+      const transactions = path.join(meta, '.transactions');
+      fs.mkdirSync(meta);
+      if (childState === 'present') fs.mkdirSync(transactions);
+      const owner = acquireLock({ wikiRoot: root, operation: `prune-replaced-meta-${childState}` });
+      const originalLstat = fs.lstatSync;
+      let injected = false;
+      let replacementCompleted = false;
+      fs.lstatSync = (pathname, ...args) => {
+        if (injected || path.resolve(String(pathname)) !== path.resolve(transactions)) {
+          return originalLstat(pathname, ...args);
+        }
+        let observed;
+        let observationError;
+        try {
+          observed = originalLstat(pathname, ...args);
+        } catch (error) {
+          observationError = error;
+        }
+        injected = true;
+        replaceMetaAfterChildObservation(root, {
+          replacementHasTransactions: childState === 'present',
+        });
+        replacementCompleted = true;
+        if (observationError) throw observationError;
+        return observed;
+      };
+      try {
+        assert.throws(() => assertPruneTransactionNamesSupported({
+          wikiRoot: root,
+          token: owner.token,
+          deadline: createDeadline({ budgetMs: 12_000 }),
+        }), (error) => error.code === 'SCAN_WINDOW_FILESYSTEM'
+          && error.message === '.wiki-meta directory identity changed after transaction-store observation');
+      } finally {
+        fs.lstatSync = originalLstat;
+        releaseLock({ wikiRoot: root, token: owner.token });
+      }
+      assert.equal(injected, true);
+      assert.equal(replacementCompleted, true);
+    });
+  }
+
+  for (const replacedContainer of ['.wiki-meta', '.wiki-meta/.transactions']) {
+    await t.test(`revalidates ${replacedContainer} after present-child enumeration`, () => {
+      const expectedMessage = `${replacedContainer} directory identity changed after transaction-store observation`;
+      const root = temporaryWiki(
+        `deep wiki enumerated ${path.basename(replacedContainer)} replacement `,
+      );
+      const meta = path.join(root, '.wiki-meta');
+      const transactions = path.join(meta, '.transactions');
+      const owner = acquireLock({
+        wikiRoot: root,
+        operation: `prune-enumerated-${path.basename(replacedContainer)}-replacement`,
+      });
+      const originalReaddir = fs.readdirSync;
+      let injected = false;
+      let replacementCompleted = false;
+      fs.readdirSync = (pathname, ...args) => {
+        if (injected || path.resolve(String(pathname)) !== path.resolve(transactions)) {
+          return originalReaddir(pathname, ...args);
+        }
+        const observed = originalReaddir(pathname, ...args);
+        injected = true;
+        if (replacedContainer === '.wiki-meta') {
+          replaceMetaAfterChildObservation(root, { replacementHasTransactions: true });
+        } else {
+          fs.renameSync(transactions, path.join(meta, '.transactions.displaced'));
+          fs.mkdirSync(transactions);
+        }
+        replacementCompleted = true;
+        return observed;
+      };
+      try {
+        assert.throws(() => assertPruneTransactionNamesSupported({
+          wikiRoot: root,
+          token: owner.token,
+          deadline: createDeadline({ budgetMs: 12_000 }),
+        }), (error) => error.code === 'SCAN_WINDOW_FILESYSTEM'
+          && error.message === expectedMessage);
+      } finally {
+        fs.readdirSync = originalReaddir;
+        releaseLock({ wikiRoot: root, token: owner.token });
+      }
+      assert.equal(injected, true);
+      assert.equal(replacementCompleted, true);
+    });
+  }
+
+  await t.test('deadline remains ahead of owner revalidation after child observation', () => {
+    const root = fs.realpathSync.native(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      'deep wiki child observation precedence ',
+    )));
+    roots.add(root);
+    fs.mkdirSync(path.join(root, '.wiki-meta'));
+    const transactions = path.join(root, '.wiki-meta', '.transactions');
+    const owner = acquireLock({ wikiRoot: root, operation: 'prune-child-observation-precedence' });
+    const originalLstat = fs.lstatSync;
+    let expired = false;
+    let injected = false;
+    const clock = { nowMs: () => (expired ? 1_000 : 0) };
+    fs.lstatSync = (pathname, ...args) => {
+      if (injected || path.resolve(String(pathname)) !== path.resolve(transactions)) {
+        return originalLstat(pathname, ...args);
+      }
+      let observationError;
+      try {
+        originalLstat(pathname, ...args);
+      } catch (error) {
+        observationError = error;
+      }
+      injected = true;
+      expired = true;
+      replaceLiveLockExternallyAtInjectedGuard(root);
+      throw observationError;
+    };
+    try {
+      assert.throws(() => assertPruneTransactionNamesSupported({
+        wikiRoot: root,
+        token: owner.token,
+        deadline: createDeadline({ clock, budgetMs: 1_000 }),
+      }), (error) => error.code === 'DEADLINE_EXCEEDED');
+    } finally {
+      fs.lstatSync = originalLstat;
+    }
+    assert.equal(injected, true);
+  });
+
+  await t.test('revalidates owner after a benign missing-child observation', () => {
+    const root = fs.realpathSync.native(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      'deep wiki missing child owner recheck ',
+    )));
+    roots.add(root);
+    fs.mkdirSync(path.join(root, '.wiki-meta'));
+    const transactions = path.join(root, '.wiki-meta', '.transactions');
+    const owner = acquireLock({ wikiRoot: root, operation: 'prune-missing-child-owner-recheck' });
+    const originalLstat = fs.lstatSync;
+    let injected = false;
+    fs.lstatSync = (pathname, ...args) => {
+      if (injected || path.resolve(String(pathname)) !== path.resolve(transactions)) {
+        return originalLstat(pathname, ...args);
+      }
+      let observationError;
+      try {
+        originalLstat(pathname, ...args);
+      } catch (error) {
+        observationError = error;
+      }
+      injected = true;
+      replaceLiveLockExternallyAtInjectedGuard(root);
+      throw observationError;
+    };
+    try {
+      assert.throws(() => assertPruneTransactionNamesSupported({
+        wikiRoot: root,
+        token: owner.token,
+        deadline: createDeadline({ budgetMs: 12_000 }),
+      }), (error) => error.code === 'LOCK_TOKEN_MISMATCH');
+    } finally {
+      fs.lstatSync = originalLstat;
+    }
+    assert.equal(injected, true);
+  });
+
+  await t.test('present-child enumeration ENOENT is never benign completion', () => {
+    const root = temporaryWiki('deep wiki present child enumeration enoent ');
+    const transactions = path.join(root, '.wiki-meta', '.transactions');
+    const owner = acquireLock({ wikiRoot: root, operation: 'prune-enumeration-enoent' });
+    const originalReaddir = fs.readdirSync;
+    let injections = 0;
+    let matchingReads = 0;
+    let throwOnMatchingRead = 1;
+    fs.readdirSync = (pathname, ...args) => {
+      if (path.resolve(String(pathname)) === path.resolve(transactions)) {
+        matchingReads += 1;
+        if (matchingReads === throwOnMatchingRead) {
+          injections += 1;
+          throw Object.assign(new Error('enumerated child disappeared'), { code: 'ENOENT' });
+        }
+      }
+      return originalReaddir(pathname, ...args);
+    };
+    try {
+      const invoke = () => assertPruneTransactionNamesSupported({
+        wikiRoot: root,
+        token: owner.token,
+        deadline: createDeadline({ budgetMs: 12_000 }),
+      });
+      assert.throws(invoke, (error) => error.code === 'SCAN_WINDOW_FILESYSTEM'
+        && error.message === '.wiki-meta/.transactions contents are unavailable');
+      matchingReads = 0;
+      throwOnMatchingRead = 2;
+      assert.throws(() => pruneScanWindowTransactions({
+        wikiRoot: root,
+        token: owner.token,
+        maxAgeDays: 0,
+        limit: 1,
+        now: new Date(T3),
+        deadline: createDeadline({ budgetMs: 12_000 }),
+      }), (error) => error.code === 'SCAN_WINDOW_FILESYSTEM'
+        && error.message === '.wiki-meta/.transactions contents are unavailable during prune');
+    } finally {
+      fs.readdirSync = originalReaddir;
+      releaseLock({ wikiRoot: root, token: owner.token });
+    }
+    assert.equal(injections, 2);
   });
 
   await t.test('symlinked .transactions remains rejected', () => {

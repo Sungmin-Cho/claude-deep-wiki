@@ -361,9 +361,46 @@ function assertPruneTransactionNamesSupported(options = {}) {
     true,
   );
   assertBudget();
-  if (transactionsIdentity === null) return;
-  const names = fs.readdirSync(transactions);
+  let names = null;
+  let namesError = null;
+  if (transactionsIdentity !== null) {
+    try {
+      names = fs.readdirSync(transactions);
+    } catch (cause) {
+      namesError = cause;
+    }
+  }
   assertBudget();
+  assertLockOwner({ wikiRoot: root, token: options.token });
+  assertBudget();
+  const closingMetaIdentity = inspectPhysicalDirectory(meta, meta, '.wiki-meta');
+  assertBudget();
+  if (!identitiesMatch(closingMetaIdentity, metaIdentity)) {
+    throw scanError(
+      'SCAN_WINDOW_FILESYSTEM',
+      '.wiki-meta directory identity changed after transaction-store observation',
+    );
+  }
+  if (transactionsIdentity === null) return;
+  const closingTransactionsIdentity = inspectPhysicalDirectory(
+    transactions,
+    transactions,
+    '.wiki-meta/.transactions',
+  );
+  assertBudget();
+  if (!identitiesMatch(closingTransactionsIdentity, transactionsIdentity)) {
+    throw scanError(
+      'SCAN_WINDOW_FILESYSTEM',
+      '.wiki-meta/.transactions directory identity changed after transaction-store observation',
+    );
+  }
+  if (namesError !== null) {
+    throw scanError(
+      'SCAN_WINDOW_FILESYSTEM',
+      '.wiki-meta/.transactions contents are unavailable',
+      namesError,
+    );
+  }
   if (names.some((name) => name.startsWith('.reservation-.prune-'))) {
     throw scanError(
       'TRANSACTION_RECOVERY_REQUIRED',
@@ -1915,11 +1952,18 @@ function pruneScanWindowTransactions(options = {}) {
     );
     if (transactionsIdentity === null) return { processed: 0, removed: [], complete: true };
     assertBudget();
-    entries = fs.readdirSync(transactions, { withFileTypes: true })
-      .sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
+    try {
+      entries = fs.readdirSync(transactions, { withFileTypes: true })
+        .sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
+    } catch (cause) {
+      throw scanError(
+        'SCAN_WINDOW_FILESYSTEM',
+        '.wiki-meta/.transactions contents are unavailable during prune',
+        cause,
+      );
+    }
     assertBudget();
   } catch (error) {
-    if (error.code === 'ENOENT') return { processed: 0, removed: [], complete: true };
     if (error.code === 'DEADLINE_EXCEEDED') {
       return { processed: 0, removed: [], complete: false };
     }

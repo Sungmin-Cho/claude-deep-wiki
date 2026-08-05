@@ -144,13 +144,13 @@ test('portable npm test cannot discover the native installed-Codex release smoke
   assert.match(smoke, /windowsHide: true/);
 });
 
-test('1.9.6 release keeps package identity and bilingual changelogs exact', () => {
+test('1.9.7 release keeps package identity and bilingual changelogs exact', () => {
   const packageFiles = [
     '.claude-plugin/plugin.json',
     '.codex-plugin/plugin.json',
     'package.json',
   ];
-  for (const file of packageFiles) assert.equal(readJson(file).version, '1.9.6', file);
+  for (const file of packageFiles) assert.equal(readJson(file).version, '1.9.7', file);
 
   const releaseSection = (text, heading) => {
     const start = text.indexOf(heading);
@@ -160,22 +160,24 @@ test('1.9.6 release keeps package identity and bilingual changelogs exact', () =
   };
   const changelog = readText('CHANGELOG.md');
   const changelogKo = readText('CHANGELOG.ko.md');
-  const englishUnreleased = releaseSection(changelog, '## [Unreleased]');
-  const koreanUnreleased = releaseSection(changelogKo, '## [Unreleased]');
-  assert.match(englishUnreleased, /nested terminal and quarantine metadata/i);
-  assert.match(englishUnreleased, /parent-first `\.wiki-meta` anchor/);
-  assert.match(englishUnreleased, /non-regular recognized names remain recovery conditions/);
-  assert.match(koreanUnreleased, /중첩 terminal·quarantine 메타데이터/);
-  assert.match(koreanUnreleased, /parent-first `\.wiki-meta` anchor/);
-  assert.match(koreanUnreleased, /non-regular 인식 이름은 recovery 조건/);
+  const english197 = releaseSection(changelog, '## [1.9.7] — 2026-08-05 (content metadata and nested prune safety)');
+  const korean197 = releaseSection(changelogKo, '## [1.9.7] — 2026-08-05 (콘텐츠 메타데이터 및 중첩 prune 안전성)');
+  assert.match(english197, /nested terminal and quarantine metadata/i);
+  assert.match(english197, /parent-first `\.wiki-meta` anchor/);
+  assert.match(english197, /non-regular recognized names remain recovery conditions/);
+  assert.match(english197, /distinct 1\.9\.7 installation identity/);
+  assert.match(korean197, /중첩 terminal·quarantine 메타데이터/);
+  assert.match(korean197, /parent-first `\.wiki-meta` anchor/);
+  assert.match(korean197, /non-regular 인식 이름은 recovery 조건/);
+  assert.match(korean197, /별도 1\.9\.7 설치 식별자/);
   assert.equal(
-    englishUnreleased.includes(
+    english197.includes(
       '- Content readers now skip regular AppleDouble and exact OS-metadata files in `pages/`, `.wiki-meta/sources/`, and `.wiki-meta/.versions/`, report them in `ignored_os_metadata`, and never delete them; junk-named symlinks/directories remain fail-closed, and `removed_junk` remains transaction-store-only.',
     ),
     true,
   );
   assert.equal(
-    koreanUnreleased.includes(
+    korean197.includes(
       '- `pages/`, `.wiki-meta/sources/`, `.wiki-meta/.versions/`의 regular AppleDouble 및 정확한 OS 메타데이터 파일은 content reader가 건너뛰고 `ignored_os_metadata`에 보고하며 삭제하지 않습니다. junk 이름의 symlink/directory는 fail-closed로 유지되고, `removed_junk`는 transaction store에만 해당합니다.',
     ),
     true,

@@ -73,6 +73,14 @@ bounded passes resume partial publications, backup-only or empty quarantines,
 and orphaned exact reservations, checking the deadline across discovery,
 validation, and recoverable mutation phases. It preserves in-flight,
 malformed, foreign-kind, linked, young, and otherwise ambiguous entries.
+Recognized direct-child metadata inside a terminal operation or its quarantine
+is reclaimed only as a plain regular file under the current owner plus the
+physical `.wiki-meta`, `.transactions`, and direct-child directory identity
+proofs. These nested removals consume the same bounded terminal-prune budget
+but do not enter top-level `removed_junk`; a held file makes `complete` false
+before later authenticated evidence can be removed. A recognized name with a
+non-regular representation remains a recovery condition and is never followed
+or removed.
 Repeat the command while `complete` is `false` to traverse more than one bounded
 pass. `complete: true` means every entry listed for that pass was inspected; it
 does not claim that ambiguous entries were removed.

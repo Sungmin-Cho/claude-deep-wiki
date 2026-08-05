@@ -59,6 +59,10 @@ test('public contracts name every terminal-prune caller and preserve recovery au
     assert.match(source, /ordinary.*age|age.*ordinary/i);
   }
   assert.match(lint, /terminal_prune\.complete/);
+  assert.match(lint, /nested terminal.*regular metadata.*owner.*directory\s+identity/is);
+  assert.match(lint, /held.*terminal_prune\.complete.*false/is);
+  assert.match(lint, /nested.*never.*removed_junk/is);
+  assert.match(lint, /non-regular.*recovery/i);
   assert.match(lint, /removed_junk_complete/);
   assert.match(lint, /Rerun while\s*\n?`removed_junk_complete` is `false`/);
   assert.strictEqual(lint.includes('recovery pass incomplete'), true);
@@ -78,6 +82,8 @@ test('public contracts name every terminal-prune caller and preserve recovery au
   assert.equal((lint.match(/^<!-- deep-wiki:exec -->$/gm) || []).length, 4);
   assert.match(storage, /transaction recover/);
   assert.match(storage, /stopped-host/);
+  assert.match(storage, /direct-child.*metadata.*owner.*directory\s+identity/is);
+  assert.match(storage, /non-regular.*recovery/i);
 });
 
 test('content catalog metadata documentation is bounded and fail-closed', () => {

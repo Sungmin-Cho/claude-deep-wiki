@@ -8,6 +8,12 @@ const { ISO_UTC_RE } = require('./config.js');
 const { atomicWriteFile, sha256 } = require('./fs-safe.js');
 const { assertBeforeDeadline, createDeadline, remainingMs } = require('./deadline.js');
 const {
+  ScanWindowError,
+  assertNestedJunkSettled,
+  defaultTransactionParentGuard,
+  semanticTransactionNames,
+} = require('./scan-window-parent-guard.js');
+const {
   acquireLock,
   assertLockOwner,
   releaseLock,
@@ -40,14 +46,6 @@ const TRANSITIONS = [
 const DAY_MS = 24 * 60 * 60 * 1000;
 const AUTOMATIC_PRUNE_LIMIT = 8;
 const PRUNE_RESERVE_MS = 250;
-
-class ScanWindowError extends Error {
-  constructor(code, message, cause) {
-    super(message, cause ? { cause } : undefined);
-    this.name = 'ScanWindowError';
-    this.code = code;
-  }
-}
 
 function scanError(code, message, cause) {
   return new ScanWindowError(code, message, cause);
@@ -351,16 +349,58 @@ function assertPruneTransactionNamesSupported(options = {}) {
   assertBudget();
   assertLockOwner({ wikiRoot: root, token: options.token });
   assertBudget();
-  const transactions = path.join(root, '.wiki-meta', '.transactions');
-  if (inspectPhysicalDirectory(
+  const meta = path.join(root, '.wiki-meta');
+  const metaIdentity = inspectPhysicalDirectory(meta, meta, '.wiki-meta', true);
+  assertBudget();
+  if (metaIdentity === null) return;
+  const transactions = path.join(meta, '.transactions');
+  const transactionsIdentity = inspectPhysicalDirectory(
     transactions,
     transactions,
     '.wiki-meta/.transactions',
     true,
-  ) === null) return;
+  );
   assertBudget();
-  const names = fs.readdirSync(transactions);
+  let names = null;
+  let namesError = null;
+  if (transactionsIdentity !== null) {
+    try {
+      names = fs.readdirSync(transactions);
+    } catch (cause) {
+      namesError = cause;
+    }
+  }
   assertBudget();
+  assertLockOwner({ wikiRoot: root, token: options.token });
+  assertBudget();
+  const closingMetaIdentity = inspectPhysicalDirectory(meta, meta, '.wiki-meta');
+  assertBudget();
+  if (!identitiesMatch(closingMetaIdentity, metaIdentity)) {
+    throw scanError(
+      'SCAN_WINDOW_FILESYSTEM',
+      '.wiki-meta directory identity changed after transaction-store observation',
+    );
+  }
+  if (transactionsIdentity === null) return;
+  const closingTransactionsIdentity = inspectPhysicalDirectory(
+    transactions,
+    transactions,
+    '.wiki-meta/.transactions',
+  );
+  assertBudget();
+  if (!identitiesMatch(closingTransactionsIdentity, transactionsIdentity)) {
+    throw scanError(
+      'SCAN_WINDOW_FILESYSTEM',
+      '.wiki-meta/.transactions directory identity changed after transaction-store observation',
+    );
+  }
+  if (namesError !== null) {
+    throw scanError(
+      'SCAN_WINDOW_FILESYSTEM',
+      '.wiki-meta/.transactions contents are unavailable',
+      namesError,
+    );
+  }
   if (names.some((name) => name.startsWith('.reservation-.prune-'))) {
     throw scanError(
       'TRANSACTION_RECOVERY_REQUIRED',
@@ -407,127 +447,6 @@ function pathsFor(wikiRoot, operationId) {
     pending: path.join(meta, '.pending-scan'),
     last: path.join(meta, '.last-scan'),
     tombstone: path.join(transaction, 'pending.removed'),
-  };
-}
-
-function defaultTransactionParentGuard(locations) {
-  const records = {
-    meta: {
-      pathname: locations.meta,
-      physical: locations.meta,
-      label: '.wiki-meta',
-      identity: null,
-    },
-    transactions: {
-      pathname: locations.transactions,
-      physical: locations.transactions,
-      label: '.wiki-meta/.transactions',
-      identity: null,
-    },
-    transaction: {
-      pathname: locations.transaction,
-      physical: locations.transaction,
-      label: 'scan-window operation directory',
-      identity: null,
-    },
-  };
-
-  const observe = (name, allowMissing = false, assertBoundary) => {
-    const record = records[name];
-    if (typeof assertBoundary === 'function') assertBoundary();
-    const current = inspectPhysicalDirectory(
-      record.pathname, record.physical, record.label, allowMissing,
-    );
-    if (typeof assertBoundary === 'function') assertBoundary();
-    if (current === null) {
-      if (record.identity !== null) {
-        throw scanError('SCAN_WINDOW_FILESYSTEM', `${record.label} identity changed`);
-      }
-      return null;
-    }
-    if (record.identity !== null && !identitiesMatch(current, record.identity)) {
-      throw scanError('SCAN_WINDOW_FILESYSTEM', `${record.label} identity changed`);
-    }
-    if (record.identity === null) record.identity = current;
-    return current;
-  };
-
-  const assertMeta = (assertBoundary) => observe('meta', false, assertBoundary);
-  const assertTransactions = (assertBoundary) => {
-    assertMeta(assertBoundary);
-    observe('transactions', false, assertBoundary);
-    assertMeta(assertBoundary);
-  };
-  const assertAll = (assertBoundary) => {
-    assertTransactions(assertBoundary);
-    observe('transaction', false, assertBoundary);
-    assertTransactions(assertBoundary);
-  };
-  const inspectExistingOperation = () => {
-    assertMeta();
-    if (observe('transactions', true) === null) return false;
-    assertMeta();
-    if (observe('transaction', true) === null) return false;
-    assertAll();
-    return true;
-  };
-  const removeEmptyOperation = (assertOwner) => {
-    if (typeof assertOwner === 'function') assertOwner();
-    assertAll();
-    if (fs.readdirSync(locations.transaction).length !== 0) {
-      throw scanError('TRANSACTION_RECOVERY_REQUIRED', 'terminal transaction directory is not empty');
-    }
-    if (typeof assertOwner === 'function') assertOwner();
-    assertAll();
-    fs.rmdirSync(locations.transaction);
-    if (typeof assertOwner === 'function') assertOwner();
-    assertTransactions();
-    if (inspectPhysicalDirectory(
-      locations.transaction,
-      locations.transaction,
-      'scan-window operation directory',
-      true,
-    ) !== null) {
-      throw scanError('SCAN_WINDOW_FILESYSTEM', 'terminal transaction directory survived removal');
-    }
-    assertTransactions();
-  };
-  const createDirectory = (name, assertOwner) => {
-    const record = records[name];
-    if (typeof assertOwner === 'function') assertOwner();
-    if (name === 'transactions') assertMeta();
-    else assertTransactions();
-    try {
-      fs.mkdirSync(record.pathname);
-    } catch (cause) {
-      if (cause.code !== 'EEXIST') {
-        throw scanError('SCAN_WINDOW_FILESYSTEM', `cannot create ${record.label}`, cause);
-      }
-    }
-    if (typeof assertOwner === 'function') assertOwner();
-    if (name === 'transactions') {
-      assertMeta();
-      observe(name);
-      assertMeta();
-    } else {
-      assertTransactions();
-      observe(name);
-      assertTransactions();
-    }
-  };
-  const prepareParent = (assertOwner) => {
-    assertMeta();
-    if (observe('transactions', true) === null) createDirectory('transactions', assertOwner);
-    else assertTransactions();
-    if (typeof assertOwner === 'function') assertOwner();
-    assertTransactions();
-  };
-  return {
-    assertAll,
-    assertTransactions,
-    inspectExistingOperation,
-    prepareParent,
-    removeEmptyOperation,
   };
 }
 
@@ -640,9 +559,19 @@ function inputHash(wikiRoot, plan) {
   return sha256(Buffer.from(JSON.stringify(canonicalInput(wikiRoot, plan))));
 }
 
-function defaultJournalAdapter(wikiRoot, operationId) {
+function defaultJournalAdapter(wikiRoot, operationId, nestedJunkContext = null) {
   const locations = pathsFor(wikiRoot, operationId);
-  const parents = defaultTransactionParentGuard(locations);
+  const parents = defaultTransactionParentGuard(locations, nestedJunkContext);
+  const semanticNames = (directory, expectedDirectoryIdentity, label, assertDirectoryChain) => {
+    if (!nestedJunkContext) return fs.readdirSync(directory).sort();
+    return assertNestedJunkSettled(semanticTransactionNames({
+      ...nestedJunkContext,
+      directory,
+      expectedDirectoryIdentity,
+      label,
+      assertOwnerAndParents: assertDirectoryChain,
+    }));
+  };
   const assertMutation = (assertOwner, assertBoundary) => {
     if (typeof assertBoundary === 'function') assertBoundary();
     if (typeof assertOwner === 'function') assertOwner();
@@ -771,7 +700,12 @@ function defaultJournalAdapter(wikiRoot, operationId) {
           'terminal journal prune quarantine identity changed',
         );
       }
-      const actualNames = fs.readdirSync(quarantine).sort();
+      const actualNames = semanticNames(
+        quarantine,
+        expectedQuarantineIdentity,
+        'terminal journal prune quarantine',
+        assertTransactionsOwner,
+      );
       assertPruneBudget();
       if ((expectedNames && (actualNames.length !== expectedNames.length
           || actualNames.some((name, index) => name !== expectedNames[index])))
@@ -976,7 +910,12 @@ function defaultJournalAdapter(wikiRoot, operationId) {
     };
 
     assertPruneBudget();
-    const initialNames = fs.readdirSync(quarantine).sort();
+    const initialNames = semanticNames(
+      quarantine,
+      expectedQuarantineIdentity,
+      'terminal journal prune quarantine',
+      assertTransactionsOwner,
+    );
     assertPruneBudget();
     const hasJournal = initialNames.includes('journal.json');
     const hasBackup = initialNames.includes('journal.backup');
@@ -1033,6 +972,7 @@ function defaultJournalAdapter(wikiRoot, operationId) {
       assertSealedEvidence(quarantinedJournal, expectedJournalIdentity, true);
       assertPruneBudget();
       assertEnsureBoundary('before-quarantined-journal-unlink');
+      assertQuarantine(['journal.backup', 'journal.json']);
       fs.unlinkSync(quarantinedJournal);
       assertExactPublication(
         locations.transaction,
@@ -1049,6 +989,7 @@ function defaultJournalAdapter(wikiRoot, operationId) {
     );
     assertPruneBudget();
     assertEnsureBoundary('before-quarantined-backup-unlink');
+    assertQuarantine(['journal.backup']);
     fs.unlinkSync(quarantinedBackup);
     assertExactPublication(
       locations.transaction,
@@ -1058,6 +999,7 @@ function defaultJournalAdapter(wikiRoot, operationId) {
     assertQuarantine([]);
     assertPruneBudget();
     assertEnsureBoundary('before-quarantine-rmdir');
+    assertQuarantine([]);
     fs.rmdirSync(quarantine);
     assertTransactionsOwner();
     assertExactPublication(
@@ -1099,7 +1041,12 @@ function defaultJournalAdapter(wikiRoot, operationId) {
         'terminal journal prune quarantine',
       );
       assertPruneBudget();
-      const names = fs.readdirSync(quarantine);
+      const names = semanticNames(
+        quarantine,
+        expectedQuarantineIdentity,
+        'terminal journal prune quarantine',
+        assertTransactionsOwner,
+      );
       assertPruneBudget();
       if (!identitiesMatch(identity, expectedQuarantineIdentity) || names.length !== 0) {
         throw scanError(
@@ -1130,6 +1077,7 @@ function defaultJournalAdapter(wikiRoot, operationId) {
     assertReservation(locations.transaction, expectedReservationIdentity);
     assertPruneBudget();
     assertEnsureBoundary('before-empty-quarantine-rmdir');
+    assertEmptyQuarantine();
     fs.rmdirSync(quarantine);
     assertTransactionsOwner();
     assertReservation(locations.transaction, expectedReservationIdentity);
@@ -1248,7 +1196,12 @@ function defaultJournalAdapter(wikiRoot, operationId) {
       ) {
         assertMutation(assertOwner, assertBudget);
         if (typeof assertBudget === 'function') assertBudget();
-        const names = fs.readdirSync(locations.transaction).sort();
+        const names = semanticNames(
+          locations.transaction,
+          null,
+          'scan-window operation directory',
+          () => assertMutation(assertOwner, assertBudget),
+        );
         if (typeof assertBudget === 'function') assertBudget();
         if (names.length !== 1 || names[0] !== 'journal.json') {
           throw scanError(
@@ -1291,7 +1244,12 @@ function defaultJournalAdapter(wikiRoot, operationId) {
         try {
           assertMutation(assertOwner, assertBudget);
           if (typeof assertBudget === 'function') assertBudget();
-          const finalNames = fs.readdirSync(locations.transaction).sort();
+          const finalNames = semanticNames(
+            locations.transaction,
+            transactionIdentity,
+            'scan-window operation directory',
+            () => assertMutation(assertOwner, assertBudget),
+          );
           if (typeof assertBudget === 'function') assertBudget();
           if (finalNames.length !== 1 || finalNames[0] !== 'journal.json') {
             throw scanError(
@@ -1307,6 +1265,8 @@ function defaultJournalAdapter(wikiRoot, operationId) {
           fs.renameSync(locations.transaction, quarantine);
         } catch (cause) {
           if (cause.code === 'DEADLINE_EXCEEDED'
+              || cause.code === 'SCAN_WINDOW_NESTED_JUNK_DEFERRED'
+              || cause.nestedJunkSafety === true
               || (typeof cause.code === 'string' && cause.code.startsWith('LOCK_'))) throw cause;
           if (cause.ensurePruneProtected) throw cause;
           const error = scanError(
@@ -1334,6 +1294,8 @@ function defaultJournalAdapter(wikiRoot, operationId) {
           );
         } catch (cause) {
           if (cause.code === 'DEADLINE_EXCEEDED'
+              || cause.code === 'SCAN_WINDOW_NESTED_JUNK_DEFERRED'
+              || cause.nestedJunkSafety === true
               || (typeof cause.code === 'string' && cause.code.startsWith('LOCK_'))) throw cause;
           if (cause.ensurePruneProtected) throw cause;
           const error = scanError(
@@ -1380,6 +1342,8 @@ function defaultJournalAdapter(wikiRoot, operationId) {
           );
         } catch (cause) {
           if (cause.code === 'DEADLINE_EXCEEDED'
+              || cause.code === 'SCAN_WINDOW_NESTED_JUNK_DEFERRED'
+              || cause.nestedJunkSafety === true
               || (typeof cause.code === 'string' && cause.code.startsWith('LOCK_'))) throw cause;
           if (cause.ensurePruneProtected) throw cause;
           const error = scanError(
@@ -1418,6 +1382,8 @@ function defaultJournalAdapter(wikiRoot, operationId) {
           );
         } catch (cause) {
           if (cause.code === 'DEADLINE_EXCEEDED'
+              || cause.code === 'SCAN_WINDOW_NESTED_JUNK_DEFERRED'
+              || cause.nestedJunkSafety === true
               || (typeof cause.code === 'string' && cause.code.startsWith('LOCK_'))) throw cause;
           if (cause.ensurePruneProtected) throw cause;
           const error = scanError(
@@ -1958,9 +1924,12 @@ function pruneScanWindowTransactions(options = {}) {
     deadline,
     'scan-window-transaction-prune',
   );
-  const transactions = path.join(physicalRoot, '.wiki-meta', '.transactions');
+  const meta = path.join(physicalRoot, '.wiki-meta');
+  const transactions = path.join(meta, '.transactions');
   let entries;
   let pruneMarkers;
+  let metaIdentity;
+  let transactionsIdentity;
   try {
     assertBudget();
     assertOwner();
@@ -1973,18 +1942,28 @@ function pruneScanWindowTransactions(options = {}) {
     assertBudget();
     pruneMarkers = inspectPruneMarkers({ wikiRoot: physicalRoot });
     assertBudget();
-    if (inspectPhysicalDirectory(
+    metaIdentity = inspectPhysicalDirectory(meta, meta, '.wiki-meta');
+    assertBudget();
+    transactionsIdentity = inspectPhysicalDirectory(
       transactions,
       transactions,
       '.wiki-meta/.transactions',
       true,
-    ) === null) return { processed: 0, removed: [], complete: true };
+    );
+    if (transactionsIdentity === null) return { processed: 0, removed: [], complete: true };
     assertBudget();
-    entries = fs.readdirSync(transactions, { withFileTypes: true })
-      .sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
+    try {
+      entries = fs.readdirSync(transactions, { withFileTypes: true })
+        .sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
+    } catch (cause) {
+      throw scanError(
+        'SCAN_WINDOW_FILESYSTEM',
+        '.wiki-meta/.transactions contents are unavailable during prune',
+        cause,
+      );
+    }
     assertBudget();
   } catch (error) {
-    if (error.code === 'ENOENT') return { processed: 0, removed: [], complete: true };
     if (error.code === 'DEADLINE_EXCEEDED') {
       return { processed: 0, removed: [], complete: false };
     }
@@ -1992,6 +1971,44 @@ function pruneScanWindowTransactions(options = {}) {
   }
 
   const removed = [];
+  const nestedJunkAttempts = {
+    attempts: 0,
+    attemptedPhysicalFiles: new Set(),
+    budgetExhausted: false,
+  };
+  const assertNestedParents = () => {
+    assertBudget();
+    assertOwner();
+    const currentMeta = inspectPhysicalDirectory(meta, meta, '.wiki-meta');
+    const currentTransactions = inspectPhysicalDirectory(
+      transactions,
+      transactions,
+      '.wiki-meta/.transactions',
+    );
+    if (!identitiesMatch(currentMeta, metaIdentity)
+        || !identitiesMatch(currentTransactions, transactionsIdentity)) {
+      throw scanError('SCAN_WINDOW_FILESYSTEM', 'transaction-store parent identity changed');
+    }
+    assertOwner();
+    assertBudget();
+  };
+  const nestedJunkContext = {
+    assertBudget,
+    nestedJunkAttempts,
+    removed,
+    limit,
+    deadline,
+    faultInjector,
+  };
+  const semanticNamesForDiscovery = (directory, expectedDirectoryIdentity, label) => (
+    assertNestedJunkSettled(semanticTransactionNames({
+      ...nestedJunkContext,
+      directory,
+      expectedDirectoryIdentity,
+      label,
+      assertOwnerAndParents: assertNestedParents,
+    }))
+  );
   const recordCommittedPrune = (operationId, boundary) => {
     removed.push(operationId);
     invokeFault(faultInjector, boundary, { operationId });
@@ -2053,7 +2070,8 @@ function pruneScanWindowTransactions(options = {}) {
 
   let complete = true;
   for (const entry of entries) {
-    if (removed.length >= limit || remainingMs(deadline) < PRUNE_RESERVE_MS) {
+    if (removed.length + nestedJunkAttempts.attempts >= limit
+        || remainingMs(deadline) < PRUNE_RESERVE_MS) {
       complete = false;
       break;
     }
@@ -2167,12 +2185,16 @@ function pruneScanWindowTransactions(options = {}) {
           'terminal journal prune quarantine',
         );
         assertBudget();
-        const names = fs.readdirSync(quarantine).sort();
+        const names = semanticNamesForDiscovery(
+          quarantine,
+          quarantineIdentity,
+          'terminal journal prune quarantine',
+        );
         assertBudget();
         if (names.length === 0) {
           operationId = operationIdFromPruneName(entry.name);
           if (operationId === excludeOperationId) continue;
-          const adapter = defaultJournalAdapter(physicalRoot, operationId);
+          const adapter = defaultJournalAdapter(physicalRoot, operationId, nestedJunkContext);
           const reservation = adapter.locations.transaction;
           const reservationIdentity = regularFileIdentity(
             fs.lstatSync(reservation, { bigint: true }),
@@ -2197,7 +2219,8 @@ function pruneScanWindowTransactions(options = {}) {
             assertOwner();
             assertBudget();
           } catch (error) {
-            if (error.code === 'DEADLINE_EXCEEDED') {
+            if (error.code === 'DEADLINE_EXCEEDED'
+                || error.code === 'SCAN_WINDOW_NESTED_JUNK_DEFERRED') {
               complete = false;
               break;
             }
@@ -2218,7 +2241,8 @@ function pruneScanWindowTransactions(options = {}) {
               ),
             );
           } catch (error) {
-            if (error.code === 'DEADLINE_EXCEEDED') {
+            if (error.code === 'DEADLINE_EXCEEDED'
+                || error.code === 'SCAN_WINDOW_NESTED_JUNK_DEFERRED') {
               complete = false;
               break;
             }
@@ -2299,9 +2323,15 @@ function pruneScanWindowTransactions(options = {}) {
       } catch (error) {
         if (error.terminal_prune) throw error;
         throwIfEnsureProtected(error);
+        if (error.nestedJunkSafety === true) throwWithTerminalPrune(error);
         if (error.code === 'DEADLINE_EXCEEDED') {
           complete = false;
           break;
+        }
+        if (error.code === 'SCAN_WINDOW_NESTED_JUNK_DEFERRED') {
+          complete = false;
+          if (error.nestedJunkBudgetExhausted === true) break;
+          continue;
         }
         continue;
       }
@@ -2315,7 +2345,7 @@ function pruneScanWindowTransactions(options = {}) {
       try { assertResidueReclaimable(journal); }
       catch (error) { throwIfEnsureProtected(error); }
 
-      const adapter = defaultJournalAdapter(physicalRoot, operationId);
+      const adapter = defaultJournalAdapter(physicalRoot, operationId, nestedJunkContext);
       const control = adapter[DEFAULT_ADAPTER_CONTROL];
       try {
         invokeFault(faultInjector, 'before-quarantine-owner-check', {
@@ -2324,7 +2354,8 @@ function pruneScanWindowTransactions(options = {}) {
         assertOwner();
         assertBudget();
       } catch (error) {
-        if (error.code === 'DEADLINE_EXCEEDED') {
+        if (error.code === 'DEADLINE_EXCEEDED'
+            || error.code === 'SCAN_WINDOW_NESTED_JUNK_DEFERRED') {
           complete = false;
           break;
         }
@@ -2352,7 +2383,8 @@ function pruneScanWindowTransactions(options = {}) {
           ),
         );
       } catch (error) {
-        if (error.code === 'DEADLINE_EXCEEDED') {
+        if (error.code === 'DEADLINE_EXCEEDED'
+            || error.code === 'SCAN_WINDOW_NESTED_JUNK_DEFERRED') {
           complete = false;
           break;
         }
@@ -2365,7 +2397,7 @@ function pruneScanWindowTransactions(options = {}) {
     if (resumableOnly) continue;
     let operationId;
     try { operationId = validateOperationId(entry.name); } catch { continue; }
-    const adapter = defaultJournalAdapter(physicalRoot, operationId);
+    const adapter = defaultJournalAdapter(physicalRoot, operationId, nestedJunkContext);
     const control = adapter[DEFAULT_ADAPTER_CONTROL];
     let journal;
     let journalBytes;
@@ -2383,9 +2415,15 @@ function pruneScanWindowTransactions(options = {}) {
       validateJournal(journal, operationId, physicalRoot);
       if (!journalBytes.equals(stageBytes(journal))) continue;
     } catch (error) {
+      if (error.nestedJunkSafety === true) throwWithTerminalPrune(error);
       if (error.code === 'DEADLINE_EXCEEDED') {
         complete = false;
         break;
+      }
+      if (error.code === 'SCAN_WINDOW_NESTED_JUNK_DEFERRED') {
+        complete = false;
+        if (error.nestedJunkBudgetExhausted === true) break;
+        continue;
       }
       continue;
     }
@@ -2396,12 +2434,27 @@ function pruneScanWindowTransactions(options = {}) {
     if (!terminalJournalIsOldEnough(journalIdentity, now.getTime(), maxAgeDays)) continue;
     let names;
     try {
-      names = fs.readdirSync(adapter.locations.transaction).sort();
+      const transactionIdentity = inspectPhysicalDirectory(
+        adapter.locations.transaction,
+        adapter.locations.transaction,
+        'scan-window operation directory',
+      );
+      names = semanticNamesForDiscovery(
+        adapter.locations.transaction,
+        transactionIdentity,
+        'scan-window operation directory',
+      );
       assertBudget();
     } catch (error) {
+      if (error.nestedJunkSafety === true) throwWithTerminalPrune(error);
       if (error.code === 'DEADLINE_EXCEEDED') {
         complete = false;
         break;
+      }
+      if (error.code === 'SCAN_WINDOW_NESTED_JUNK_DEFERRED') {
+        complete = false;
+        if (error.nestedJunkBudgetExhausted === true) break;
+        continue;
       }
       continue;
     }
@@ -2414,7 +2467,8 @@ function pruneScanWindowTransactions(options = {}) {
       assertOwner();
       assertBudget();
     } catch (error) {
-      if (error.code === 'DEADLINE_EXCEEDED') {
+      if (error.code === 'DEADLINE_EXCEEDED'
+          || error.code === 'SCAN_WINDOW_NESTED_JUNK_DEFERRED') {
         complete = false;
         break;
       }
@@ -2439,7 +2493,8 @@ function pruneScanWindowTransactions(options = {}) {
         ),
       );
     } catch (error) {
-      if (error.code === 'DEADLINE_EXCEEDED') {
+      if (error.code === 'DEADLINE_EXCEEDED'
+          || error.code === 'SCAN_WINDOW_NESTED_JUNK_DEFERRED') {
         complete = false;
         break;
       }

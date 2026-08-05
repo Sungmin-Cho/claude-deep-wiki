@@ -13,6 +13,13 @@ const repoRoot = path.resolve(__dirname, '..');
 const scanWindowPath = path.join(repoRoot, 'hooks', 'scripts', 'runtime', 'scan-window.js');
 const lockPath = path.join(repoRoot, 'hooks', 'scripts', 'runtime', 'lock.js');
 const deadlinePath = path.join(repoRoot, 'hooks', 'scripts', 'runtime', 'deadline.js');
+const parentGuardPath = path.join(
+  repoRoot,
+  'hooks',
+  'scripts',
+  'runtime',
+  'scan-window-parent-guard.js',
+);
 const cliPath = path.join(repoRoot, 'scripts', 'wiki-runtime.js');
 const racer = path.join(__dirname, 'fixtures', 'scan-window-racer.js');
 const roots = new Set();
@@ -686,6 +693,1192 @@ test('raw reservation-prune compatibility names fail before type parsing or sibl
       assert.deepEqual(snapshotTree(transactions), before);
     });
   }
+});
+
+test('prune-name preflight proves .wiki-meta before accepting a missing transaction store', async (t) => {
+  const {
+    acquireLock,
+    assertPruneTransactionNamesSupported,
+    createDeadline,
+    pruneScanWindowTransactions,
+    releaseLock,
+  } = modules();
+
+  await t.test('symlinked .wiki-meta with a missing child fails closed', () => {
+    const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'deep wiki parent anchor ')));
+    const outside = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'deep wiki outside meta ')));
+    roots.add(root);
+    roots.add(outside);
+    fs.symlinkSync(outside, path.join(root, '.wiki-meta'));
+    const before = snapshotTree(outside);
+    const owner = acquireLock({ wikiRoot: root, operation: 'prune-parent-anchor' });
+    try {
+      assert.throws(() => assertPruneTransactionNamesSupported({
+        wikiRoot: root,
+        token: owner.token,
+        deadline: createDeadline({ budgetMs: 12_000 }),
+      }), (error) => error.code === 'SCAN_WINDOW_FILESYSTEM'
+        && /\.wiki-meta/.test(error.message));
+    } finally {
+      releaseLock({ wikiRoot: root, token: owner.token });
+    }
+    assert.deepEqual(snapshotTree(outside), before);
+  });
+
+  await t.test('physical .wiki-meta with a missing child is benign', () => {
+    const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'deep wiki absent store ')));
+    roots.add(root);
+    fs.mkdirSync(path.join(root, '.wiki-meta'));
+    const owner = acquireLock({ wikiRoot: root, operation: 'prune-missing-store' });
+    try {
+      assert.doesNotThrow(() => assertPruneTransactionNamesSupported({
+        wikiRoot: root,
+        token: owner.token,
+        deadline: createDeadline({ budgetMs: 12_000 }),
+      }));
+    } finally {
+      releaseLock({ wikiRoot: root, token: owner.token });
+    }
+  });
+
+  await t.test('missing child observation preserves post-observation deadline precedence', () => {
+    const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'deep wiki absent store deadline ')));
+    roots.add(root);
+    fs.mkdirSync(path.join(root, '.wiki-meta'));
+    const owner = acquireLock({ wikiRoot: root, operation: 'prune-missing-store-deadline' });
+    let calls = 0;
+    const clock = {
+      nowMs() {
+        calls += 1;
+        return calls >= 5 ? 1_000 : 0;
+      },
+    };
+    try {
+      assert.throws(() => assertPruneTransactionNamesSupported({
+        wikiRoot: root,
+        token: owner.token,
+        deadline: createDeadline({ clock, budgetMs: 1_000 }),
+      }), (error) => error.code === 'DEADLINE_EXCEEDED');
+    } finally {
+      releaseLock({ wikiRoot: root, token: owner.token });
+    }
+  });
+
+  const replaceMetaAfterChildObservation = (root, { replacementHasTransactions }) => {
+    const meta = path.join(root, '.wiki-meta');
+    const displaced = path.join(root, '.wiki-meta.displaced');
+    fs.renameSync(meta, displaced);
+    fs.mkdirSync(meta);
+    fs.cpSync(
+      path.join(displaced, '.wiki-lock'),
+      path.join(meta, '.wiki-lock'),
+      { recursive: true },
+    );
+    if (replacementHasTransactions) fs.mkdirSync(path.join(meta, '.transactions'));
+  };
+
+  for (const childState of ['missing', 'present']) {
+    await t.test(`revalidates .wiki-meta after observing a ${childState} child`, () => {
+      const root = fs.realpathSync.native(fs.mkdtempSync(path.join(
+        os.tmpdir(),
+        `deep wiki replaced meta ${childState} child `,
+      )));
+      roots.add(root);
+      const meta = path.join(root, '.wiki-meta');
+      const transactions = path.join(meta, '.transactions');
+      fs.mkdirSync(meta);
+      if (childState === 'present') fs.mkdirSync(transactions);
+      const owner = acquireLock({ wikiRoot: root, operation: `prune-replaced-meta-${childState}` });
+      const originalLstat = fs.lstatSync;
+      let injected = false;
+      let replacementCompleted = false;
+      fs.lstatSync = (pathname, ...args) => {
+        if (injected || path.resolve(String(pathname)) !== path.resolve(transactions)) {
+          return originalLstat(pathname, ...args);
+        }
+        let observed;
+        let observationError;
+        try {
+          observed = originalLstat(pathname, ...args);
+        } catch (error) {
+          observationError = error;
+        }
+        injected = true;
+        replaceMetaAfterChildObservation(root, {
+          replacementHasTransactions: childState === 'present',
+        });
+        replacementCompleted = true;
+        if (observationError) throw observationError;
+        return observed;
+      };
+      try {
+        assert.throws(() => assertPruneTransactionNamesSupported({
+          wikiRoot: root,
+          token: owner.token,
+          deadline: createDeadline({ budgetMs: 12_000 }),
+        }), (error) => error.code === 'SCAN_WINDOW_FILESYSTEM'
+          && error.message === '.wiki-meta directory identity changed after transaction-store observation');
+      } finally {
+        fs.lstatSync = originalLstat;
+        releaseLock({ wikiRoot: root, token: owner.token });
+      }
+      assert.equal(injected, true);
+      assert.equal(replacementCompleted, true);
+    });
+  }
+
+  for (const replacedContainer of ['.wiki-meta', '.wiki-meta/.transactions']) {
+    await t.test(`revalidates ${replacedContainer} after present-child enumeration`, () => {
+      const expectedMessage = `${replacedContainer} directory identity changed after transaction-store observation`;
+      const root = temporaryWiki(
+        `deep wiki enumerated ${path.basename(replacedContainer)} replacement `,
+      );
+      const meta = path.join(root, '.wiki-meta');
+      const transactions = path.join(meta, '.transactions');
+      const owner = acquireLock({
+        wikiRoot: root,
+        operation: `prune-enumerated-${path.basename(replacedContainer)}-replacement`,
+      });
+      const originalReaddir = fs.readdirSync;
+      let injected = false;
+      let replacementCompleted = false;
+      fs.readdirSync = (pathname, ...args) => {
+        if (injected || path.resolve(String(pathname)) !== path.resolve(transactions)) {
+          return originalReaddir(pathname, ...args);
+        }
+        const observed = originalReaddir(pathname, ...args);
+        injected = true;
+        if (replacedContainer === '.wiki-meta') {
+          replaceMetaAfterChildObservation(root, { replacementHasTransactions: true });
+        } else {
+          fs.renameSync(transactions, path.join(meta, '.transactions.displaced'));
+          fs.mkdirSync(transactions);
+        }
+        replacementCompleted = true;
+        return observed;
+      };
+      try {
+        assert.throws(() => assertPruneTransactionNamesSupported({
+          wikiRoot: root,
+          token: owner.token,
+          deadline: createDeadline({ budgetMs: 12_000 }),
+        }), (error) => error.code === 'SCAN_WINDOW_FILESYSTEM'
+          && error.message === expectedMessage);
+      } finally {
+        fs.readdirSync = originalReaddir;
+        releaseLock({ wikiRoot: root, token: owner.token });
+      }
+      assert.equal(injected, true);
+      assert.equal(replacementCompleted, true);
+    });
+  }
+
+  await t.test('deadline remains ahead of owner revalidation after child observation', () => {
+    const root = fs.realpathSync.native(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      'deep wiki child observation precedence ',
+    )));
+    roots.add(root);
+    fs.mkdirSync(path.join(root, '.wiki-meta'));
+    const transactions = path.join(root, '.wiki-meta', '.transactions');
+    const owner = acquireLock({ wikiRoot: root, operation: 'prune-child-observation-precedence' });
+    const originalLstat = fs.lstatSync;
+    let expired = false;
+    let injected = false;
+    const clock = { nowMs: () => (expired ? 1_000 : 0) };
+    fs.lstatSync = (pathname, ...args) => {
+      if (injected || path.resolve(String(pathname)) !== path.resolve(transactions)) {
+        return originalLstat(pathname, ...args);
+      }
+      let observationError;
+      try {
+        originalLstat(pathname, ...args);
+      } catch (error) {
+        observationError = error;
+      }
+      injected = true;
+      expired = true;
+      replaceLiveLockExternallyAtInjectedGuard(root);
+      throw observationError;
+    };
+    try {
+      assert.throws(() => assertPruneTransactionNamesSupported({
+        wikiRoot: root,
+        token: owner.token,
+        deadline: createDeadline({ clock, budgetMs: 1_000 }),
+      }), (error) => error.code === 'DEADLINE_EXCEEDED');
+    } finally {
+      fs.lstatSync = originalLstat;
+    }
+    assert.equal(injected, true);
+  });
+
+  await t.test('revalidates owner after a benign missing-child observation', () => {
+    const root = fs.realpathSync.native(fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      'deep wiki missing child owner recheck ',
+    )));
+    roots.add(root);
+    fs.mkdirSync(path.join(root, '.wiki-meta'));
+    const transactions = path.join(root, '.wiki-meta', '.transactions');
+    const owner = acquireLock({ wikiRoot: root, operation: 'prune-missing-child-owner-recheck' });
+    const originalLstat = fs.lstatSync;
+    let injected = false;
+    fs.lstatSync = (pathname, ...args) => {
+      if (injected || path.resolve(String(pathname)) !== path.resolve(transactions)) {
+        return originalLstat(pathname, ...args);
+      }
+      let observationError;
+      try {
+        originalLstat(pathname, ...args);
+      } catch (error) {
+        observationError = error;
+      }
+      injected = true;
+      replaceLiveLockExternallyAtInjectedGuard(root);
+      throw observationError;
+    };
+    try {
+      assert.throws(() => assertPruneTransactionNamesSupported({
+        wikiRoot: root,
+        token: owner.token,
+        deadline: createDeadline({ budgetMs: 12_000 }),
+      }), (error) => error.code === 'LOCK_TOKEN_MISMATCH');
+    } finally {
+      fs.lstatSync = originalLstat;
+    }
+    assert.equal(injected, true);
+  });
+
+  await t.test('present-child enumeration ENOENT is never benign completion', () => {
+    const root = temporaryWiki('deep wiki present child enumeration enoent ');
+    const transactions = path.join(root, '.wiki-meta', '.transactions');
+    const owner = acquireLock({ wikiRoot: root, operation: 'prune-enumeration-enoent' });
+    const originalReaddir = fs.readdirSync;
+    let injections = 0;
+    let matchingReads = 0;
+    let throwOnMatchingRead = 1;
+    fs.readdirSync = (pathname, ...args) => {
+      if (path.resolve(String(pathname)) === path.resolve(transactions)) {
+        matchingReads += 1;
+        if (matchingReads === throwOnMatchingRead) {
+          injections += 1;
+          throw Object.assign(new Error('enumerated child disappeared'), { code: 'ENOENT' });
+        }
+      }
+      return originalReaddir(pathname, ...args);
+    };
+    try {
+      const invoke = () => assertPruneTransactionNamesSupported({
+        wikiRoot: root,
+        token: owner.token,
+        deadline: createDeadline({ budgetMs: 12_000 }),
+      });
+      assert.throws(invoke, (error) => error.code === 'SCAN_WINDOW_FILESYSTEM'
+        && error.message === '.wiki-meta/.transactions contents are unavailable');
+      matchingReads = 0;
+      throwOnMatchingRead = 2;
+      assert.throws(() => pruneScanWindowTransactions({
+        wikiRoot: root,
+        token: owner.token,
+        maxAgeDays: 0,
+        limit: 1,
+        now: new Date(T3),
+        deadline: createDeadline({ budgetMs: 12_000 }),
+      }), (error) => error.code === 'SCAN_WINDOW_FILESYSTEM'
+        && error.message === '.wiki-meta/.transactions contents are unavailable during prune');
+    } finally {
+      fs.readdirSync = originalReaddir;
+      releaseLock({ wikiRoot: root, token: owner.token });
+    }
+    assert.equal(injections, 2);
+  });
+
+  await t.test('symlinked .transactions remains rejected', () => {
+    const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'deep wiki linked store ')));
+    const outside = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'deep wiki outside store ')));
+    roots.add(root);
+    roots.add(outside);
+    fs.mkdirSync(path.join(root, '.wiki-meta'));
+    fs.symlinkSync(outside, path.join(root, '.wiki-meta', '.transactions'));
+    const owner = acquireLock({ wikiRoot: root, operation: 'prune-linked-store' });
+    try {
+      assert.throws(() => assertPruneTransactionNamesSupported({
+        wikiRoot: root,
+        token: owner.token,
+        deadline: createDeadline({ budgetMs: 12_000 }),
+      }), (error) => error.code === 'SCAN_WINDOW_FILESYSTEM');
+    } finally {
+      releaseLock({ wikiRoot: root, token: owner.token });
+    }
+  });
+});
+
+test('terminal prune reclaims regular metadata from cleaned transactions and quarantines', async (t) => {
+  const seedPromote = (label, faultInjector) => {
+    const root = temporaryWiki(`deep wiki nested terminal junk ${label} `);
+    const operationId = `nested-junk-${label}`;
+    setState(root, { pending: `${T1}\n`, last: `${T0}\n` });
+    const result = promote(root, T1, operationId, {
+      faultInjector: faultInjector
+        ? (boundary) => faultInjector(boundary, { root, operationId })
+        : undefined,
+    });
+    assert.equal(result.status, 'promoted');
+    return { root, operationId };
+  };
+  const prune = (root, operationId, extra = {}) => withOwner(
+    root,
+    `prune-${operationId}`,
+    (owner) => modules().pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 0,
+      limit: 4,
+      kinds: ['promote'],
+      now: pruneClock(root),
+      deadline: modules().createDeadline({ budgetMs: 12_000 }),
+      ...extra,
+    }),
+  );
+
+  await t.test('cleaned transaction metadata is removed before terminal evidence', () => {
+    let operationDirectory;
+    const { root, operationId } = seedPromote('cleaned', (boundary, context) => {
+      if (boundary !== 'before-transition-cleaned-write') return;
+      operationDirectory = metaPath(
+        context.root,
+        path.join('.transactions', context.operationId),
+      );
+      fs.writeFileSync(path.join(operationDirectory, '.DS_Store'), 'finder\n');
+    });
+    const result = prune(root, operationId);
+    assert.deepEqual(result, { processed: 1, removed: [operationId], complete: true });
+    assert.equal(fs.existsSync(operationDirectory), false);
+  });
+
+  await t.test('journal-bearing quarantine metadata is removed on a resumable retry', () => {
+    const { root, operationId } = seedPromote('journal-quarantine');
+    let quarantine;
+    const interrupted = prune(root, operationId, {
+      faultInjector(boundary) {
+        if (boundary !== 'before-quarantined-journal-unlink') return;
+        quarantine = fs.readdirSync(metaPath(root, '.transactions'), { withFileTypes: true })
+          .find((entry) => entry.isDirectory() && entry.name.startsWith('.prune-'));
+        assert.ok(quarantine);
+        fs.writeFileSync(
+          metaPath(root, path.join('.transactions', quarantine.name, '.DS_Store')),
+          'finder\n',
+        );
+        throw new Error('leave journal-bearing quarantine');
+      },
+    });
+    assert.deepEqual(interrupted, { processed: 0, removed: [], complete: true });
+    const result = prune(root, operationId, { resumableOnly: true });
+    assert.deepEqual(result, { processed: 1, removed: [operationId], complete: true });
+    assert.equal(fs.existsSync(metaPath(root, path.join('.transactions', quarantine.name))), false);
+  });
+
+  await t.test('evidence-empty quarantine metadata is removed on a resumable retry', () => {
+    const { root, operationId } = seedPromote('empty-quarantine');
+    let quarantine;
+    const interrupted = prune(root, operationId, {
+      faultInjector(boundary) {
+        if (boundary !== 'before-quarantine-rmdir') return;
+        quarantine = fs.readdirSync(metaPath(root, '.transactions'), { withFileTypes: true })
+          .find((entry) => entry.isDirectory() && entry.name.startsWith('.prune-'));
+        assert.ok(quarantine);
+        throw new Error('leave empty quarantine');
+      },
+    });
+    assert.deepEqual(interrupted, { processed: 0, removed: [], complete: true });
+    fs.writeFileSync(
+      metaPath(root, path.join('.transactions', quarantine.name, '._finder')),
+      'appledouble\n',
+    );
+    const result = prune(root, operationId, { resumableOnly: true });
+    assert.deepEqual(result, { processed: 1, removed: [operationId], complete: true });
+    assert.equal(fs.existsSync(metaPath(root, path.join('.transactions', quarantine.name))), false);
+  });
+
+  await t.test('a held file arriving inside empty-quarantine finalization returns incomplete', () => {
+    const { root, operationId } = seedPromote('empty-quarantine-held');
+    let quarantine;
+    prune(root, operationId, {
+      faultInjector(boundary) {
+        if (boundary !== 'before-quarantine-rmdir') return;
+        quarantine = fs.readdirSync(metaPath(root, '.transactions'), { withFileTypes: true })
+          .find((entry) => entry.isDirectory() && entry.name.startsWith('.prune-'));
+        throw new Error('leave empty quarantine for held-file retry');
+      },
+    });
+    assert.ok(quarantine);
+    const { acquireLock, releaseLock } = modules();
+    const owner = acquireLock({ wikiRoot: root, operation: 'empty-quarantine-held-retry' });
+    try {
+      const child = spawnSync(process.execPath, [
+        '-e',
+        `const fs=require('node:fs');const path=require('node:path');
+const sw=require(process.argv[1]);const dl=require(process.argv[2]);let injected=false;
+const original=fs.unlinkSync;fs.unlinkSync=(pathname,...args)=>{
+  if(path.basename(pathname)==='._finder')throw Object.assign(new Error('held'),{code:'EACCES'});
+  return original(pathname,...args);
+};
+const result=sw.pruneScanWindowTransactions({wikiRoot:process.argv[3],token:process.argv[4],
+  maxAgeDays:0,limit:4,kinds:['promote'],resumableOnly:true,now:new Date(process.argv[5]),
+  deadline:dl.createDeadline({budgetMs:12000}),faultInjector(boundary){
+    if(injected||boundary!=='before-empty-quarantine-rmdir')return;
+    const entry=fs.readdirSync(path.join(process.argv[3],'.wiki-meta','.transactions'),{withFileTypes:true})
+      .find((item)=>item.isDirectory()&&item.name.startsWith('.prune-'));
+    fs.writeFileSync(path.join(process.argv[3],'.wiki-meta','.transactions',entry.name,'._finder'),'held\\n');
+    injected=true;
+  }});
+process.stdout.write(JSON.stringify(result));`,
+        scanWindowPath,
+        deadlinePath,
+        root,
+        owner.token,
+        pruneClock(root).toISOString(),
+      ], { encoding: 'utf8', shell: false, timeout: 20_000 });
+      assert.equal(child.status, 0, child.stderr);
+      assert.deepEqual(JSON.parse(child.stdout), {
+        processed: 0,
+        removed: [],
+        complete: false,
+      });
+    } finally {
+      releaseLock({ wikiRoot: root, token: owner.token });
+    }
+    assert.deepEqual(prune(root, operationId, { resumableOnly: true }), {
+      processed: 1,
+      removed: [operationId],
+      complete: true,
+    });
+  });
+
+  await t.test('later quarantine assertions share one monotonically increasing counter', () => {
+    const { root, operationId } = seedPromote('shared-quarantine-counter');
+    let quarantine;
+    prune(root, operationId, {
+      faultInjector(boundary) {
+        if (boundary !== 'before-quarantined-journal-unlink') return;
+        quarantine = fs.readdirSync(metaPath(root, '.transactions'), { withFileTypes: true })
+          .find((entry) => entry.isDirectory() && entry.name.startsWith('.prune-'));
+        throw new Error('leave journal quarantine for shared-counter retry');
+      },
+    });
+    assert.ok(quarantine);
+    const attempts = [];
+    const semanticSnapshots = [];
+    let firstInjected = false;
+    let secondInjected = false;
+    const result = prune(root, operationId, {
+      resumableOnly: true,
+      faultInjector(boundary, context) {
+        if (boundary.startsWith('nested-junk-remove:')) attempts.push(boundary);
+        if (boundary === 'nested-junk-semantic-names'
+            && path.basename(context.directory) === quarantine.name) {
+          semanticSnapshots.push(context.names);
+        }
+        if (!firstInjected && boundary === 'before-quarantined-journal-unlink') {
+          fs.writeFileSync(
+            metaPath(root, path.join('.transactions', quarantine.name, '.DS_Store')),
+            'first assertion\n',
+          );
+          firstInjected = true;
+        } else if (!secondInjected && boundary === 'before-quarantined-backup-unlink') {
+          fs.writeFileSync(
+            metaPath(root, path.join('.transactions', quarantine.name, '._finder')),
+            'second assertion\n',
+          );
+          secondInjected = true;
+        }
+      },
+    });
+    assert.deepEqual(result, { processed: 1, removed: [operationId], complete: true });
+    assert.equal(firstInjected, true);
+    assert.equal(secondInjected, true);
+    assert.deepEqual(attempts, ['nested-junk-remove:1', 'nested-junk-remove:2']);
+    assert.equal(semanticSnapshots.some((names) => (
+      JSON.stringify(names) === JSON.stringify(['journal.backup', 'journal.json'])
+    )), true);
+    assert.equal(semanticSnapshots.some((names) => (
+      JSON.stringify(names) === JSON.stringify(['journal.backup'])
+    )), true);
+  });
+
+  for (const code of ['EPERM', 'EACCES', 'EBUSY', 'EROFS', 'ETXTBSY']) {
+    await t.test(`foreign ${code} hold is incomplete and a fresh process can converge`, () => {
+      let operationDirectory;
+      const { root, operationId } = seedPromote(`held-${code.toLowerCase()}`, (
+        boundary,
+        context,
+      ) => {
+        if (boundary !== 'before-transition-cleaned-write') return;
+        operationDirectory = metaPath(
+          context.root,
+          path.join('.transactions', context.operationId),
+        );
+        fs.writeFileSync(path.join(operationDirectory, '.DS_Store'), 'held\n');
+      });
+      const before = snapshotTree(operationDirectory);
+      const { acquireLock, releaseLock } = modules();
+      const owner = acquireLock({ wikiRoot: root, operation: `nested-hold-${code}` });
+      try {
+        const child = spawnSync(process.execPath, [
+          '-e',
+          `const fs=require('node:fs');const path=require('node:path');
+const sw=require(process.argv[1]);const dl=require(process.argv[2]);
+const original=fs.unlinkSync;fs.unlinkSync=(pathname,...args)=>{
+  if(path.basename(pathname)==='.DS_Store')throw Object.assign(new Error('held'),{code:process.argv[5]});
+  return original(pathname,...args);
+};
+const result=sw.pruneScanWindowTransactions({wikiRoot:process.argv[3],token:process.argv[4],
+  maxAgeDays:0,limit:4,kinds:['promote'],now:new Date(process.argv[6]),
+  deadline:dl.createDeadline({budgetMs:12000})});
+process.stdout.write(JSON.stringify(result));`,
+          scanWindowPath,
+          deadlinePath,
+          root,
+          owner.token,
+          code,
+          pruneClock(root).toISOString(),
+        ], { encoding: 'utf8', shell: false, timeout: 20_000 });
+        assert.equal(child.status, 0, child.stderr);
+        assert.deepEqual(JSON.parse(child.stdout), {
+          processed: 0,
+          removed: [],
+          complete: false,
+        });
+      } finally {
+        releaseLock({ wikiRoot: root, token: owner.token });
+      }
+      assert.deepEqual(snapshotTree(operationDirectory), before);
+      assert.deepEqual(prune(root, operationId), {
+        processed: 1,
+        removed: [operationId],
+        complete: true,
+      });
+    });
+  }
+
+  await t.test('a held discovery candidate does not starve a later independent operation', () => {
+    const root = temporaryWiki('deep wiki held quarantine liveness ');
+    const heldOperation = 'a-held-quarantine';
+    const laterOperation = 'b-later-operation';
+    setState(root, { pending: `${T1}\n`, last: `${T0}\n` });
+    assert.equal(promote(root, T1, heldOperation).status, 'promoted');
+    let quarantine;
+    const leaveHeld = withOwner(root, 'leave-held-quarantine', (owner) => (
+      modules().pruneScanWindowTransactions({
+        wikiRoot: root,
+        token: owner.token,
+        maxAgeDays: 0,
+        limit: 4,
+        kinds: ['promote'],
+        now: pruneClock(root),
+        deadline: modules().createDeadline({ budgetMs: 12_000 }),
+        faultInjector(boundary) {
+          if (boundary !== 'before-quarantined-journal-unlink') return;
+          quarantine = fs.readdirSync(metaPath(root, '.transactions'), { withFileTypes: true })
+            .find((entry) => entry.isDirectory() && entry.name.startsWith('.prune-'));
+          throw new Error('leave first quarantine');
+        },
+      })
+    ));
+    assert.deepEqual(leaveHeld, { processed: 0, removed: [], complete: true });
+    assert.ok(quarantine);
+    fs.writeFileSync(
+      metaPath(root, path.join('.transactions', quarantine.name, '.DS_Store')),
+      'held first candidate\n',
+    );
+    setState(root, { pending: `${T2}\n`, last: `${T1}\n` });
+    assert.equal(promote(root, T2, laterOperation).status, 'promoted');
+
+    const { acquireLock, releaseLock } = modules();
+    const owner = acquireLock({ wikiRoot: root, operation: 'held-quarantine-liveness' });
+    try {
+      const child = spawnSync(process.execPath, [
+        '-e',
+        `const fs=require('node:fs');const path=require('node:path');
+const sw=require(process.argv[1]);const dl=require(process.argv[2]);const original=fs.unlinkSync;
+fs.unlinkSync=(pathname,...args)=>{
+  if(path.basename(pathname)==='.DS_Store')throw Object.assign(new Error('held'),{code:'EACCES'});
+  return original(pathname,...args);
+};
+const result=sw.pruneScanWindowTransactions({wikiRoot:process.argv[3],token:process.argv[4],
+  maxAgeDays:0,limit:4,kinds:['promote'],now:new Date(process.argv[5]),
+  deadline:dl.createDeadline({budgetMs:12000})});process.stdout.write(JSON.stringify(result));`,
+        scanWindowPath,
+        deadlinePath,
+        root,
+        owner.token,
+        pruneClock(root).toISOString(),
+      ], { encoding: 'utf8', shell: false, timeout: 20_000 });
+      assert.equal(child.status, 0, child.stderr);
+      assert.deepEqual(JSON.parse(child.stdout), {
+        processed: 1,
+        removed: [laterOperation],
+        complete: false,
+      });
+    } finally {
+      releaseLock({ wikiRoot: root, token: owner.token });
+    }
+    assert.deepEqual(prune(root, heldOperation, { resumableOnly: true }), {
+      processed: 1,
+      removed: [heldOperation],
+      complete: true,
+    });
+  });
+
+  await t.test('one successful junk attempt consumes the last shared slot', () => {
+    let operationDirectory;
+    const { root, operationId } = seedPromote('one-slot', (boundary, context) => {
+      if (boundary !== 'before-transition-cleaned-write') return;
+      operationDirectory = metaPath(
+        context.root,
+        path.join('.transactions', context.operationId),
+      );
+      fs.writeFileSync(path.join(operationDirectory, '.DS_Store'), 'one slot\n');
+    });
+    const boundaries = [];
+    const first = prune(root, operationId, {
+      limit: 1,
+      faultInjector(boundary) { boundaries.push(boundary); },
+    });
+    assert.deepEqual(first, { processed: 0, removed: [], complete: false });
+    assert.equal(fs.existsSync(path.join(operationDirectory, '.DS_Store')), false);
+    assert.equal(fs.existsSync(path.join(operationDirectory, 'journal.json')), true);
+    assert.equal(boundaries.includes('before-transaction-quarantine-rename'), false);
+    assert.equal(boundaries.filter((value) => value.startsWith('nested-junk-remove:')).length, 1);
+    assert.deepEqual(prune(root, operationId, { limit: 1 }), {
+      processed: 1,
+      removed: [operationId],
+      complete: true,
+    });
+  });
+
+  await t.test('post-attempt reserve exhaustion preserves terminal evidence', () => {
+    let operationDirectory;
+    const { root, operationId } = seedPromote('reserve-after-attempt', (boundary, context) => {
+      if (boundary !== 'before-transition-cleaned-write') return;
+      operationDirectory = metaPath(
+        context.root,
+        path.join('.transactions', context.operationId),
+      );
+      fs.writeFileSync(path.join(operationDirectory, '.DS_Store'), 'reserve\n');
+    });
+    let nowMs = 0;
+    const clock = { nowMs: () => nowMs };
+    const boundaries = [];
+    const result = prune(root, operationId, {
+      deadline: modules().createDeadline({ clock, budgetMs: 1_000 }),
+      faultInjector(boundary) {
+        boundaries.push(boundary);
+        if (boundary === 'after-nested-junk-unlink') nowMs = 800;
+      },
+    });
+    assert.deepEqual(result, { processed: 0, removed: [], complete: false });
+    assert.equal(fs.existsSync(path.join(operationDirectory, '.DS_Store')), false);
+    assert.equal(fs.existsSync(path.join(operationDirectory, 'journal.json')), true);
+    assert.equal(boundaries.includes('before-transaction-quarantine-rename'), false);
+  });
+
+  await t.test('retyping an admitted file to a symlink preserves the outside target', () => {
+    let operationDirectory;
+    const { root, operationId } = seedPromote('retype-symlink', (boundary, context) => {
+      if (boundary !== 'before-transition-cleaned-write') return;
+      operationDirectory = metaPath(
+        context.root,
+        path.join('.transactions', context.operationId),
+      );
+      fs.writeFileSync(path.join(operationDirectory, '.DS_Store'), 'replace me\n');
+    });
+    const outside = path.join(root, 'outside-junk-target');
+    fs.writeFileSync(outside, 'outside sentinel\n');
+    let replaced = false;
+    const boundaries = [];
+    let semanticNames;
+    const result = prune(root, operationId, {
+      faultInjector(boundary, context) {
+        boundaries.push(boundary);
+        if (boundary === 'nested-junk-semantic-names'
+            && context.directory === operationDirectory) {
+          semanticNames = context.names;
+        }
+        if (replaced || boundary !== 'after-nested-junk-admission'
+            || path.basename(context.pathname) !== '.DS_Store') return;
+        fs.unlinkSync(context.pathname);
+        fs.symlinkSync(outside, context.pathname);
+        replaced = true;
+      },
+    });
+    assert.equal(replaced, true);
+    assert.deepEqual(result, { processed: 0, removed: [], complete: true });
+    assert.deepEqual(semanticNames, ['.DS_Store', 'journal.json']);
+    assert.equal(fs.lstatSync(path.join(operationDirectory, '.DS_Store')).isSymbolicLink(), true);
+    assert.equal(fs.readFileSync(outside, 'utf8'), 'outside sentinel\n');
+    assert.equal(boundaries.includes('before-transaction-quarantine-rename'), false);
+  });
+
+  await t.test('a regular replacement needs a fresh admission and obeys the same cap', () => {
+    let operationDirectory;
+    const { root, operationId } = seedPromote('retype-regular', (boundary, context) => {
+      if (boundary !== 'before-transition-cleaned-write') return;
+      operationDirectory = metaPath(
+        context.root,
+        path.join('.transactions', context.operationId),
+      );
+      fs.writeFileSync(path.join(operationDirectory, '.DS_Store'), 'first inode\n');
+    });
+    let replaced = false;
+    const attempts = [];
+    const result = prune(root, operationId, {
+      limit: 2,
+      faultInjector(boundary, context) {
+        if (boundary.startsWith('nested-junk-remove:')) attempts.push(boundary);
+        if (replaced || boundary !== 'after-nested-junk-admission') return;
+        fs.unlinkSync(context.pathname);
+        fs.writeFileSync(context.pathname, 'replacement inode\n');
+        replaced = true;
+      },
+    });
+    assert.deepEqual(result, { processed: 0, removed: [], complete: false });
+    assert.deepEqual(attempts, ['nested-junk-remove:1', 'nested-junk-remove:2']);
+    assert.equal(fs.existsSync(path.join(operationDirectory, '.DS_Store')), false);
+    assert.equal(fs.existsSync(path.join(operationDirectory, 'journal.json')), true);
+    assert.deepEqual(prune(root, operationId, { limit: 1 }), {
+      processed: 1,
+      removed: [operationId],
+      complete: true,
+    });
+  });
+
+  await t.test('a transaction-store ancestor swap cannot redirect nested unlink', () => {
+    let operationDirectory;
+    const { root, operationId } = seedPromote('ancestor-swap', (boundary, context) => {
+      if (boundary !== 'before-transition-cleaned-write') return;
+      operationDirectory = metaPath(
+        context.root,
+        path.join('.transactions', context.operationId),
+      );
+      fs.writeFileSync(path.join(operationDirectory, '.DS_Store'), 'inside\n');
+    });
+    const outside = path.join(root, 'outside-transaction-store');
+    fs.mkdirSync(outside);
+    fs.writeFileSync(path.join(outside, '.DS_Store'), 'outside sentinel\n');
+    const canonical = metaPath(root, '.transactions');
+    const held = metaPath(root, '.transactions-held');
+    let swapped = false;
+    assert.throws(() => prune(root, operationId, {
+      faultInjector(boundary) {
+        if (swapped || boundary !== 'after-nested-junk-admission') return;
+        fs.renameSync(canonical, held);
+        fs.symlinkSync(outside, canonical);
+        swapped = true;
+      },
+    }), (error) => error.code === 'SCAN_WINDOW_FILESYSTEM'
+      && error.terminal_prune?.complete === false);
+    assert.equal(swapped, true);
+    assert.equal(fs.readFileSync(path.join(outside, '.DS_Store'), 'utf8'), 'outside sentinel\n');
+    assert.equal(fs.readFileSync(path.join(
+      held,
+      operationId,
+      '.DS_Store',
+    ), 'utf8'), 'inside\n');
+  });
+
+  await t.test('a quarantine generation swap cannot redirect nested unlink', () => {
+    const { root, operationId } = seedPromote('quarantine-swap');
+    let quarantine;
+    prune(root, operationId, {
+      faultInjector(boundary) {
+        if (boundary !== 'before-quarantined-journal-unlink') return;
+        quarantine = fs.readdirSync(metaPath(root, '.transactions'), { withFileTypes: true })
+          .find((entry) => entry.isDirectory() && entry.name.startsWith('.prune-'));
+        fs.writeFileSync(
+          metaPath(root, path.join('.transactions', quarantine.name, '.DS_Store')),
+          'inside\n',
+        );
+        throw new Error('leave quarantine for generation-swap retry');
+      },
+    });
+    assert.ok(quarantine);
+    const quarantinePath = metaPath(root, path.join('.transactions', quarantine.name));
+    assert.equal(fs.existsSync(path.join(quarantinePath, '.DS_Store')), true);
+    const held = `${quarantinePath}-held`;
+    const outside = path.join(root, 'outside-quarantine');
+    fs.mkdirSync(outside);
+    fs.writeFileSync(path.join(outside, '.DS_Store'), 'outside sentinel\n');
+    let swapped = false;
+    let observed;
+    let observedError;
+    try { observed = prune(root, operationId, {
+      resumableOnly: true,
+      faultInjector(boundary, context) {
+        if (swapped || boundary !== 'after-nested-junk-admission') return;
+        assert.equal(path.dirname(context.pathname), quarantinePath);
+        fs.renameSync(quarantinePath, held);
+        fs.symlinkSync(outside, quarantinePath);
+        swapped = true;
+      },
+    }); } catch (error) { observedError = error; }
+    assert.equal(swapped, true);
+    assert.equal(observed, undefined);
+    assert.equal(observedError?.code, 'SCAN_WINDOW_FILESYSTEM');
+    assert.equal(observedError?.terminal_prune?.complete, false);
+    assert.equal(fs.readFileSync(path.join(outside, '.DS_Store'), 'utf8'), 'outside sentinel\n');
+    assert.equal(fs.readFileSync(path.join(held, '.DS_Store'), 'utf8'), 'inside\n');
+  });
+
+  await t.test('post-unlink quarantine and meta swaps are detected without outside mutation', () => {
+    const { root, operationId } = seedPromote('post-unlink-swaps');
+    let quarantine;
+    prune(root, operationId, {
+      faultInjector(boundary) {
+        if (boundary !== 'before-quarantined-journal-unlink') return;
+        quarantine = fs.readdirSync(metaPath(root, '.transactions'), { withFileTypes: true })
+          .find((entry) => entry.isDirectory() && entry.name.startsWith('.prune-'));
+        fs.writeFileSync(
+          metaPath(root, path.join('.transactions', quarantine.name, '.DS_Store')),
+          'remove before swap\n',
+        );
+        throw new Error('leave quarantine for post-unlink swap');
+      },
+    });
+    const quarantinePath = metaPath(root, path.join('.transactions', quarantine.name));
+    const quarantineHeld = `${quarantinePath}-held`;
+    const outsideQuarantine = path.join(root, 'outside-post-unlink-quarantine');
+    fs.mkdirSync(outsideQuarantine);
+    fs.writeFileSync(path.join(outsideQuarantine, 'sentinel'), 'outside quarantine\n');
+    assert.throws(() => prune(root, operationId, {
+      resumableOnly: true,
+      faultInjector(boundary) {
+        if (boundary !== 'after-nested-junk-unlink') return;
+        fs.renameSync(quarantinePath, quarantineHeld);
+        fs.symlinkSync(outsideQuarantine, quarantinePath);
+      },
+    }), (error) => error.code === 'SCAN_WINDOW_FILESYSTEM'
+      && error.terminal_prune?.complete === false);
+    assert.equal(
+      fs.readFileSync(path.join(outsideQuarantine, 'sentinel'), 'utf8'),
+      'outside quarantine\n',
+    );
+
+    const metaRoot = temporaryWiki('deep wiki post unlink meta swap ');
+    const metaOperation = 'post-unlink-meta-swap';
+    setState(metaRoot, { pending: `${T1}\n`, last: `${T0}\n` });
+    let operationDirectory;
+    assert.equal(promote(metaRoot, T1, metaOperation, {
+      faultInjector(boundary) {
+        if (boundary !== 'before-transition-cleaned-write') return;
+        operationDirectory = metaPath(metaRoot, path.join('.transactions', metaOperation));
+        fs.writeFileSync(path.join(operationDirectory, '.DS_Store'), 'meta swap\n');
+      },
+    }).status, 'promoted');
+    const canonicalMeta = metaPath(metaRoot, '');
+    const heldMeta = path.join(metaRoot, '.wiki-meta-held');
+    const outsideMeta = path.join(metaRoot, 'outside-meta');
+    fs.mkdirSync(outsideMeta);
+    fs.writeFileSync(path.join(outsideMeta, 'sentinel'), 'outside meta\n');
+    const { acquireLock, releaseLock } = modules();
+    const owner = acquireLock({ wikiRoot: metaRoot, operation: 'post-unlink-meta-owner' });
+    let metaError;
+    try {
+      modules().pruneScanWindowTransactions({
+        wikiRoot: metaRoot,
+        token: owner.token,
+        maxAgeDays: 0,
+        limit: 4,
+        kinds: ['promote'],
+        now: pruneClock(metaRoot),
+        deadline: modules().createDeadline({ budgetMs: 12_000 }),
+        faultInjector(boundary) {
+          if (boundary !== 'after-nested-junk-unlink') return;
+          fs.renameSync(canonicalMeta, heldMeta);
+          fs.symlinkSync(outsideMeta, canonicalMeta);
+        },
+      });
+    } catch (error) {
+      metaError = error;
+    } finally {
+      fs.unlinkSync(canonicalMeta);
+      fs.renameSync(heldMeta, canonicalMeta);
+      releaseLock({ wikiRoot: metaRoot, token: owner.token });
+    }
+    assert.equal(metaError?.terminal_prune?.complete, false);
+    assert.match(metaError?.code ?? '', /^(LOCK_|SCAN_WINDOW_FILESYSTEM$)/);
+    assert.equal(fs.readFileSync(path.join(outsideMeta, 'sentinel'), 'utf8'), 'outside meta\n');
+    assert.equal(fs.existsSync(path.join(operationDirectory, 'journal.json')), true);
+  });
+
+  await t.test('owner takeover after admission permits zero nested or evidence mutation', () => {
+    let operationDirectory;
+    const { root, operationId } = seedPromote('owner-takeover', (boundary, context) => {
+      if (boundary !== 'before-transition-cleaned-write') return;
+      operationDirectory = metaPath(
+        context.root,
+        path.join('.transactions', context.operationId),
+      );
+      fs.writeFileSync(path.join(operationDirectory, '.DS_Store'), 'owned\n');
+    });
+    const before = snapshotTree(operationDirectory);
+    const { acquireLock, assertLockOwner, releaseLock } = modules();
+    const owner = acquireLock({ wikiRoot: root, operation: 'nested-owner-before' });
+    let successor;
+    assert.throws(() => modules().pruneScanWindowTransactions({
+      wikiRoot: root,
+      token: owner.token,
+      maxAgeDays: 0,
+      limit: 4,
+      kinds: ['promote'],
+      now: pruneClock(root),
+      deadline: modules().createDeadline({ budgetMs: 12_000 }),
+      faultInjector(boundary) {
+        if (successor || boundary !== 'after-nested-junk-admission') return;
+        replaceLiveLockExternallyAtInjectedGuard(root);
+        successor = acquireLock({ wikiRoot: root, operation: 'nested-owner-successor' });
+      },
+    }), (error) => error.code === 'LOCK_TOKEN_MISMATCH'
+      && error.terminal_prune?.complete === false);
+    assert.ok(successor);
+    assert.deepEqual(snapshotTree(operationDirectory), before);
+    assert.equal(assertLockOwner({ wikiRoot: root, token: successor.token }).operation,
+      'nested-owner-successor');
+    releaseLock({ wikiRoot: root, token: successor.token });
+  });
+});
+
+test('default parent guard applies the nested metadata contract before empty removal', async (t) => {
+  const {
+    ScanWindowError,
+    defaultTransactionParentGuard,
+    semanticTransactionNames,
+  } = require(parentGuardPath);
+  const { createDeadline } = modules();
+  const makeGuard = (root, operationId, extra = {}) => {
+    const locations = {
+      meta: metaPath(root, ''),
+      transactions: metaPath(root, '.transactions'),
+      transaction: metaPath(root, path.join('.transactions', operationId)),
+    };
+    const nestedJunkAttempts = {
+      attempts: 0,
+      attemptedPhysicalFiles: new Set(),
+      budgetExhausted: false,
+    };
+    const deadline = createDeadline({ budgetMs: 12_000 });
+    const guard = defaultTransactionParentGuard(locations, {
+      assertBudget() {},
+      nestedJunkAttempts,
+      removed: [],
+      limit: extra.limit ?? 2,
+      deadline,
+      faultInjector: extra.faultInjector,
+    });
+    return { guard, locations, nestedJunkAttempts };
+  };
+
+  await t.test('regular metadata is identity-checked, unlinked, then the directory is removed', () => {
+    const root = temporaryWiki('deep wiki parent guard regular junk ');
+    const operationId = 'parent-guard-regular-junk';
+    const operation = metaPath(root, path.join('.transactions', operationId));
+    fs.mkdirSync(operation);
+    fs.writeFileSync(path.join(operation, '.DS_Store'), 'finder\n');
+    const boundaries = [];
+    const { guard, nestedJunkAttempts } = makeGuard(root, operationId, {
+      faultInjector(boundary) { boundaries.push(boundary); },
+    });
+    assert.equal(guard.inspectExistingOperation(), true);
+    guard.removeEmptyOperation(() => {});
+    assert.equal(fs.existsSync(operation), false);
+    assert.equal(nestedJunkAttempts.attempts, 1);
+    assert.deepEqual(
+      boundaries.filter((value) => value.startsWith('nested-junk-remove:')),
+      ['nested-junk-remove:1'],
+    );
+  });
+
+  for (const kind of ['symlink', 'directory']) {
+    await t.test(`junk-named ${kind} remains a recovery condition`, () => {
+      const root = temporaryWiki(`deep wiki parent guard ${kind} junk `);
+      const operationId = `parent-guard-${kind}-junk`;
+      const operation = metaPath(root, path.join('.transactions', operationId));
+      fs.mkdirSync(operation);
+      const junk = path.join(operation, '.DS_Store');
+      if (kind === 'symlink') {
+        const outside = path.join(root, 'outside-parent-guard');
+        fs.writeFileSync(outside, 'outside\n');
+        fs.symlinkSync(outside, junk);
+      } else {
+        fs.mkdirSync(junk);
+      }
+      const { guard, nestedJunkAttempts } = makeGuard(root, operationId);
+      assert.equal(guard.inspectExistingOperation(), true);
+      assert.throws(
+        () => guard.removeEmptyOperation(() => {}),
+        (error) => error.code === 'TRANSACTION_RECOVERY_REQUIRED',
+      );
+      assert.equal(fs.existsSync(operation), true);
+      assert.equal(fs.lstatSync(junk).isSymbolicLink(), kind === 'symlink');
+      assert.equal(nestedJunkAttempts.attempts, 0);
+    });
+  }
+
+  await t.test('limit zero admits neither nested junk nor the terminal removal', () => {
+    const root = temporaryWiki('deep wiki parent guard zero limit ');
+    const operationId = 'parent-guard-zero-limit';
+    const operation = metaPath(root, path.join('.transactions', operationId));
+    fs.mkdirSync(operation);
+    const junk = path.join(operation, '.DS_Store');
+    fs.writeFileSync(junk, 'zero limit\n');
+    const { guard, nestedJunkAttempts } = makeGuard(root, operationId, { limit: 0 });
+    assert.equal(guard.inspectExistingOperation(), true);
+    assert.throws(
+      () => guard.removeEmptyOperation(() => {}),
+      (error) => error.code === 'SCAN_WINDOW_NESTED_JUNK_DEFERRED'
+        && error.nestedJunkBudgetExhausted === true,
+    );
+    assert.equal(nestedJunkAttempts.attempts, 0);
+    assert.equal(fs.readFileSync(junk, 'utf8'), 'zero limit\n');
+  });
+
+  await t.test('a replacement identity already attempted is never charged or unlinked twice', () => {
+    const root = temporaryWiki('deep wiki parent guard attempted replacement ');
+    const operationId = 'parent-guard-attempted-replacement';
+    const operation = metaPath(root, path.join('.transactions', operationId));
+    fs.mkdirSync(operation);
+    const junk = path.join(operation, '.DS_Store');
+    fs.writeFileSync(junk, 'first identity\n');
+    let context;
+    let replaced = false;
+    context = makeGuard(root, operationId, {
+      faultInjector(boundary, faultContext) {
+        if (replaced || boundary !== 'after-nested-junk-admission') return;
+        fs.unlinkSync(faultContext.pathname);
+        fs.writeFileSync(faultContext.pathname, 'already attempted replacement\n');
+        const stat = fs.lstatSync(faultContext.pathname, { bigint: true });
+        const key = [stat.dev, stat.ino, stat.mode & 0o170000n, stat.birthtimeNs]
+          .map((value) => value.toString())
+          .join(':');
+        context.nestedJunkAttempts.attemptedPhysicalFiles.add(key);
+        replaced = true;
+      },
+    });
+    assert.equal(context.guard.inspectExistingOperation(), true);
+    assert.throws(
+      () => context.guard.removeEmptyOperation(() => {}),
+      (error) => error.code === 'SCAN_WINDOW_NESTED_JUNK_DEFERRED',
+    );
+    assert.equal(replaced, true);
+    assert.equal(context.nestedJunkAttempts.attempts, 1);
+    assert.equal(fs.readFileSync(junk, 'utf8'), 'already attempted replacement\n');
+  });
+
+  await t.test('identity failures retain the canonical runtime error class', () => {
+    const root = temporaryWiki('deep wiki parent guard canonical error ');
+    const operationId = 'parent-guard-canonical-error';
+    const operation = metaPath(root, path.join('.transactions', operationId));
+    const held = `${operation}-held`;
+    const outside = path.join(root, 'outside-parent-guard-error');
+    fs.mkdirSync(operation);
+    fs.mkdirSync(outside);
+    const { guard } = makeGuard(root, operationId);
+    assert.equal(guard.inspectExistingOperation(), true);
+    fs.renameSync(operation, held);
+    fs.symlinkSync(outside, operation);
+    assert.throws(
+      () => guard.assertAll(),
+      (error) => error instanceof ScanWindowError
+        && error.code === 'SCAN_WINDOW_FILESYSTEM',
+    );
+  });
+
+  await t.test('the closing parent proof tags trust loss but preserves deadline polarity', () => {
+    const makeSemanticOptions = (label, assertOwnerAndParents) => {
+      const root = temporaryWiki(`deep wiki parent proof ${label} `);
+      const directory = metaPath(root, path.join('.transactions', `parent-proof-${label}`));
+      fs.mkdirSync(directory);
+      fs.writeFileSync(path.join(directory, '.DS_Store'), 'proof\n');
+      return {
+        directory,
+        label: `parent proof ${label}`,
+        assertOwnerAndParents,
+        assertBudget() {},
+        nestedJunkAttempts: {
+          attempts: 0,
+          attemptedPhysicalFiles: new Set(),
+          budgetExhausted: false,
+        },
+        removed: [],
+        limit: 2,
+        deadline: createDeadline({ budgetMs: 12_000 }),
+      };
+    };
+
+    let closingProofs = 0;
+    assert.throws(
+      () => semanticTransactionNames(makeSemanticOptions('trust-loss', () => {
+        closingProofs += 1;
+        if (closingProofs === 2) {
+          throw Object.assign(new Error('parent identity changed'), {
+            code: 'SCAN_WINDOW_FILESYSTEM',
+          });
+        }
+      })),
+      (error) => error.code === 'SCAN_WINDOW_FILESYSTEM'
+        && error.nestedJunkSafety === true,
+    );
+
+    assert.throws(
+      () => semanticTransactionNames(makeSemanticOptions('deadline', () => {
+        throw Object.assign(new Error('deadline exceeded'), { code: 'DEADLINE_EXCEEDED' });
+      })),
+      (error) => error.code === 'DEADLINE_EXCEEDED'
+        && error.nestedJunkSafety !== true,
+    );
+  });
+});
+
+test('scan-window evidence names stay disjoint from the shared junk classifier', () => {
+  const {
+    isReclaimableJunkEntry,
+    isTransactionStoreJunkName,
+  } = require('../hooks/scripts/runtime/transaction-debris.js');
+  const engineNames = [
+    'journal.json',
+    'journal.backup',
+    'journal.backup.pending',
+    'source.reservation.pending',
+    'scan-window-operation',
+    '.prune-22-scan-window-operation-1-id',
+    '.reservation-.prune-22-scan-window-operation-1-id',
+    `.journal.json.tmp.${process.pid}.${crypto.randomUUID()}`,
+  ];
+  for (const name of engineNames) assert.equal(isTransactionStoreJunkName(name), false, name);
+
+  const root = temporaryWiki('deep wiki classifier compatibility ');
+  const directory = metaPath(root, '.transactions');
+  fs.writeFileSync(path.join(directory, '.DS_Store'), 'regular\n');
+  fs.mkdirSync(path.join(directory, '._directory'));
+  fs.symlinkSync(path.join(directory, '.DS_Store'), path.join(directory, '._symlink'));
+  const entries = new Map(fs.readdirSync(directory, { withFileTypes: true })
+    .map((entry) => [entry.name, entry]));
+  assert.equal(isReclaimableJunkEntry(entries.get('.DS_Store'), directory), true);
+  assert.equal(isReclaimableJunkEntry(entries.get('._directory'), directory), false);
+  assert.equal(isReclaimableJunkEntry(entries.get('._symlink'), directory), false);
+
+  const unknown = {
+    name: '._unknown',
+    isFile: () => false,
+    isDirectory: () => false,
+    isSymbolicLink: () => false,
+    isBlockDevice: () => false,
+    isCharacterDevice: () => false,
+    isFIFO: () => false,
+    isSocket: () => false,
+  };
+  assert.equal(isReclaimableJunkEntry(unknown, directory), false);
 });
 
 test('ensurePendingScan rejects every raw reservation-prune representation before debris mutation', async (t) => {

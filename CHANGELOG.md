@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Nested terminal and quarantine metadata left by desktop shells or sync clients is now reclaimed as bounded internal scan-window prerequisite work under the current owner and complete directory-identity chain. A held regular file reports `terminal_prune.complete: false` before any later authenticated journal, backup, reservation, operation, or quarantine evidence is removed; non-regular recognized names remain recovery conditions and nested cleanup never widens top-level `removed_junk`.
+- The scan-window prune-name preflight now uses a parent-first `.wiki-meta` anchor before treating a missing `.transactions` child as benign, so a symlinked metadata parent fails closed with `SCAN_WINDOW_FILESYSTEM`.
 - Content readers now skip regular AppleDouble and exact OS-metadata files in `pages/`, `.wiki-meta/sources/`, and `.wiki-meta/.versions/`, report them in `ignored_os_metadata`, and never delete them; junk-named symlinks/directories remain fail-closed, and `removed_junk` remains transaction-store-only.
 
 ## [1.9.6] — 2026-08-04 (transaction store junk tolerance)

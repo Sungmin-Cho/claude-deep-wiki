@@ -1930,6 +1930,7 @@ function pruneScanWindowTransactions(options = {}) {
   let pruneMarkers;
   let metaIdentity;
   let transactionsIdentity;
+  let enumerationError = null;
   try {
     assertBudget();
     assertOwner();
@@ -1950,19 +1951,78 @@ function pruneScanWindowTransactions(options = {}) {
       '.wiki-meta/.transactions',
       true,
     );
-    if (transactionsIdentity === null) return { processed: 0, removed: [], complete: true };
+    const closeOuterObservation = (deferredEnumerationError) => {
+      assertBudget();
+      assertOwner();
+      assertBudget();
+      const closingMetaBeforeChild = inspectPhysicalDirectory(meta, meta, '.wiki-meta');
+      if (!identitiesMatch(closingMetaBeforeChild, metaIdentity)) {
+        throw scanError(
+          'SCAN_WINDOW_FILESYSTEM',
+          '.wiki-meta directory identity changed after transaction-store observation',
+        );
+      }
+      assertBudget();
+      let appeared = false;
+      if (transactionsIdentity === null) {
+        const closingTransactionsIdentity = inspectPhysicalDirectory(
+          transactions,
+          transactions,
+          '.wiki-meta/.transactions',
+          true,
+        );
+        appeared = closingTransactionsIdentity !== null;
+      } else {
+        const closingTransactionsIdentity = inspectPhysicalDirectory(
+          transactions,
+          transactions,
+          '.wiki-meta/.transactions',
+        );
+        if (!identitiesMatch(closingTransactionsIdentity, transactionsIdentity)) {
+          throw scanError(
+            'SCAN_WINDOW_FILESYSTEM',
+            '.wiki-meta/.transactions directory identity changed after transaction-store observation',
+          );
+        }
+      }
+      assertBudget();
+      const closingMetaAfterChild = inspectPhysicalDirectory(meta, meta, '.wiki-meta');
+      if (!identitiesMatch(closingMetaAfterChild, metaIdentity)) {
+        throw scanError(
+          'SCAN_WINDOW_FILESYSTEM',
+          '.wiki-meta directory identity changed after transaction-store observation',
+        );
+      }
+      assertBudget();
+      assertOwner();
+      assertBudget();
+      if (appeared) {
+        throw scanError(
+          'TRANSACTION_RECOVERY_REQUIRED',
+          '.wiki-meta/.transactions appeared after a missing-store observation',
+        );
+      }
+      if (deferredEnumerationError !== null) {
+        throw scanError(
+          'SCAN_WINDOW_FILESYSTEM',
+          '.wiki-meta/.transactions contents are unavailable during prune',
+          deferredEnumerationError,
+        );
+      }
+    };
+    if (transactionsIdentity === null) {
+      closeOuterObservation(null);
+      return { processed: 0, removed: [], complete: true };
+    }
     assertBudget();
     try {
       entries = fs.readdirSync(transactions, { withFileTypes: true })
         .sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
     } catch (cause) {
-      throw scanError(
-        'SCAN_WINDOW_FILESYSTEM',
-        '.wiki-meta/.transactions contents are unavailable during prune',
-        cause,
-      );
+      enumerationError = cause;
     }
     assertBudget();
+    closeOuterObservation(enumerationError);
   } catch (error) {
     if (error.code === 'DEADLINE_EXCEEDED') {
       return { processed: 0, removed: [], complete: false };

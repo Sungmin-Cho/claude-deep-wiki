@@ -56,6 +56,521 @@ function replaceLiveLockExternallyAtInjectedGuard(root) {
   fs.rmSync(metaPath(root, '.wiki-lock'), { recursive: true });
 }
 
+function outerPruneRoot({ withTransactions = true } = {}) {
+  const root = fs.realpathSync.native(fs.mkdtempSync(
+    path.join(os.tmpdir(), 'deep wiki outer prune red '),
+  ));
+  roots.add(root);
+  fs.mkdirSync(metaPath(root, ''), { recursive: true });
+  if (withTransactions) fs.mkdirSync(metaPath(root, '.transactions'));
+  return root;
+}
+
+function releaseOuterPruneLockIfPresent(root, token) {
+  if (!fs.existsSync(metaPath(root, '.wiki-lock'))) return;
+  modules().releaseLock({ wikiRoot: root, token });
+}
+
+function replaceOuterPruneMeta(root, { withTransactions = false, transplantTransactions = false } = {}) {
+  const meta = metaPath(root, '');
+  const displaced = path.join(root, '.wiki-meta.displaced');
+  fs.renameSync(meta, displaced);
+  fs.mkdirSync(meta);
+  fs.cpSync(path.join(displaced, '.wiki-lock'), metaPath(root, '.wiki-lock'), { recursive: true });
+  if (transplantTransactions) {
+    fs.renameSync(path.join(displaced, '.transactions'), metaPath(root, '.transactions'));
+  } else if (withTransactions) {
+    fs.mkdirSync(metaPath(root, '.transactions'));
+  }
+}
+
+function replaceOuterPruneTransactions(root) {
+  const transactions = metaPath(root, '.transactions');
+  fs.renameSync(transactions, `${transactions}.displaced`);
+  fs.mkdirSync(transactions);
+}
+
+function pruneOuterObservation(root, token, deadline = modules().createDeadline({ budgetMs: 12_000 })) {
+  return modules().pruneScanWindowTransactions({
+    wikiRoot: root,
+    token,
+    maxAgeDays: 0,
+    limit: 1,
+    now: new Date(T3),
+    deadline,
+  });
+}
+
+test('OUTER-PRUNE-1 Case 01 missing child appearance is not complete', () => {
+  const root = outerPruneRoot({ withTransactions: false });
+  const transactions = metaPath(root, '.transactions');
+  const owner = modules().acquireLock({ wikiRoot: root, operation: 'outer-prune-case-01' });
+  const originalLstat = fs.lstatSync;
+  let matchingCalls = 0;
+  let injected = false;
+  fs.lstatSync = (pathname, ...args) => {
+    if (path.resolve(String(pathname)) !== path.resolve(transactions)) {
+      return originalLstat(pathname, ...args);
+    }
+    matchingCalls += 1;
+    let observed;
+    let observationError;
+    try { observed = originalLstat(pathname, ...args); }
+    catch (error) { observationError = error; }
+    if (matchingCalls === 2) {
+      fs.mkdirSync(transactions);
+      injected = true;
+    }
+    if (observationError) throw observationError;
+    return observed;
+  };
+  try {
+    assert.throws(() => pruneOuterObservation(root, owner.token), (error) => (
+      error.code === 'TRANSACTION_RECOVERY_REQUIRED'
+        && error.message === '.wiki-meta/.transactions appeared after a missing-store observation'
+    ));
+    assert.equal(injected, true);
+    assert.equal(matchingCalls, 3);
+  } finally {
+    fs.lstatSync = originalLstat;
+    releaseOuterPruneLockIfPresent(root, owner.token);
+  }
+});
+
+test('OUTER-PRUNE-1 Case 02 missing child parent generation replacement is rejected', () => {
+  const root = outerPruneRoot({ withTransactions: false });
+  const transactions = metaPath(root, '.transactions');
+  const owner = modules().acquireLock({ wikiRoot: root, operation: 'outer-prune-case-02' });
+  const originalLstat = fs.lstatSync;
+  let matchingCalls = 0;
+  let injected = false;
+  let replacementCompleted = false;
+  fs.lstatSync = (pathname, ...args) => {
+    if (path.resolve(String(pathname)) !== path.resolve(transactions)) {
+      return originalLstat(pathname, ...args);
+    }
+    matchingCalls += 1;
+    let observed;
+    let observationError;
+    try { observed = originalLstat(pathname, ...args); }
+    catch (error) { observationError = error; }
+    if (matchingCalls === 2) {
+      replaceOuterPruneMeta(root, { withTransactions: true });
+      injected = true;
+      replacementCompleted = true;
+    }
+    if (observationError) throw observationError;
+    return observed;
+  };
+  try {
+    assert.throws(() => pruneOuterObservation(root, owner.token), (error) => (
+      error.code === 'SCAN_WINDOW_FILESYSTEM'
+        && error.message === '.wiki-meta directory identity changed after transaction-store observation'
+    ));
+    assert.equal(injected, true);
+    assert.equal(replacementCompleted, true);
+    assert.equal(matchingCalls, 2);
+  } finally {
+    fs.lstatSync = originalLstat;
+    releaseOuterPruneLockIfPresent(root, owner.token);
+  }
+});
+
+test('OUTER-PRUNE-1 Case 03 missing child closing identity error is reached', () => {
+  const root = outerPruneRoot({ withTransactions: false });
+  const transactions = metaPath(root, '.transactions');
+  const owner = modules().acquireLock({ wikiRoot: root, operation: 'outer-prune-case-03' });
+  const originalLstat = fs.lstatSync;
+  let matchingCalls = 0;
+  let injected = false;
+  fs.lstatSync = (pathname, ...args) => {
+    if (path.resolve(String(pathname)) !== path.resolve(transactions)) {
+      return originalLstat(pathname, ...args);
+    }
+    matchingCalls += 1;
+    if (matchingCalls === 3) {
+      injected = true;
+      throw Object.assign(new Error('closing child denied'), { code: 'EACCES' });
+    }
+    return originalLstat(pathname, ...args);
+  };
+  try {
+    let observedError = null;
+    try { pruneOuterObservation(root, owner.token); }
+    catch (error) { observedError = error; }
+    assert.ok(
+      injected,
+      `Case 03 closing-child injection was not reached; matchingCalls=${matchingCalls}`,
+    );
+    assert.ok(
+      observedError
+        && observedError.code === 'SCAN_WINDOW_FILESYSTEM'
+        && observedError.message === '.wiki-meta/.transactions directory identity is unavailable',
+      `Case 03 observed ${observedError?.code || 'no error'}: ${observedError?.message || 'complete return'}`,
+    );
+  } finally {
+    fs.lstatSync = originalLstat;
+    releaseOuterPruneLockIfPresent(root, owner.token);
+  }
+});
+
+test('OUTER-PRUNE-1 Case 03b closing physical path error outranks deferred enumeration', () => {
+  const root = outerPruneRoot();
+  const transactions = metaPath(root, '.transactions');
+  const owner = modules().acquireLock({ wikiRoot: root, operation: 'outer-prune-case-03b' });
+  const originalLstat = fs.lstatSync;
+  const originalRealpath = fs.realpathSync.native;
+  const originalReaddir = fs.readdirSync;
+  let matchingRealpaths = 0;
+  let matchingReads = 0;
+  let realpathInjected = false;
+  let enumerationInjected = false;
+  fs.realpathSync.native = (pathname, ...args) => {
+    if (path.resolve(String(pathname)) !== path.resolve(transactions)) {
+      return originalRealpath(pathname, ...args);
+    }
+    matchingRealpaths += 1;
+    if (matchingRealpaths === 4) {
+      realpathInjected = true;
+      throw Object.assign(new Error('closing physical path denied'), { code: 'EACCES' });
+    }
+    return originalRealpath(pathname, ...args);
+  };
+  fs.readdirSync = (pathname, ...args) => {
+    if (path.resolve(String(pathname)) === path.resolve(transactions)) {
+      matchingReads += 1;
+      if (matchingReads === 2) {
+        enumerationInjected = true;
+        throw Object.assign(new Error('enumerated child disappeared'), { code: 'ENOENT' });
+      }
+    }
+    return originalReaddir(pathname, ...args);
+  };
+  try {
+    let observedError = null;
+    try { pruneOuterObservation(root, owner.token); }
+    catch (error) { observedError = error; }
+    assert.ok(
+      realpathInjected
+        && observedError?.code === 'SCAN_WINDOW_FILESYSTEM'
+        && observedError.message === '.wiki-meta/.transactions physical path is unavailable',
+      `Case 03b realpathInjected=${realpathInjected}; enumerationInjected=${enumerationInjected}; `
+        + `observed=${observedError?.code || 'no error'}:${observedError?.message || 'complete return'}`,
+    );
+    assert.equal(enumerationInjected, true);
+    assert.equal(matchingReads, 2);
+  } finally {
+    fs.realpathSync.native = originalRealpath;
+    fs.readdirSync = originalReaddir;
+    fs.lstatSync = originalLstat;
+    releaseOuterPruneLockIfPresent(root, owner.token);
+  }
+});
+
+test('OUTER-PRUNE-1 Case 04 missing child owner loss is rejected', () => {
+  const root = outerPruneRoot({ withTransactions: false });
+  const transactions = metaPath(root, '.transactions');
+  const owner = modules().acquireLock({ wikiRoot: root, operation: 'outer-prune-case-04' });
+  const originalLstat = fs.lstatSync;
+  let matchingCalls = 0;
+  let lockDestroyed = false;
+  fs.lstatSync = (pathname, ...args) => {
+    if (path.resolve(String(pathname)) !== path.resolve(transactions)) {
+      return originalLstat(pathname, ...args);
+    }
+    matchingCalls += 1;
+    let observed;
+    let observationError;
+    try { observed = originalLstat(pathname, ...args); }
+    catch (error) { observationError = error; }
+    if (matchingCalls === 2) {
+      replaceLiveLockExternallyAtInjectedGuard(root);
+      lockDestroyed = true;
+    }
+    if (observationError) throw observationError;
+    return observed;
+  };
+  try {
+    assert.throws(() => pruneOuterObservation(root, owner.token), (error) => (
+      error.code === 'LOCK_TOKEN_MISMATCH'
+    ));
+    assert.equal(lockDestroyed, true);
+    assert.equal(matchingCalls, 2);
+  } finally {
+    fs.lstatSync = originalLstat;
+    releaseOuterPruneLockIfPresent(root, owner.token);
+  }
+});
+
+test('OUTER-PRUNE-1 Case 05 missing child deadline expiry returns incomplete', () => {
+  const root = outerPruneRoot({ withTransactions: false });
+  const transactions = metaPath(root, '.transactions');
+  const owner = modules().acquireLock({ wikiRoot: root, operation: 'outer-prune-case-05' });
+  const originalLstat = fs.lstatSync;
+  let matchingCalls = 0;
+  let expired = false;
+  const clock = { nowMs: () => (expired ? 1_000 : 0) };
+  fs.lstatSync = (pathname, ...args) => {
+    if (path.resolve(String(pathname)) !== path.resolve(transactions)) {
+      return originalLstat(pathname, ...args);
+    }
+    matchingCalls += 1;
+    let observed;
+    let observationError;
+    try { observed = originalLstat(pathname, ...args); }
+    catch (error) { observationError = error; }
+    if (matchingCalls === 2) expired = true;
+    if (observationError) throw observationError;
+    return observed;
+  };
+  try {
+    assert.deepEqual(
+      pruneOuterObservation(root, owner.token, modules().createDeadline({ clock, budgetMs: 1_000 })),
+      { processed: 0, removed: [], complete: false },
+    );
+    assert.equal(matchingCalls, 2);
+  } finally {
+    fs.lstatSync = originalLstat;
+    releaseOuterPruneLockIfPresent(root, owner.token);
+  }
+});
+
+test('OUTER-PRUNE-1 Case 06 missing child deadline wins owner loss', () => {
+  const root = outerPruneRoot({ withTransactions: false });
+  const transactions = metaPath(root, '.transactions');
+  const owner = modules().acquireLock({ wikiRoot: root, operation: 'outer-prune-case-06' });
+  const originalLstat = fs.lstatSync;
+  let matchingCalls = 0;
+  let expired = false;
+  let lockDestroyed = false;
+  const clock = { nowMs: () => (expired ? 1_000 : 0) };
+  fs.lstatSync = (pathname, ...args) => {
+    if (path.resolve(String(pathname)) !== path.resolve(transactions)) {
+      return originalLstat(pathname, ...args);
+    }
+    matchingCalls += 1;
+    let observed;
+    let observationError;
+    try { observed = originalLstat(pathname, ...args); }
+    catch (error) { observationError = error; }
+    if (matchingCalls === 2) {
+      expired = true;
+      replaceLiveLockExternallyAtInjectedGuard(root);
+      lockDestroyed = true;
+    }
+    if (observationError) throw observationError;
+    return observed;
+  };
+  try {
+    assert.deepEqual(
+      pruneOuterObservation(root, owner.token, modules().createDeadline({ clock, budgetMs: 1_000 })),
+      { processed: 0, removed: [], complete: false },
+    );
+    assert.equal(lockDestroyed, true);
+    assert.equal(matchingCalls, 2);
+  } finally {
+    fs.lstatSync = originalLstat;
+    releaseOuterPruneLockIfPresent(root, owner.token);
+  }
+});
+
+test('OUTER-PRUNE-1 Case 07 present child final parent identity replacement is rejected', () => {
+  const root = outerPruneRoot();
+  const transactions = metaPath(root, '.transactions');
+  const owner = modules().acquireLock({ wikiRoot: root, operation: 'outer-prune-case-07' });
+  const originalLstat = fs.lstatSync;
+  let matchingCalls = 0;
+  let injected = false;
+  let replacementCompleted = false;
+  fs.lstatSync = (pathname, ...args) => {
+    if (path.resolve(String(pathname)) !== path.resolve(transactions)) {
+      return originalLstat(pathname, ...args);
+    }
+    matchingCalls += 1;
+    if (matchingCalls !== 4) return originalLstat(pathname, ...args);
+    const observed = originalLstat(pathname, ...args);
+    replaceOuterPruneMeta(root, { transplantTransactions: true });
+    injected = true;
+    replacementCompleted = true;
+    return observed;
+  };
+  try {
+    assert.throws(() => pruneOuterObservation(root, owner.token), (error) => (
+      error.code === 'SCAN_WINDOW_FILESYSTEM'
+        && error.message === '.wiki-meta directory identity changed after transaction-store observation'
+    ));
+    assert.equal(injected, true);
+    assert.equal(replacementCompleted, true);
+    assert.equal(matchingCalls, 4);
+  } finally {
+    fs.lstatSync = originalLstat;
+    releaseOuterPruneLockIfPresent(root, owner.token);
+  }
+});
+
+test('OUTER-PRUNE-1 Case 08 present child replacement preserves late operation', () => {
+  const root = outerPruneRoot();
+  const transactions = metaPath(root, '.transactions');
+  const lateOperation = path.join(transactions, 'late-operation');
+  const owner = modules().acquireLock({ wikiRoot: root, operation: 'outer-prune-case-08' });
+  const originalReaddir = fs.readdirSync;
+  let matchingReads = 0;
+  let injected = false;
+  let observedError = null;
+  fs.readdirSync = (pathname, ...args) => {
+    if (path.resolve(String(pathname)) !== path.resolve(transactions)) {
+      return originalReaddir(pathname, ...args);
+    }
+    matchingReads += 1;
+    const observed = originalReaddir(pathname, ...args);
+    if (matchingReads === 2) {
+      replaceOuterPruneTransactions(root);
+      fs.mkdirSync(lateOperation);
+      injected = true;
+    }
+    return observed;
+  };
+  try {
+    try { pruneOuterObservation(root, owner.token); }
+    catch (error) { observedError = error; }
+    assert.equal(fs.existsSync(lateOperation), true);
+    assert.ok(
+      observedError
+        && observedError.code === 'SCAN_WINDOW_FILESYSTEM'
+        && observedError.message === '.wiki-meta/.transactions directory identity changed after transaction-store observation',
+      `Case 08 observed ${observedError?.code || 'no error'}: ${observedError?.message || 'complete return'}`,
+    );
+    assert.equal(injected, true);
+    assert.equal(matchingReads, 2);
+  } finally {
+    fs.readdirSync = originalReaddir;
+    releaseOuterPruneLockIfPresent(root, owner.token);
+  }
+});
+
+test('OUTER-PRUNE-1 Case 09 present child owner loss is rejected', () => {
+  const root = outerPruneRoot();
+  const transactions = metaPath(root, '.transactions');
+  const owner = modules().acquireLock({ wikiRoot: root, operation: 'outer-prune-case-09' });
+  const originalReaddir = fs.readdirSync;
+  let matchingReads = 0;
+  let lockDestroyed = false;
+  fs.readdirSync = (pathname, ...args) => {
+    if (path.resolve(String(pathname)) !== path.resolve(transactions)) {
+      return originalReaddir(pathname, ...args);
+    }
+    matchingReads += 1;
+    const observed = originalReaddir(pathname, ...args);
+    if (matchingReads === 2) {
+      replaceLiveLockExternallyAtInjectedGuard(root);
+      lockDestroyed = true;
+    }
+    return observed;
+  };
+  try {
+    assert.throws(() => pruneOuterObservation(root, owner.token), (error) => (
+      error.code === 'LOCK_TOKEN_MISMATCH'
+    ));
+    assert.equal(lockDestroyed, true);
+    assert.equal(matchingReads, 2);
+  } finally {
+    fs.readdirSync = originalReaddir;
+    releaseOuterPruneLockIfPresent(root, owner.token);
+  }
+});
+
+test('OUTER-PRUNE-1 Case 10 present child deadline wins deferred enumeration error', () => {
+  const root = outerPruneRoot();
+  const transactions = metaPath(root, '.transactions');
+  const owner = modules().acquireLock({ wikiRoot: root, operation: 'outer-prune-case-10' });
+  const originalReaddir = fs.readdirSync;
+  let matchingReads = 0;
+  let expired = false;
+  const clock = { nowMs: () => (expired ? 1_000 : 0) };
+  fs.readdirSync = (pathname, ...args) => {
+    if (path.resolve(String(pathname)) !== path.resolve(transactions)) {
+      return originalReaddir(pathname, ...args);
+    }
+    matchingReads += 1;
+    if (matchingReads === 2) {
+      expired = true;
+      throw Object.assign(new Error('enumerated child disappeared'), { code: 'ENOENT' });
+    }
+    return originalReaddir(pathname, ...args);
+  };
+  try {
+    assert.deepEqual(
+      pruneOuterObservation(root, owner.token, modules().createDeadline({ clock, budgetMs: 1_000 })),
+      { processed: 0, removed: [], complete: false },
+    );
+    assert.equal(matchingReads, 2);
+  } finally {
+    fs.readdirSync = originalReaddir;
+    releaseOuterPruneLockIfPresent(root, owner.token);
+  }
+});
+
+test('OUTER-PRUNE-1 Case 11 present child disappearance is unavailable', () => {
+  const root = outerPruneRoot();
+  const transactions = metaPath(root, '.transactions');
+  const owner = modules().acquireLock({ wikiRoot: root, operation: 'outer-prune-case-11' });
+  const originalReaddir = fs.readdirSync;
+  let matchingReads = 0;
+  let disappeared = false;
+  fs.readdirSync = (pathname, ...args) => {
+    if (path.resolve(String(pathname)) !== path.resolve(transactions)) {
+      return originalReaddir(pathname, ...args);
+    }
+    matchingReads += 1;
+    if (matchingReads === 2) {
+      fs.rmSync(transactions, { recursive: true, force: true });
+      disappeared = true;
+    }
+    return originalReaddir(pathname, ...args);
+  };
+  try {
+    assert.throws(() => pruneOuterObservation(root, owner.token), (error) => (
+      error.code === 'SCAN_WINDOW_FILESYSTEM'
+        && error.message === '.wiki-meta/.transactions directory identity is unavailable'
+    ));
+    assert.equal(disappeared, true);
+    assert.equal(matchingReads, 2);
+  } finally {
+    fs.readdirSync = originalReaddir;
+    releaseOuterPruneLockIfPresent(root, owner.token);
+  }
+});
+
+test('OUTER-PRUNE-1 Case 12 present child parent disappearance preserves owner fencing', () => {
+  const root = outerPruneRoot();
+  const transactions = metaPath(root, '.transactions');
+  const owner = modules().acquireLock({ wikiRoot: root, operation: 'outer-prune-case-12' });
+  const originalReaddir = fs.readdirSync;
+  let matchingReads = 0;
+  let parentDisappeared = false;
+  fs.readdirSync = (pathname, ...args) => {
+    if (path.resolve(String(pathname)) !== path.resolve(transactions)) {
+      return originalReaddir(pathname, ...args);
+    }
+    matchingReads += 1;
+    if (matchingReads === 2) {
+      fs.rmSync(metaPath(root, ''), { recursive: true, force: true });
+      parentDisappeared = true;
+    }
+    return originalReaddir(pathname, ...args);
+  };
+  try {
+    assert.throws(() => pruneOuterObservation(root, owner.token), (error) => (
+      error.code === 'LOCK_TOKEN_MISMATCH'
+    ));
+    assert.equal(parentDisappeared, true);
+    assert.equal(matchingReads, 2);
+  } finally {
+    fs.readdirSync = originalReaddir;
+    releaseOuterPruneLockIfPresent(root, owner.token);
+  }
+});
+
 function setState(root, { pending, last } = {}) {
   if (pending === undefined || pending === null) fs.rmSync(metaPath(root, '.pending-scan'), { force: true });
   else fs.writeFileSync(metaPath(root, '.pending-scan'), pending);

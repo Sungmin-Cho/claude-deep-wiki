@@ -218,16 +218,28 @@ function sealAbsentPath(pathname, options = {}) {
       if (stat.isSymbolicLink() || !stat.isDirectory()) {
         throw authorityError('SETUP_AUTHORITY_INVALID', 'absence container must be a non-symlink directory');
       }
-      const identity = filesystemIdentity(stat, DIRECTORY_TYPE);
+      let physicalAncestor;
+      try { physicalAncestor = api.normalize(realpathNative(fs, cursor)); } catch (cause) {
+        throw authorityError('SETUP_AUTHORITY_INVALID', 'absence container cannot be canonicalized', cause);
+      }
+      let physicalStat;
+      try { physicalStat = fs.lstatSync(physicalAncestor, { bigint: true }); } catch (cause) {
+        throw authorityError('SETUP_AUTHORITY_INVALID', 'physical absence container cannot be inspected', cause);
+      }
+      if (physicalStat.isSymbolicLink() || !physicalStat.isDirectory()) {
+        throw authorityError('SETUP_AUTHORITY_INVALID', 'physical absence container must be a non-symlink directory');
+      }
+      const identity = filesystemIdentity(physicalStat, DIRECTORY_TYPE);
       if (!identity) throw authorityError('SETUP_AUTHORITY_INVALID', 'absence container identity is unavailable');
       const suffix = api.relative(cursor, target);
       if (!suffix || api.isAbsolute(suffix) || suffix.split(api.sep).includes('..')) {
         throw authorityError('SETUP_AUTHORITY_INVALID', 'absence suffix is invalid');
       }
+      const physicalTarget = api.normalize(api.join(physicalAncestor, suffix));
       return {
-        path: target,
+        path: physicalTarget,
         state: 'absent',
-        ancestor_path: cursor,
+        ancestor_path: physicalAncestor,
         ancestor_identity: serializeIdentity(identity),
         relative_suffix: api.normalize(suffix),
       };
@@ -489,7 +501,7 @@ function validateAuthority(value) {
       || authorityEvidence(value) !== value.evidence_sha256) return null;
   if (value.state !== 'committed' && (!validateOwner(value.owner)
       || !OPERATION_ID_RE.test(value.operation_id)
-      || !isNormalizedAbsolute(value.selected_target))) return null;
+      || !(value.selected_target === null || isNormalizedAbsolute(value.selected_target)))) return null;
   if (value.state === 'rebind_pending' && (
     !isNormalizedAbsolute(value.previous_root)
       || !Array.isArray(value.allowed_route_created)
@@ -818,7 +830,7 @@ function newPending({ generation, state = 'pending', previousRoot, root, owner, 
     wiki_root: root,
     owner,
     operation_id: operationId,
-    selected_target: selectedTarget || candidates[0].path,
+    selected_target: selectedTarget,
     candidates,
     candidate_permits: [],
     requested_wiki_claim: claim,
@@ -898,6 +910,7 @@ function coordinateSetup(options = {}, actions = {}) {
   try {
     let preflight = setupPreflight(normalizedOptions, home);
     let authority = loadSetupAuthority(home.path, { fs });
+    let committedReentry = false;
     const oldRoot = normalizeOldRoot(options.rebindAuthorityFrom, {
       platform, home: home.path,
     });
@@ -925,25 +938,32 @@ function coordinateSetup(options = {}, actions = {}) {
     } else if (authority.state === 'committed') {
       if (samePath(authority.wiki_root, requestedRoot, platform)) {
         if (oldRoot !== null) throw authorityError('SETUP_AUTHORITY_CONFLICT', 'same-root setup is not a rebind');
-        revalidateRequestedWikiClaim(authority.requested_wiki_claim, { fs, platform });
-        const union = revalidateCandidateUnion(
-          authority, authorityEnv, home.path, preflight.selected.target, { fs, platform },
-        );
-        if (union.length !== authority.candidates.length) {
-          authority = publishAuthority({
-            home: home.path,
-            homeIdentity: home.identity,
-            expected: authority,
-            reservationToken: owner.token,
-            fs,
-            record: canonicalRecord({
-              ...authority,
-              generation: authority.generation + 1,
-              candidates: union,
-              evidence_sha256: '0'.repeat(64),
-            }),
-          });
+        if (preflight.requested.claim.claim_state !== 'present') {
+          throw authorityError('SETUP_AUTHORITY_RECOVERY_REQUIRED', 'committed wiki root is absent');
         }
+        const candidates = sealCandidateVector(
+          authorityEnv, home.path, preflight.selected.target, { fs, platform },
+        );
+        if (candidates.some((candidate) => candidate.state === 'present'
+            && !samePath(candidate.wiki_root, requestedRoot, platform))) {
+          throw authorityError('SETUP_AUTHORITY_CONFLICT', 'a global candidate names another committed wiki root');
+        }
+        authority = publishAuthority({
+          home: home.path,
+          homeIdentity: home.identity,
+          expected: authority,
+          reservationToken: owner.token,
+          fs,
+          record: canonicalRecord({
+            ...authority,
+            generation: authority.generation + 1,
+            candidates,
+            candidate_permits: [],
+            requested_wiki_claim: preflight.requested.claim,
+            evidence_sha256: '0'.repeat(64),
+          }),
+        });
+        committedReentry = true;
       } else {
         if (oldRoot === null || !samePath(oldRoot, authority.wiki_root, platform)) {
           throw authorityError('SETUP_AUTHORITY_CONFLICT', 'requested root disagrees with committed setup authority');
@@ -1003,7 +1023,10 @@ function coordinateSetup(options = {}, actions = {}) {
       );
       revalidateRequestedWikiClaim(authority.requested_wiki_claim, { fs, platform });
       if (authority.state === 'rebind_pending'
-          && !samePath(preflight.selected.target, authority.selected_target, platform)) {
+          && (authority.selected_target === null
+            ? preflight.selected.target !== null
+            : preflight.selected.target === null
+              || !samePath(preflight.selected.target, authority.selected_target, platform))) {
         throw authorityError('SETUP_AUTHORITY_RECOVERY_REQUIRED', 'rebind_pending selected target changed');
       }
       if (authority.state === 'pending' && union.length !== authority.candidates.length) {
@@ -1081,23 +1104,25 @@ function coordinateSetup(options = {}, actions = {}) {
           desiredConfigText: setupConfigText(requestedRoot, preflight.global),
           replaceConfig: options.replaceConfig === true,
         });
-        const permit = candidatePermit(authority, config.path, authority.operation_id, owner, fs);
-        authority = publishAuthority({
-          home: home.path,
-          homeIdentity: home.identity,
-          expected: authority,
-          reservationToken: owner.token,
-          fs,
-          record: canonicalRecord({
-            ...authority,
-            candidate_permits: [
-              ...authority.candidate_permits.filter((entry) => !samePath(entry.path, permit.path, platform)),
-              permit,
-            ],
-            evidence_sha256: '0'.repeat(64),
-          }),
-        });
-        if (typeof options.faultInjector === 'function') options.faultInjector('after-candidate-permit');
+        if (!committedReentry) {
+          const permit = candidatePermit(authority, config.path, authority.operation_id, owner, fs);
+          authority = publishAuthority({
+            home: home.path,
+            homeIdentity: home.identity,
+            expected: authority,
+            reservationToken: owner.token,
+            fs,
+            record: canonicalRecord({
+              ...authority,
+              candidate_permits: [
+                ...authority.candidate_permits.filter((entry) => !samePath(entry.path, permit.path, platform)),
+                permit,
+              ],
+              evidence_sha256: '0'.repeat(64),
+            }),
+          });
+          if (typeof options.faultInjector === 'function') options.faultInjector('after-candidate-permit');
+        }
       }
     }
     const postGlobal = resolvedGlobal(authorityEnv, fs);
@@ -1105,17 +1130,19 @@ function coordinateSetup(options = {}, actions = {}) {
       throw authorityError('SETUP_AUTHORITY_RECOVERY_REQUIRED', 'post-publication global resolution did not converge');
     }
     revalidateRequestedWikiClaim(authority.requested_wiki_claim, { fs, platform });
-    revalidateCandidateEvidence(authority, { fs, platform });
-    const committedCandidates = sealCandidateVector(authorityEnv, home.path, preflight.selected.target, { fs, platform });
-    authority = publishAuthority({
-      home: home.path,
-      homeIdentity: home.identity,
-      expected: authority,
-      reservationToken: owner.token,
-      fs,
-      record: committedFrom(authority, realpathNative(fs, requestedRoot), committedCandidates),
-    });
-    output = { result, config, authority };
+    if (!committedReentry) {
+      revalidateCandidateEvidence(authority, { fs, platform });
+      const committedCandidates = sealCandidateVector(authorityEnv, home.path, preflight.selected.target, { fs, platform });
+      authority = publishAuthority({
+        home: home.path,
+        homeIdentity: home.identity,
+        expected: authority,
+        reservationToken: owner.token,
+        fs,
+        record: committedFrom(authority, realpathNative(fs, requestedRoot), committedCandidates),
+      });
+    }
+    output = { result, config, authority, migrationEligible: postGlobal !== null };
   } catch (error) {
     primaryError = error;
   }

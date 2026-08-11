@@ -102,6 +102,44 @@ test('setup through a home symlink publishes only in the sealed physical-home do
   assert.equal(fs.existsSync(path.join(aliasHome, RESERVATION_DIRECTORY)), false);
 });
 
+test('setup returns only the committed root decision and generation from durable authority', () => {
+  const home = fixture('deep wiki redacted authority home ');
+  const vault = fixture('deep wiki redacted authority vault ');
+  const wiki = path.join(vault, 'wiki');
+
+  const result = setup(home, wiki);
+
+  assert.deepEqual(result.authority, {
+    wiki_root: fs.realpathSync.native(wiki),
+    generation: 1,
+  });
+  assert.doesNotMatch(JSON.stringify(result.authority), new RegExp(home.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.equal(Object.hasOwn(result.authority, 'owner'), false);
+  assert.equal(Object.hasOwn(result.authority, 'candidates'), false);
+  assert.equal(Object.hasOwn(result.authority, 'requested_wiki_claim'), false);
+});
+
+test('an absent requested wiki below a symlinked container is claimed in the physical path domain', () => {
+  const home = fixture('deep wiki physical requested root ');
+  const physicalVault = path.join(home, 'physical-vault');
+  const existingContainer = path.join(physicalVault, 'existing');
+  const aliasVault = path.join(home, 'alias-vault');
+  fs.mkdirSync(existingContainer, { recursive: true });
+  fs.symlinkSync(physicalVault, aliasVault, 'dir');
+  const requestedWiki = path.join(aliasVault, 'existing', 'nested', 'wiki');
+  const physicalWiki = path.join(existingContainer, 'nested', 'wiki');
+
+  const result = setup(home, requestedWiki);
+  const authority = loadSetupAuthority(home);
+
+  assert.equal(result.authority.wiki_root, fs.realpathSync.native(physicalWiki));
+  assert.equal(authority.wiki_root, fs.realpathSync.native(physicalWiki));
+  assert.equal(authority.requested_wiki_claim.path, fs.realpathSync.native(physicalWiki));
+  assert.match(authority.requested_wiki_claim.route_created_permit.owner_token, /^[a-f0-9]{64}$/);
+  assert.equal(fs.existsSync(path.join(physicalWiki, 'pages', 'welcome.md')), true);
+  assert.equal(setup(home, requestedWiki).status, 'compatible');
+});
+
 test('authority loading rejects noncanonical, duplicate, oversized, and identity-changing records', () => {
   const home = fixture('deep wiki authority parse ');
   const file = authorityPath(home);
@@ -187,21 +225,104 @@ test('first install publishes one canonical committed authority with an owner-bo
   const home = fixture('deep wiki first install ');
   const wiki = path.join(home, 'Vault', 'Wiki');
   const result = setup(home, wiki);
-  assert.equal(result.authority.state, 'committed');
+  const authority = loadSetupAuthority(home);
+  assert.equal(authority.state, 'committed');
   assert.equal(result.authority.generation, 1);
   assert.equal(result.authority.wiki_root, fs.realpathSync.native(wiki));
-  assert.equal(result.authority.requested_wiki_claim.claim_state, 'absent');
-  assert.match(result.authority.requested_wiki_claim.route_created_permit.owner_token, /^[a-f0-9]{64}$/);
+  assert.equal(authority.requested_wiki_claim.claim_state, 'absent');
+  assert.match(authority.requested_wiki_claim.route_created_permit.owner_token, /^[a-f0-9]{64}$/);
   assert.equal(
-    result.authority.requested_wiki_claim.route_created_permit.operation_id,
+    authority.requested_wiki_claim.route_created_permit.operation_id,
     '01K2CP8QT0B2D2QCR6HVG8YM01',
   );
-  assert.equal(result.authority.candidates.some((entry) => (
+  assert.equal(authority.candidates.some((entry) => (
     entry.path === path.join(home, '.codex', 'deep-wiki-config.yaml') && entry.state === 'present'
   )), true);
   assert.equal(fs.existsSync(path.join(home, RESERVATION_DIRECTORY)), false);
-  assert.deepEqual(loadSetupAuthority(home), result.authority);
-  assert.deepEqual(fs.readFileSync(authorityPath(home)), Buffer.from(`${JSON.stringify(result.authority)}\n`));
+  assert.deepEqual(fs.readFileSync(authorityPath(home)), Buffer.from(`${JSON.stringify(authority)}\n`));
+});
+
+test('committed same-root setup can publish a second host alias without a pending operation identity', () => {
+  const home = fixture('deep wiki dual host setup ');
+  const wiki = path.join(home, 'wiki');
+  setup(home, wiki, { configHost: 'codex' });
+
+  const second = setup(home, wiki, {
+    configHost: 'claude',
+    operationId: '01K2CP8QT0B2D2QCR6HVG8YM0D',
+    eventId: '01K2CP8QT0B2D2QCR6HVG8YM0E',
+  });
+
+  assert.equal(second.status, 'compatible');
+  assert.equal(second.config.path, path.join(home, '.claude', 'deep-wiki-config.yaml'));
+  assert.equal(fs.existsSync(path.join(home, '.codex', 'deep-wiki-config.yaml')), true);
+  assert.equal(fs.existsSync(path.join(home, '.claude', 'deep-wiki-config.yaml')), true);
+  assert.equal(loadSetupAuthority(home).state, 'committed');
+});
+
+test('committed same-root setup accepts documented removal of legacy global auto_ingest', () => {
+  const home = fixture('deep wiki committed global cleanup ');
+  const wiki = path.join(home, 'wiki');
+  const global = path.join(home, '.codex', 'deep-wiki-config.yaml');
+  fs.mkdirSync(path.dirname(global), { recursive: true });
+  fs.writeFileSync(global, [
+    `wiki_root: "${wiki}"`,
+    'auto_ingest:',
+    '  ignore_globs: ["private/**"]',
+    '  require_tag: public',
+    '',
+  ].join('\n'));
+  setup(home, wiki);
+
+  fs.writeFileSync(global, `wiki_root: "${wiki}"\n`);
+
+  assert.equal(setup(home, wiki).status, 'compatible');
+  assert.equal(loadSetupAuthority(home).state, 'committed');
+});
+
+test('committed same-root setup accepts a semantically valid manual global config edit', () => {
+  const home = fixture('deep wiki committed global edit ');
+  const wiki = path.join(home, 'wiki');
+  const global = path.join(home, '.codex', 'deep-wiki-config.yaml');
+  setup(home, wiki);
+
+  fs.writeFileSync(global, [
+    `wiki_root: "${wiki}"`,
+    'obsidian_cli:',
+    '  available: true',
+    `  vault_path: "${home}"`,
+    '  wiki_prefix: wiki',
+    '',
+  ].join('\n'));
+
+  assert.equal(setup(home, wiki).status, 'compatible');
+  assert.equal(loadSetupAuthority(home).state, 'committed');
+});
+
+test('committed same-root setup accepts a hand-added second alias for the same root', () => {
+  const home = fixture('deep wiki committed second alias ');
+  const wiki = path.join(home, 'wiki');
+  const claude = path.join(home, '.claude', 'deep-wiki-config.yaml');
+  setup(home, wiki);
+  fs.mkdirSync(path.dirname(claude), { recursive: true });
+  fs.writeFileSync(claude, `wiki_root: "${wiki}"\n`);
+
+  assert.equal(setup(home, wiki).status, 'compatible');
+  assert.equal(loadSetupAuthority(home).state, 'committed');
+});
+
+test('committed same-root setup accepts an authenticated backup restore at the sealed root', () => {
+  const home = fixture('deep wiki committed restore ');
+  const wiki = path.join(home, 'wiki');
+  const backup = path.join(home, 'wiki-backup');
+  setup(home, wiki);
+  const originalIdentity = fs.lstatSync(wiki, { bigint: true }).ino;
+  fs.renameSync(wiki, backup);
+  fs.cpSync(backup, wiki, { recursive: true });
+  assert.notEqual(fs.lstatSync(wiki, { bigint: true }).ino, originalIdentity);
+
+  assert.equal(setup(home, wiki).status, 'compatible');
+  assert.equal(loadSetupAuthority(home).state, 'committed');
 });
 
 test('a durable authority rejects a different requested root even when its custom winning target is no longer enumerated', () => {
@@ -356,13 +477,76 @@ test('a published absent-to-present permit resumes, but later re-absence fails c
     },
   }), /stop after permit/);
   const resumed = setup(home, wiki);
-  assert.equal(resumed.authority.state, 'committed');
+  assert.equal(loadSetupAuthority(home).state, 'committed');
+  assert.equal(resumed.authority.wiki_root, fs.realpathSync.native(wiki));
   fs.rmSync(wiki, { recursive: true });
   assert.throws(
     () => setup(home, wiki),
     (error) => error.code === 'SETUP_AUTHORITY_RECOVERY_REQUIRED',
   );
   assert.equal(fs.existsSync(wiki), false);
+});
+
+test('rebind_pending without a selected config host preserves a null target and resumes safely', () => {
+  const home = fixture('deep wiki hostless rebind ');
+  const oldWiki = path.join(home, 'wiki-a');
+  const newWiki = path.join(home, 'wiki-b');
+  const global = path.join(home, '.codex', 'deep-wiki-config.yaml');
+  setup(home, oldWiki);
+  fs.rmSync(oldWiki, { recursive: true });
+  fs.writeFileSync(global, `wiki_root: "${newWiki}"\n`);
+
+  assert.throws(() => setupWiki({
+    wikiRoot: newWiki,
+    rebindAuthorityFrom: oldWiki,
+    env: envFor(home),
+    now: new Date(TS),
+    operationId: '01K2CP8QT0B2D2QCR6HVG8YM0F',
+    eventId: '01K2CP8QT0B2D2QCR6HVG8YM0G',
+    faultInjector(boundary) {
+      if (boundary === 'after-rebind-pending') throw new Error('stop hostless rebind');
+    },
+  }), /stop hostless rebind/);
+  assert.equal(loadSetupAuthority(home).selected_target, null);
+
+  const resumed = setupWiki({
+    wikiRoot: newWiki,
+    rebindAuthorityFrom: oldWiki,
+    env: envFor(home),
+    now: new Date(TS),
+    operationId: '01K2CP8QT0B2D2QCR6HVG8YM0H',
+    eventId: '01K2CP8QT0B2D2QCR6HVG8YM0J',
+  });
+  assert.equal(fs.existsSync(path.join(newWiki, 'pages', 'welcome.md')), true);
+  assert.equal(resumed.authority.wiki_root, fs.realpathSync.native(newWiki));
+});
+
+test('setup without a selected config host still migrates an eligible legacy policy', () => {
+  const home = fixture('deep wiki hostless migration ');
+  const wiki = path.join(home, 'wiki');
+  const global = path.join(home, '.codex', 'deep-wiki-config.yaml');
+  fs.mkdirSync(path.dirname(global), { recursive: true });
+  fs.writeFileSync(global, [
+    `wiki_root: "${wiki}"`,
+    'auto_ingest:',
+    '  ignore_globs: ["private/**"]',
+    '  require_tag: public',
+    '',
+  ].join('\n'));
+
+  const result = setupWiki({
+    wikiRoot: wiki,
+    env: envFor(home),
+    now: new Date(TS),
+    operationId: '01K2CP8QT0B2D2QCR6HVG8YM0K',
+    eventId: '01K2CP8QT0B2D2QCR6HVG8YM0M',
+  });
+
+  assert.equal(result.migration.status, 'migrated');
+  assert.deepEqual(
+    JSON.parse(fs.readFileSync(path.join(wiki, '.wiki-meta', '.config.json'), 'utf8')),
+    { auto_ingest: { ignore_globs: ['private/**'], require_tag: 'public' } },
+  );
 });
 
 test('explicit rebind requires exact old-root authorization and never restores A after rebind_pending publication', () => {
@@ -393,7 +577,7 @@ test('explicit rebind requires exact old-root authorization and never restores A
   );
   assert.equal(loadSetupAuthority(home).state, 'rebind_pending');
   const completed = setup(home, newWiki, { rebindAuthorityFrom: oldWiki });
-  assert.equal(completed.authority.state, 'committed');
+  assert.equal(loadSetupAuthority(home).state, 'committed');
   assert.equal(completed.authority.generation, 2);
   assert.equal(completed.authority.wiki_root, fs.realpathSync.native(newWiki));
 });
@@ -411,8 +595,9 @@ test('explicit rebind preserves a sealed pre-existing B wiki without inventing a
     `wiki_root: "${newWiki}"\n`,
   );
   const result = setup(home, newWiki, { rebindAuthorityFrom: oldWiki });
+  const authority = loadSetupAuthority(home);
   assert.equal(result.status, 'compatible');
   assert.equal(result.authority.generation, 2);
-  assert.equal(result.authority.requested_wiki_claim.claim_state, 'present');
-  assert.equal(result.authority.requested_wiki_claim.route_created_permit, null);
+  assert.equal(authority.requested_wiki_claim.claim_state, 'present');
+  assert.equal(authority.requested_wiki_claim.route_created_permit, null);
 });

@@ -1385,10 +1385,13 @@ function setupWiki(options = {}) {
   });
   const result = {
     ...coordinated.result,
-    authority: coordinated.authority,
+    authority: {
+      wiki_root: coordinated.authority.wiki_root,
+      generation: coordinated.authority.generation,
+    },
   };
   if (coordinated.config) result.config = coordinated.config;
-  if (options.configHost) {
+  if (coordinated.migrationEligible) {
     result.migration = migrateAutoIngestPolicy({
       env: options.env || process.env,
       wikiRoot: coordinated.authority.wiki_root,

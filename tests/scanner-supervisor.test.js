@@ -42,6 +42,48 @@ function temporaryRoot(prefix) {
   return value;
 }
 
+function writeYamlConfig(file, wikiRoot, autoIngest) {
+  const lines = [
+    `wiki_root: ${JSON.stringify(wikiRoot)}`,
+    'obsidian_cli:',
+    '  available: false',
+  ];
+  if (autoIngest) {
+    lines.push('auto_ingest:');
+    lines.push(`  ignore_globs: ${JSON.stringify(autoIngest.ignoreGlobs || [])}`);
+    if (autoIngest.requireTag) lines.push(`  require_tag: ${JSON.stringify(autoIngest.requireTag)}`);
+  }
+  fs.writeFileSync(file, `${lines.join('\n')}\n`, 'utf8');
+}
+
+function writeLocalConfig(wikiRoot, autoIngest) {
+  fs.mkdirSync(path.join(wikiRoot, '.wiki-meta'), { recursive: true });
+  const output = { auto_ingest: { ignore_globs: autoIngest.ignoreGlobs || [] } };
+  if (autoIngest.requireTag) output.auto_ingest.require_tag = autoIngest.requireTag;
+  fs.writeFileSync(path.join(wikiRoot, '.wiki-meta', '.config.json'), `${JSON.stringify(output, null, 2)}\n`);
+}
+
+function supervisorEnv(base, extra = {}, configOptions = {}) {
+  const wikiRoot = configOptions.wikiRoot || path.join(base, 'policy-wiki');
+  fs.mkdirSync(path.join(wikiRoot, '.wiki-meta'), { recursive: true });
+  const configPath = path.join(base, 'deep-wiki-config.yaml');
+  writeYamlConfig(configPath, wikiRoot, configOptions.autoIngest);
+  if (configOptions.localAutoIngest) writeLocalConfig(wikiRoot, configOptions.localAutoIngest);
+  const env = {
+    PATH: process.env.PATH,
+    SystemRoot: process.env.SystemRoot,
+    HOME: base,
+    DEEP_WIKI_CONFIG: configPath,
+    DEEP_WIKI_EXPECTED_POLICY_SOURCE: 'inherited-garbage',
+    DEEP_WIKI_EXPECTED_POLICY_SHA256: 'not-a-sha',
+    ...extra,
+  };
+  for (const key of Object.keys(env)) {
+    if (env[key] === undefined) delete env[key];
+  }
+  return { env, wikiRoot, configPath };
+}
+
 test.after(() => {
   for (const value of roots) fs.rmSync(value, { recursive: true, force: true });
 });
@@ -65,8 +107,11 @@ test('supervisor owns a 12-second cap and validates one exact newline-terminated
   const calls = [];
   const output = await runSupervisor({
     workerPath: fixturePath,
-    timeoutMs: 1000,
-    env: { ...process.env, SCANNER_FIXTURE_MODE: 'valid', SCANNER_RESULT_JSON: JSON.stringify(result) },
+    timeoutMs: 3_000,
+    env: supervisorEnv(base, {
+      SCANNER_FIXTURE_MODE: 'valid',
+      SCANNER_RESULT_JSON: JSON.stringify(result),
+    }).env,
     ensurePendingScan(options) { calls.push(options); return { status: 'created' }; },
   });
   assert.equal(PARENT_BUDGET_MS, 12_000);
@@ -84,12 +129,11 @@ test('hook boundary wraps detected files in the shared SessionStart JSON contrac
   const stdout = [];
   const status = await hookMain({
     workerPath: fixturePath,
-    timeoutMs: 1000,
-    env: {
-      ...process.env,
+    timeoutMs: 3_000,
+    env: supervisorEnv(base, {
       SCANNER_FIXTURE_MODE: 'valid',
       SCANNER_RESULT_JSON: JSON.stringify(validResult(base)),
-    },
+    }).env,
     ensurePendingScan() { return { status: 'created' }; },
     stdout: { write(value) { stdout.push(value); } },
   });
@@ -108,14 +152,13 @@ test('parent deadline remains authoritative through persistence and before outpu
   await assert.rejects(
     runSupervisor({
       workerPath: fixturePath,
-      timeoutMs: 1_000,
-      env: {
-        ...process.env,
+      timeoutMs: 3_000,
+      env: supervisorEnv(base, {
         SCANNER_FIXTURE_MODE: 'valid',
         SCANNER_RESULT_JSON: JSON.stringify(validResult(base)),
-      },
+      }).env,
       ensurePendingScan() {
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1_500);
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 3_100);
         return { status: 'created' };
       },
     }),
@@ -132,12 +175,11 @@ for (const mode of ['hang', 'partial', 'stderr', 'malformed', 'missing', 'oversi
     let ensureCalls = 0;
     const status = await hookMain({
       workerPath: fixturePath,
-      timeoutMs: mode === 'hang' ? 50 : 1000,
-      env: {
-        ...process.env,
+      timeoutMs: mode === 'hang' ? 2_050 : 3_000,
+      env: supervisorEnv(base, {
         SCANNER_FIXTURE_MODE: mode,
         SCANNER_RESULT_JSON: JSON.stringify(validResult(base)),
-      },
+      }).env,
       ensurePendingScan() { ensureCalls += 1; return { status: 'created' }; },
       stdout: { write(value) { stdout.push(value); } },
       stderr: { write(value) { stderr.push(value); } },
@@ -155,12 +197,11 @@ test('timeout kills the complete POSIX worker tree', { skip: process.platform ==
   const pidFile = path.join(base, 'grandchild.pid');
   await hookMain({
     workerPath: fixturePath,
-    timeoutMs: 1_000,
-    env: {
-      ...process.env,
+    timeoutMs: 3_000,
+    env: supervisorEnv(base, {
       SCANNER_FIXTURE_MODE: 'grandchild-hang',
       SCANNER_GRANDCHILD_PID_FILE: pidFile,
-    },
+    }).env,
     ensurePendingScan() { throw new Error('must not persist'); },
     stdout: { write() { throw new Error('must stay quiet'); } },
     stderr: { write() { throw new Error('must stay quiet'); } },
@@ -180,18 +221,17 @@ test('persistence timeout kills its worker and reclaims only that worker lock', 
   const pidFile = path.join(base, 'persist-worker.pid');
   const events = [];
   fs.mkdirSync(result.wiki_root, { recursive: true });
-  const env = {
-    ...process.env,
+  const env = supervisorEnv(base, {
     SCANNER_FIXTURE_MODE: 'valid',
     SCANNER_RESULT_JSON: JSON.stringify(result),
     PERSIST_FIXTURE_MODE: 'hang-after-lock',
     PERSIST_LOCK_PID_FILE: pidFile,
-  };
+  }).env;
 
   const status = await hookMain({
     workerPath: fixturePath,
     persistWorkerPath: persistFixturePath,
-    timeoutMs: 2_000,
+    timeoutMs: 3_000,
     env,
     async terminateWorkerTree(child, options) {
       const childPid = child.pid;
@@ -235,9 +275,9 @@ test('persistence child success preserves exact hook stdout and releases its loc
   const status = await hookMain({
     workerPath: fixturePath,
     persistWorkerPath: persistFixturePath,
-    timeoutMs: 2_000,
+    timeoutMs: 3_000,
     env: {
-      ...process.env,
+      ...supervisorEnv(base).env,
       SCANNER_FIXTURE_MODE: 'valid',
       SCANNER_RESULT_JSON: JSON.stringify(result),
       PERSIST_FIXTURE_MODE: 'success',
@@ -287,12 +327,11 @@ for (const mode of ['malformed-grandchild-hang', 'missing-grandchild-hang', 'non
     const pidFile = path.join(base, 'grandchild.pid');
     await hookMain({
       workerPath: fixturePath,
-      timeoutMs: 1_000,
-      env: {
-        ...process.env,
+      timeoutMs: 3_000,
+      env: supervisorEnv(base, {
         SCANNER_FIXTURE_MODE: mode,
         SCANNER_GRANDCHILD_PID_FILE: pidFile,
-      },
+      }).env,
       ensurePendingScan() { throw new Error('must not persist'); },
       stdout: { write() { throw new Error('must stay quiet'); } },
       stderr: { write() { throw new Error('must stay quiet'); } },
@@ -314,13 +353,12 @@ for (const mode of ['partial-grandchild-exit', 'missing-grandchild-exit', 'nonze
     try {
       await hookMain({
         workerPath: fixturePath,
-        timeoutMs: 1000,
-        env: {
-          ...process.env,
+        timeoutMs: 3_000,
+        env: supervisorEnv(base, {
           SCANNER_FIXTURE_MODE: mode,
           SCANNER_RESULT_JSON: JSON.stringify(validResult(base)),
           SCANNER_GRANDCHILD_PID_FILE: pidFile,
-        },
+        }).env,
         ensurePendingScan() { throw new Error('must not persist'); },
         stdout: { write() { throw new Error('must stay quiet'); } },
         stderr: { write() { throw new Error('must stay quiet'); } },
@@ -408,6 +446,155 @@ test('persistence refuses a sub-millisecond remainder instead of dispatching equ
     () => persistenceBudgets(deadline),
     (error) => error.code === 'DEADLINE_EXCEEDED',
   );
+});
+
+test('supervisor migrates legacy auto-ingest before spawning and overwrites inherited policy proof', async () => {
+  const { runSupervisor } = require(supervisorPath);
+  const base = temporaryRoot('deep wiki supervisor migration proof ');
+  const vaultRoot = path.join(base, 'vault');
+  const wikiRoot = path.join(vaultRoot, 'wiki');
+  fs.mkdirSync(path.join(wikiRoot, '.wiki-meta'), { recursive: true });
+  fs.mkdirSync(path.join(vaultRoot, 'legacy'), { recursive: true });
+  fs.mkdirSync(path.join(vaultRoot, 'notes'), { recursive: true });
+  fs.writeFileSync(path.join(vaultRoot, 'legacy', 'drop.md'), '# drop\n');
+  fs.writeFileSync(path.join(vaultRoot, 'notes', 'keep.md'), '# keep\n');
+  const { env } = supervisorEnv(base, {}, {
+    wikiRoot,
+    autoIngest: { ignoreGlobs: ['legacy/**'] },
+  });
+
+  const output = await runSupervisor({
+    workerPath,
+    timeoutMs: 12_000,
+    env,
+    ensurePendingScan() { return { status: 'created' }; },
+  });
+
+  assert.match(output, /notes\/keep\.md/);
+  assert.doesNotMatch(output, /legacy\/drop\.md/);
+  const localConfig = JSON.parse(fs.readFileSync(path.join(wikiRoot, '.wiki-meta', '.config.json'), 'utf8'));
+  assert.deepEqual(localConfig.auto_ingest.ignore_globs, ['legacy/**']);
+});
+
+test('supervisor fails closed before worker spawn on hard wiki-local policy errors', async () => {
+  const { runSupervisor } = require(supervisorPath);
+  const base = temporaryRoot('deep wiki supervisor hard local error ');
+  const wikiRoot = path.join(base, 'wiki');
+  const { env } = supervisorEnv(base, {
+    SCANNER_FIXTURE_MODE: 'valid',
+    SCANNER_RESULT_JSON: JSON.stringify(validResult(base)),
+  }, { wikiRoot, autoIngest: { ignoreGlobs: ['legacy/**'] } });
+  fs.writeFileSync(path.join(wikiRoot, '.wiki-meta', '.config.json'), '{"auto_ingest":{"ignore_globs":[1]}}\n');
+  let persisted = false;
+
+  await assert.rejects(
+    runSupervisor({
+      workerPath: fixturePath,
+      timeoutMs: 12_000,
+      env,
+      ensurePendingScan() { persisted = true; return { status: 'created' }; },
+    }),
+    /auto_ingest\.ignore_globs/,
+  );
+  assert.equal(persisted, false);
+});
+
+test('supervisor scans with validated legacy policy when migration is lock-deferred', async () => {
+  const { runSupervisor } = require(supervisorPath);
+  const { acquireLock, releaseLock } = require('../hooks/scripts/runtime/lock.js');
+  const base = temporaryRoot('deep wiki supervisor migration deferred ');
+  const vaultRoot = path.join(base, 'vault');
+  const wikiRoot = path.join(vaultRoot, 'wiki');
+  fs.mkdirSync(path.join(wikiRoot, '.wiki-meta'), { recursive: true });
+  fs.mkdirSync(path.join(vaultRoot, 'legacy'), { recursive: true });
+  fs.mkdirSync(path.join(vaultRoot, 'notes'), { recursive: true });
+  fs.writeFileSync(path.join(vaultRoot, 'legacy', 'drop.md'), '# drop\n');
+  fs.writeFileSync(path.join(vaultRoot, 'notes', 'keep.md'), '# keep\n');
+  const { env } = supervisorEnv(base, {}, {
+    wikiRoot,
+    autoIngest: { ignoreGlobs: ['legacy/**'] },
+  });
+  const owner = acquireLock({ wikiRoot, operation: 'test-lock-defers-migration' });
+  let persisted = false;
+  try {
+    const output = await runSupervisor({
+      workerPath,
+      timeoutMs: 12_000,
+      env,
+      ensurePendingScan() { persisted = true; return { status: 'created' }; },
+    });
+    assert.match(output, /notes\/keep\.md/);
+    assert.doesNotMatch(output, /legacy\/drop\.md/);
+    assert.equal(fs.existsSync(path.join(wikiRoot, '.wiki-meta', '.config.json')), false);
+    assert.equal(persisted, true);
+  } finally {
+    releaseLock({ wikiRoot, token: owner.token });
+  }
+});
+
+test('worker rejects malformed or mismatched supervisor policy proof before walking the vault', () => {
+  const { workerMain } = require(workerPath);
+  const { canonicalPolicyDigest } = require('../hooks/scripts/runtime/config.js');
+  const base = temporaryRoot('deep wiki worker proof ');
+  const vaultRoot = path.join(base, 'vault');
+  const wikiRoot = path.join(vaultRoot, 'wiki');
+  fs.mkdirSync(path.join(wikiRoot, '.wiki-meta'), { recursive: true });
+  fs.writeFileSync(path.join(vaultRoot, 'note.md'), '# note\n');
+  const { env } = supervisorEnv(base, {}, { wikiRoot });
+  const goodDigest = canonicalPolicyDigest({ ignoreGlobs: [], requireTag: null });
+  const cases = [
+    ['missing source', { DEEP_WIKI_EXPECTED_POLICY_SHA256: goodDigest }],
+    ['malformed source', { DEEP_WIKI_EXPECTED_POLICY_SOURCE: 'global_legacy,wiki_local', DEEP_WIKI_EXPECTED_POLICY_SHA256: goodDigest }],
+    ['digest mismatch', { DEEP_WIKI_EXPECTED_POLICY_SOURCE: 'default', DEEP_WIKI_EXPECTED_POLICY_SHA256: '0'.repeat(64) }],
+  ];
+  for (const [name, proof] of cases) {
+    const originalEnv = process.env;
+    const originalStdout = process.stdout.write;
+    const originalReaddir = fs.readdirSync;
+    let walked = false;
+    const stdout = [];
+    try {
+      process.env = { ...env, ...proof };
+      process.stdout.write = (value) => { stdout.push(value); return true; };
+      fs.readdirSync = function readdirGuard(directory, options) {
+        if (directory === vaultRoot) walked = true;
+        return originalReaddir.call(this, directory, options);
+      };
+      assert.throws(() => workerMain(), /policy proof|policy source|policy digest/, name);
+      assert.equal(walked, false, name);
+      assert.deepEqual(stdout, [], name);
+    } finally {
+      fs.readdirSync = originalReaddir;
+      process.stdout.write = originalStdout;
+      process.env = originalEnv;
+    }
+  }
+});
+
+test('parent-anchored deadline arithmetic preserves migration, scan, termination, and persistence reserves', () => {
+  const {
+    MIGRATION_BUDGET_MS,
+    SCAN_CUTOFF_RESERVE_MS,
+    PERSISTENCE_EXECUTION_RESERVE_MS,
+    WINDOWS_TERMINATION_RESERVE_MS,
+    migrationBudgetMs,
+    scannerWorkerBudgetMs,
+    persistenceBudgets,
+  } = require(supervisorPath);
+  const { createDeadline } = require('../hooks/scripts/runtime/deadline.js');
+  let nowMs = 0;
+  const deadline = createDeadline({ clock: { nowMs: () => nowMs }, budgetMs: 12_000 });
+
+  assert.equal(MIGRATION_BUDGET_MS, 2_000);
+  assert.equal(SCAN_CUTOFF_RESERVE_MS, 2_000);
+  assert.equal(WINDOWS_TERMINATION_RESERVE_MS, 1_250);
+  assert.equal(PERSISTENCE_EXECUTION_RESERVE_MS, 750);
+  assert.equal(WINDOWS_TERMINATION_RESERVE_MS + PERSISTENCE_EXECUTION_RESERVE_MS, SCAN_CUTOFF_RESERVE_MS);
+  assert.equal(migrationBudgetMs(deadline), 2_000);
+  nowMs = 2_000;
+  assert.equal(scannerWorkerBudgetMs(deadline), 8_000);
+  nowMs = 10_000;
+  assert.deepEqual(persistenceBudgets(deadline), { budgetMs: 750, workerBudgetMs: 750 });
 });
 
 test('parent and worker never write scan-window files directly and child spawn is shell-free', () => {

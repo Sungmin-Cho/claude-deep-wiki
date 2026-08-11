@@ -6,13 +6,18 @@ const path = require('node:path');
 const {
   ISO_UTC_RE,
   compilePortableGlob,
+  canonicalPolicyDigest,
+  loadWikiLocalConfig,
   readFrontmatterTags,
   resolveConfig,
+  resolveEffectivePolicy,
 } = require('./runtime/config.js');
 const { createDeadline, assertBeforeDeadline } = require('./runtime/deadline.js');
 
 const WORKER_BUDGET_MS = 11_000;
 const MAX_FILES = 20;
+const SHA256_RE = /^[0-9a-f]{64}$/;
+const POLICY_SOURCES = new Set(['default', 'global_legacy', 'wiki_local', 'wiki_local_migrated']);
 const EXCLUDED_DIRECTORIES = new Set([
   '.obsidian', '.trash', '.git', '.wiki-meta', 'node_modules',
   '.claude', '.codex', '.ssh', '.gnupg', '.aws', '.azure', '.kube',
@@ -45,6 +50,33 @@ function readTimestamp(file) {
 function isInside(root, candidate) {
   const relative = path.relative(root, candidate);
   return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
+}
+
+function verifySupervisorPolicyProof(resolved, env = process.env) {
+  const expectedSource = env.DEEP_WIKI_EXPECTED_POLICY_SOURCE;
+  const expectedDigest = env.DEEP_WIKI_EXPECTED_POLICY_SHA256;
+  if (typeof expectedSource !== 'string' || !POLICY_SOURCES.has(expectedSource)) {
+    throw new Error('policy proof source is invalid');
+  }
+  if (typeof expectedDigest !== 'string' || !SHA256_RE.test(expectedDigest)) {
+    throw new Error('policy proof digest is invalid');
+  }
+  if (resolved.policy_source !== expectedSource) {
+    throw new Error('policy source transition is not allowed');
+  }
+  if (resolved.policy_digest !== expectedDigest) {
+    throw new Error('policy digest does not match supervisor proof');
+  }
+}
+
+function effectiveAutoIngestPolicy(resolved) {
+  const localConfig = loadWikiLocalConfig(resolved.config.wikiRoot);
+  const effective = resolveEffectivePolicy({ globalConfig: resolved.config, localConfig });
+  if (effective.policySource !== resolved.policy_source
+      || canonicalPolicyDigest(effective.policy) !== resolved.policy_digest) {
+    throw new Error('policy proof resolved state changed before scanning');
+  }
+  return effective.policy;
 }
 
 function scanVault({ vaultRoot, wikiRoot, boundMs, config, deadline }) {
@@ -92,6 +124,10 @@ function workerMain() {
   const detectedAt = canonicalNow();
   const resolved = resolveConfig(process.env);
   assertBeforeDeadline(deadline, 'config-resolved');
+  verifySupervisorPolicyProof(resolved, process.env);
+  assertBeforeDeadline(deadline, 'policy-proof-verified');
+  const autoIngest = effectiveAutoIngestPolicy(resolved);
+  assertBeforeDeadline(deadline, 'effective-policy-resolved');
   const wikiRoot = fs.realpathSync.native(resolved.config.wikiRoot);
   const vaultRoot = fs.realpathSync.native(path.dirname(wikiRoot));
   const meta = path.join(wikiRoot, '.wiki-meta');
@@ -102,7 +138,7 @@ function workerMain() {
     vaultRoot,
     wikiRoot,
     boundMs: Date.parse(bound),
-    config: resolved.config,
+    config: { autoIngest },
     deadline,
   });
   const result = {
@@ -120,4 +156,10 @@ function workerMain() {
 
 if (require.main === module) workerMain();
 
-module.exports = { WORKER_BUDGET_MS, workerMain, scanVault, readTimestamp };
+module.exports = {
+  WORKER_BUDGET_MS,
+  workerMain,
+  scanVault,
+  readTimestamp,
+  verifySupervisorPolicyProof,
+};

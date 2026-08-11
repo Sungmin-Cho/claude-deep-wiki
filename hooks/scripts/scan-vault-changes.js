@@ -12,14 +12,21 @@ const {
   DeadlineExceeded,
 } = require('./runtime/deadline.js');
 const { recoverLock: defaultRecoverLock } = require('./runtime/lock.js');
+const { resolveConfig } = require('./runtime/config.js');
+const { migrateAutoIngestPolicy } = require('./runtime/config-migration.js');
 
 const PARENT_BUDGET_MS = 12_000;
-const PERSISTENCE_GRACE_MS = 250;
+const MIGRATION_BUDGET_MS = 2_000;
+const WINDOWS_TERMINATION_RESERVE_MS = 1_250;
+const PERSISTENCE_EXECUTION_RESERVE_MS = 750;
+const SCAN_CUTOFF_RESERVE_MS = WINDOWS_TERMINATION_RESERVE_MS + PERSISTENCE_EXECUTION_RESERVE_MS;
 const MAX_CAPTURE_BYTES = 1024 * 1024;
 const RESULT_KEYS = [
   'contract_version', 'status', 'detected_at', 'wiki_root', 'vault_root', 'total', 'files',
 ];
 const ISO_UTC_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
+const SHA256_RE = /^[0-9a-f]{64}$/;
+const POLICY_SOURCES = new Set(['default', 'global_legacy', 'wiki_local', 'wiki_local_migrated']);
 const terminationSleep = new Int32Array(new SharedArrayBuffer(4));
 
 function codePointCompare(left, right) {
@@ -171,15 +178,68 @@ function formatSessionStartOutput(additionalContext) {
 
 function persistenceBudgets(deadline) {
   assertBeforeDeadline(deadline, 'scanner-supervisor-before-persistence-spawn');
-  const budgetMs = Math.min(PARENT_BUDGET_MS, Math.floor(remainingMs(deadline)));
-  if (budgetMs < 2) {
-    throw new DeadlineExceeded('scanner-supervisor-before-persistence-spawn-budget');
+  const budgetMs = Math.floor(remainingMs(deadline));
+  if (budgetMs < SCAN_CUTOFF_RESERVE_MS) {
+    throw new DeadlineExceeded('scanner-supervisor-before-persistence-spawn-reserve');
   }
-  const workerBudgetMs = Math.max(1, budgetMs - PERSISTENCE_GRACE_MS);
-  if (workerBudgetMs >= budgetMs) {
-    throw new DeadlineExceeded('scanner-supervisor-before-persistence-spawn-grace');
+  const workerBudgetMs = budgetMs - WINDOWS_TERMINATION_RESERVE_MS;
+  if (workerBudgetMs < PERSISTENCE_EXECUTION_RESERVE_MS) {
+    throw new DeadlineExceeded('scanner-supervisor-before-persistence-spawn-execution-reserve');
   }
-  return { budgetMs, workerBudgetMs };
+  return { budgetMs: workerBudgetMs, workerBudgetMs };
+}
+
+function migrationBudgetMs(deadline) {
+  assertBeforeDeadline(deadline, 'scanner-supervisor-before-config-migration');
+  const budgetMs = Math.min(MIGRATION_BUDGET_MS, Math.floor(remainingMs(deadline) - SCAN_CUTOFF_RESERVE_MS));
+  if (budgetMs < 1) throw new DeadlineExceeded('scanner-supervisor-before-config-migration-reserve');
+  return budgetMs;
+}
+
+function scannerWorkerBudgetMs(deadline) {
+  assertBeforeDeadline(deadline, 'scanner-supervisor-before-worker-spawn');
+  const budgetMs = Math.floor(remainingMs(deadline) - SCAN_CUTOFF_RESERVE_MS);
+  if (budgetMs < 1) throw new DeadlineExceeded('scanner-supervisor-before-worker-spawn-reserve');
+  return budgetMs;
+}
+
+function validatePolicyProofShape(source, digest) {
+  if (typeof source !== 'string' || !POLICY_SOURCES.has(source)) {
+    throw new Error('policy proof source is invalid');
+  }
+  if (typeof digest !== 'string' || !SHA256_RE.test(digest)) {
+    throw new Error('policy proof digest is invalid');
+  }
+}
+
+function proofFromResolvedConfig(resolved) {
+  const source = resolved.policy_source;
+  const digest = resolved.policy_digest;
+  validatePolicyProofShape(source, digest);
+  return { source, digest };
+}
+
+function resolvePolicyProof({ env, deadline }) {
+  let resolved = resolveConfig(env);
+  if (resolved.migration_required) {
+    let migrationBudget = 0;
+    try { migrationBudget = migrationBudgetMs(deadline); } catch (error) {
+      if (error?.code !== 'DEADLINE_EXCEEDED') throw error;
+    }
+    if (migrationBudget > 0) {
+      const migrationDeadline = createDeadline({ clock: deadline.clock, budgetMs: migrationBudget });
+      const migration = migrateAutoIngestPolicy({
+        env,
+        wikiRoot: resolved.config.wikiRoot,
+        deadline: migrationDeadline,
+      });
+      if (!migration || !['already-local', 'migrated', 'deferred'].includes(migration.status)) {
+        throw new Error('config migration returned an invalid status');
+      }
+      resolved = resolveConfig(env);
+    }
+  }
+  return proofFromResolvedConfig(resolved);
 }
 
 function runPersistenceWorker(result, deadline, options = {}) {
@@ -285,6 +345,8 @@ async function runSupervisor(options = {}) {
     throw new TypeError('workerPath must be absolute');
   }
   const deadline = createDeadline({ budgetMs: timeoutMs });
+  const proof = resolvePolicyProof({ env, deadline });
+  const workerBudgetMs = scannerWorkerBudgetMs(deadline);
   const result = await new Promise((resolve, reject) => {
     let child;
     let stdoutBytes = 0;
@@ -308,7 +370,11 @@ async function runSupervisor(options = {}) {
     try {
       child = spawn(process.execPath, [workerPath], {
         cwd: path.dirname(workerPath),
-        env,
+        env: {
+          ...env,
+          DEEP_WIKI_EXPECTED_POLICY_SOURCE: proof.source,
+          DEEP_WIKI_EXPECTED_POLICY_SHA256: proof.digest,
+        },
         stdio: ['ignore', 'pipe', 'pipe'],
         detached: process.platform !== 'win32',
         shell: false,
@@ -318,7 +384,7 @@ async function runSupervisor(options = {}) {
       fail(error, false);
       return;
     }
-    timer = setTimeout(() => fail(new Error('scanner worker timed out')), timeoutMs);
+    timer = setTimeout(() => fail(new Error('scanner worker timed out')), workerBudgetMs);
     timer.unref?.();
     child.stdout.on('data', (chunk) => {
       if (terminal) return;
@@ -389,8 +455,14 @@ if (require.main === module) {
 
 module.exports = {
   PARENT_BUDGET_MS,
+  MIGRATION_BUDGET_MS,
+  SCAN_CUTOFF_RESERVE_MS,
+  PERSISTENCE_EXECUTION_RESERVE_MS,
+  WINDOWS_TERMINATION_RESERVE_MS,
   MAX_CAPTURE_BYTES,
   terminateWorkerTree,
+  migrationBudgetMs,
+  scannerWorkerBudgetMs,
   persistenceBudgets,
   runSupervisor,
   hookMain,

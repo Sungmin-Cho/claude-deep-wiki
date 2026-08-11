@@ -1,0 +1,8 @@
+{
+  "description": "legacy auto_ingest policy migrates wiki-local before SessionStart scan",
+  "vault_tree": {
+    "notes/keep.md": "# keep\n",
+    "legacy/drop.md": "# drop\n"
+  },
+  "config_yaml": "wiki_root: ${WIKI_ROOT}\nauto_ingest:\n  ignore_globs:\n    - legacy/**\n"
+}

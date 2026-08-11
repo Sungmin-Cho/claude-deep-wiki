@@ -581,7 +581,7 @@ test('supervisor fails closed before worker spawn on divergent global aliases', 
   assert.equal(fs.existsSync(spawnedMarker), false);
 });
 
-test('supervisor subprocess resolves a symlinked CODEX_HOME to the native config target', async () => {
+test('supervisor subprocess does not fail closed on a symlinked CODEX_HOME', async () => {
   const { runSupervisor } = require(supervisorPath);
   const base = temporaryRoot('deep wiki supervisor symlink codex home ');
   const vaultRoot = path.join(base, 'vault');

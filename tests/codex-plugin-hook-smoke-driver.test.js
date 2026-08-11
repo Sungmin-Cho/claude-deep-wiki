@@ -2,6 +2,8 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
+const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -185,6 +187,10 @@ function shaFile(file) {
   return require('node:crypto').createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 }
 
+function sha256Text(value) {
+  return crypto.createHash('sha256').update(Buffer.from(value, 'utf8')).digest('hex');
+}
+
 test('pending receipt requires a canonical valid timestamp inside the fixture freshness window', (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'deep-wiki-pending-test-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -229,7 +235,44 @@ test('direct installed supervisor witness requires one exact parent-formatted me
   });
 });
 
-test('release smoke fixture pins local policy bytes and Windows-shaped direct supervisor launch', () => {
+test('default process runner launches the observed executable with shell disabled', async () => {
+  const calls = [];
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.pid = 4242;
+  child.kill = () => true;
+  process.nextTick(() => child.emit('close', 0, null));
+
+  const result = await defaultRunProcess('/nonexistent/deep-wiki-node', ['script.js'], {
+    cwd: repositoryRoot,
+    env: { PATH: process.env.PATH || '' },
+    timeoutMs: 1_000,
+    spawn(file, args, options) {
+      calls.push({ file, args, options });
+      return child;
+    },
+  }, { phase: 'spawn-observation' });
+
+  assert.equal(result.status, 0);
+  assert.deepEqual(calls.map(({ file, args, options }) => ({
+    file,
+    args,
+    shell: options.shell,
+    stdio: options.stdio,
+    detached: options.detached,
+    windowsHide: options.windowsHide,
+  })), [{
+    file: '/nonexistent/deep-wiki-node',
+    args: ['script.js'],
+    shell: false,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    detached: process.platform !== 'win32',
+    windowsHide: true,
+  }]);
+});
+
+test('release smoke fixture pins local policy bytes', () => {
   assert.equal(releaseFixture.local_config_json, [
     '{',
     '  "auto_ingest": {',
@@ -241,21 +284,6 @@ test('release smoke fixture pins local policy bytes and Windows-shaped direct su
   assert.deepEqual(JSON.parse(releaseFixture.local_config_json), {
     auto_ingest: { ignore_globs: [] },
   });
-
-  const windows = releaseFixture.windows_native_paths;
-  const directSpawn = releaseFixture.direct_supervisor_spawn;
-  assert.equal(path.win32.join(
-    windows.installed_plugin_root,
-    ...directSpawn.script_relative.split('\\'),
-  ), windows.direct_supervisor_script);
-  assert.equal(windows.project_root, 'C:\\Users\\Example User\\Vault With Spaces');
-  assert.equal(directSpawn.executable, 'process.execPath');
-  assert.equal(directSpawn.shell, false);
-  assert.doesNotMatch(JSON.stringify(windows), /[|;&<>`\r\n]|\$\(/);
-
-  const source = fs.readFileSync(path.join(repositoryRoot, 'scripts', 'codex-plugin-hook-smoke.js'), 'utf8');
-  assert.match(source, /runProcess\(process\.execPath,\s*\[directScript\]/);
-  assert.match(source, /spawn\(file,\s*args,[\s\S]*?shell:\s*false/);
 });
 
 test('Codex JSONL receipt requires the exact completed assistant message', () => {
@@ -306,10 +334,17 @@ test('portable full-phase seam proves trusted pre-model effect, independent dire
   fs.writeFileSync(codexBin, 'fixture');
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const phases = [];
+  const directLaunches = [];
   let diagnosticMarketplace;
 
   async function fakeRun(file, args, options, context = {}) {
     phases.push(context.phase || 'unknown');
+    if (context.phase === 'direct-supervisor') {
+      directLaunches.push({ file, args, cwd: options.cwd });
+      assert.equal(file, process.execPath);
+      assert.deepEqual(args, [path.join(context.installedPluginRoot, 'hooks', 'scripts', 'scan-vault-changes.js')]);
+      return defaultRunProcess(file, args, options, context);
+    }
     if (file === 'git' || file === process.execPath) {
       return defaultRunProcess(file, args, options, context);
     }
@@ -400,7 +435,9 @@ test('portable full-phase seam proves trusted pre-model effect, independent dire
   });
   assert.equal(receipt.codex_version, 'codex-cli 0.144.1');
   assert.equal(receipt.trusted.request_count, 1);
+  assert.equal(receipt.trusted.local_config_sha256, sha256Text(releaseFixture.local_config_json));
   assert.equal(receipt.direct_installed_supervisor.stderr_empty, true);
+  assert.equal(receipt.direct_installed_supervisor.local_config_sha256, sha256Text(releaseFixture.local_config_json));
   assert.deepEqual(receipt.untrusted, {
     deep_wiki_effect: false,
     model_continued: true,
@@ -408,6 +445,7 @@ test('portable full-phase seam proves trusted pre-model effect, independent dire
     mutated: false,
   });
   assert.deepEqual(receipt.diagnostic, { variant: 'commandWindows', rootEqual: true, requestCount: 1 });
+  assert.equal(directLaunches.length, 1);
   assert.ok(phases.indexOf('trusted-exec') < phases.indexOf('direct-supervisor'));
   assert.ok(phases.indexOf('untrusted-exec') < phases.indexOf('diagnostic-exec'));
 });

@@ -6,6 +6,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { spawnSync } = require('node:child_process');
 
 const {
   AUTHORITY_FILE,
@@ -54,6 +55,38 @@ function setup(home, wikiRoot, extra = {}) {
     eventId: '01K2CP8QT0B2D2QCR6HVG8YM02',
     ...extra,
   });
+}
+
+function extractLegacySetupRuntime(t, label) {
+  const repoRoot = path.resolve(__dirname, '..');
+  const listing = spawnSync('git', [
+    'ls-tree', '-r', '--name-only', '3ebe6bd', 'hooks/scripts/runtime',
+  ], { cwd: repoRoot, encoding: 'utf8', shell: false });
+  if (listing.status !== 0) {
+    t.skip(`git show unavailable: ${listing.stderr.trim()}`);
+    return null;
+  }
+  const extraction = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), label)));
+  roots.add(extraction);
+  const files = [
+    ...listing.stdout.trim().split('\n').filter(Boolean),
+    'hooks/scripts/envelope.js',
+    'hooks/scripts/read-index-envelope.js',
+    '.claude-plugin/plugin.json',
+  ];
+  for (const relative of files) {
+    const shown = spawnSync('git', ['show', `3ebe6bd:${relative}`], {
+      cwd: repoRoot, encoding: null, shell: false,
+    });
+    if (shown.status !== 0) {
+      t.skip(`git show unavailable for ${relative}`);
+      return null;
+    }
+    const destination = path.join(extraction, relative);
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    fs.writeFileSync(destination, shown.stdout);
+  }
+  return extraction;
 }
 
 test.after(() => {
@@ -735,6 +768,47 @@ test('rebind resume commits absent-to-created proof without retaining the transi
   assert.equal(committed.requested_wiki_claim.claim_state, 'absent');
   assert.match(committed.requested_wiki_claim.route_created_permit.owner_token, /^[a-f0-9]{64}$/);
   assert.equal(fs.existsSync(path.join(newWiki, 'pages', 'welcome.md')), true);
+});
+
+test('downgrade fixture leaves rebind_pending authority incomplete under v1.8.2 setup', (t) => {
+  const extraction = extractLegacySetupRuntime(t, 'deep wiki legacy rebind ');
+  if (extraction === null) return;
+  const legacyWikiState = require(path.join(extraction, 'hooks', 'scripts', 'runtime', 'wiki-state.js'));
+  const home = fixture('deep wiki rebind downgrade ');
+  const oldWiki = path.join(home, 'wiki-a');
+  const newWiki = path.join(home, 'wiki-b');
+  const env = envFor(home);
+  setup(home, oldWiki);
+  fs.rmSync(oldWiki, { recursive: true });
+  fs.writeFileSync(path.join(home, '.codex', 'deep-wiki-config.yaml'), `wiki_root: "${newWiki}"\n`);
+  assert.throws(() => setup(home, newWiki, {
+    rebindAuthorityFrom: oldWiki,
+    faultInjector(boundary) {
+      if (boundary === 'after-rebind-pending') throw new Error('stop after rebind pending');
+    },
+  }), /stop after rebind pending/);
+  const before = loadSetupAuthority(home);
+
+  legacyWikiState.setupWiki({
+    wikiRoot: newWiki,
+    configHost: 'codex',
+    env,
+    now: new Date(TS),
+    operationId: '01K2CP8QT0B2D2QCR6HVG8YM0S',
+    eventId: '01K2CP8QT0B2D2QCR6HVG8YM0T',
+  });
+  const afterLegacy = loadSetupAuthority(home);
+
+  assert.equal(before.state, 'rebind_pending');
+  assert.equal(afterLegacy.state, 'rebind_pending');
+  assert.equal(afterLegacy.generation, before.generation);
+  assert.equal(fs.existsSync(path.join(newWiki, 'pages', 'welcome.md')), true);
+  assert.throws(
+    () => setup(home, newWiki, { rebindAuthorityFrom: oldWiki }),
+    (error) => error.code === 'SETUP_AUTHORITY_RECOVERY_REQUIRED'
+      && /sealed absent path became present/.test(error.message),
+  );
+  assert.equal(loadSetupAuthority(home).state, 'rebind_pending');
 });
 
 test('explicit rebind preserves a sealed pre-existing B wiki without inventing a route-created permit', () => {

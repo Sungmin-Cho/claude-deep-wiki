@@ -89,6 +89,7 @@ function defaultRunProcess(file, args, options = {}, context = {}) {
   return new Promise((resolve) => {
     const timeoutMs = options.timeoutMs || DEFAULT_PHASE_TIMEOUT_MS;
     const maxOutput = options.maxOutput || MAX_OUTPUT;
+    const run = options.spawn || spawn;
     let child;
     let stdoutBytes = 0;
     let stderrBytes = 0;
@@ -126,7 +127,7 @@ function defaultRunProcess(file, args, options = {}, context = {}) {
     };
 
     try {
-      child = spawn(file, args, {
+      child = run(file, args, {
         cwd: options.cwd,
         env: options.env,
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -361,6 +362,21 @@ function assertPending(vault, fixture, code, nowMs = Date.now()) {
     throw new SmokeError(code);
   }
   return { bytes: text, sha256: sha256(bytes), ageMs };
+}
+
+function assertLocalConfig(vault, fixture, code) {
+  if (typeof fixture?.local_config_json !== 'string' || fixture.local_config_json.length === 0) {
+    throw new SmokeError(code);
+  }
+  const file = path.join(vault.metaRoot, '.config.json');
+  let bytes;
+  try { bytes = fs.readFileSync(file); } catch {
+    throw new SmokeError(code);
+  }
+  if (!bytes.equals(Buffer.from(fixture.local_config_json, 'utf8'))) {
+    throw new SmokeError(code);
+  }
+  return { sha256: sha256(bytes) };
 }
 
 function assertNoAuthorityFiles(home) {
@@ -708,6 +724,9 @@ async function runCodexPluginHookSmoke(options = {}) {
     }
     if (trustedError) throw trustedError;
     trustedPending ||= assertPending(trustedVault, fixture, 'CODEX_PREMODEL_STATE_INVALID');
+    const trustedLocalConfig = assertLocalConfig(
+      trustedVault, fixture, 'CODEX_PREMODEL_STATE_INVALID',
+    );
     assertNoAuthorityFiles(trustedHome);
 
     const directHome = prepareHome(layout.artifactRoot, 'direct');
@@ -723,6 +742,9 @@ async function runCodexPluginHookSmoke(options = {}) {
       throw new SmokeError('CODEX_DIRECT_SUPERVISOR_FAILED');
     }
     const directPending = assertPending(
+      directVault, fixture, 'CODEX_DIRECT_SUPERVISOR_FAILED',
+    );
+    const directLocalConfig = assertLocalConfig(
       directVault, fixture, 'CODEX_DIRECT_SUPERVISOR_FAILED',
     );
 
@@ -784,12 +806,14 @@ async function runCodexPluginHookSmoke(options = {}) {
         request_count: trustedServer.requests.length,
         request: trustedServer.requests[0],
         pending_sha256: trustedPending.sha256,
+        local_config_sha256: trustedLocalConfig.sha256,
         jsonl_sha256: sha256(trustedResult.stdout),
       },
       direct_installed_supervisor: {
         stderr_empty: direct.stderr === '',
         stdout_sha256: sha256(direct.stdout),
         pending_sha256: directPending.sha256,
+        local_config_sha256: directLocalConfig.sha256,
       },
       untrusted: {
         deep_wiki_effect: false,

@@ -5,8 +5,10 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { spawnSync } = require('node:child_process');
 
 const { createDeadline } = require('../hooks/scripts/runtime/deadline.js');
+const currentConfig = require('../hooks/scripts/runtime/config.js');
 const { acquireLock, releaseLock } = require('../hooks/scripts/runtime/lock.js');
 const wikiState = require('../hooks/scripts/runtime/wiki-state.js');
 const releaseSmokeFixture = require('./fixtures/codex-release-smoke.json');
@@ -46,6 +48,32 @@ function deadline() {
 
 function expectCode(fn, code) {
   assert.throws(fn, (error) => error?.code === code);
+}
+
+function extractLegacyRuntime(t, label) {
+  const repoRoot = path.resolve(__dirname, '..');
+  const listing = spawnSync('git', [
+    'ls-tree', '-r', '--name-only', '3ebe6bd', 'hooks/scripts/runtime',
+  ], { cwd: repoRoot, encoding: 'utf8', shell: false });
+  if (listing.status !== 0) {
+    t.skip(`git show unavailable: ${listing.stderr.trim()}`);
+    return null;
+  }
+  const extraction = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), label)));
+  roots.add(extraction);
+  for (const relative of listing.stdout.trim().split('\n').filter(Boolean)) {
+    const shown = spawnSync('git', ['show', `3ebe6bd:${relative}`], {
+      cwd: repoRoot, encoding: null, shell: false,
+    });
+    if (shown.status !== 0) {
+      t.skip(`git show unavailable for ${relative}`);
+      return null;
+    }
+    const destination = path.join(extraction, relative);
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    fs.writeFileSync(destination, shown.stdout);
+  }
+  return extraction;
 }
 
 function expiredDeadline() {
@@ -141,6 +169,34 @@ test('release smoke fixture local_config_json remains an idempotent empty local 
     policySource: 'wiki_local_migrated',
   });
   assert.equal(fs.readFileSync(input.target, 'utf8'), releaseSmokeFixture.local_config_json);
+});
+
+test('downgrade fixture blocks v1.8.2 from certifying a local-only auto-ingest policy', (t) => {
+  const extraction = extractLegacyRuntime(t, 'deep wiki legacy local policy ');
+  if (extraction === null) return;
+  const legacyConfig = require(path.join(extraction, 'hooks', 'scripts', 'runtime', 'config.js'));
+  const input = fixture({
+    legacy: false,
+    local: '{"auto_ingest":{"ignore_globs":["private/**"],"require_tag":"project"}}\n',
+  });
+  const current = currentConfig.resolveConfig(input.env);
+  const legacy = legacyConfig.resolveConfig(input.env);
+  const currentDigest = current.policy_digest;
+  const legacyDigest = currentConfig.canonicalPolicyDigest(legacy.config.autoIngest);
+
+  assert.equal(current.policy_source, 'wiki_local');
+  assert.equal(currentDigest, currentConfig.canonicalPolicyDigest({
+    ignoreGlobs: ['private/**'],
+    requireTag: 'project',
+  }));
+  assert.deepEqual(current.config.autoIngest, { ignoreGlobs: [], requireTag: null });
+  assert.deepEqual(legacy.config.autoIngest, { ignoreGlobs: [], requireTag: null });
+  assert.notEqual(legacyDigest, currentDigest);
+  assert.throws(() => {
+    if (legacyDigest !== currentDigest) {
+      throw new Error('authenticated pre-upgrade backup restore required before older runtime can read local-only policy');
+    }
+  }, /authenticated pre-upgrade backup restore required/);
 });
 
 test('migration converges when a cooperating host publishes an equivalent local policy before lock acquisition', () => {

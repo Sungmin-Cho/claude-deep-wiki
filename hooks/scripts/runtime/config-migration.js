@@ -196,7 +196,12 @@ function migrateAutoIngestPolicy(options = {}) {
   let result;
   let primaryError;
   try {
+    const target = path.join(preflight.physicalRoot, '.wiki-meta', '.config.json');
+    const initialSeal = targetSeal(fs, target);
     const initial = resolveState({ env, wikiRoot: preflight.physicalRoot, fs });
+    if (!samePath(initial.physicalRoot, preflight.physicalRoot)) {
+      throw configError('CONFIG_INVALID', 'wiki root changed while acquiring the wiki lock');
+    }
     if (!initial.effective.migrationRequired) {
       if (initial.effective.policySource !== 'wiki_local_migrated'
           || canonicalPolicyDigest(initial.effective.policy) !== canonicalPolicyDigest(preflight.effective.policy)) {
@@ -204,8 +209,6 @@ function migrateAutoIngestPolicy(options = {}) {
       }
       result = policyResult('already-local', initial.effective);
     } else {
-      const target = path.join(initial.physicalRoot, '.wiki-meta', '.config.json');
-      const initialSeal = targetSeal(fs, target);
       assertPublicationBoundary({
         env, wikiRoot: initial.physicalRoot, fs, deadline, token: owner.token,
         expectedSeal: initialSeal, expectedPolicy: initial.effective.policy,

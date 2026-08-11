@@ -152,6 +152,60 @@ test('migration converges when a cooperating host publishes an equivalent local 
   assert.equal(converged, true);
 });
 
+test('migration fails closed when the in-lock convergence state removes legacy policy and diverges locally', () => {
+  const input = fixture();
+  const lockPath = path.join(input.wikiRoot, '.wiki-meta', '.wiki-lock');
+  const divergentLocal = '{"auto_ingest":{"ignore_globs":["EVERYTHING/**"]}}\n';
+  let raced = false;
+  const racingFs = new Proxy(fs, {
+    get(target, property) {
+      if (property === 'mkdirSync') return (pathname, options) => {
+        if (pathname === lockPath && !raced) {
+          raced = true;
+          target.writeFileSync(input.target, divergentLocal);
+          target.writeFileSync(input.globalPath, `wiki_root: ${input.wikiRoot}\nobsidian_cli:\n  available: false\n`);
+        }
+        return target.mkdirSync(pathname, options);
+      };
+      return target[property];
+    },
+  });
+
+  expectCode(() => migration().migrateAutoIngestPolicy({
+    env: input.env, wikiRoot: input.wikiRoot, deadline: deadline(), fs: racingFs,
+  }), 'CONFIG_INVALID');
+  assert.equal(raced, true);
+  assert.equal(fs.readFileSync(input.target, 'utf8'), divergentLocal);
+});
+
+test('migration preserves an in-lock A5 edit between its target seal and authoritative state read', () => {
+  const input = fixture({ local: '{"a5_fanout_threshold":3}\n' });
+  const edited = '{"a5_fanout_threshold":77}\n';
+  let targetLstats = 0;
+  let injected = false;
+  const racingFs = new Proxy(fs, {
+    get(target, property) {
+      if (property === 'lstatSync') return (pathname, options) => {
+        if (pathname === input.target) {
+          targetLstats += 1;
+          if (targetLstats === 9) {
+            injected = true;
+            target.writeFileSync(input.target, edited);
+          }
+        }
+        return target.lstatSync(pathname, options);
+      };
+      return target[property];
+    },
+  });
+
+  expectCode(() => migration().migrateAutoIngestPolicy({
+    env: input.env, wikiRoot: input.wikiRoot, deadline: deadline(), fs: racingFs,
+  }), 'CONFIG_INVALID');
+  assert.equal(injected, true);
+  assert.equal(fs.readFileSync(input.target, 'utf8'), edited);
+});
+
 test('an expired deadline reports already-local when no migration is required', () => {
   const localOnly = fixture({
     legacy: false,

@@ -9,6 +9,7 @@ const path = require('node:path');
 const { createDeadline } = require('../hooks/scripts/runtime/deadline.js');
 const { acquireLock, releaseLock } = require('../hooks/scripts/runtime/lock.js');
 const wikiState = require('../hooks/scripts/runtime/wiki-state.js');
+const releaseSmokeFixture = require('./fixtures/codex-release-smoke.json');
 
 const roots = new Set();
 
@@ -125,6 +126,23 @@ test('migration is idempotent for an equivalent local policy and rejects diverge
   }), 'CONFIG_INVALID');
 });
 
+test('release smoke fixture local_config_json remains an idempotent empty local policy', () => {
+  const input = fixture({
+    globalAutoIngest: '  ignore_globs: []\n',
+    local: releaseSmokeFixture.local_config_json,
+  });
+  const result = migration().migrateAutoIngestPolicy({
+    env: input.env, wikiRoot: input.wikiRoot, deadline: deadline(), fs,
+  });
+
+  assert.deepEqual(result, {
+    status: 'already-local',
+    policy: { ignoreGlobs: [], requireTag: null },
+    policySource: 'wiki_local_migrated',
+  });
+  assert.equal(fs.readFileSync(input.target, 'utf8'), releaseSmokeFixture.local_config_json);
+});
+
 test('migration converges when a cooperating host publishes an equivalent local policy before lock acquisition', () => {
   const input = fixture();
   const lockPath = path.join(input.wikiRoot, '.wiki-meta', '.wiki-lock');
@@ -206,27 +224,35 @@ test('migration preserves an in-lock A5 edit between its target seal and authori
   assert.equal(fs.readFileSync(input.target, 'utf8'), edited);
 });
 
-test('migration target seal rejects oversized wiki-local config before reading bytes', () => {
-  const input = fixture({ local: `${' '.repeat(64 * 1024)}x` });
-  let oversizedRead = false;
-  const boundedFs = new Proxy(fs, {
-    get(target, property) {
-      if (property === 'readFileSync') return (pathname, ...args) => {
-        if (pathname === input.target && target.lstatSync(pathname, { bigint: true }).size > 64n * 1024n) {
-          oversizedRead = true;
-          throw new Error('oversized read occurred');
-        }
-        return target.readFileSync(pathname, ...args);
-      };
-      return target[property];
-    },
-  });
+for (const boundary of ['before-rename', 'before-publish']) {
+  test(`migration target seal rejects oversized ${boundary} replacement before reading bytes`, () => {
+    const input = fixture();
+    const oversized = `${' '.repeat(64 * 1024)}x`;
+    let targetBytesRead = 0;
+    const boundedFs = new Proxy(fs, {
+      get(target, property) {
+        if (property === 'readFileSync') return (pathname, ...args) => {
+          if (pathname === input.target) {
+            targetBytesRead += Number(target.lstatSync(pathname, { bigint: true }).size);
+          }
+          return target.readFileSync(pathname, ...args);
+        };
+        return target[property];
+      },
+    });
 
-  assert.throws(() => migration().migrateAutoIngestPolicy({
-    env: input.env, wikiRoot: input.wikiRoot, deadline: deadline(), fs: boundedFs,
-  }), (error) => error.code === 'CONFIG_INVALID' && /64 KiB/.test(error.message));
-  assert.equal(oversizedRead, false);
-});
+    assert.throws(() => migration().migrateAutoIngestPolicy({
+      env: input.env,
+      wikiRoot: input.wikiRoot,
+      deadline: deadline(),
+      fs: boundedFs,
+      faultInjector(point) {
+        if (point === boundary) fs.writeFileSync(input.target, oversized);
+      },
+    }), (error) => error.code === 'CONFIG_INVALID' && /64 KiB/.test(error.message));
+    assert.equal(targetBytesRead, 0);
+  });
+}
 
 test('an expired deadline reports already-local when no migration is required', () => {
   const localOnly = fixture({

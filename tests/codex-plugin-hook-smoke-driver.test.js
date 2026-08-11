@@ -229,6 +229,35 @@ test('direct installed supervisor witness requires one exact parent-formatted me
   });
 });
 
+test('release smoke fixture pins local policy bytes and Windows-shaped direct supervisor launch', () => {
+  assert.equal(releaseFixture.local_config_json, [
+    '{',
+    '  "auto_ingest": {',
+    '    "ignore_globs": []',
+    '  }',
+    '}',
+    '',
+  ].join('\n'));
+  assert.deepEqual(JSON.parse(releaseFixture.local_config_json), {
+    auto_ingest: { ignore_globs: [] },
+  });
+
+  const windows = releaseFixture.windows_native_paths;
+  const directSpawn = releaseFixture.direct_supervisor_spawn;
+  assert.equal(path.win32.join(
+    windows.installed_plugin_root,
+    ...directSpawn.script_relative.split('\\'),
+  ), windows.direct_supervisor_script);
+  assert.equal(windows.project_root, 'C:\\Users\\Example User\\Vault With Spaces');
+  assert.equal(directSpawn.executable, 'process.execPath');
+  assert.equal(directSpawn.shell, false);
+  assert.doesNotMatch(JSON.stringify(windows), /[|;&<>`\r\n]|\$\(/);
+
+  const source = fs.readFileSync(path.join(repositoryRoot, 'scripts', 'codex-plugin-hook-smoke.js'), 'utf8');
+  assert.match(source, /runProcess\(process\.execPath,\s*\[directScript\]/);
+  assert.match(source, /spawn\(file,\s*args,[\s\S]*?shell:\s*false/);
+});
+
 test('Codex JSONL receipt requires the exact completed assistant message', () => {
   const exact = `${JSON.stringify({
     type: 'item.completed',

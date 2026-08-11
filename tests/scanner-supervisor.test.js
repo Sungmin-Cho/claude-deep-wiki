@@ -63,6 +63,11 @@ function writeLocalConfig(wikiRoot, autoIngest) {
   fs.writeFileSync(path.join(wikiRoot, '.wiki-meta', '.config.json'), `${JSON.stringify(output, null, 2)}\n`);
 }
 
+function writeMarkdown(file, body = '# note\n') {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, body);
+}
+
 function supervisorEnv(base, extra = {}, configOptions = {}) {
   const wikiRoot = configOptions.wikiRoot || path.join(base, 'policy-wiki');
   if (configOptions.createMeta !== false) fs.mkdirSync(path.join(wikiRoot, '.wiki-meta'), { recursive: true });
@@ -475,6 +480,135 @@ test('supervisor migrates legacy auto-ingest before spawning and overwrites inhe
   assert.doesNotMatch(output, /legacy\/drop\.md/);
   const localConfig = JSON.parse(fs.readFileSync(path.join(wikiRoot, '.wiki-meta', '.config.json'), 'utf8'));
   assert.deepEqual(localConfig.auto_ingest.ignore_globs, ['legacy/**']);
+});
+
+test('supervisor subprocess honors wiki-local only policy for ignore and tag polarity', async () => {
+  const { runSupervisor } = require(supervisorPath);
+  const base = temporaryRoot('deep wiki supervisor local only ');
+  const vaultRoot = path.join(base, 'vault');
+  const wikiRoot = path.join(vaultRoot, 'wiki');
+  writeMarkdown(path.join(vaultRoot, 'notes', 'keep.md'), '---\ntags: [project]\n---\n# keep\n');
+  writeMarkdown(path.join(vaultRoot, 'notes', 'wrong-tag.md'), '---\ntags: [other]\n---\n# skip\n');
+  writeMarkdown(path.join(vaultRoot, 'drop', 'ignored.md'), '---\ntags: [project]\n---\n# skip\n');
+  const { env } = supervisorEnv(base, {}, {
+    wikiRoot,
+    localAutoIngest: { ignoreGlobs: ['drop/**'], requireTag: 'project' },
+  });
+
+  const output = await runSupervisor({
+    workerPath,
+    timeoutMs: 12_000,
+    env,
+    ensurePendingScan() { return { status: 'created' }; },
+  });
+
+  assert.match(output, /notes\/keep\.md/);
+  assert.doesNotMatch(output, /notes\/wrong-tag\.md/);
+  assert.doesNotMatch(output, /drop\/ignored\.md/);
+});
+
+test('supervisor subprocess migrates equivalent explicit-empty and absent global aliases', async () => {
+  const { runSupervisor } = require(supervisorPath);
+  const base = temporaryRoot('deep wiki supervisor equivalent aliases ');
+  const vaultRoot = path.join(base, 'vault');
+  const wikiRoot = path.join(vaultRoot, 'wiki');
+  const codexHome = path.join(base, 'codex-home');
+  const explicitConfig = path.join(base, 'explicit-deep-wiki-config.yaml');
+  const codexConfig = path.join(codexHome, 'deep-wiki-config.yaml');
+  fs.mkdirSync(codexHome, { recursive: true });
+  writeMarkdown(path.join(vaultRoot, 'note.md'));
+  supervisorEnv(base, {}, { wikiRoot });
+  writeYamlConfig(explicitConfig, wikiRoot, { ignoreGlobs: [] });
+  writeYamlConfig(codexConfig, wikiRoot, null);
+  const env = {
+    PATH: process.env.PATH,
+    SystemRoot: process.env.SystemRoot,
+    HOME: base,
+    CODEX_HOME: codexHome,
+    DEEP_WIKI_CONFIG: explicitConfig,
+  };
+
+  const output = await runSupervisor({
+    workerPath,
+    timeoutMs: 12_000,
+    env,
+    ensurePendingScan() { return { status: 'created' }; },
+  });
+
+  assert.match(output, /note\.md/);
+  assert.deepEqual(
+    JSON.parse(fs.readFileSync(path.join(wikiRoot, '.wiki-meta', '.config.json'), 'utf8')).auto_ingest,
+    { ignore_globs: [] },
+  );
+});
+
+test('supervisor fails closed before worker spawn on divergent global aliases', async () => {
+  const { runSupervisor } = require(supervisorPath);
+  const base = temporaryRoot('deep wiki supervisor divergent aliases ');
+  const vaultRoot = path.join(base, 'vault');
+  const wikiRoot = path.join(vaultRoot, 'wiki');
+  const codexHome = path.join(base, 'codex-home');
+  const explicitConfig = path.join(base, 'explicit-deep-wiki-config.yaml');
+  const codexConfig = path.join(codexHome, 'deep-wiki-config.yaml');
+  const spawnedMarker = path.join(base, 'worker-spawned.txt');
+  const markerWorker = path.join(base, 'marker-worker.js');
+  fs.mkdirSync(path.join(wikiRoot, '.wiki-meta'), { recursive: true });
+  fs.mkdirSync(codexHome, { recursive: true });
+  writeYamlConfig(explicitConfig, wikiRoot, { ignoreGlobs: ['drop/**'] });
+  writeYamlConfig(codexConfig, wikiRoot, { ignoreGlobs: ['other/**'] });
+  fs.writeFileSync(markerWorker, [
+    "'use strict';",
+    "const fs = require('node:fs');",
+    `fs.writeFileSync(${JSON.stringify(spawnedMarker)}, 'spawned');`,
+    "process.stdout.write('{\"contract_version\":1,\"status\":\"ok\",\"detected_at\":\"2026-07-11T00:00:00Z\",\"wiki_root\":\"/tmp/wiki\",\"vault_root\":\"/tmp\",\"total\":0,\"files\":[]}\\n');",
+  ].join('\n'));
+
+  await assert.rejects(
+    runSupervisor({
+      workerPath: markerWorker,
+      timeoutMs: 12_000,
+      env: {
+        PATH: process.env.PATH,
+        SystemRoot: process.env.SystemRoot,
+        HOME: base,
+        CODEX_HOME: codexHome,
+        DEEP_WIKI_CONFIG: explicitConfig,
+      },
+      ensurePendingScan() { throw new Error('must not persist'); },
+    }),
+    /CONFIG_CONFLICT/,
+  );
+  assert.equal(fs.existsSync(spawnedMarker), false);
+});
+
+test('supervisor subprocess resolves a symlinked CODEX_HOME to the native config target', async () => {
+  const { runSupervisor } = require(supervisorPath);
+  const base = temporaryRoot('deep wiki supervisor symlink codex home ');
+  const vaultRoot = path.join(base, 'vault');
+  const wikiRoot = path.join(vaultRoot, 'wiki');
+  const physicalCodexHome = path.join(base, 'physical-codex-home');
+  const linkedCodexHome = path.join(base, 'linked-codex-home');
+  fs.mkdirSync(path.join(wikiRoot, '.wiki-meta'), { recursive: true });
+  fs.mkdirSync(physicalCodexHome, { recursive: true });
+  fs.symlinkSync(physicalCodexHome, linkedCodexHome, 'dir');
+  writeYamlConfig(path.join(physicalCodexHome, 'deep-wiki-config.yaml'), wikiRoot, { ignoreGlobs: ['drop/**'] });
+  writeMarkdown(path.join(vaultRoot, 'keep.md'));
+  writeMarkdown(path.join(vaultRoot, 'drop', 'ignored.md'));
+
+  const output = await runSupervisor({
+    workerPath,
+    timeoutMs: 12_000,
+    env: {
+      PATH: process.env.PATH,
+      SystemRoot: process.env.SystemRoot,
+      HOME: base,
+      CODEX_HOME: linkedCodexHome,
+    },
+    ensurePendingScan() { return { status: 'created' }; },
+  });
+
+  assert.match(output, /keep\.md/);
+  assert.doesNotMatch(output, /drop\/ignored\.md/);
 });
 
 test('supervisor fails closed before worker spawn on hard wiki-local policy errors', async () => {

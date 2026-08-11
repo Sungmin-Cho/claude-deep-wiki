@@ -4,6 +4,17 @@
   "expected_candidates": [
     "노트/Windows 검증.md"
   ],
+  "local_config_json": "{\n  \"auto_ingest\": {\n    \"ignore_globs\": []\n  }\n}\n",
+  "windows_native_paths": {
+    "installed_plugin_root": "C:\\Users\\Example User\\.codex\\plugins\\cache\\deep-wiki-smoke\\deep-wiki\\1.7.1",
+    "project_root": "C:\\Users\\Example User\\Vault With Spaces",
+    "direct_supervisor_script": "C:\\Users\\Example User\\.codex\\plugins\\cache\\deep-wiki-smoke\\deep-wiki\\1.7.1\\hooks\\scripts\\scan-vault-changes.js"
+  },
+  "direct_supervisor_spawn": {
+    "executable": "process.execPath",
+    "script_relative": "hooks\\scripts\\scan-vault-changes.js",
+    "shell": false
+  },
   "pending_scan": {
     "format": "canonical-utc-z-newline",
     "max_age_ms": 60000

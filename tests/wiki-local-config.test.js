@@ -29,6 +29,16 @@ function writeLocal(wikiRoot, source) {
   return target;
 }
 
+function nestedArrayJson(depth) {
+  return `${'['.repeat(depth)}"x"${']'.repeat(depth)}`;
+}
+
+function nestedObjectJson(depth) {
+  let source = '"x"';
+  for (let index = 0; index < depth; index += 1) source = `{"x":${source}}`;
+  return source;
+}
+
 function globalConfig(wikiRoot, autoIngestDefined, autoIngest = {}) {
   return {
     wikiRoot,
@@ -114,12 +124,21 @@ test('loadWikiLocalConfig normalizes malformed string tokens, deeply nested inpu
   writeLocal(deepRoot, `{"auto_ingest":${'['.repeat(1_000)}${']'.repeat(1_000)}}`);
   assert.throws(() => config.loadWikiLocalConfig(deepRoot), (error) => error.code === 'CONFIG_INVALID');
 
-  const depthBoundaryRoot = temporaryRoot();
-  writeLocal(depthBoundaryRoot, `{"auto_ingest":{"ignore_globs":${'['.repeat(260)}"x"${']'.repeat(260)}}}`);
-  assert.throws(
-    () => config.loadWikiLocalConfig(depthBoundaryRoot),
-    (error) => error.code === 'CONFIG_INVALID' && /nesting/i.test(error.message),
-  );
+  const depthCases = [
+    ['array boundary is accepted before schema validation', `{"auto_ingest":{"ignore_globs":${nestedArrayJson(255)}}}`, /ignore_globs/i],
+    ['array boundary plus one is rejected by the depth guard', `{"auto_ingest":{"ignore_globs":${nestedArrayJson(256)}}}`, /nesting/i],
+    ['object boundary is accepted before schema validation', `{"x":${nestedObjectJson(256)}}`, /unsupported key/i],
+    ['object boundary plus one is rejected by the depth guard', `{"x":${nestedObjectJson(257)}}`, /nesting/i],
+  ];
+  for (const [name, source, messagePattern] of depthCases) {
+    const depthBoundaryRoot = temporaryRoot();
+    writeLocal(depthBoundaryRoot, source);
+    assert.throws(
+      () => config.loadWikiLocalConfig(depthBoundaryRoot),
+      (error) => error.code === 'CONFIG_INVALID' && messagePattern.test(error.message),
+      name,
+    );
+  }
 
   const linkedRoot = temporaryRoot();
   const linked = writeLocal(linkedRoot, '{"auto_ingest":{}}');

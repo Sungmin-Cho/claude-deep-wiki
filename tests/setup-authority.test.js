@@ -709,6 +709,34 @@ test('rebind resume consumes allowed_route_created before creating an absent wik
   assert.equal(loadSetupAuthority(home).state, 'rebind_pending');
 });
 
+test('rebind resume commits absent-to-created proof without retaining the transient route allowlist', () => {
+  const home = fixture('deep wiki rebind route-created proof ');
+  const oldWiki = path.join(home, 'wiki-a');
+  const newWiki = path.join(home, 'wiki-b');
+  setup(home, oldWiki);
+  fs.rmSync(oldWiki, { recursive: true });
+  fs.writeFileSync(path.join(home, '.codex', 'deep-wiki-config.yaml'), `wiki_root: "${newWiki}"\n`);
+  assert.throws(() => setup(home, newWiki, {
+    rebindAuthorityFrom: oldWiki,
+    faultInjector(boundary) {
+      if (boundary === 'after-rebind-pending') throw new Error('stop after rebind pending');
+    },
+  }), /stop after rebind pending/);
+  const pending = loadSetupAuthority(home);
+  assert.equal(pending.state, 'rebind_pending');
+  assert.equal(pending.allowed_route_created.includes(path.join(home, 'wiki-b')), true);
+
+  const result = setup(home, newWiki, { rebindAuthorityFrom: oldWiki });
+  const committed = loadSetupAuthority(home);
+
+  assert.equal(result.authority.generation, 2);
+  assert.equal(committed.state, 'committed');
+  assert.equal(Object.hasOwn(committed, 'allowed_route_created'), false);
+  assert.equal(committed.requested_wiki_claim.claim_state, 'absent');
+  assert.match(committed.requested_wiki_claim.route_created_permit.owner_token, /^[a-f0-9]{64}$/);
+  assert.equal(fs.existsSync(path.join(newWiki, 'pages', 'welcome.md')), true);
+});
+
 test('explicit rebind preserves a sealed pre-existing B wiki without inventing a route-created permit', () => {
   const home = fixture('deep wiki preexisting rebind ');
   const preparerHome = fixture('deep wiki preexisting rebind preparer ');

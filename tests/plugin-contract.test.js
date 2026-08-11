@@ -16,6 +16,13 @@ function readText(relativePath) {
   return fs.readFileSync(path.join(ROOT, relativePath), 'utf8');
 }
 
+function changelogSection(text, heading) {
+  const start = text.indexOf(heading);
+  assert.notEqual(start, -1, heading);
+  const next = text.indexOf('\n## [', start + heading.length);
+  return text.slice(start, next === -1 ? undefined : next);
+}
+
 test('Codex manifest uses default hook discovery and has no MCP surface', () => {
   const manifest = readJson('.codex-plugin/plugin.json');
   assert.equal(Object.hasOwn(manifest, 'hooks'), false);
@@ -335,6 +342,7 @@ test('wiki-local auto-ingest and setup-authority operator docs stay aligned', ()
   assert.match(schema, /accepted_keys:\s+\["auto_ingest", "a5_fanout_threshold", "a5_worker_timeout_sec"\]/);
   assert.match(schema, /invalid_local_fail_closed: "Non-regular file, symlink, duplicate key, invalid UTF-8, and >64 KiB wiki-local config states are CONFIG_INVALID."/);
   assert.match(schema, /a5_preservation: "Migration preserves a5_fanout_threshold and a5_worker_timeout_sec while moving only auto_ingest ownership."/);
+  assert.match(schema, /conflict_recovery: "CONFIG_CONFLICT local-vs-legacy policy values require matching local and legacy values or deleting one policy block while hosts are stopped; CONFIG_CONFLICT candidates=/);
   assert.doesNotMatch(schema, /absence = defaults; no migration needed/);
 
   const englishSurfaces = [
@@ -351,7 +359,8 @@ test('wiki-local auto-ingest and setup-authority operator docs stay aligned', ()
     assert.match(text, /migration preserves A5 keys/i, file);
     assert.match(text, /ignore globs are vault-relative/i, file);
     assert.match(text, /non-regular file, symlink, duplicate key, invalid UTF-8, or >64 KiB/i, file);
-    assert.match(text, /`CONFIG_CONFLICT` recovery is to make local and legacy values match, or delete one policy block/i, file);
+    assert.match(text, /`CONFIG_CONFLICT` recovery for local-vs-legacy policy values is to make local and legacy values match, or delete one policy block/i, file);
+    assert.match(text, /`CONFIG_CONFLICT candidates=[^`]+` means cross-host candidate YAML files diverge/i, file);
     assert.match(text, /remove legacy YAML only after `policy_source=wiki_local_migrated`/i, file);
     assert.match(text, /re-resolve and confirm `policy_source=wiki_local`/i, file);
     assert.match(text, /stop all hosts before direct edit/i, file);
@@ -371,7 +380,8 @@ test('wiki-local auto-ingest and setup-authority operator docs stay aligned', ()
   assert.match(korean, /migration은 A5 key를 보존/);
   assert.match(korean, /ignore glob은 vault-relative/);
   assert.match(korean, /non-regular file, symlink, duplicate key, invalid UTF-8, 또는 >64 KiB/);
-  assert.match(korean, /`CONFIG_CONFLICT` recovery는 local과 legacy 값을 일치시키거나 policy block 하나를 삭제/);
+  assert.match(korean, /`CONFIG_CONFLICT` recovery for local-vs-legacy policy values는 local과 legacy 값을 일치시키거나 policy block 하나를 삭제/);
+  assert.match(korean, /`CONFIG_CONFLICT candidates=[^`]+`는 cross-host candidate YAML file divergence/);
   assert.match(korean, /legacy YAML은 `policy_source=wiki_local_migrated` 이후에만 제거/);
   assert.match(korean, /다시 resolve해 `policy_source=wiki_local` 확인/);
   assert.match(korean, /직접 편집 전에는 모든 host를 중지/);
@@ -379,24 +389,46 @@ test('wiki-local auto-ingest and setup-authority operator docs stay aligned', ()
   assert.match(korean, /명시적 stopped-host rebind/);
   assert.match(korean, /rebind resume에는 원래 `CODEX_HOME` 및 `DEEP_WIKI_CONFIG` spelling/);
   assert.match(korean, /백업 전용 downgrade/);
-  assert.match(korean, /`--replace-config`는 invalid selected-host YAML을 우회하지 않음/);
-  assert.match(korean, /`\.deep-wiki-setup-authority\.json`와 `\.deep-wiki-setup\.reserve`는 home authority artifact이며 SessionStart config candidate가 아님/);
+  assert.match(korean, /`--replace-config`는 invalid selected-host YAML을 우회하지 않습니다/);
+  assert.match(korean, /`\.deep-wiki-setup-authority\.json`와 `\.deep-wiki-setup\.reserve`는 home authority artifact이며 SessionStart config candidate가 아닙니다/);
 
-  const changelogUnreleased = readText('CHANGELOG.md').split('\n## [1.9.7]')[0];
+  const readme = readText('README.md').replace(/\s+/g, ' ');
+  assert.match(readme, /"auto_ingest":\s*\{\s*"ignore_globs":\s*\[\s*"archive\/\*\*"\s*\],\s*"require_tag":\s*"project"\s*\}/);
+  assert.match(readme, /YAML examples above are bootstrap\/legacy alias forms/i);
+  assert.match(readme, /including non-regular file, symlink, duplicate key, invalid UTF-8, or >64 KiB.*`CONFIG_INVALID`/i);
+  assert.match(readme, /local-vs-legacy policy values/);
+  assert.match(readme, /`CONFIG_CONFLICT candidates=[^`]+` means cross-host candidate YAML files diverge/);
+
+  const koreanReadme = readText('README.ko.md').replace(/\s+/g, ' ');
+  assert.match(koreanReadme, /"auto_ingest":\s*\{\s*"ignore_globs":\s*\[\s*"archive\/\*\*"\s*\],\s*"require_tag":\s*"project"\s*\}/);
+  assert.match(koreanReadme, /위 YAML 예시는 bootstrap\/legacy alias 형식/);
+  assert.match(koreanReadme, /including non-regular file, symlink, duplicate key, invalid UTF-8, 또는 >64 KiB.*`CONFIG_INVALID`/);
+  assert.match(koreanReadme, /local-vs-legacy policy value/);
+  assert.match(koreanReadme, /`CONFIG_CONFLICT candidates=[^`]+`는 cross-host candidate YAML file divergence/);
+
+  const changelogUnreleased = changelogSection(readText('CHANGELOG.md'), '## [Unreleased]');
   assert.match(changelogUnreleased, /setup lifecycle event.*`YYYY-MM-DDTHH:MM:SSZ`.*`MANIFEST_INVALID`/);
   assert.doesNotMatch(changelogUnreleased, /scan-window metadata/);
-  assert.match(changelogUnreleased, /wiki-local `\.wiki-meta\/\.config\.json` owner/);
-  assert.match(changelogUnreleased, /migration\/legacy bootstrap/);
-  assert.match(changelogUnreleased, /fail-closed conflict and invalid-local/);
-  assert.match(changelogUnreleased, /home authority artifacts and backup-only downgrade safety/);
+  assert.match(changelogUnreleased, /`auto_ingest` policy now lives in `<wiki_root>\/\.wiki-meta\/\.config\.json`/);
+  assert.match(changelogUnreleased, /`\/wiki-setup` and SessionStart create it by migrating an equivalent global YAML block/);
+  assert.match(changelogUnreleased, /`\/wiki-setup` also creates `~\/\.deep-wiki-setup-authority\.json` and `~\/\.deep-wiki-setup\.reserve\/`/);
+  assert.match(changelogUnreleased, /Divergent local\/legacy policy and representative invalid local config shapes now fail closed/);
 
-  const koreanChangelogUnreleased = readText('CHANGELOG.ko.md').split('\n## [1.9.7]')[0];
+  const changelogHistorical = readText('CHANGELOG.md');
+  assert.doesNotMatch(changelogHistorical, /no shipped code reads that file/);
+  assert.match(changelogHistorical, /At 1\.9\.2 release time, no shipped code read that file/);
+
+  const koreanChangelogUnreleased = changelogSection(readText('CHANGELOG.ko.md'), '## [Unreleased]');
   assert.match(koreanChangelogUnreleased, /setup lifecycle event.*`YYYY-MM-DDTHH:MM:SSZ`.*`MANIFEST_INVALID`/);
   assert.doesNotMatch(koreanChangelogUnreleased, /scan-window metadata/);
-  assert.match(koreanChangelogUnreleased, /wiki-local `\.wiki-meta\/\.config\.json` owner/);
-  assert.match(koreanChangelogUnreleased, /migration\/legacy bootstrap/);
-  assert.match(koreanChangelogUnreleased, /fail-closed conflict 및 invalid-local/);
-  assert.match(koreanChangelogUnreleased, /home authority artifact와 백업 전용 downgrade safety/);
+  assert.match(koreanChangelogUnreleased, /`auto_ingest` policy는 이제 `<wiki_root>\/\.wiki-meta\/\.config\.json`에 저장/);
+  assert.match(koreanChangelogUnreleased, /`\/wiki-setup`과 SessionStart가 동등한 global YAML block을 migration해 생성/);
+  assert.match(koreanChangelogUnreleased, /`\/wiki-setup`은 `~\/\.deep-wiki-setup-authority\.json`와 `~\/\.deep-wiki-setup\.reserve\/`도 생성/);
+  assert.match(koreanChangelogUnreleased, /divergent local\/legacy policy와 대표 invalid local config shape는 fail closed/);
+
+  const koreanChangelogHistorical = readText('CHANGELOG.ko.md');
+  assert.doesNotMatch(koreanChangelogHistorical, /배포되는 코드 중 이 파일을 읽는 곳은 없습니다/);
+  assert.match(koreanChangelogHistorical, /1\.9\.2 release 시점에는 배포되는 코드 중 이 파일을 읽는 곳이 없었습니다/);
 });
 
 test('1.8.0 ships no MCP, native binary, runtime dependency, or shell entrypoint', () => {

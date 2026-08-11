@@ -1685,7 +1685,7 @@ test('wiki-schema instruction surfaces document the wiki-local config and home a
     .replace(/\s+/g, ' ');
 
   assert.match(storageLayout, /\.wiki-meta\/ \s*├── \.config\.json\s+wiki-local auto-ingest and A5 knob config/);
-  assert.match(storageLayout, /`\.deep-wiki-setup-authority\.json` and `\.deep-wiki-setup\.reserve` are home authority artifacts, never SessionStart config candidates; they live in the selected home/);
+  assert.match(storageLayout, /`\.deep-wiki-setup-authority\.json` and `\.deep-wiki-setup\.reserve` are home authority artifacts, never SessionStart config candidates; they live in the physical user home/);
   assert.match(schemaSkill, /Invalid wiki-local config is fail-closed before any legacy fallback/);
   assert.match(schemaSkill, /Remove legacy YAML only after `policy_source=wiki_local_migrated`/);
   assert.match(setupSkill, /A pending rebind resume must use the same `CODEX_HOME` and `DEEP_WIKI_CONFIG` spelling/);

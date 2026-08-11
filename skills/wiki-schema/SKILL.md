@@ -129,10 +129,13 @@ are vault-relative inside `auto_ingest`.
 
 Invalid wiki-local config is fail-closed before any legacy fallback:
 non-regular file, symlink, duplicate key, invalid UTF-8, or >64 KiB state is
-`CONFIG_INVALID`. `CONFIG_CONFLICT` recovery is to make local and legacy values
-match, or delete one policy block while all hosts are stopped. Remove legacy
-YAML only after `policy_source=wiki_local_migrated`, then re-resolve and confirm
-`policy_source=wiki_local` before relying on the local owner alone.
+`CONFIG_INVALID`. `CONFIG_CONFLICT` recovery for local-vs-legacy policy values
+is to make local and legacy values match, or delete one policy block while all
+hosts are stopped. `CONFIG_CONFLICT candidates=...` means cross-host candidate
+YAML files diverge; reconcile the named host YAML files while hosts are stopped.
+Remove legacy YAML only after `policy_source=wiki_local_migrated`, then
+re-resolve and confirm `policy_source=wiki_local` before relying on the local
+owner alone.
 
 Stop all hosts before direct edit of global YAML or wiki-local JSON, keep a
 backup, and restart one host so the runtime can revalidate. `--replace-config`

@@ -33,9 +33,11 @@ local and legacy policies fail closed. Accepted wiki-local keys are
 preserves A5 keys while moving only `auto_ingest` ownership. The ignore globs
 are vault-relative inside `auto_ingest`. Non-regular file, symlink, duplicate
 key, invalid UTF-8, or >64 KiB wiki-local config state is `CONFIG_INVALID`.
-`CONFIG_CONFLICT` recovery is to make local and legacy values match, or delete
-one policy block while all hosts are stopped. Remove legacy YAML only after
-`policy_source=wiki_local_migrated`, then re-resolve and confirm
+`CONFIG_CONFLICT` recovery for local-vs-legacy policy values is to make local
+and legacy values match, or delete one policy block while all hosts are stopped.
+`CONFIG_CONFLICT candidates=...` means cross-host candidate YAML files diverge;
+reconcile the named host YAML files while hosts are stopped. Remove legacy YAML
+only after `policy_source=wiki_local_migrated`, then re-resolve and confirm
 `policy_source=wiki_local`.
 
 Stop all hosts before direct edit of global YAML, wiki-local JSON, setup
@@ -46,7 +48,7 @@ conditions. Divergent `CODEX_HOME` or `HOME` values create separate
 setup-authority domains, so a shared wiki should use one physical home and one
 host configuration route. `.deep-wiki-setup-authority.json` and
 `.deep-wiki-setup.reserve` are home authority artifacts, never SessionStart
-config candidates; they live in the selected home. A wiki move is an explicit
+config candidates; they live in the physical user home. A wiki move is an explicit
 stopped-host rebind; rebind resumes require the original `CODEX_HOME` and
 `DEEP_WIKI_CONFIG` spelling from the pending rebind so the same candidate vector
 is revalidated. Rollback uses backup-only downgrade after current-version

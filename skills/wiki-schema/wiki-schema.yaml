@@ -221,7 +221,7 @@ auto_ingest:
   retained_global_aliases: "Global host YAML remains accepted as bootstrap/legacy alias input until operators remove it after the migrated source is confirmed."
   invalid_local_fail_closed: "Non-regular file, symlink, duplicate key, invalid UTF-8, and >64 KiB wiki-local config states are CONFIG_INVALID."
   a5_preservation: "Migration preserves a5_fanout_threshold and a5_worker_timeout_sec while moving only auto_ingest ownership."
-  conflict_recovery: "CONFIG_CONFLICT recovery is to make local and legacy values match, or delete one policy block while hosts are stopped."
+  conflict_recovery: "CONFIG_CONFLICT local-vs-legacy policy values require matching local and legacy values or deleting one policy block while hosts are stopped; CONFIG_CONFLICT candidates=... means cross-host candidate YAML files diverge and require reconciling the named host YAML files."
   filters:
     ignore_globs:
       type: list

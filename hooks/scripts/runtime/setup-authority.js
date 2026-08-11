@@ -357,11 +357,19 @@ function sealCandidate(candidate, { env, home, fs, platform }) {
   }
   const identity = filesystemIdentity(stat, REGULAR_FILE_TYPE);
   if (!identity) throw authorityError('SETUP_AUTHORITY_INVALID', 'global candidate identity is unavailable or linked');
+  let physicalCandidate;
+  try { physicalCandidate = pathApi(platform).normalize(realpathNative(fs, candidate)); } catch (cause) {
+    throw authorityError('SETUP_AUTHORITY_INVALID', 'global candidate cannot be canonicalized', cause);
+  }
+  const physicalIdentity = currentIdentity(fs, physicalCandidate, REGULAR_FILE_TYPE);
+  if (!physicalIdentity || !identitiesEqual(identity, physicalIdentity)) {
+    throw authorityError('SETUP_AUTHORITY_INVALID', 'global candidate changed while canonicalizing');
+  }
   let bytes;
-  try { bytes = Buffer.from(fs.readFileSync(candidate)); } catch (cause) {
+  try { bytes = Buffer.from(fs.readFileSync(physicalCandidate)); } catch (cause) {
     throw authorityError('SETUP_AUTHORITY_INVALID', 'global candidate cannot be read', cause);
   }
-  const after = currentIdentity(fs, candidate, REGULAR_FILE_TYPE);
+  const after = currentIdentity(fs, physicalCandidate, REGULAR_FILE_TYPE);
   if (!identitiesEqual(identity, after)) {
     throw authorityError('SETUP_AUTHORITY_INVALID', 'global candidate identity changed while reading');
   }
@@ -374,7 +382,7 @@ function sealCandidate(candidate, { env, home, fs, platform }) {
     throw authorityError('SETUP_AUTHORITY_INVALID', 'global candidate is invalid', cause);
   }
   return {
-    path: candidate,
+    path: physicalCandidate,
     state: 'present',
     identity: serializeIdentity(identity),
     sha256: sha256(bytes),
@@ -385,8 +393,19 @@ function sealCandidate(candidate, { env, home, fs, platform }) {
 function sealCandidateVector(env, home, selectedTarget, options = {}) {
   const fs = options.fs || nodeFs;
   const platform = options.platform || process.platform;
-  return candidatePaths(env, home, selectedTarget, platform)
-    .map((candidate) => sealCandidate(candidate, { env, home, fs, platform }));
+  const sealed = [];
+  for (const candidate of candidatePaths(env, home, selectedTarget, platform)) {
+    const current = sealCandidate(candidate, { env, home, fs, platform });
+    const existing = sealed.find((entry) => samePath(entry.path, current.path, platform));
+    if (existing) {
+      if (JSON.stringify(existing) !== JSON.stringify(current)) {
+        throw authorityError('SETUP_AUTHORITY_INVALID', 'global candidate aliases changed while sealing');
+      }
+      continue;
+    }
+    sealed.push(current);
+  }
+  return sealed.sort((left, right) => left.path.localeCompare(right.path, 'en'));
 }
 
 function sealWikiClaim(wikiRoot, options = {}) {
@@ -869,12 +888,16 @@ function ownerCanResume(record, options) {
 }
 
 function candidatePermit(record, candidatePath, operationId, owner, fs) {
-  const stat = currentIdentity(fs, candidatePath, REGULAR_FILE_TYPE);
+  let physicalCandidate;
+  try { physicalCandidate = realpathNative(fs, candidatePath); } catch (cause) {
+    throw authorityError('SETUP_AUTHORITY_RECOVERY_REQUIRED', 'route-created config cannot be canonicalized', cause);
+  }
+  const stat = currentIdentity(fs, physicalCandidate, REGULAR_FILE_TYPE);
   if (!stat) throw authorityError('SETUP_AUTHORITY_RECOVERY_REQUIRED', 'route-created config identity is unavailable');
-  const bytes = Buffer.from(fs.readFileSync(candidatePath));
+  const bytes = Buffer.from(fs.readFileSync(physicalCandidate));
   const parsed = normalizeConfigSemantics(parseConfig(utf8Decoder.decode(bytes)), { fs });
   return {
-    path: candidatePath,
+    path: physicalCandidate,
     owner_token: owner.token,
     operation_id: operationId,
     resulting_identity: serializeIdentity(stat),

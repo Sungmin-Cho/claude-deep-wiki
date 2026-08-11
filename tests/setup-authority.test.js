@@ -140,6 +140,74 @@ test('an absent requested wiki below a symlinked container is claimed in the phy
   assert.equal(setup(home, requestedWiki).status, 'compatible');
 });
 
+test('a route-created CODEX_HOME candidate below a symlinked ancestor uses one physical key', () => {
+  const home = fixture('deep wiki physical codex candidate ');
+  const physicalContainer = path.join(home, 'physical-config');
+  const physicalCodexHome = path.join(physicalContainer, 'codex-home');
+  const aliasContainer = path.join(home, 'alias-config');
+  fs.mkdirSync(physicalCodexHome, { recursive: true });
+  fs.symlinkSync(physicalContainer, aliasContainer, 'dir');
+  const lexicalCodexHome = path.join(aliasContainer, 'codex-home');
+  const lexicalConfig = path.join(lexicalCodexHome, 'deep-wiki-config.yaml');
+  const physicalConfig = path.join(physicalCodexHome, 'deep-wiki-config.yaml');
+  const wiki = path.join(home, 'wiki');
+  const env = envFor(home, { CODEX_HOME: lexicalCodexHome });
+
+  const first = setupWiki({
+    wikiRoot: wiki,
+    configHost: 'codex',
+    env,
+    now: new Date(TS),
+    operationId: '01K2CP8QT0B2D2QCR6HVG8YM0N',
+    eventId: '01K2CP8QT0B2D2QCR6HVG8YM0P',
+  });
+  const authority = loadSetupAuthority(home);
+
+  assert.equal(first.config.path, lexicalConfig);
+  assert.equal(fs.realpathSync.native(lexicalConfig), physicalConfig);
+  assert.equal(authority.state, 'committed');
+  assert.equal(authority.candidates.some((entry) => entry.path === physicalConfig && entry.state === 'present'), true);
+  assert.equal(authority.candidate_permits.some((permit) => permit.path === physicalConfig), true);
+  assert.equal(setupWiki({ wikiRoot: wiki, configHost: 'codex', env, now: new Date(TS) }).status, 'compatible');
+});
+
+test('DEEP_WIKI_CONFIG and CODEX_HOME aliases of one route-created file collapse to one physical key', () => {
+  const home = fixture('deep wiki twin config aliases ');
+  const physicalContainer = path.join(home, 'physical-config');
+  const physicalCodexHome = path.join(physicalContainer, 'codex-home');
+  const aliasA = path.join(home, 'alias-a');
+  const aliasB = path.join(home, 'alias-b');
+  fs.mkdirSync(physicalCodexHome, { recursive: true });
+  fs.symlinkSync(physicalContainer, aliasA, 'dir');
+  fs.symlinkSync(physicalContainer, aliasB, 'dir');
+  const lexicalCodexHome = path.join(aliasA, 'codex-home');
+  const lexicalExplicit = path.join(aliasB, 'codex-home', 'deep-wiki-config.yaml');
+  const physicalConfig = path.join(physicalCodexHome, 'deep-wiki-config.yaml');
+  const wiki = path.join(home, 'wiki');
+  const env = envFor(home, {
+    CODEX_HOME: lexicalCodexHome,
+    DEEP_WIKI_CONFIG: lexicalExplicit,
+  });
+
+  const first = setupWiki({
+    wikiRoot: wiki,
+    configHost: 'codex',
+    env,
+    now: new Date(TS),
+    operationId: '01K2CP8QT0B2D2QCR6HVG8YM0Q',
+    eventId: '01K2CP8QT0B2D2QCR6HVG8YM0R',
+  });
+  const authority = loadSetupAuthority(home);
+  const physicalKeys = authority.candidates.filter((entry) => entry.path === physicalConfig);
+
+  assert.equal(first.config.path, path.join(lexicalCodexHome, 'deep-wiki-config.yaml'));
+  assert.equal(fs.realpathSync.native(lexicalExplicit), physicalConfig);
+  assert.equal(authority.state, 'committed');
+  assert.equal(physicalKeys.length, 1);
+  assert.equal(authority.candidate_permits.filter((permit) => permit.path === physicalConfig).length, 1);
+  assert.equal(setupWiki({ wikiRoot: wiki, configHost: 'codex', env, now: new Date(TS) }).status, 'compatible');
+});
+
 test('authority loading rejects noncanonical, duplicate, oversized, and identity-changing records', () => {
   const home = fixture('deep wiki authority parse ');
   const file = authorityPath(home);

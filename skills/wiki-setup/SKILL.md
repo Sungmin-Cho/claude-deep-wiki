@@ -52,6 +52,9 @@ For a stopped-host authority move, use the explicit rebind route only when the
 operator supplies the old root and the old wiki is already absent. This is not
 automatic rollback or restoration; if the route publishes `rebind_pending`, the
 runtime may complete the new root or fail closed for stopped-host recovery.
+A pending rebind resume must use the same `CODEX_HOME` and `DEEP_WIKI_CONFIG`
+spelling used when that pending rebind was published, so the original candidate
+vector is revalidated rather than silently rebound.
 
 <!-- deep-wiki:exec -->
 ```deep-wiki-exec

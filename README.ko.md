@@ -102,6 +102,7 @@ codex plugin install deep-wiki
 ├── log.jsonl                 # Append-only 구조화 이벤트 로그
 ├── pages/                    # 위키 페이지 (flat, 태그 기반 분류)
 └── .wiki-meta/
+    ├── .config.json          # Wiki-local auto-ingest 및 A5 knob config
     ├── index.json            # Machine-readable 페이지 catalog (파생; M3 envelope-wrapped)
     ├── sources/              # 소스별 provenance YAML 파일
     └── .versions/            # 덮어쓰기 전 페이지 백업 (최근 3개)
@@ -147,7 +148,11 @@ auto_ingest:
 auto_ingest.ignore_globs: ["**/archive-*.md"]
 ```
 
-프로덕션 ownership: wiki-local `.wiki-meta/.config.json`가 `auto_ingest`를 소유합니다. global host YAML `auto_ingest`는 bootstrap/legacy alias일 뿐이며, `/wiki-setup`과 SessionStart가 동등한 legacy policy를 스캔 전에 wiki-local 파일로 migration합니다. 충돌하는 local 및 legacy policy는 fail closed합니다. 두 파일을 직접 편집 전에는 모든 host를 중지하고 backup을 만든 뒤, 한 host만 다시 시작해 runtime revalidation을 통과시키세요. 서로 다른 `CODEX_HOME` 또는 `HOME` 값은 별도 setup-authority domain을 만들므로, 같은 wiki를 공유할 때는 하나의 physical home을 사용하세요. authority가 소유한 wiki를 이동하려면 명시적 stopped-host rebind가 필요하며, rebind resume에는 원래 `CODEX_HOME` 및 `DEEP_WIKI_CONFIG` spelling이 필요합니다. Rollback은 계속 백업 전용 downgrade이며, 구버전의 in-place mutation이 아닙니다.
+프로덕션 ownership: wiki-local `.wiki-meta/.config.json`가 `auto_ingest`를 소유합니다. 허용되는 wiki-local key는 `auto_ingest`, `a5_fanout_threshold`, `a5_worker_timeout_sec`입니다. migration은 A5 key를 보존하면서 `auto_ingest` ownership만 이동합니다. `ignore_globs`의 ignore glob은 vault-relative이므로 `notes/private/**`는 wiki metadata directory가 아니라 vault root 기준으로 매칭됩니다.
+
+global host YAML `auto_ingest`는 bootstrap/legacy alias일 뿐이며, `/wiki-setup`과 SessionStart가 동등한 legacy policy를 스캔 전에 wiki-local 파일로 migration합니다. 유지된 global alias는 제거 전까지 계속 resolve됩니다. legacy YAML은 `policy_source=wiki_local_migrated` 이후에만 제거하고, 다시 resolve해 `policy_source=wiki_local` 확인 후 local owner만 신뢰하세요. 충돌하는 local 및 legacy policy는 fail closed합니다. `CONFIG_CONFLICT` recovery는 local과 legacy 값을 일치시키거나 policy block 하나를 삭제하는 것입니다. 이 작업은 모든 host를 중지한 상태에서 수행하세요. non-regular file, symlink, duplicate key, invalid UTF-8, 또는 >64 KiB wiki-local config state는 invalid-local fail-closed입니다.
+
+두 파일을 직접 편집 전에는 모든 host를 중지하고 backup을 만든 뒤, 한 host만 다시 시작해 runtime revalidation을 통과시키세요. `--replace-config`는 invalid selected-host YAML을 우회하지 않음; 해당 selected host file을 stopped-host 규칙 아래에서 먼저 고치거나 제거한 뒤 replace해야 합니다. 서로 다른 `CODEX_HOME` 또는 `HOME` 값은 별도 setup-authority domain을 만들므로, 같은 wiki를 공유할 때는 하나의 physical home을 사용하세요. `.deep-wiki-setup-authority.json`와 `.deep-wiki-setup.reserve`는 home authority artifact이며 SessionStart config candidate가 아님. authority가 소유한 wiki를 이동하려면 명시적 stopped-host rebind가 필요하며, rebind resume에는 원래 `CODEX_HOME` 및 `DEEP_WIKI_CONFIG` spelling이 필요합니다. Rollback은 계속 백업 전용 downgrade이며, 구버전의 in-place mutation이 아닙니다.
 
 ### 클라우드 백업 `wiki_root` (iCloud / Google Drive / Dropbox)
 

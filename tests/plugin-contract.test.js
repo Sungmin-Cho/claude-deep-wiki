@@ -332,6 +332,10 @@ test('wiki-local auto-ingest and setup-authority operator docs stay aligned', ()
   assert.match(schema, /config_block:\s+"<wiki_root>\/\.wiki-meta\/\.config\.json"/);
   assert.match(schema, /legacy_alias:\s+"Global host YAML .*bootstrap\/legacy alias/);
   assert.match(schema, /owner:\s+"wiki-local"/);
+  assert.match(schema, /accepted_keys:\s+\["auto_ingest", "a5_fanout_threshold", "a5_worker_timeout_sec"\]/);
+  assert.match(schema, /invalid_local_fail_closed: "Non-regular file, symlink, duplicate key, invalid UTF-8, and >64 KiB wiki-local config states are CONFIG_INVALID."/);
+  assert.match(schema, /a5_preservation: "Migration preserves a5_fanout_threshold and a5_worker_timeout_sec while moving only auto_ingest ownership."/);
+  assert.doesNotMatch(schema, /absence = defaults; no migration needed/);
 
   const englishSurfaces = [
     'README.md',
@@ -343,27 +347,56 @@ test('wiki-local auto-ingest and setup-authority operator docs stay aligned', ()
     assert.match(text, /wiki-local `\.wiki-meta\/\.config\.json` owns `auto_ingest`/i, file);
     assert.match(text, /global host YAML `auto_ingest` is only a bootstrap\/legacy alias/i, file);
     assert.match(text, /conflicting local and legacy policies fail closed/i, file);
+    assert.match(text, /accepted wiki-local keys are `auto_ingest`, `a5_fanout_threshold`, and `a5_worker_timeout_sec`/i, file);
+    assert.match(text, /migration preserves A5 keys/i, file);
+    assert.match(text, /ignore globs are vault-relative/i, file);
+    assert.match(text, /non-regular file, symlink, duplicate key, invalid UTF-8, or >64 KiB/i, file);
+    assert.match(text, /`CONFIG_CONFLICT` recovery is to make local and legacy values match, or delete one policy block/i, file);
+    assert.match(text, /remove legacy YAML only after `policy_source=wiki_local_migrated`/i, file);
+    assert.match(text, /re-resolve and confirm `policy_source=wiki_local`/i, file);
     assert.match(text, /stop all hosts before direct edit/i, file);
     assert.match(text, /divergent `CODEX_HOME` or `HOME` values create separate setup-authority domains/i, file);
     assert.match(text, /explicit stopped-host rebind/i, file);
     assert.match(text, /rebind resumes require the original `CODEX_HOME` and `DEEP_WIKI_CONFIG` spelling/i, file);
     assert.match(text, /backup-only downgrade/i, file);
+    assert.match(text, /`--replace-config` does not bypass invalid selected-host YAML/i, file);
+    assert.match(text, /`\.deep-wiki-setup-authority\.json` and `\.deep-wiki-setup\.reserve` are home authority artifacts, never SessionStart config candidates/i, file);
   }
 
   const korean = readText('README.ko.md').replace(/\s+/g, ' ');
   assert.match(korean, /wiki-local `\.wiki-meta\/\.config\.json`가 `auto_ingest`를 소유/);
   assert.match(korean, /global host YAML `auto_ingest`는 bootstrap\/legacy alias/);
   assert.match(korean, /충돌하는 local 및 legacy policy는 fail closed/);
+  assert.match(korean, /허용되는 wiki-local key는 `auto_ingest`, `a5_fanout_threshold`, `a5_worker_timeout_sec`/);
+  assert.match(korean, /migration은 A5 key를 보존/);
+  assert.match(korean, /ignore glob은 vault-relative/);
+  assert.match(korean, /non-regular file, symlink, duplicate key, invalid UTF-8, 또는 >64 KiB/);
+  assert.match(korean, /`CONFIG_CONFLICT` recovery는 local과 legacy 값을 일치시키거나 policy block 하나를 삭제/);
+  assert.match(korean, /legacy YAML은 `policy_source=wiki_local_migrated` 이후에만 제거/);
+  assert.match(korean, /다시 resolve해 `policy_source=wiki_local` 확인/);
   assert.match(korean, /직접 편집 전에는 모든 host를 중지/);
   assert.match(korean, /서로 다른 `CODEX_HOME` 또는 `HOME` 값은 별도 setup-authority domain/);
   assert.match(korean, /명시적 stopped-host rebind/);
   assert.match(korean, /rebind resume에는 원래 `CODEX_HOME` 및 `DEEP_WIKI_CONFIG` spelling/);
   assert.match(korean, /백업 전용 downgrade/);
+  assert.match(korean, /`--replace-config`는 invalid selected-host YAML을 우회하지 않음/);
+  assert.match(korean, /`\.deep-wiki-setup-authority\.json`와 `\.deep-wiki-setup\.reserve`는 home authority artifact이며 SessionStart config candidate가 아님/);
 
-  assert.match(readText('CHANGELOG.md'), /wiki-local `\.wiki-meta\/\.config\.json` ownership/);
-  assert.match(readText('CHANGELOG.md'), /canonical UTC-Z timestamp/);
-  assert.match(readText('CHANGELOG.ko.md'), /wiki-local `\.wiki-meta\/\.config\.json` ownership/);
-  assert.match(readText('CHANGELOG.ko.md'), /canonical UTC-Z timestamp/);
+  const changelogUnreleased = readText('CHANGELOG.md').split('\n## [1.9.7]')[0];
+  assert.match(changelogUnreleased, /setup lifecycle event.*`YYYY-MM-DDTHH:MM:SSZ`.*`MANIFEST_INVALID`/);
+  assert.doesNotMatch(changelogUnreleased, /scan-window metadata/);
+  assert.match(changelogUnreleased, /wiki-local `\.wiki-meta\/\.config\.json` owner/);
+  assert.match(changelogUnreleased, /migration\/legacy bootstrap/);
+  assert.match(changelogUnreleased, /fail-closed conflict and invalid-local/);
+  assert.match(changelogUnreleased, /home authority artifacts and backup-only downgrade safety/);
+
+  const koreanChangelogUnreleased = readText('CHANGELOG.ko.md').split('\n## [1.9.7]')[0];
+  assert.match(koreanChangelogUnreleased, /setup lifecycle event.*`YYYY-MM-DDTHH:MM:SSZ`.*`MANIFEST_INVALID`/);
+  assert.doesNotMatch(koreanChangelogUnreleased, /scan-window metadata/);
+  assert.match(koreanChangelogUnreleased, /wiki-local `\.wiki-meta\/\.config\.json` owner/);
+  assert.match(koreanChangelogUnreleased, /migration\/legacy bootstrap/);
+  assert.match(koreanChangelogUnreleased, /fail-closed conflict 및 invalid-local/);
+  assert.match(koreanChangelogUnreleased, /home authority artifact와 백업 전용 downgrade safety/);
 });
 
 test('1.8.0 ships no MCP, native binary, runtime dependency, or shell entrypoint', () => {

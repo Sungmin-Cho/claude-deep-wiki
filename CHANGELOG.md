@@ -9,8 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `/wiki-setup` now preserves the shipped canonical UTC-Z timestamp format when creating or refreshing scan-window metadata.
-- SessionStart and setup docs now state wiki-local `.wiki-meta/.config.json` ownership for `auto_ingest`, with global host YAML kept only as a bootstrap/legacy alias and conflicting local/legacy policy handled fail-closed.
+- `/wiki-setup` now emits its setup lifecycle event with the canonical `YYYY-MM-DDTHH:MM:SSZ` timestamp, so the documented setup route no longer fails with `MANIFEST_INVALID`.
+
+### Changed
+
+- Documented the wiki-local `.wiki-meta/.config.json` owner for `auto_ingest`, the migration/legacy bootstrap path from global host YAML, fail-closed conflict and invalid-local handling, and home authority artifacts and backup-only downgrade safety.
 
 ## [1.9.7] — 2026-08-05 (content metadata and nested prune safety)
 

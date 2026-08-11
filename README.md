@@ -102,6 +102,7 @@ Prerequisite: the [Claude Code](https://docs.anthropic.com/en/docs/claude-code) 
 ├── log.jsonl                 # Append-only structured event log
 ├── pages/                    # Wiki pages (flat, tag-based classification)
 └── .wiki-meta/
+    ├── .config.json          # Wiki-local auto-ingest and A5 knob config
     ├── index.json            # Machine-readable page catalog (derived; M3 envelope-wrapped)
     ├── sources/              # Per-source provenance YAML files
     └── .versions/            # Page backups before overwrite (last 3)
@@ -147,7 +148,11 @@ auto_ingest:
 auto_ingest.ignore_globs: ["**/archive-*.md"]
 ```
 
-Production ownership: wiki-local `.wiki-meta/.config.json` owns `auto_ingest`. The global host YAML `auto_ingest` is only a bootstrap/legacy alias; `/wiki-setup` and SessionStart migrate equivalent legacy policy into the wiki-local file before scanning. Conflicting local and legacy policies fail closed. Stop all hosts before direct edit of either file, keep a backup, then restart one host and let the runtime revalidate. Divergent `CODEX_HOME` or `HOME` values create separate setup-authority domains, so use one physical home when sharing a wiki. Moving an authority-owned wiki requires an explicit stopped-host rebind; rebind resumes require the original `CODEX_HOME` and `DEEP_WIKI_CONFIG` spelling used when the pending rebind was published. Rollback remains backup-only downgrade, not in-place mutation by an older version.
+Production ownership: wiki-local `.wiki-meta/.config.json` owns `auto_ingest`. Accepted wiki-local keys are `auto_ingest`, `a5_fanout_threshold`, and `a5_worker_timeout_sec`; migration preserves A5 keys while moving only `auto_ingest` ownership. The ignore globs are vault-relative, so `notes/private/**` matches from the vault root rather than from the wiki metadata directory.
+
+The global host YAML `auto_ingest` is only a bootstrap/legacy alias; `/wiki-setup` and SessionStart migrate equivalent legacy policy into the wiki-local file before scanning, and retained global aliases continue to resolve until you remove them. Remove legacy YAML only after `policy_source=wiki_local_migrated`, then re-resolve and confirm `policy_source=wiki_local` before relying on the local owner alone. Conflicting local and legacy policies fail closed; `CONFIG_CONFLICT` recovery is to make local and legacy values match, or delete one policy block while all hosts are stopped. Non-regular file, symlink, duplicate key, invalid UTF-8, or >64 KiB wiki-local config state is invalid-local fail-closed.
+
+Stop all hosts before direct edit of either file, keep a backup, then restart one host and let the runtime revalidate. `--replace-config` does not bypass invalid selected-host YAML; repair or remove that selected host file under the stopped-host rule before replacing it. Divergent `CODEX_HOME` or `HOME` values create separate setup-authority domains, so use one physical home when sharing a wiki. `.deep-wiki-setup-authority.json` and `.deep-wiki-setup.reserve` are home authority artifacts, never SessionStart config candidates. Moving an authority-owned wiki requires an explicit stopped-host rebind; rebind resumes require the original `CODEX_HOME` and `DEEP_WIKI_CONFIG` spelling used when the pending rebind was published. Rollback remains backup-only downgrade, not in-place mutation by an older version.
 
 ### Cloud-backed `wiki_root` (iCloud / Google Drive / Dropbox)
 

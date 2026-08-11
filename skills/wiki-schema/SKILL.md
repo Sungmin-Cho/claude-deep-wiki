@@ -20,6 +20,7 @@ WIKI_ROOT/
   log.md
   log.jsonl
   .wiki-meta/
+    .config.json
     index.json
     sources/
     .versions/
@@ -121,14 +122,29 @@ Valid lifecycle actions are `ingest`, `ingest-skip`, `ingest-repair`,
 The wiki-local `.wiki-meta/.config.json` owns `auto_ingest`. The global host YAML
 `auto_ingest` is only a bootstrap/legacy alias; setup and SessionStart migrate
 equivalent legacy policy to the wiki-local owner before scanning. Conflicting
-local and legacy policies fail closed. Stop all hosts before direct edit of
-global YAML or wiki-local JSON, keep a backup, and restart one host so the
-runtime can revalidate. Divergent `CODEX_HOME` or `HOME` values create separate
-setup-authority domains; share one physical home for one authority. Moving an
-authority-owned wiki is an explicit stopped-host rebind, and rebind resumes
-require the original `CODEX_HOME` and `DEEP_WIKI_CONFIG` spelling used for the
-pending rebind. Downgrade remains backup-only downgrade, not older-version
-in-place recovery.
+local and legacy policies fail closed. Accepted wiki-local keys are
+`auto_ingest`, `a5_fanout_threshold`, and `a5_worker_timeout_sec`; migration
+preserves A5 keys while moving only `auto_ingest` ownership. The ignore globs
+are vault-relative inside `auto_ingest`.
+
+Invalid wiki-local config is fail-closed before any legacy fallback:
+non-regular file, symlink, duplicate key, invalid UTF-8, or >64 KiB state is
+`CONFIG_INVALID`. `CONFIG_CONFLICT` recovery is to make local and legacy values
+match, or delete one policy block while all hosts are stopped. Remove legacy
+YAML only after `policy_source=wiki_local_migrated`, then re-resolve and confirm
+`policy_source=wiki_local` before relying on the local owner alone.
+
+Stop all hosts before direct edit of global YAML or wiki-local JSON, keep a
+backup, and restart one host so the runtime can revalidate. `--replace-config`
+does not bypass invalid selected-host YAML; repair or remove the invalid file
+under the stopped-host rule before replacing it. Divergent `CODEX_HOME` or
+`HOME` values create separate setup-authority domains; share one physical home
+for one authority. `.deep-wiki-setup-authority.json` and
+`.deep-wiki-setup.reserve` are home authority artifacts, never SessionStart
+config candidates. Moving an authority-owned wiki is an explicit stopped-host
+rebind, and rebind resumes require the original `CODEX_HOME` and
+`DEEP_WIKI_CONFIG` spelling used for the pending rebind. Downgrade remains
+backup-only downgrade, not older-version in-place recovery.
 
 ## Versioning
 

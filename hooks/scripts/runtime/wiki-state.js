@@ -1807,8 +1807,5 @@ module.exports = {
   cleanupInbox,
   inspectWiki,
   fixWiki,
+  migrateAutoIngestPolicy,
 };
-
-Object.defineProperty(module.exports, 'migrateAutoIngestPolicy', {
-  value: migrateAutoIngestPolicy,
-});

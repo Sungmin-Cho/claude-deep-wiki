@@ -16,13 +16,17 @@ function migration() {
   return require('../hooks/scripts/runtime/config-migration.js');
 }
 
-function fixture({ globalAutoIngest = '  ignore_globs: [archive/**, drafts/**]\n  require_tag: project\n', local } = {}) {
+function fixture({
+  legacy = true,
+  globalAutoIngest = '  ignore_globs: [archive/**, drafts/**]\n  require_tag: project\n',
+  local,
+} = {}) {
   const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'deep-wiki-local-migration-')));
   roots.add(base);
   const wikiRoot = path.join(base, 'wiki');
   fs.mkdirSync(path.join(wikiRoot, '.wiki-meta'), { recursive: true });
   const globalPath = path.join(base, 'deep-wiki-config.yaml');
-  const globalBytes = Buffer.from(`# retained comment\nwiki_root: ${wikiRoot}\nauto_ingest:\n${globalAutoIngest}obsidian_cli:\n  available: false\n`, 'utf8');
+  const globalBytes = Buffer.from(`# retained comment\nwiki_root: ${wikiRoot}\n${legacy ? `auto_ingest:\n${globalAutoIngest}` : ''}obsidian_cli:\n  available: false\n`, 'utf8');
   fs.writeFileSync(globalPath, globalBytes);
   const target = path.join(wikiRoot, '.wiki-meta', '.config.json');
   if (local !== undefined) fs.writeFileSync(target, local);
@@ -41,6 +45,13 @@ function deadline() {
 
 function expectCode(fn, code) {
   assert.throws(fn, (error) => error?.code === code);
+}
+
+function expiredDeadline() {
+  let now = 0;
+  const value = createDeadline({ budgetMs: 1, clock: { nowMs: () => now } });
+  now = 1;
+  return value;
 }
 
 test.after(() => {
@@ -114,6 +125,63 @@ test('migration is idempotent for an equivalent local policy and rejects diverge
   }), 'CONFIG_INVALID');
 });
 
+test('migration converges when a cooperating host publishes an equivalent local policy before lock acquisition', () => {
+  const input = fixture();
+  const lockPath = path.join(input.wikiRoot, '.wiki-meta', '.wiki-lock');
+  let converged = false;
+  const racingFs = new Proxy(fs, {
+    get(target, property) {
+      if (property === 'mkdirSync') return (pathname, options) => {
+        if (pathname === lockPath && !converged) {
+          converged = true;
+          target.writeFileSync(input.target, '{"auto_ingest":{"ignore_globs":["archive/**","drafts/**"],"require_tag":"project"}}\n');
+        }
+        return target.mkdirSync(pathname, options);
+      };
+      return target[property];
+    },
+  });
+
+  assert.deepEqual(migration().migrateAutoIngestPolicy({
+    env: input.env, wikiRoot: input.wikiRoot, deadline: deadline(), fs: racingFs,
+  }), {
+    status: 'already-local',
+    policy: { ignoreGlobs: ['archive/**', 'drafts/**'], requireTag: 'project' },
+    policySource: 'wiki_local_migrated',
+  });
+  assert.equal(converged, true);
+});
+
+test('an expired deadline reports already-local when no migration is required', () => {
+  const localOnly = fixture({
+    legacy: false,
+    local: '{"auto_ingest":{"ignore_globs":["local/**"]}}\n',
+  });
+  assert.deepEqual(migration().migrateAutoIngestPolicy({
+    env: localOnly.env, wikiRoot: localOnly.wikiRoot, deadline: expiredDeadline(), fs,
+  }), {
+    status: 'already-local',
+    policy: { ignoreGlobs: ['local/**'], requireTag: null },
+    policySource: 'wiki_local',
+  });
+
+  const migrated = fixture({
+    local: '{"auto_ingest":{"ignore_globs":["archive/**","drafts/**"],"require_tag":"project"}}\n',
+  });
+  assert.equal(migration().migrateAutoIngestPolicy({
+    env: migrated.env, wikiRoot: migrated.wikiRoot, deadline: expiredDeadline(), fs,
+  }).status, 'already-local');
+
+  const defaultPolicy = fixture({ legacy: false });
+  assert.deepEqual(migration().migrateAutoIngestPolicy({
+    env: defaultPolicy.env, wikiRoot: defaultPolicy.wikiRoot, deadline: expiredDeadline(), fs,
+  }), {
+    status: 'already-local',
+    policy: { ignoreGlobs: [], requireTag: null },
+    policySource: 'default',
+  });
+});
+
 for (const boundary of ['before-rename', 'before-publish']) {
   test(`migration detects target replacement at ${boundary} before publication`, () => {
     const input = fixture({ local: '{"a5_fanout_threshold":3}\n' });
@@ -176,6 +244,100 @@ test('migration detects an in-place target edit and a type replacement at public
       }
     },
   }), 'CONFIG_INVALID');
+});
+
+test('migration pins same-digest replacement identity, lock ownership, root/meta rechecks, and boundary deadlines', () => {
+  const sameDigest = fixture({ local: '{"a5_fanout_threshold":3}\n' });
+  const replacement = path.join(path.dirname(sameDigest.target), 'same-digest.json');
+  fs.copyFileSync(sameDigest.target, replacement);
+  expectCode(() => migration().migrateAutoIngestPolicy({
+    env: sameDigest.env,
+    wikiRoot: sameDigest.wikiRoot,
+    deadline: deadline(),
+    fs,
+    faultInjector(point) {
+      if (point === 'before-publish') fs.renameSync(replacement, sameDigest.target);
+    },
+  }), 'CONFIG_INVALID');
+
+  const lockLost = fixture();
+  expectCode(() => migration().migrateAutoIngestPolicy({
+    env: lockLost.env,
+    wikiRoot: lockLost.wikiRoot,
+    deadline: deadline(),
+    fs,
+    faultInjector(point) {
+      if (point !== 'before-rename') return;
+      const owner = JSON.parse(fs.readFileSync(path.join(lockLost.wikiRoot, '.wiki-meta', '.wiki-lock', 'owner.json'), 'utf8'));
+      releaseLock({ wikiRoot: lockLost.wikiRoot, token: owner.token });
+    },
+  }), 'LOCK_TOKEN_MISMATCH');
+  assert.equal(fs.existsSync(lockLost.target), false);
+
+  const rootChanged = fixture();
+  const alternateRoot = fs.mkdtempSync(path.join(path.dirname(rootChanged.wikiRoot), 'alternate-root-'));
+  fs.mkdirSync(path.join(alternateRoot, '.wiki-meta'));
+  let useAlternateRoot = false;
+  const rootFs = new Proxy(fs, {
+    get(target, property) {
+      if (property === 'realpathSync') {
+        const realpath = (pathname) => (useAlternateRoot && pathname === rootChanged.wikiRoot
+          ? alternateRoot : target.realpathSync(pathname));
+        realpath.native = realpath;
+        return realpath;
+      }
+      return target[property];
+    },
+  });
+  expectCode(() => migration().migrateAutoIngestPolicy({
+    env: rootChanged.env,
+    wikiRoot: rootChanged.wikiRoot,
+    deadline: deadline(),
+    fs: rootFs,
+    faultInjector(point) { if (point === 'before-rename') useAlternateRoot = true; },
+  }), 'CONFIG_INVALID');
+  assert.equal(fs.existsSync(rootChanged.target), false);
+
+  const metaChanged = fixture();
+  let rejectMeta = false;
+  const metaPath = path.join(metaChanged.wikiRoot, '.wiki-meta');
+  const metaFs = new Proxy(fs, {
+    get(target, property) {
+      if (property === 'lstatSync') return (pathname, options) => {
+        if (rejectMeta && pathname === metaPath) {
+          const error = new Error('injected metadata replacement');
+          error.code = 'ENOENT';
+          throw error;
+        }
+        return target.lstatSync(pathname, options);
+      };
+      return target[property];
+    },
+  });
+  expectCode(() => migration().migrateAutoIngestPolicy({
+    env: metaChanged.env,
+    wikiRoot: metaChanged.wikiRoot,
+    deadline: deadline(),
+    fs: metaFs,
+    faultInjector(point) { if (point === 'before-publish') rejectMeta = true; },
+  }), 'CONFIG_INVALID');
+  assert.equal(fs.existsSync(metaChanged.target), false);
+
+  let now = 0;
+  const boundaryDeadline = createDeadline({ budgetMs: 1, clock: { nowMs: () => now } });
+  const deadlineChanged = fixture();
+  assert.deepEqual(migration().migrateAutoIngestPolicy({
+    env: deadlineChanged.env,
+    wikiRoot: deadlineChanged.wikiRoot,
+    deadline: boundaryDeadline,
+    fs,
+    faultInjector(point) { if (point === 'before-rename') now = 1; },
+  }), {
+    status: 'deferred',
+    policy: { ignoreGlobs: ['archive/**', 'drafts/**'], requireTag: 'project' },
+    policySource: 'global_legacy',
+  });
+  assert.equal(fs.existsSync(deadlineChanged.target), false);
 });
 
 test('migration defers only before publication and reconciles a close error after rename', () => {

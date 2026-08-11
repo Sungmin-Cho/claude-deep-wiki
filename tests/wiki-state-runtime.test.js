@@ -9,6 +9,7 @@ const path = require('node:path');
 
 const statePath = '../hooks/scripts/runtime/wiki-state.js';
 const scanWindow = require('../hooks/scripts/runtime/scan-window.js');
+const { migrateAutoIngestPolicy } = require('../hooks/scripts/runtime/config-migration.js');
 const { spawnSync } = require('node:child_process');
 const { acquireLock, releaseLock } = require('../hooks/scripts/runtime/lock.js');
 const { createDeadline } = require('../hooks/scripts/runtime/deadline.js');
@@ -161,10 +162,11 @@ function snapshotTransactionTree(root, operationId = OPERATION_ID) {
 test('wiki-state exports the one state surface and exact shared promotion identity', () => {
   const state = require(statePath);
   assert.deepEqual(Object.keys(state).sort(), [
-    'applyCommit', 'cleanupInbox', 'fixWiki', 'inspectWiki', 'promotePendingScan',
+    'applyCommit', 'cleanupInbox', 'fixWiki', 'inspectWiki', 'migrateAutoIngestPolicy', 'promotePendingScan',
     'recoverTransaction', 'registerIngestFailure', 'setupWiki', 'snapshotWiki',
   ]);
   assert.equal(state.promotePendingScan, scanWindow.promotePendingScan);
+  assert.equal(state.migrateAutoIngestPolicy, migrateAutoIngestPolicy);
   const source = fs.readFileSync(require.resolve(statePath), 'utf8');
   assert.doesNotMatch(source, /(?:writeFile|rename|unlink|rm)(?:Sync)?\([^\n]*(?:\.pending-scan|\.last-scan)/);
 });

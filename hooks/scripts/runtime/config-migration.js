@@ -9,7 +9,7 @@ const {
   resolveConfig,
   resolveEffectivePolicy,
 } = require('./config.js');
-const { assertBeforeDeadline, DeadlineExceeded } = require('./deadline.js');
+const { assertBeforeDeadline } = require('./deadline.js');
 const { atomicWriteFile, regularFileIdentity, regularFileIdentitiesMatch, sha256 } = require('./fs-safe.js');
 const { acquireLock, assertLockOwner, releaseLock } = require('./lock.js');
 
@@ -135,7 +135,9 @@ function assertPublicationBoundary({ env, wikiRoot, fs, deadline, token, expecte
   if (boundary) invokeFault(faultInjector, boundary);
   assertBeforeDeadline(deadline, `config-migration:${boundary || 'pre-write'}`);
   assertLockOwner({ wikiRoot, token, fs });
-  physicalDirectory(fs, wikiRoot, 'wiki root');
+  if (!samePath(physicalDirectory(fs, wikiRoot, 'wiki root'), wikiRoot)) {
+    throw configError('CONFIG_INVALID', 'wiki root changed before migration publication');
+  }
   assertMetaDirectory(fs, wikiRoot);
   if (!sameTargetSeal(expectedSeal, targetSeal(fs, path.join(wikiRoot, '.wiki-meta', '.config.json')))) {
     throw configError('CONFIG_INVALID', 'wiki-local config changed before publication');
@@ -151,6 +153,9 @@ function assertPublicationBoundary({ env, wikiRoot, fs, deadline, token, expecte
 
 function classifyAtomicError({ error, initial, initialSeal, env, wikiRoot, fs }) {
   const current = resolveState({ env, wikiRoot, fs });
+  if (!samePath(current.physicalRoot, wikiRoot)) {
+    throw configError('CONFIG_INVALID', 'wiki root changed during migration', error);
+  }
   const currentDigest = canonicalPolicyDigest(current.effective.policy);
   const expectedDigest = canonicalPolicyDigest(initial.effective.policy);
   if (current.effective.policySource === 'wiki_local_migrated' && currentDigest === expectedDigest) {
@@ -175,25 +180,15 @@ function migrateAutoIngestPolicy(options = {}) {
   if (typeof requestedRoot !== 'string' || !path.isAbsolute(requestedRoot)) {
     throw configError('CONFIG_INVALID', 'wikiRoot must be absolute');
   }
-  try {
-    assertBeforeDeadline(deadline, 'config-migration:before-resolution');
-  } catch (error) {
-    if (!(error instanceof DeadlineExceeded) && error?.code !== 'DEADLINE_EXCEEDED') throw error;
-    const state = resolveState({ env, wikiRoot: requestedRoot, fs });
-    return policyResult('deferred', state.effective);
-  }
-
-  const initial = resolveState({ env, wikiRoot: requestedRoot, fs });
-  if (!initial.effective.migrationRequired) return policyResult('already-local', initial.effective);
-  const target = path.join(initial.physicalRoot, '.wiki-meta', '.config.json');
-  const initialSeal = targetSeal(fs, target);
+  const preflight = resolveState({ env, wikiRoot: requestedRoot, fs });
+  if (!preflight.effective.migrationRequired) return policyResult('already-local', preflight.effective);
   let owner;
   try {
     assertBeforeDeadline(deadline, 'config-migration:before-lock');
-    owner = acquireLock({ wikiRoot: initial.physicalRoot, operation: MIGRATION_OPERATION, fs });
+    owner = acquireLock({ wikiRoot: preflight.physicalRoot, operation: MIGRATION_OPERATION, fs });
   } catch (error) {
     if (error?.code === 'LOCK_CONTENDED' || error?.code === 'DEADLINE_EXCEEDED') {
-      return policyResult('deferred', initial.effective);
+      return policyResult('deferred', preflight.effective);
     }
     throw error;
   }
@@ -201,45 +196,56 @@ function migrateAutoIngestPolicy(options = {}) {
   let result;
   let primaryError;
   try {
-    assertPublicationBoundary({
-      env, wikiRoot: initial.physicalRoot, fs, deadline, token: owner.token,
-      expectedSeal: initialSeal, expectedPolicy: initial.effective.policy,
-      faultInjector: options.faultInjector, boundary: null,
-    });
-    const inside = resolveState({ env, wikiRoot: initial.physicalRoot, fs });
-    const bytes = canonicalLocalBytes(inside.local, inside.effective.policy);
-    try {
-      atomicWriteFile(target, bytes, {
-        fs,
-        createParent: false,
-        beforeRename: () => assertPublicationBoundary({
-          env, wikiRoot: initial.physicalRoot, fs, deadline, token: owner.token,
-          expectedSeal: initialSeal, expectedPolicy: initial.effective.policy,
-          faultInjector: options.faultInjector, boundary: 'before-rename',
-        }),
-        beforePublish: () => assertPublicationBoundary({
-          env, wikiRoot: initial.physicalRoot, fs, deadline, token: owner.token,
-          expectedSeal: initialSeal, expectedPolicy: initial.effective.policy,
-          faultInjector: options.faultInjector, boundary: 'before-publish',
-        }),
-      });
-      const after = resolveState({ env, wikiRoot: initial.physicalRoot, fs });
-      if (after.effective.policySource !== 'wiki_local_migrated'
-          || canonicalPolicyDigest(after.effective.policy) !== canonicalPolicyDigest(initial.effective.policy)) {
-        throw configError('CONFIG_INVALID', 'published wiki-local configuration cannot be validated');
+    const initial = resolveState({ env, wikiRoot: preflight.physicalRoot, fs });
+    if (!initial.effective.migrationRequired) {
+      if (initial.effective.policySource !== 'wiki_local_migrated'
+          || canonicalPolicyDigest(initial.effective.policy) !== canonicalPolicyDigest(preflight.effective.policy)) {
+        throw configError('CONFIG_INVALID', 'migration preconditions changed while acquiring the wiki lock');
       }
-      result = policyResult('migrated', after.effective);
-    } catch (error) {
-      result = classifyAtomicError({
-        error, initial, initialSeal, env, wikiRoot: initial.physicalRoot, fs,
+      result = policyResult('already-local', initial.effective);
+    } else {
+      const target = path.join(initial.physicalRoot, '.wiki-meta', '.config.json');
+      const initialSeal = targetSeal(fs, target);
+      assertPublicationBoundary({
+        env, wikiRoot: initial.physicalRoot, fs, deadline, token: owner.token,
+        expectedSeal: initialSeal, expectedPolicy: initial.effective.policy,
+        faultInjector: options.faultInjector, boundary: null,
       });
+      const bytes = canonicalLocalBytes(initial.local, initial.effective.policy);
+      try {
+        atomicWriteFile(target, bytes, {
+          fs,
+          createParent: false,
+          beforeRename: () => assertPublicationBoundary({
+            env, wikiRoot: initial.physicalRoot, fs, deadline, token: owner.token,
+            expectedSeal: initialSeal, expectedPolicy: initial.effective.policy,
+            faultInjector: options.faultInjector, boundary: 'before-rename',
+          }),
+          beforePublish: () => assertPublicationBoundary({
+            env, wikiRoot: initial.physicalRoot, fs, deadline, token: owner.token,
+            expectedSeal: initialSeal, expectedPolicy: initial.effective.policy,
+            faultInjector: options.faultInjector, boundary: 'before-publish',
+          }),
+        });
+        const after = resolveState({ env, wikiRoot: initial.physicalRoot, fs });
+        if (after.effective.policySource !== 'wiki_local_migrated'
+            || canonicalPolicyDigest(after.effective.policy) !== canonicalPolicyDigest(initial.effective.policy)) {
+          throw configError('CONFIG_INVALID', 'published wiki-local configuration cannot be validated');
+        }
+        result = policyResult('migrated', after.effective);
+      } catch (error) {
+        assertLockOwner({ wikiRoot: initial.physicalRoot, token: owner.token, fs });
+        result = classifyAtomicError({
+          error, initial, initialSeal, env, wikiRoot: initial.physicalRoot, fs,
+        });
+      }
     }
   } catch (error) {
     primaryError = error;
   }
   try {
-    assertLockOwner({ wikiRoot: initial.physicalRoot, token: owner.token, fs });
-    releaseLock({ wikiRoot: initial.physicalRoot, token: owner.token, fs });
+    assertLockOwner({ wikiRoot: preflight.physicalRoot, token: owner.token, fs });
+    releaseLock({ wikiRoot: preflight.physicalRoot, token: owner.token, fs });
   } catch (releaseError) {
     if (primaryError) primaryError.release_error = releaseError;
     else primaryError = releaseError;

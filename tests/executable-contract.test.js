@@ -123,3 +123,34 @@ test('shipped command policies reject malformed subcommands and misplaced probes
     ).violations.some((item) => item.reason === 'EXECUTABLE_NOT_ALLOWED'), skill);
   }
 });
+
+test('wiki-setup policy allowlists only host-specific setup and explicit rebind argv', () => {
+  const allowed = SKILL_COMMAND_CONTRACTS['wiki-setup'].commands;
+  for (const host of ['claude', 'codex']) {
+    assert.ok(
+      allowed.some((contract) => JSON.stringify(contract) === JSON.stringify([
+        'setup', '--wiki-root', null, '--config-host', host, '--json',
+      ])),
+      `normal setup for ${host}`,
+    );
+    assert.ok(
+      allowed.some((contract) => JSON.stringify(contract) === JSON.stringify([
+        'setup', '--rebind-authority-from', null, '--wiki-root', null,
+        '--config-host', host, '--json',
+      ])),
+      `explicit rebind for ${host}`,
+    );
+  }
+
+  const rebind = '# Rebind\n<!-- deep-wiki:exec -->\n```deep-wiki-exec\n'
+    + '{"executable":"node","argv":["<plugin_root>/scripts/wiki-runtime.js","setup","--rebind-authority-from","OLD_ROOT","--wiki-root","NEW_ROOT","--config-host","codex","--json"]}\n```\n';
+  assert.deepEqual(validateSkillCommands(
+    'skills/wiki-setup/SKILL.md', rebind, SKILL_COMMAND_CONTRACTS['wiki-setup'],
+  ).violations, []);
+
+  const implicitRebind = '# Rebind\n<!-- deep-wiki:exec -->\n```deep-wiki-exec\n'
+    + '{"executable":"node","argv":["<plugin_root>/scripts/wiki-runtime.js","setup","--wiki-root","NEW_ROOT","--config-host","codex","--rebind","OLD_ROOT","--json"]}\n```\n';
+  assert.ok(validateSkillCommands(
+    'skills/wiki-setup/SKILL.md', implicitRebind, SKILL_COMMAND_CONTRACTS['wiki-setup'],
+  ).violations.some((item) => item.reason === 'COMMAND_ARGV_NOT_ALLOWED'));
+});

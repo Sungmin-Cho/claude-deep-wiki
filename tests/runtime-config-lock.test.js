@@ -3983,6 +3983,41 @@ test('runtime CLI exposes config and token-lock commands with stable JSON and ex
   assert.match(help.stdout, /never bypasses owner validity, same-host liveness/);
 });
 
+test('config resolve CLI exposes wiki-local policy metadata without mutating either config', () => {
+  const root = temporaryRoot('deep wiki runtime config resolve metadata ');
+  const wikiRoot = path.join(root, 'Wiki Root');
+  fs.mkdirSync(path.join(wikiRoot, '.wiki-meta'), { recursive: true });
+  const legacy = write(path.join(root, '.codex', 'deep-wiki-config.yaml'), canonicalConfig(wikiRoot, {
+    autoIngest: { ignoreGlobs: ['archive/**'], requireTag: 'project' },
+  }));
+  const local = write(path.join(wikiRoot, '.wiki-meta', '.config.json'), `${JSON.stringify({
+    auto_ingest: { ignore_globs: ['archive/**'], require_tag: 'project' },
+  })}\n`);
+  const before = new Map([legacy, local].map((file) => [file, {
+    bytes: fs.readFileSync(file, 'utf8'),
+    mtimeMs: fs.statSync(file).mtimeMs,
+  }]));
+
+  const result = spawnSync(process.execPath, [cli, 'config', 'resolve', '--json'], {
+    cwd: temporaryRoot('deep wiki resolve unrelated cwd '),
+    env: { ...process.env, HOME: root, CODEX_HOME: '' },
+    encoding: 'utf8',
+    shell: false,
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stderr, '');
+  const output = JSON.parse(result.stdout);
+  assert.equal(output.local_config_path, local);
+  assert.equal(output.policy_source, 'wiki_local_migrated');
+  assert.equal(output.migration_required, false);
+  assert.match(output.policy_digest, /^[a-f0-9]{64}$/);
+  for (const [file, expected] of before) {
+    assert.equal(fs.readFileSync(file, 'utf8'), expected.bytes, file);
+    assert.equal(fs.statSync(file).mtimeMs, expected.mtimeMs, file);
+  }
+});
+
 test('runtime lock status rejects a relative wiki root independently of cwd', () => {
   const first = temporaryRoot('deep wiki status cwd one ');
   const second = temporaryRoot('deep wiki status cwd two ');
@@ -3993,6 +4028,98 @@ test('runtime lock status rejects a relative wiki root independently of cwd', ()
     assert.equal(result.status, 4, `${cwd}: ${result.stderr}`);
     assert.equal(result.stdout, '');
     assert.match(result.stderr, /^LOCK_INVALID:/);
+  }
+});
+
+test('setup CLI maps config and authority safety errors to contract exit 4 without leaking bodies', () => {
+  const cases = [
+    {
+      name: 'CONFIG_INVALID',
+      prepare(root) {
+        write(path.join(root, '.codex', 'deep-wiki-config.yaml'), [
+          'wiki_root: /tmp/secret-invalid-root',
+          'auto_ingest:',
+          '  require_tag: should-not-leak-policy-value',
+          '  require_tag: conflicting-secret-policy-value',
+          '',
+        ].join('\n'));
+        return [cli, 'config', 'resolve', '--json'];
+      },
+      forbidden: ['secret-invalid-root', 'should-not-leak-policy-value', 'conflicting-secret-policy-value'],
+    },
+    {
+      name: 'CONFIG_CONFLICT',
+      prepare(root) {
+        write(path.join(root, '.codex', 'deep-wiki-config.yaml'), canonicalConfig(path.join(root, 'one-secret-root')));
+        write(path.join(root, '.claude', 'deep-wiki-config.yaml'), canonicalConfig(path.join(root, 'two-secret-root')));
+        return [cli, 'config', 'resolve', '--json'];
+      },
+      forbidden: ['one-secret-root', 'two-secret-root'],
+    },
+    {
+      name: 'CONFIG_TARGET_CONFLICT',
+      prepare(root) {
+        const wikiRoot = path.join(root, 'wiki');
+        const codex = write(path.join(root, '.codex', 'deep-wiki-config.yaml'), canonicalConfig(wikiRoot));
+        fs.mkdirSync(path.join(root, '.claude'), { recursive: true });
+        fs.symlinkSync(codex, path.join(root, '.claude', 'deep-wiki-config.yaml'));
+        return [cli, 'setup', '--wiki-root', wikiRoot, '--config-host', 'claude', '--json'];
+      },
+      forbidden: [],
+    },
+    {
+      name: 'SETUP_AUTHORITY_INVALID',
+      prepare(root) {
+        const real = path.join(root, 'real-wiki');
+        const link = path.join(root, 'linked-wiki');
+        fs.mkdirSync(real);
+        fs.symlinkSync(real, link);
+        return [cli, 'setup', '--wiki-root', link, '--config-host', 'codex', '--json'];
+      },
+      forbidden: ['real-wiki'],
+    },
+    {
+      name: 'SETUP_AUTHORITY_CONFLICT',
+      prepare(root) {
+        const oldRoot = path.join(root, 'old-secret-root');
+        const newRoot = path.join(root, 'new-secret-root');
+        const first = spawnSync(process.execPath, [
+          cli, 'setup', '--wiki-root', oldRoot, '--config-host', 'codex', '--json',
+        ], { cwd: root, env: { ...process.env, HOME: root, CODEX_HOME: '' }, encoding: 'utf8', shell: false });
+        assert.equal(first.status, 0, first.stderr);
+        return [cli, 'setup', '--wiki-root', newRoot, '--config-host', 'codex', '--json'];
+      },
+      forbidden: ['old-secret-root', 'new-secret-root'],
+    },
+    {
+      name: 'SETUP_AUTHORITY_RECOVERY_REQUIRED',
+      prepare(root) {
+        const wikiRoot = path.join(root, 'missing-secret-root');
+        const first = spawnSync(process.execPath, [
+          cli, 'setup', '--wiki-root', wikiRoot, '--config-host', 'codex', '--json',
+        ], { cwd: root, env: { ...process.env, HOME: root, CODEX_HOME: '' }, encoding: 'utf8', shell: false });
+        assert.equal(first.status, 0, first.stderr);
+        fs.rmSync(wikiRoot, { recursive: true, force: true });
+        return [cli, 'setup', '--wiki-root', wikiRoot, '--config-host', 'codex', '--json'];
+      },
+      forbidden: ['missing-secret-root'],
+    },
+  ];
+
+  for (const entry of cases) {
+    const root = temporaryRoot(`deep wiki cli ${entry.name} `);
+    const argv = entry.prepare(root);
+    const result = spawnSync(process.execPath, argv, {
+      cwd: root,
+      env: { ...process.env, HOME: root, CODEX_HOME: '' },
+      encoding: 'utf8',
+      shell: false,
+    });
+    assert.equal(result.status, 4, `${entry.name}: ${result.stderr}`);
+    assert.equal(result.stdout, '', entry.name);
+    assert.match(result.stderr, new RegExp(`^${entry.name}:`), entry.name);
+    assert.doesNotMatch(result.stderr, /wiki_root:|auto_ingest:|require_tag|welcome.md|# Welcome/);
+    for (const value of entry.forbidden) assert.equal(result.stderr.includes(value), false, entry.name);
   }
 });
 

@@ -1442,6 +1442,95 @@ test('setup rejects an unauthenticated empty pages/meta scaffold', () => {
   assert.deepEqual(fs.readdirSync(root).sort(), ['.wiki-meta', 'pages']);
 });
 
+test('setup CLI exposes only explicit stopped-host rebind and returns public authority generation', () => {
+  const home = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'deep wiki cli rebind home ')));
+  roots.add(home);
+  const oldRoot = path.join(home, 'Old Wiki');
+  const newRoot = path.join(home, 'New Wiki');
+  const env = setupEnv(home);
+
+  const first = spawnSync(process.execPath, [
+    cli, 'setup', '--wiki-root', oldRoot, '--config-host', 'codex', '--json',
+  ], { cwd: home, env, encoding: 'utf8', shell: false });
+  assert.equal(first.status, 0, first.stderr);
+  assert.deepEqual(JSON.parse(first.stdout).authority, {
+    wiki_root: fs.realpathSync.native(oldRoot),
+    generation: 1,
+  });
+
+  fs.rmSync(oldRoot, { recursive: true, force: true });
+  fs.rmSync(path.join(home, '.codex', 'deep-wiki-config.yaml'), { force: true });
+
+  const implicit = spawnSync(process.execPath, [
+    cli, 'setup', '--wiki-root', newRoot, '--config-host', 'codex', '--json',
+  ], { cwd: home, env, encoding: 'utf8', shell: false });
+  assert.equal(implicit.status, 4, implicit.stderr);
+  assert.match(implicit.stderr, /^SETUP_AUTHORITY_CONFLICT:/);
+  assert.equal(fs.existsSync(newRoot), false);
+
+  const explicit = spawnSync(process.execPath, [
+    cli, 'setup', '--rebind-authority-from', oldRoot, '--wiki-root', newRoot,
+    '--config-host', 'codex', '--json',
+  ], { cwd: home, env, encoding: 'utf8', shell: false });
+  assert.equal(explicit.status, 0, explicit.stderr);
+  const result = JSON.parse(explicit.stdout);
+  assert.deepEqual(result.authority, {
+    wiki_root: fs.realpathSync.native(newRoot),
+    generation: 2,
+  });
+  assert.equal(fs.existsSync(path.join(newRoot, 'pages', 'welcome.md')), true);
+});
+
+test('setup rejects unsafe global and selected-target inputs before requested wiki mutation', () => {
+  const { setupWiki } = require(statePath);
+  const cases = [
+    {
+      name: 'invalid global candidate',
+      prepare(home, root) {
+        fs.mkdirSync(path.join(home, '.codex'), { recursive: true });
+        fs.writeFileSync(path.join(home, '.codex', 'deep-wiki-config.yaml'), 'wiki_root:\n  hidden: value\n');
+        return { wikiRoot: root, configHost: 'codex', env: setupEnv(home), now: new Date(TS) };
+      },
+      code: 'CONFIG_INVALID',
+    },
+    {
+      name: 'conflicting global candidates',
+      prepare(home, root) {
+        fs.mkdirSync(path.join(home, '.codex'), { recursive: true });
+        fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+        fs.writeFileSync(path.join(home, '.codex', 'deep-wiki-config.yaml'), `wiki_root: ${JSON.stringify(root)}\n`);
+        fs.writeFileSync(path.join(home, '.claude', 'deep-wiki-config.yaml'), `wiki_root: ${JSON.stringify(path.join(home, 'other'))}\n`);
+        return { wikiRoot: root, configHost: 'codex', env: setupEnv(home), now: new Date(TS) };
+      },
+      code: 'CONFIG_CONFLICT',
+    },
+    {
+      name: 'symlinked selected target under replace-config',
+      prepare(home, root) {
+        const codex = path.join(home, '.codex', 'deep-wiki-config.yaml');
+        fs.mkdirSync(path.dirname(codex), { recursive: true });
+        fs.writeFileSync(codex, `wiki_root: ${JSON.stringify(root)}\n`);
+        fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+        fs.symlinkSync(codex, path.join(home, '.claude', 'deep-wiki-config.yaml'));
+        return {
+          wikiRoot: root, configHost: 'claude', replaceConfig: true,
+          env: setupEnv(home), now: new Date(TS),
+        };
+      },
+      code: 'CONFIG_TARGET_CONFLICT',
+    },
+  ];
+
+  for (const entry of cases) {
+    const home = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), `deep wiki ${entry.name} home `)));
+    roots.add(home);
+    const root = path.join(home, 'requested-wiki');
+    const options = entry.prepare(home, root);
+    assert.throws(() => setupWiki(options), (error) => error.code === entry.code, entry.name);
+    assert.equal(fs.existsSync(root), false, entry.name);
+  }
+});
+
 test('cleaned transactions compact to bounded receipts while preserving idempotent retry', () => {
   const { applyCommit } = require(statePath);
   const root = fixture('deep wiki compact receipt ');

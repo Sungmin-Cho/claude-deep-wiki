@@ -406,6 +406,8 @@ const SKILL_COMMAND_CONTRACTS = {
     ['config', 'resolve', '--json'],
     ['setup', '--wiki-root', null, '--config-host', 'claude', '--json'],
     ['setup', '--wiki-root', null, '--config-host', 'codex', '--json'],
+    ['setup', '--rebind-authority-from', null, '--wiki-root', null, '--config-host', 'claude', '--json'],
+    ['setup', '--rebind-authority-from', null, '--wiki-root', null, '--config-host', 'codex', '--json'],
     ['probe', 'obsidian', '--json'],
   ] },
   'wiki-ingest': { commands: [

@@ -1,0 +1,9 @@
+{
+  "description": "legacy auto_ingest scans when wiki_root exists but .wiki-meta is not yet present",
+  "create_wiki_meta": false,
+  "vault_tree": {
+    "notes/keep.md": "# keep\n",
+    "legacy/drop.md": "# drop\n"
+  },
+  "config_yaml": "wiki_root: ${WIKI_ROOT}\nauto_ingest:\n  ignore_globs:\n    - legacy/**\n"
+}

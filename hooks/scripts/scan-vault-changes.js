@@ -212,34 +212,68 @@ function validatePolicyProofShape(source, digest) {
   }
 }
 
-function proofFromResolvedConfig(resolved) {
+function encodePolicySources(sources) {
+  if (!Array.isArray(sources) || sources.length === 0) throw new Error('policy source set is invalid');
+  const seen = new Set();
+  for (const source of sources) {
+    if (typeof source !== 'string' || !POLICY_SOURCES.has(source) || seen.has(source)) {
+      throw new Error('policy source set is invalid');
+    }
+    seen.add(source);
+  }
+  return sources.join(',');
+}
+
+function migrationPreconditionCanDefer(error, resolved) {
+  return error?.code === 'CONFIG_INVALID'
+    && resolved?.policy_source === 'global_legacy'
+    && /wiki metadata directory cannot be inspected/.test(error.message || '');
+}
+
+function proofFromResolvedConfig(resolved, allowedSources = [resolved.policy_source]) {
   const source = resolved.policy_source;
   const digest = resolved.policy_digest;
   validatePolicyProofShape(source, digest);
-  return { source, digest };
+  const allowed = encodePolicySources(allowedSources);
+  if (!allowedSources.includes(source)) throw new Error('policy source set is invalid');
+  return { source, allowed, digest };
 }
 
-function resolvePolicyProof({ env, deadline }) {
+function resolvePolicyProof({ env, deadline, migrationFaultInjector } = {}) {
   let resolved = resolveConfig(env);
+  let allowedSources = [resolved.policy_source];
   if (resolved.migration_required) {
+    let widenedForDeferral = false;
     let migrationBudget = 0;
     try { migrationBudget = migrationBudgetMs(deadline); } catch (error) {
       if (error?.code !== 'DEADLINE_EXCEEDED') throw error;
     }
     if (migrationBudget > 0) {
       const migrationDeadline = createDeadline({ clock: deadline.clock, budgetMs: migrationBudget });
-      const migration = migrateAutoIngestPolicy({
-        env,
-        wikiRoot: resolved.config.wikiRoot,
-        deadline: migrationDeadline,
-      });
+      let migration;
+      try {
+        migration = migrateAutoIngestPolicy({
+          env,
+          wikiRoot: resolved.config.wikiRoot,
+          deadline: migrationDeadline,
+          faultInjector: migrationFaultInjector,
+        });
+      } catch (error) {
+        if (!migrationPreconditionCanDefer(error, resolved)) throw error;
+        migration = { status: 'deferred' };
+      }
       if (!migration || !['already-local', 'migrated', 'deferred'].includes(migration.status)) {
         throw new Error('config migration returned an invalid status');
       }
+      if (migration.status === 'deferred' && resolved.policy_source === 'global_legacy') {
+        allowedSources = ['global_legacy', 'wiki_local_migrated'];
+        widenedForDeferral = true;
+      }
       resolved = resolveConfig(env);
+      if (!widenedForDeferral) allowedSources = [resolved.policy_source];
     }
   }
-  return proofFromResolvedConfig(resolved);
+  return proofFromResolvedConfig(resolved, allowedSources);
 }
 
 function runPersistenceWorker(result, deadline, options = {}) {
@@ -345,7 +379,7 @@ async function runSupervisor(options = {}) {
     throw new TypeError('workerPath must be absolute');
   }
   const deadline = createDeadline({ budgetMs: timeoutMs });
-  const proof = resolvePolicyProof({ env, deadline });
+  const proof = resolvePolicyProof({ env, deadline, migrationFaultInjector: options.migrationFaultInjector });
   const workerBudgetMs = scannerWorkerBudgetMs(deadline);
   const result = await new Promise((resolve, reject) => {
     let child;
@@ -373,7 +407,9 @@ async function runSupervisor(options = {}) {
         env: {
           ...env,
           DEEP_WIKI_EXPECTED_POLICY_SOURCE: proof.source,
+          DEEP_WIKI_ALLOWED_POLICY_SOURCES: proof.allowed,
           DEEP_WIKI_EXPECTED_POLICY_SHA256: proof.digest,
+          DEEP_WIKI_WORKER_BUDGET_MS: String(workerBudgetMs),
         },
         stdio: ['ignore', 'pipe', 'pipe'],
         detached: process.platform !== 'win32',

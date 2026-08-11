@@ -23,6 +23,19 @@ const EXCLUDED_DIRECTORIES = new Set([
   '.claude', '.codex', '.ssh', '.gnupg', '.aws', '.azure', '.kube',
 ]);
 
+function workerBudgetMs(env = process.env) {
+  const raw = env.DEEP_WIKI_WORKER_BUDGET_MS;
+  if (raw === undefined) return WORKER_BUDGET_MS;
+  if (typeof raw !== 'string' || !/^(?:[1-9]\d*)$/.test(raw)) {
+    throw new RangeError('worker budget must be an integer from 1 through 11_000 milliseconds');
+  }
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 1 || value > WORKER_BUDGET_MS) {
+    throw new RangeError('worker budget must be an integer from 1 through 11_000 milliseconds');
+  }
+  return value;
+}
+
 function codePointCompare(left, right) {
   const a = Array.from(left, (value) => value.codePointAt(0));
   const b = Array.from(right, (value) => value.codePointAt(0));
@@ -54,14 +67,27 @@ function isInside(root, candidate) {
 
 function verifySupervisorPolicyProof(resolved, env = process.env) {
   const expectedSource = env.DEEP_WIKI_EXPECTED_POLICY_SOURCE;
+  const allowedSources = env.DEEP_WIKI_ALLOWED_POLICY_SOURCES;
   const expectedDigest = env.DEEP_WIKI_EXPECTED_POLICY_SHA256;
   if (typeof expectedSource !== 'string' || !POLICY_SOURCES.has(expectedSource)) {
     throw new Error('policy proof source is invalid');
   }
+  if (typeof allowedSources !== 'string' || allowedSources.length === 0) {
+    throw new Error('policy proof source set is invalid');
+  }
+  const allowed = allowedSources.split(',');
+  const seen = new Set();
+  for (const source of allowed) {
+    if (!POLICY_SOURCES.has(source) || seen.has(source)) {
+      throw new Error('policy proof source set is invalid');
+    }
+    seen.add(source);
+  }
+  if (!seen.has(expectedSource)) throw new Error('policy proof source set is invalid');
   if (typeof expectedDigest !== 'string' || !SHA256_RE.test(expectedDigest)) {
     throw new Error('policy proof digest is invalid');
   }
-  if (resolved.policy_source !== expectedSource) {
+  if (!seen.has(resolved.policy_source)) {
     throw new Error('policy source transition is not allowed');
   }
   if (resolved.policy_digest !== expectedDigest) {
@@ -120,7 +146,7 @@ function scanVault({ vaultRoot, wikiRoot, boundMs, config, deadline }) {
 }
 
 function workerMain() {
-  const deadline = createDeadline({ budgetMs: WORKER_BUDGET_MS });
+  const deadline = createDeadline({ budgetMs: workerBudgetMs(process.env) });
   const detectedAt = canonicalNow();
   const resolved = resolveConfig(process.env);
   assertBeforeDeadline(deadline, 'config-resolved');
@@ -162,4 +188,5 @@ module.exports = {
   scanVault,
   readTimestamp,
   verifySupervisorPolicyProof,
+  workerBudgetMs,
 };

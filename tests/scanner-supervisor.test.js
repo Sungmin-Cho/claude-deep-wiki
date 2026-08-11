@@ -65,7 +65,8 @@ function writeLocalConfig(wikiRoot, autoIngest) {
 
 function supervisorEnv(base, extra = {}, configOptions = {}) {
   const wikiRoot = configOptions.wikiRoot || path.join(base, 'policy-wiki');
-  fs.mkdirSync(path.join(wikiRoot, '.wiki-meta'), { recursive: true });
+  if (configOptions.createMeta !== false) fs.mkdirSync(path.join(wikiRoot, '.wiki-meta'), { recursive: true });
+  else fs.mkdirSync(wikiRoot, { recursive: true });
   const configPath = path.join(base, 'deep-wiki-config.yaml');
   writeYamlConfig(configPath, wikiRoot, configOptions.autoIngest);
   if (configOptions.localAutoIngest) writeLocalConfig(wikiRoot, configOptions.localAutoIngest);
@@ -569,6 +570,187 @@ test('worker rejects malformed or mismatched supervisor policy proof before walk
       process.env = originalEnv;
     }
   }
+});
+
+test('worker accepts a deferred migration proof when an equivalent local policy appears before scan', () => {
+  const { workerMain } = require(workerPath);
+  const { canonicalPolicyDigest } = require('../hooks/scripts/runtime/config.js');
+  const base = temporaryRoot('deep wiki worker equivalent convergence ');
+  const vaultRoot = path.join(base, 'vault');
+  const wikiRoot = path.join(vaultRoot, 'wiki');
+  fs.mkdirSync(path.join(wikiRoot, '.wiki-meta'), { recursive: true });
+  fs.mkdirSync(path.join(vaultRoot, 'legacy'), { recursive: true });
+  fs.mkdirSync(path.join(vaultRoot, 'notes'), { recursive: true });
+  fs.writeFileSync(path.join(vaultRoot, 'legacy', 'drop.md'), '# drop\n');
+  fs.writeFileSync(path.join(vaultRoot, 'notes', 'keep.md'), '# keep\n');
+  writeLocalConfig(wikiRoot, { ignoreGlobs: ['legacy/**'] });
+  const digest = canonicalPolicyDigest({ ignoreGlobs: ['legacy/**'], requireTag: null });
+  const { env } = supervisorEnv(base, {
+    DEEP_WIKI_EXPECTED_POLICY_SOURCE: 'global_legacy',
+    DEEP_WIKI_ALLOWED_POLICY_SOURCES: 'global_legacy,wiki_local_migrated',
+    DEEP_WIKI_EXPECTED_POLICY_SHA256: digest,
+  }, {
+    wikiRoot,
+    autoIngest: { ignoreGlobs: ['legacy/**'] },
+  });
+  const originalEnv = process.env;
+  const originalStdout = process.stdout.write;
+  const stdout = [];
+  try {
+    process.env = env;
+    process.stdout.write = (value) => { stdout.push(value); return true; };
+    workerMain();
+  } finally {
+    process.stdout.write = originalStdout;
+    process.env = originalEnv;
+  }
+  const result = JSON.parse(stdout.join('').trim());
+  assert.deepEqual(result.files, ['notes/keep.md']);
+});
+
+test('worker rejects disallowed policy source transitions even when the digest matches', () => {
+  const { workerMain } = require(workerPath);
+  const { canonicalPolicyDigest } = require('../hooks/scripts/runtime/config.js');
+  const base = temporaryRoot('deep wiki worker disallowed source ');
+  const vaultRoot = path.join(base, 'vault');
+  const wikiRoot = path.join(vaultRoot, 'wiki');
+  fs.mkdirSync(path.join(wikiRoot, '.wiki-meta'), { recursive: true });
+  fs.writeFileSync(path.join(vaultRoot, 'note.md'), '# note\n');
+  writeLocalConfig(wikiRoot, { ignoreGlobs: [] });
+  const digest = canonicalPolicyDigest({ ignoreGlobs: [], requireTag: null });
+  const { env } = supervisorEnv(base, {
+    DEEP_WIKI_EXPECTED_POLICY_SOURCE: 'global_legacy',
+    DEEP_WIKI_ALLOWED_POLICY_SOURCES: 'global_legacy',
+    DEEP_WIKI_EXPECTED_POLICY_SHA256: digest,
+  }, {
+    wikiRoot,
+    autoIngest: { ignoreGlobs: [] },
+  });
+  const originalEnv = process.env;
+  const originalStdout = process.stdout.write;
+  try {
+    process.env = env;
+    process.stdout.write = () => { throw new Error('must not publish'); };
+    assert.throws(() => workerMain(), /policy source transition/);
+  } finally {
+    process.stdout.write = originalStdout;
+    process.env = originalEnv;
+  }
+});
+
+test('supervisor passes the parent-cutoff worker budget to the child environment', async () => {
+  const { runSupervisor } = require(supervisorPath);
+  const base = temporaryRoot('deep wiki supervisor child budget ');
+  const result = validResult(base);
+  fs.mkdirSync(result.wiki_root, { recursive: true });
+  const budgetFile = path.join(base, 'worker-budget.txt');
+  const budgetWorker = path.join(base, 'budget-worker.js');
+  fs.writeFileSync(budgetWorker, [
+    "'use strict';",
+    "const fs = require('node:fs');",
+    `fs.writeFileSync(${JSON.stringify(budgetFile)}, String(process.env.DEEP_WIKI_WORKER_BUDGET_MS || ''));`,
+    `process.stdout.write(${JSON.stringify(`${JSON.stringify(result)}\n`)});`,
+  ].join('\n'));
+
+  await runSupervisor({
+    workerPath: budgetWorker,
+    timeoutMs: 12_000,
+    env: supervisorEnv(base).env,
+    ensurePendingScan() { return { status: 'created' }; },
+  });
+
+  const childBudget = Number(fs.readFileSync(budgetFile, 'utf8'));
+  assert.equal(Number.isSafeInteger(childBudget), true);
+  assert.ok(childBudget > 0);
+  assert.ok(childBudget < 11_000);
+});
+
+test('worker uses the supervisor-provided cooperative budget instead of its default 11 seconds', () => {
+  const { workerMain } = require(workerPath);
+  const { canonicalPolicyDigest } = require('../hooks/scripts/runtime/config.js');
+  const base = temporaryRoot('deep wiki worker env budget ');
+  const vaultRoot = path.join(base, 'vault');
+  const wikiRoot = path.join(vaultRoot, 'wiki');
+  fs.mkdirSync(path.join(wikiRoot, '.wiki-meta'), { recursive: true });
+  fs.writeFileSync(path.join(vaultRoot, 'late.md'), '# late\n');
+  const digest = canonicalPolicyDigest({ ignoreGlobs: [], requireTag: null });
+  const { env } = supervisorEnv(base, {
+    DEEP_WIKI_EXPECTED_POLICY_SOURCE: 'default',
+    DEEP_WIKI_ALLOWED_POLICY_SOURCES: 'default',
+    DEEP_WIKI_EXPECTED_POLICY_SHA256: digest,
+    DEEP_WIKI_WORKER_BUDGET_MS: '1',
+  }, { wikiRoot });
+  const originalEnv = process.env;
+  const originalStat = fs.statSync;
+  const originalStdout = process.stdout.write;
+  try {
+    process.env = env;
+    fs.statSync = function slowStat(...args) {
+      if (args[0] === path.join(vaultRoot, 'late.md')) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+      }
+      return originalStat.apply(this, args);
+    };
+    process.stdout.write = () => { throw new Error('must not publish'); };
+    assert.throws(() => workerMain(), (error) => error.code === 'DEADLINE_EXCEEDED');
+  } finally {
+    process.stdout.write = originalStdout;
+    fs.statSync = originalStat;
+    process.env = originalEnv;
+  }
+});
+
+test('migration, scanner child, persistence timeout, termination, and close latency stay inside the parent bound', async () => {
+  const { hookMain, terminateWorkerTree } = require(supervisorPath);
+  const base = temporaryRoot('deep wiki supervisor latency envelope ');
+  const result = validResult(base);
+  const pidFile = path.join(base, 'persist-worker.pid');
+  const events = [];
+  fs.mkdirSync(path.join(result.wiki_root, '.wiki-meta'), { recursive: true });
+  const env = supervisorEnv(base, {
+    SCANNER_FIXTURE_MODE: 'valid',
+    SCANNER_RESULT_JSON: JSON.stringify(result),
+    PERSIST_FIXTURE_MODE: 'hang-after-lock',
+    PERSIST_LOCK_PID_FILE: pidFile,
+  }, {
+    wikiRoot: result.wiki_root,
+    autoIngest: { ignoreGlobs: ['legacy/**'] },
+  }).env;
+  const started = Date.now();
+  const status = await hookMain({
+    workerPath: fixturePath,
+    persistWorkerPath: persistFixturePath,
+    timeoutMs: 12_000,
+    env,
+    migrationFaultInjector(boundary) {
+      if (boundary === 'before-rename') {
+        events.push('migration-delay');
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+      }
+    },
+    async terminateWorkerTree(child, options) {
+      events.push('terminate-requested');
+      const closed = once(child, 'close').then(() => {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+        events.push('termination-confirmed-with-close-latency');
+        return true;
+      });
+      assert.equal(terminateWorkerTree(child, { env, ...options }), true);
+      return closed;
+    },
+    stdout: { write() { throw new Error('must stay quiet after persistence timeout'); } },
+    stderr: { write() { throw new Error('must stay quiet'); } },
+  });
+
+  const elapsed = Date.now() - started;
+  assert.equal(status, 0);
+  assert.ok(fs.existsSync(pidFile), 'persistence worker must have started');
+  assert.deepEqual(events, [
+    'migration-delay',
+    'terminate-requested',
+    'termination-confirmed-with-close-latency',
+  ]);
+  assert.ok(elapsed < 12_000, `elapsed ${elapsed}ms exceeded the original parent bound`);
 });
 
 test('parent-anchored deadline arithmetic preserves migration, scan, termination, and persistence reserves', () => {

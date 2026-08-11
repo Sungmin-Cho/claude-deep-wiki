@@ -136,7 +136,8 @@ describe('scan-vault-changes.js golden fixtures (M5.5 #3)', () => {
         const wikiPath = fixture.input.wiki_path || 'wiki';
         const vaultRoot = path.join(tmpRoot, vaultPath);
         const wikiRoot = path.join(vaultRoot, wikiPath);
-        fs.mkdirSync(path.join(wikiRoot, '.wiki-meta'), { recursive: true });
+        if (fixture.input.create_wiki_meta === false) fs.mkdirSync(wikiRoot, { recursive: true });
+        else fs.mkdirSync(path.join(wikiRoot, '.wiki-meta'), { recursive: true });
 
         // Materialize the vault tree BEFORE the config is written so that
         // any mtime adjustments hit real files. Skip if no tree (e.g. the
@@ -272,6 +273,14 @@ describe('scan-vault-changes.js golden fixtures (M5.5 #3)', () => {
             JSON.parse(fs.readFileSync(localConfig, 'utf8')),
             expected.local_config_json,
             `wiki-local config mismatch for ${name}`,
+          );
+        }
+
+        if (expected.meta_created === true) {
+          assert.equal(
+            fs.existsSync(path.join(wikiRoot, '.wiki-meta')),
+            true,
+            `wiki metadata directory should exist for ${name}`,
           );
         }
       } finally {

@@ -2,6 +2,7 @@
 
 const nodeFs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 
 const { assertBeforeDeadline } = require('./deadline.js');
 
@@ -313,6 +314,7 @@ function parseConfig(input) {
   const text = String(input).replace(/^\uFEFF/, '').replaceAll('\r\n', '\n').replaceAll('\r', '\n');
   const result = {
     wikiRoot: null,
+    autoIngestDefined: false,
     autoIngest: { ignoreGlobs: [], requireTag: null },
     obsidianCli: { available: null, vaultPath: null, vaultName: null, wikiPrefix: null },
   };
@@ -407,8 +409,13 @@ function parseConfig(input) {
       if (hasKeyToken(trimmed, 'obsidian_cli')) {
         throw new ConfigError('CONFIG_INVALID', 'malformed obsidianCli section definition');
       }
-      if (/^auto_ingest\s*:\s*$/.test(trimmed)) { section = 'autoIngest'; continue; }
+      if (/^auto_ingest\s*:\s*$/.test(trimmed)) {
+        result.autoIngestDefined = true;
+        section = 'autoIngest';
+        continue;
+      }
       if (/^auto_ingest\.ignore_globs\s*:/.test(trimmed)) {
+        result.autoIngestDefined = true;
         const raw = trimmed.replace(/^auto_ingest\.ignore_globs\s*:\s*/, '');
         const values = inlineList(raw);
         if (!values) throw new ConfigError('CONFIG_INVALID', 'autoIngest.ignoreGlobs dotted form must be an inline list');
@@ -615,6 +622,7 @@ function normalizeConfigSemantics(config, options = {}) {
   const obsidian = config.obsidianCli || {};
   const result = {
     wikiRoot: physicalPath(config.wikiRoot, { platform, fs, home }),
+    autoIngestDefined: config.autoIngestDefined === true,
     autoIngest: {
       requireTag: String(config.autoIngest?.requireTag || '').trim() || null,
       ignoreGlobs,
@@ -627,6 +635,184 @@ function normalizeConfigSemantics(config, options = {}) {
     },
   };
   return deepFreeze(result);
+}
+
+function normalizeAutoIngestPolicy(autoIngest = {}) {
+  const ignoreGlobs = [...new Set((autoIngest.ignoreGlobs || [])
+    .map((value) => String(value).trim().replaceAll('\\', '/'))
+    .filter(Boolean))].sort(codePointCompare);
+  for (const glob of ignoreGlobs) compilePortableGlob(glob);
+  return deepFreeze({
+    ignoreGlobs,
+    requireTag: String(autoIngest.requireTag || '').trim() || null,
+  });
+}
+
+function fileIdentity(stat) {
+  return { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs };
+}
+
+function sameFileIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino
+    && left.size === right.size && left.mtimeMs === right.mtimeMs;
+}
+
+function decodeUtf8(buffer) {
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(buffer);
+  } catch (cause) {
+    throw new ConfigError('CONFIG_INVALID', 'wiki-local config is not valid UTF-8', cause);
+  }
+}
+
+function scanJsonObjectKeys(source) {
+  let index = 0;
+  const whitespace = () => {
+    while (/\s/u.test(source[index] || '')) index += 1;
+  };
+  const string = () => {
+    const start = index;
+    index += 1;
+    let escaped = false;
+    while (index < source.length) {
+      const character = source[index];
+      if (escaped) escaped = false;
+      else if (character === '\\') escaped = true;
+      else if (character === '"') {
+        index += 1;
+        return JSON.parse(source.slice(start, index));
+      }
+      index += 1;
+    }
+    throw new ConfigError('CONFIG_INVALID', 'malformed wiki-local JSON string');
+  };
+  const value = () => {
+    whitespace();
+    if (source[index] === '{') return object();
+    if (source[index] === '[') {
+      index += 1;
+      whitespace();
+      if (source[index] === ']') { index += 1; return; }
+      while (true) {
+        value(); whitespace();
+        if (source[index] === ']') { index += 1; return; }
+        if (source[index] !== ',') throw new ConfigError('CONFIG_INVALID', 'malformed wiki-local JSON array');
+        index += 1;
+      }
+    }
+    if (source[index] === '"') { string(); return; }
+    const match = source.slice(index).match(/^(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)/);
+    if (!match) throw new ConfigError('CONFIG_INVALID', 'malformed wiki-local JSON value');
+    index += match[0].length;
+  };
+  const object = () => {
+    index += 1;
+    const keys = new Set();
+    whitespace();
+    if (source[index] === '}') { index += 1; return; }
+    while (true) {
+      whitespace();
+      if (source[index] !== '"') throw new ConfigError('CONFIG_INVALID', 'malformed wiki-local JSON object');
+      const key = string();
+      if (keys.has(key)) throw new ConfigError('CONFIG_INVALID', 'duplicate wiki-local JSON key');
+      keys.add(key);
+      whitespace();
+      if (source[index] !== ':') throw new ConfigError('CONFIG_INVALID', 'malformed wiki-local JSON object');
+      index += 1;
+      value(); whitespace();
+      if (source[index] === '}') { index += 1; return; }
+      if (source[index] !== ',') throw new ConfigError('CONFIG_INVALID', 'malformed wiki-local JSON object');
+      index += 1;
+    }
+  };
+  whitespace();
+  if (source[index] !== '{') return;
+  object(); whitespace();
+  if (index !== source.length) throw new ConfigError('CONFIG_INVALID', 'malformed wiki-local JSON');
+}
+
+function loadWikiLocalConfig(wikiRoot, options = {}) {
+  const fs = options.fs || nodeFs;
+  const target = path.join(wikiRoot, '.wiki-meta', '.config.json');
+  let before;
+  try { before = fs.lstatSync(target); } catch (cause) {
+    if (cause.code === 'ENOENT') return { status: 'absent', path: target, autoIngestDefined: false, config: null };
+    throw new ConfigError('CONFIG_INVALID', 'wiki-local config cannot be inspected', cause);
+  }
+  if (before.isSymbolicLink() || !before.isFile()) {
+    throw new ConfigError('CONFIG_INVALID', 'wiki-local config must be a regular non-symlink file');
+  }
+  if (before.size > 64 * 1024) throw new ConfigError('CONFIG_INVALID', 'wiki-local config exceeds 64 KiB');
+  const identity = fileIdentity(before);
+  let bytes;
+  try { bytes = fs.readFileSync(target); } catch (cause) {
+    throw new ConfigError('CONFIG_INVALID', 'wiki-local config cannot be read', cause);
+  }
+  let after;
+  try { after = fs.lstatSync(target); } catch (cause) {
+    throw new ConfigError('CONFIG_INVALID', 'wiki-local config identity was lost', cause);
+  }
+  if (after.isSymbolicLink() || !after.isFile() || !sameFileIdentity(identity, fileIdentity(after))) {
+    throw new ConfigError('CONFIG_INVALID', 'wiki-local config identity changed while reading');
+  }
+  const source = decodeUtf8(bytes);
+  scanJsonObjectKeys(source);
+  let parsed;
+  try { parsed = JSON.parse(source); } catch (cause) {
+    throw new ConfigError('CONFIG_INVALID', 'malformed wiki-local JSON', cause);
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new ConfigError('CONFIG_INVALID', 'wiki-local config must be a JSON object');
+  }
+  const allowed = new Set(['auto_ingest', 'a5_fanout_threshold', 'a5_worker_timeout_sec']);
+  for (const key of Object.keys(parsed)) {
+    if (!allowed.has(key)) throw new ConfigError('CONFIG_INVALID', 'wiki-local config contains an unsupported key');
+  }
+  const autoIngestDefined = Object.hasOwn(parsed, 'auto_ingest');
+  const result = {};
+  if (autoIngestDefined) {
+    const auto = parsed.auto_ingest;
+    if (!auto || typeof auto !== 'object' || Array.isArray(auto)) throw new ConfigError('CONFIG_INVALID', 'auto_ingest must be an object');
+    for (const key of Object.keys(auto)) {
+      if (key !== 'ignore_globs' && key !== 'require_tag') throw new ConfigError('CONFIG_INVALID', 'auto_ingest contains an unsupported key');
+    }
+    if (Object.hasOwn(auto, 'ignore_globs') && (!Array.isArray(auto.ignore_globs)
+        || auto.ignore_globs.some((value) => typeof value !== 'string' || value.trim() === ''))) {
+      throw new ConfigError('CONFIG_INVALID', 'auto_ingest.ignore_globs must be an array of non-empty strings');
+    }
+    if (Object.hasOwn(auto, 'require_tag') && typeof auto.require_tag !== 'string') {
+      throw new ConfigError('CONFIG_INVALID', 'auto_ingest.require_tag must be a string');
+    }
+    result.autoIngest = normalizeAutoIngestPolicy({
+      ignoreGlobs: auto.ignore_globs || [], requireTag: auto.require_tag || null,
+    });
+  }
+  for (const [jsonKey, configKey] of [['a5_fanout_threshold', 'a5FanoutThreshold'], ['a5_worker_timeout_sec', 'a5WorkerTimeoutSec']]) {
+    if (!Object.hasOwn(parsed, jsonKey)) continue;
+    if (!Number.isInteger(parsed[jsonKey])) throw new ConfigError('CONFIG_INVALID', `${jsonKey} must be an integer`);
+    result[configKey] = parsed[jsonKey];
+  }
+  return { status: 'present', path: target, autoIngestDefined, config: deepFreeze(result) };
+}
+
+function resolveEffectivePolicy({ globalConfig, localConfig }) {
+  const globalDefined = globalConfig?.autoIngestDefined === true;
+  const localDefined = localConfig?.status === 'present' && localConfig.autoIngestDefined === true;
+  const globalPolicy = normalizeAutoIngestPolicy(globalConfig?.autoIngest || {});
+  const localPolicy = localDefined ? normalizeAutoIngestPolicy(localConfig.config?.autoIngest || {}) : null;
+  if (!localDefined && !globalDefined) return { policy: globalPolicy, policySource: 'default', migrationRequired: false };
+  if (!localDefined) return { policy: globalPolicy, policySource: 'global_legacy', migrationRequired: true };
+  if (!globalDefined) return { policy: localPolicy, policySource: 'wiki_local', migrationRequired: false };
+  if (semanticDiff(globalPolicy, localPolicy).length > 0) {
+    throw new ConfigError('CONFIG_CONFLICT', 'CONFIG_CONFLICT local and legacy auto-ingest policies differ');
+  }
+  return { policy: localPolicy, policySource: 'wiki_local_migrated', migrationRequired: false };
+}
+
+function canonicalPolicyDigest(policy) {
+  const normalized = normalizeAutoIngestPolicy(policy);
+  const source = `${JSON.stringify({ ignore_globs: normalized.ignoreGlobs, require_tag: normalized.requireTag })}\n`;
+  return crypto.createHash('sha256').update(source).digest('hex');
 }
 
 function semanticDiff(left, right, prefix = '') {
@@ -687,7 +873,17 @@ function resolveConfig(env = process.env, options = {}) {
     const fields = [...new Set(conflicts.flatMap((value) => value.differences))].sort(codePointCompare).join(',');
     throw new ConfigError('CONFIG_CONFLICT', `CONFIG_CONFLICT candidates=${labels} fields=${fields}`);
   }
-  return { path: first.path, label: first.label, config: first.config };
+  const localConfig = loadWikiLocalConfig(first.config.wikiRoot, { fs });
+  const effective = resolveEffectivePolicy({ globalConfig: first.config, localConfig });
+  return {
+    path: first.path,
+    label: first.label,
+    config: first.config,
+    local_config_path: localConfig.path,
+    policy_source: effective.policySource,
+    migration_required: effective.migrationRequired,
+    policy_digest: canonicalPolicyDigest(effective.policy),
+  };
 }
 
 function resolveConfigWriteTarget(env = process.env, host, options = {}) {
@@ -832,6 +1028,9 @@ module.exports = {
   ISO_UTC_RE,
   parseConfig,
   normalizeConfigSemantics,
+  loadWikiLocalConfig,
+  resolveEffectivePolicy,
+  canonicalPolicyDigest,
   resolveHome,
   resolveConfig,
   resolveConfigWriteTarget,

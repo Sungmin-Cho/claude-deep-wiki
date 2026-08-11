@@ -112,6 +112,12 @@ test('parseConfig accepts BOM, CRLF, quoted Windows paths, Unicode, and filters'
   assert.equal(parsed.autoIngest.requireTag, 'project');
 });
 
+test('parseConfig preserves autoIngest presence independently from its normalized empty default', () => {
+  const { parseConfig } = runtimeModule('config.js');
+  assert.equal(parseConfig('wiki_root: /vault\n').autoIngestDefined, false);
+  assert.equal(parseConfig('wiki_root: /vault\nauto_ingest:\n').autoIngestDefined, true);
+});
+
 test('config parser unions block, inline, and dotted filters without treating quoted hashes as comments', () => {
   const { parseConfig } = runtimeModule('config.js');
   const parsed = parseConfig([
@@ -751,6 +757,23 @@ test('config aliases across three and four candidates require complete semantic 
   assert.throws(() => resolveConfig(env), (error) => error.code === 'CONFIG_CONFLICT');
 });
 
+test('config aliases reject absent versus explicit-empty legacy autoIngest definitions in either order', () => {
+  const { resolveConfig } = runtimeModule('config.js');
+  for (const [firstEmpty, secondEmpty] of [[false, true], [true, false]]) {
+    const root = temporaryRoot('deep wiki legacy presence alias ');
+    const wikiRoot = temporaryRoot('deep wiki legacy presence root ');
+    const explicit = write(path.join(root, 'explicit.yaml'), firstEmpty
+      ? canonicalConfig(wikiRoot)
+      : `wiki_root: "${wikiRoot}"\n`);
+    const codexHome = path.join(root, 'codex');
+    write(path.join(codexHome, 'deep-wiki-config.yaml'), secondEmpty
+      ? canonicalConfig(wikiRoot)
+      : `wiki_root: "${wikiRoot}"\n`);
+    assert.throws(() => resolveConfig({ DEEP_WIKI_CONFIG: explicit, CODEX_HOME: codexHome, HOME: root }),
+      (error) => error.code === 'CONFIG_CONFLICT' && error.message.includes('autoIngestDefined'));
+  }
+});
+
 test('config pairwise conflicts disclose stable labels and key paths but no values or secrets', () => {
   const { resolveConfig } = runtimeModule('config.js');
   const fields = [
@@ -831,6 +854,7 @@ test('config normalization deep-freezes the complete supported semantic object',
   })), { platform: process.platform, fs, home: os.homedir() });
   assert.deepEqual(value, {
     wikiRoot: fs.realpathSync.native(root),
+    autoIngestDefined: true,
     autoIngest: { requireTag: 'project', ignoreGlobs: ['a/**', 'z/*'] },
     obsidianCli: { enabled: false, vaultPath: null, vaultName: null, wikiPrefix: null },
   });

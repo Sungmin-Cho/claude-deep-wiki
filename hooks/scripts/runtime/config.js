@@ -835,6 +835,42 @@ function canonicalCandidate(candidate, fs, platform) {
   return fs.existsSync(normalized) ? api.normalize(realpathNative(fs, normalized)) : normalized;
 }
 
+function readConfigCandidate(candidate, fs, platform) {
+  let before;
+  try { before = fs.lstatSync(candidate.path, { bigint: true }); } catch (cause) {
+    throw new ConfigError('CONFIG_INVALID', `${candidate.label} config candidate cannot be inspected`, cause);
+  }
+  if (before.isSymbolicLink() || !before.isFile()) {
+    throw new ConfigError('CONFIG_INVALID', `${candidate.label} config candidate must be a regular non-symlink file`);
+  }
+  if (typeof fs.openSync !== 'function' || typeof fs.fstatSync !== 'function'
+      || typeof fs.closeSync !== 'function') {
+    try { return fs.readFileSync(candidate.path, 'utf8'); } catch (cause) {
+      throw new ConfigError('CONFIG_INVALID', `${candidate.label} config candidate cannot be read`, cause);
+    }
+  }
+  let descriptor = null;
+  try {
+    const constants = nodeFs.constants;
+    const flags = constants.O_RDONLY
+      | (platform === 'win32' ? 0 : (constants.O_NONBLOCK || 0))
+      | (constants.O_NOFOLLOW || 0);
+    descriptor = fs.openSync(candidate.path, flags);
+    const opened = fs.fstatSync(descriptor, { bigint: true });
+    if (!opened.isFile()) {
+      throw new ConfigError('CONFIG_INVALID', `${candidate.label} config candidate must be a regular non-symlink file`);
+    }
+    return fs.readFileSync(descriptor, 'utf8');
+  } catch (cause) {
+    if (cause instanceof ConfigError) throw cause;
+    throw new ConfigError('CONFIG_INVALID', `${candidate.label} config candidate cannot be read`, cause);
+  } finally {
+    if (descriptor !== null) {
+      try { fs.closeSync(descriptor); } catch { /* best-effort descriptor cleanup */ }
+    }
+  }
+}
+
 function resolveConfig(env = process.env, options = {}) {
   const platform = options.platform || process.platform;
   const fs = options.fs || nodeFs;
@@ -859,7 +895,7 @@ function resolveConfig(env = process.env, options = {}) {
     unique.push({ ...candidate, path: canonical });
   }
   const extant = unique.filter((candidate) => fs.existsSync(candidate.path)).map((candidate) => {
-    const parsed = parseConfig(fs.readFileSync(candidate.path, 'utf8'));
+    const parsed = parseConfig(readConfigCandidate(candidate, fs, platform));
     return { ...candidate, config: normalizeConfigSemantics(parsed, { platform, fs, home, env }) };
   });
   if (extant.length === 0) throw new ConfigError('CONFIG_NOT_FOUND', 'deep-wiki config not found');

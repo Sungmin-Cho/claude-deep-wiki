@@ -4123,6 +4123,99 @@ test('setup CLI maps config and authority safety errors to contract exit 4 witho
   }
 });
 
+test('config CLI rejects non-regular candidates before raw reads or requested wiki mutation', () => {
+  const cases = [
+    {
+      name: 'selected directory candidate',
+      command: 'setup',
+      prepare(root) {
+        fs.mkdirSync(path.join(root, '.codex', 'deep-wiki-config.yaml'), { recursive: true });
+        return {
+          argv: [cli, 'setup', '--wiki-root', path.join(root, 'selected-secret-wiki'), '--config-host', 'codex', '--json'],
+          wikiRoot: path.join(root, 'selected-secret-wiki'),
+          forbidden: ['selected-secret-wiki'],
+        };
+      },
+    },
+    {
+      name: 'non-selected directory candidate',
+      command: 'setup',
+      prepare(root) {
+        const wikiRoot = path.join(root, 'non-selected-secret-wiki');
+        write(path.join(root, '.codex', 'deep-wiki-config.yaml'), canonicalConfig(wikiRoot));
+        fs.mkdirSync(path.join(root, '.claude', 'deep-wiki-config.yaml'), { recursive: true });
+        return {
+          argv: [cli, 'setup', '--wiki-root', wikiRoot, '--config-host', 'codex', '--json'],
+          wikiRoot,
+          forbidden: ['non-selected-secret-wiki'],
+        };
+      },
+    },
+    {
+      name: 'config resolve directory candidate',
+      command: 'config',
+      prepare(root) {
+        const wikiRoot = path.join(root, 'resolve-secret-wiki');
+        write(path.join(root, '.codex', 'deep-wiki-config.yaml'), canonicalConfig(wikiRoot));
+        fs.mkdirSync(path.join(root, '.claude', 'deep-wiki-config.yaml'), { recursive: true });
+        return {
+          argv: [cli, 'config', 'resolve', '--json'],
+          wikiRoot,
+          forbidden: ['resolve-secret-wiki'],
+        };
+      },
+    },
+  ];
+
+  for (const entry of cases) {
+    const root = temporaryRoot(`deep wiki ${entry.name} `);
+    const { argv, wikiRoot, forbidden } = entry.prepare(root);
+    const result = spawnSync(process.execPath, argv, {
+      cwd: root,
+      env: { ...process.env, HOME: root, CODEX_HOME: '' },
+      encoding: 'utf8',
+      shell: false,
+    });
+    assert.equal(result.status, 4, `${entry.name}: ${result.stderr}`);
+    assert.equal(result.stdout, '', entry.name);
+    assert.match(result.stderr, /^CONFIG_INVALID:/, entry.name);
+    assert.doesNotMatch(result.stderr, /EISDIR|illegal operation|wiki_root:|auto_ingest:|require_tag/i);
+    for (const value of forbidden) assert.equal(result.stderr.includes(value), false, entry.name);
+    if (entry.command === 'setup') assert.equal(fs.existsSync(wikiRoot), false, entry.name);
+  }
+});
+
+test('setup CLI rejects FIFO config candidates within a bounded read window', { skip: process.platform === 'win32' }, (t) => {
+  const root = temporaryRoot('deep wiki fifo candidate ');
+  const wikiRoot = path.join(root, 'fifo-secret-wiki');
+  write(path.join(root, '.codex', 'deep-wiki-config.yaml'), canonicalConfig(wikiRoot));
+  fs.mkdirSync(path.join(root, '.claude'), { recursive: true });
+  const fifo = path.join(root, '.claude', 'deep-wiki-config.yaml');
+  const mkfifo = spawnSync('mkfifo', [fifo], { cwd: root, encoding: 'utf8', shell: false });
+  if (mkfifo.status !== 0) {
+    t.skip('mkfifo unavailable');
+    return;
+  }
+
+  const result = spawnSync(process.execPath, [
+    cli, 'setup', '--wiki-root', wikiRoot, '--config-host', 'codex', '--json',
+  ], {
+    cwd: root,
+    env: { ...process.env, HOME: root, CODEX_HOME: '' },
+    encoding: 'utf8',
+    shell: false,
+    timeout: 1000,
+    killSignal: 'SIGKILL',
+  });
+
+  assert.notEqual(result.error?.code, 'ETIMEDOUT', result.stderr);
+  assert.equal(result.status, 4, result.stderr);
+  assert.equal(result.stdout, '');
+  assert.match(result.stderr, /^CONFIG_INVALID:/);
+  assert.doesNotMatch(result.stderr, /fifo-secret-wiki|wiki_root:|auto_ingest:|require_tag/i);
+  assert.equal(fs.existsSync(wikiRoot), false);
+});
+
 test('Issue #40 CLI contention emits an exact token-redacted holder', () => {
   const { acquireLock, releaseLock } = runtimeModule('lock.js');
   const wikiRoot = newWikiRoot('deep wiki issue 40 cli holder ');

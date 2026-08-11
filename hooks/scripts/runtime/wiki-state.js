@@ -10,6 +10,7 @@ const {
   atomicWriteFile, parsePageFrontmatter, readMaybe, sha256, stateError, SHA_RE,
 } = require('./fs-safe.js');
 const { ISO_UTC_RE, resolveConfigWriteTarget } = require('./config.js');
+const { migrateAutoIngestPolicy } = require('./config-migration.js');
 const {
   createDeadline, assertBeforeDeadline, remainingMs, DeadlineExceeded,
 } = require('./deadline.js');
@@ -1807,3 +1808,7 @@ module.exports = {
   inspectWiki,
   fixWiki,
 };
+
+Object.defineProperty(module.exports, 'migrateAutoIngestPolicy', {
+  value: migrateAutoIngestPolicy,
+});

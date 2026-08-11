@@ -100,6 +100,80 @@ test('loadWikiLocalConfig fails closed for unsafe or invalid local state', () =>
   assert.throws(() => config.loadWikiLocalConfig(linkedRoot), (error) => error.code === 'CONFIG_INVALID');
 });
 
+test('loadWikiLocalConfig normalizes malformed string tokens, deeply nested input, and unsafe physical identities', () => {
+  const invalidStrings = [
+    '{"a\\qb":1}',
+    '{"auto_ingest":{"require_tag":"a\nb"}}',
+  ];
+  for (const source of invalidStrings) {
+    const wikiRoot = temporaryRoot();
+    writeLocal(wikiRoot, source);
+    assert.throws(() => config.loadWikiLocalConfig(wikiRoot), (error) => error.code === 'CONFIG_INVALID');
+  }
+  const deepRoot = temporaryRoot();
+  writeLocal(deepRoot, `{"auto_ingest":${'['.repeat(1_000)}${']'.repeat(1_000)}}`);
+  assert.throws(() => config.loadWikiLocalConfig(deepRoot), (error) => error.code === 'CONFIG_INVALID');
+
+  const linkedRoot = temporaryRoot();
+  const linked = writeLocal(linkedRoot, '{"auto_ingest":{}}');
+  fs.linkSync(linked, path.join(linkedRoot, '.wiki-meta', '.config-copy.json'));
+  assert.throws(() => config.loadWikiLocalConfig(linkedRoot), (error) => error.code === 'CONFIG_INVALID');
+});
+
+test('loadWikiLocalConfig exercises injected filesystem error, identity, bounds, root-shape, and Windows path branches', () => {
+  const inaccessible = {
+    lstatSync() { const error = new Error('permission denied'); error.code = 'EACCES'; throw error; },
+  };
+  assert.throws(() => config.loadWikiLocalConfig('/virtual/wiki', { fs: inaccessible }),
+    (error) => error.code === 'CONFIG_INVALID');
+
+  const replacementRoot = temporaryRoot();
+  const replacement = writeLocal(replacementRoot, '{"auto_ingest":{}}');
+  const replacementFs = {
+    lstatSync: (...args) => fs.lstatSync(...args),
+    readFileSync(pathname) {
+      const bytes = fs.readFileSync(pathname);
+      fs.writeFileSync(pathname, '{"auto_ingest":{"require_tag":"replacement"}}');
+      return bytes;
+    },
+  };
+  assert.throws(() => config.loadWikiLocalConfig(replacementRoot, { fs: replacementFs }),
+    (error) => error.code === 'CONFIG_INVALID' && /identity/i.test(error.message));
+  assert.equal(replacement, localPath(replacementRoot));
+
+  const boundaryRoot = temporaryRoot();
+  const base = '{"auto_ingest":{}}';
+  writeLocal(boundaryRoot, base + ' '.repeat(64 * 1024 - Buffer.byteLength(base)));
+  assert.equal(config.loadWikiLocalConfig(boundaryRoot).status, 'present');
+  fs.appendFileSync(localPath(boundaryRoot), ' ');
+  assert.throws(() => config.loadWikiLocalConfig(boundaryRoot), (error) => error.code === 'CONFIG_INVALID');
+
+  for (const source of ['123', 'null', '"value"', '']) {
+    const root = temporaryRoot();
+    writeLocal(root, source);
+    assert.throws(() => config.loadWikiLocalConfig(root), (error) => error.code === 'CONFIG_INVALID');
+  }
+
+  const stat = {
+    dev: 1n, ino: 2n, mode: 0o100600n, birthtimeNs: 3n, mtimeNs: 4n, nlink: 1n, size: 19n,
+    isFile: () => true, isSymbolicLink: () => false,
+  };
+  const windowsFs = { lstatSync: () => stat, readFileSync: () => Buffer.from('{"auto_ingest":{}}') };
+  const windows = config.loadWikiLocalConfig('C:\\Wiki', { platform: 'win32', fs: windowsFs });
+  assert.equal(windows.path, 'C:\\Wiki\\.wiki-meta\\.config.json');
+});
+
+test('resolveConfig never falls back to valid legacy policy when local state is invalid', () => {
+  const root = temporaryRoot();
+  const wikiRoot = path.join(root, 'wiki');
+  fs.mkdirSync(wikiRoot);
+  const global = path.join(root, 'global.yaml');
+  fs.writeFileSync(global, `wiki_root: "${wikiRoot}"\nauto_ingest:\n  require_tag: project\n`);
+  writeLocal(wikiRoot, '{"auto_ingest":{"require_tag":1}}');
+  assert.throws(() => config.resolveConfig({ DEEP_WIKI_CONFIG: global, HOME: root }),
+    (error) => error.code === 'CONFIG_INVALID');
+});
+
 test('resolveEffectivePolicy normalizes each ownership state and rejects semantic divergence', () => {
   const wikiRoot = temporaryRoot();
   const local = {

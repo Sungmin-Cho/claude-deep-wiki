@@ -5,6 +5,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 
 const { assertBeforeDeadline } = require('./deadline.js');
+const { regularFileIdentity, regularFileIdentitiesMatch } = require('./fs-safe.js');
 
 const ISO_UTC_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
 
@@ -648,15 +649,6 @@ function normalizeAutoIngestPolicy(autoIngest = {}) {
   });
 }
 
-function fileIdentity(stat) {
-  return { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs };
-}
-
-function sameFileIdentity(left, right) {
-  return left.dev === right.dev && left.ino === right.ino
-    && left.size === right.size && left.mtimeMs === right.mtimeMs;
-}
-
 function decodeUtf8(buffer) {
   try {
     return new TextDecoder('utf-8', { fatal: true }).decode(buffer);
@@ -680,21 +672,23 @@ function scanJsonObjectKeys(source) {
       else if (character === '\\') escaped = true;
       else if (character === '"') {
         index += 1;
-        return JSON.parse(source.slice(start, index));
+        try { return JSON.parse(source.slice(start, index)); }
+        catch (cause) { throw new ConfigError('CONFIG_INVALID', 'malformed wiki-local JSON string', cause); }
       }
       index += 1;
     }
     throw new ConfigError('CONFIG_INVALID', 'malformed wiki-local JSON string');
   };
-  const value = () => {
+  const value = (depth) => {
     whitespace();
-    if (source[index] === '{') return object();
+    if (source[index] === '{') return object(depth + 1);
     if (source[index] === '[') {
+      if (depth >= 256) throw new ConfigError('CONFIG_INVALID', 'wiki-local JSON nesting is too deep');
       index += 1;
       whitespace();
       if (source[index] === ']') { index += 1; return; }
       while (true) {
-        value(); whitespace();
+        value(depth + 1); whitespace();
         if (source[index] === ']') { index += 1; return; }
         if (source[index] !== ',') throw new ConfigError('CONFIG_INVALID', 'malformed wiki-local JSON array');
         index += 1;
@@ -705,7 +699,8 @@ function scanJsonObjectKeys(source) {
     if (!match) throw new ConfigError('CONFIG_INVALID', 'malformed wiki-local JSON value');
     index += match[0].length;
   };
-  const object = () => {
+  const object = (depth) => {
+    if (depth > 256) throw new ConfigError('CONFIG_INVALID', 'wiki-local JSON nesting is too deep');
     index += 1;
     const keys = new Set();
     whitespace();
@@ -713,13 +708,17 @@ function scanJsonObjectKeys(source) {
     while (true) {
       whitespace();
       if (source[index] !== '"') throw new ConfigError('CONFIG_INVALID', 'malformed wiki-local JSON object');
-      const key = string();
+      let key;
+      try { key = string(); } catch (cause) {
+        if (cause instanceof ConfigError) throw cause;
+        throw new ConfigError('CONFIG_INVALID', 'malformed wiki-local JSON string', cause);
+      }
       if (keys.has(key)) throw new ConfigError('CONFIG_INVALID', 'duplicate wiki-local JSON key');
       keys.add(key);
       whitespace();
       if (source[index] !== ':') throw new ConfigError('CONFIG_INVALID', 'malformed wiki-local JSON object');
       index += 1;
-      value(); whitespace();
+      value(depth); whitespace();
       if (source[index] === '}') { index += 1; return; }
       if (source[index] !== ',') throw new ConfigError('CONFIG_INVALID', 'malformed wiki-local JSON object');
       index += 1;
@@ -727,32 +726,34 @@ function scanJsonObjectKeys(source) {
   };
   whitespace();
   if (source[index] !== '{') return;
-  object(); whitespace();
+  object(0); whitespace();
   if (index !== source.length) throw new ConfigError('CONFIG_INVALID', 'malformed wiki-local JSON');
 }
 
 function loadWikiLocalConfig(wikiRoot, options = {}) {
   const fs = options.fs || nodeFs;
-  const target = path.join(wikiRoot, '.wiki-meta', '.config.json');
+  const api = pathApi(options.platform || process.platform);
+  const target = api.join(wikiRoot, '.wiki-meta', '.config.json');
   let before;
-  try { before = fs.lstatSync(target); } catch (cause) {
+  try { before = fs.lstatSync(target, { bigint: true }); } catch (cause) {
     if (cause.code === 'ENOENT') return { status: 'absent', path: target, autoIngestDefined: false, config: null };
     throw new ConfigError('CONFIG_INVALID', 'wiki-local config cannot be inspected', cause);
   }
   if (before.isSymbolicLink() || !before.isFile()) {
     throw new ConfigError('CONFIG_INVALID', 'wiki-local config must be a regular non-symlink file');
   }
-  if (before.size > 64 * 1024) throw new ConfigError('CONFIG_INVALID', 'wiki-local config exceeds 64 KiB');
-  const identity = fileIdentity(before);
+  if (before.size > 64n * 1024n) throw new ConfigError('CONFIG_INVALID', 'wiki-local config exceeds 64 KiB');
+  const identity = regularFileIdentity(before);
+  if (!identity) throw new ConfigError('CONFIG_INVALID', 'wiki-local config identity is unavailable or linked');
   let bytes;
   try { bytes = fs.readFileSync(target); } catch (cause) {
     throw new ConfigError('CONFIG_INVALID', 'wiki-local config cannot be read', cause);
   }
   let after;
-  try { after = fs.lstatSync(target); } catch (cause) {
+  try { after = fs.lstatSync(target, { bigint: true }); } catch (cause) {
     throw new ConfigError('CONFIG_INVALID', 'wiki-local config identity was lost', cause);
   }
-  if (after.isSymbolicLink() || !after.isFile() || !sameFileIdentity(identity, fileIdentity(after))) {
+  if (after.isSymbolicLink() || !after.isFile() || !regularFileIdentitiesMatch(identity, regularFileIdentity(after))) {
     throw new ConfigError('CONFIG_INVALID', 'wiki-local config identity changed while reading');
   }
   const source = decodeUtf8(bytes);
@@ -873,7 +874,7 @@ function resolveConfig(env = process.env, options = {}) {
     const fields = [...new Set(conflicts.flatMap((value) => value.differences))].sort(codePointCompare).join(',');
     throw new ConfigError('CONFIG_CONFLICT', `CONFIG_CONFLICT candidates=${labels} fields=${fields}`);
   }
-  const localConfig = loadWikiLocalConfig(first.config.wikiRoot, { fs });
+  const localConfig = loadWikiLocalConfig(first.config.wikiRoot, { fs, platform });
   const effective = resolveEffectivePolicy({ globalConfig: first.config, localConfig });
   return {
     path: first.path,
@@ -931,7 +932,9 @@ function resolveConfigWriteTarget(env = process.env, host, options = {}) {
     try {
       if (fs.lstatSync(target).isSymbolicLink()) throw new Error('config target is a symlink');
       const existing = normalizeConfigSemantics(parseConfig(fs.readFileSync(target, 'utf8')), { platform, fs, home, env });
-      if (semanticDiff(existing, desired).length === 0) return { path: target, status: 'alias' };
+      const { autoIngestDefined: ignoredExistingPresence, ...existingWriteComparable } = existing;
+      const { autoIngestDefined: ignoredDesiredPresence, ...desiredWriteComparable } = desired;
+      if (semanticDiff(existingWriteComparable, desiredWriteComparable).length === 0) return { path: target, status: 'alias' };
       if (!options.replaceConfig) throw new Error('supported config semantics differ');
       status = 'replaced';
     } catch (cause) {

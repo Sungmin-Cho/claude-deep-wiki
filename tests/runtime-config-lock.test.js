@@ -1450,6 +1450,24 @@ test('config-write semantic aliases stay byte-identical and conflicting supporte
   assert.equal(fs.readFileSync(target, 'utf8'), conflict);
 });
 
+test('config-write preserves empty legacy autoIngest aliases even with replace-config', () => {
+  const { resolveConfigWriteTarget } = runtimeModule('config.js');
+  for (const legacy of ['auto_ingest:\n', 'auto_ingest:\n  ignore_globs: []\n  require_tag:\n']) {
+    const root = temporaryRoot('deep wiki config write legacy presence ');
+    const wikiRoot = path.join(root, 'wiki');
+    fs.mkdirSync(wikiRoot);
+    const target = write(path.join(root, '.codex', 'deep-wiki-config.yaml'), `wiki_root: "${wikiRoot}"\n${legacy}`);
+    const before = fs.readFileSync(target);
+    const desired = `wiki_root: "${wikiRoot}"\n`;
+    assert.deepEqual(resolveConfigWriteTarget({ HOME: root }, 'codex', { desiredConfigText: desired }),
+      { path: target, status: 'alias' });
+    assert.deepEqual(resolveConfigWriteTarget({ HOME: root }, 'codex', {
+      desiredConfigText: desired, replaceConfig: true,
+    }), { path: target, status: 'alias' });
+    assert.deepEqual(fs.readFileSync(target), before);
+  }
+});
+
 test('config-write rejects an existing target with node-property-hidden supported keys before aliasing', () => {
   const { resolveConfigWriteTarget } = runtimeModule('config.js');
   const root = temporaryRoot('deep wiki tagged config target ');

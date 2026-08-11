@@ -37,6 +37,10 @@ function fixture(prefix = 'deep wiki state Unicode 공간 ') {
   return root;
 }
 
+function setupEnv(home) {
+  return { HOME: home, USERPROFILE: home, CODEX_HOME: '' };
+}
+
 test.after(() => {
   for (const root of roots) fs.rmSync(root, { recursive: true, force: true });
 });
@@ -1336,7 +1340,7 @@ test('setup commits a compatible wiki before writing the selected host config ta
   const result = setupWiki({
     wikiRoot: root,
     configHost: 'codex',
-    env: { ...process.env, HOME: home, CODEX_HOME: '' },
+    env: setupEnv(home),
     now: new Date(TS),
     operationId: OPERATION_ID,
     eventId: EVENT_ID,
@@ -1355,6 +1359,7 @@ test('setup resumes its journal after interruption without leaving an incompatib
   const root = path.join(home, 'Interrupted Wiki');
   assert.throws(() => setupWiki({
     wikiRoot: root,
+    env: setupEnv(home),
     now: new Date(TS),
     operationId: OPERATION_ID,
     eventId: EVENT_ID,
@@ -1362,6 +1367,7 @@ test('setup resumes its journal after interruption without leaving an incompatib
   }));
   const result = setupWiki({
     wikiRoot: root,
+    env: setupEnv(home),
     now: new Date(TS),
     operationId: OPERATION_ID,
     eventId: EVENT_ID,
@@ -1377,19 +1383,20 @@ test('setup resumes from its authenticated intent when interrupted before journa
   const root = path.join(home, 'Intent Wiki');
   assert.throws(() => setupWiki({
     wikiRoot: root,
+    env: setupEnv(home),
     now: new Date(TS),
     operationId: OPERATION_ID,
     eventId: EVENT_ID,
     faultInjector(boundary) { if (boundary === 'after-setup-intent') throw new Error('stop'); },
   }));
   assert.equal(fs.existsSync(path.join(root, '.wiki-meta', '.setup-intent.json')), true);
-  const result = setupWiki({ wikiRoot: root, now: new Date(TS) });
+  const result = setupWiki({ wikiRoot: root, env: setupEnv(home), now: new Date(TS) });
   assert.equal(result.operationId, OPERATION_ID);
   assert.equal(fs.existsSync(path.join(root, 'pages', 'welcome.md')), true);
   assert.equal(fs.existsSync(path.join(root, '.wiki-meta', '.setup-intent.json')), false);
 });
 
-test('setup revalidates compatibility after locking when a concurrent setup wins', () => {
+test('setup repeats fresh preflight after reservation when a concurrent setup wins', () => {
   const { setupWiki } = require(statePath);
   const home = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'deep wiki setup race home ')));
   roots.add(home);
@@ -1397,13 +1404,15 @@ test('setup revalidates compatibility after locking when a concurrent setup wins
   let competingResult;
   const result = setupWiki({
     wikiRoot: root,
+    env: setupEnv(home),
     now: new Date(TS),
     operationId: '01JZ7P9Q6MD7S5PB8H4Y40HJ85',
     eventId: '01JZ7P9Q6MD7S5PB8H4Y40HJ86',
     faultInjector(boundary) {
-      if (boundary === 'before-setup-lock') {
+      if (boundary === 'before-setup-reservation') {
         competingResult = setupWiki({
           wikiRoot: root,
+          env: setupEnv(home),
           now: new Date(TS),
           operationId: OPERATION_ID,
           eventId: EVENT_ID,
@@ -1420,12 +1429,14 @@ test('setup revalidates compatibility after locking when a concurrent setup wins
 
 test('setup rejects an unauthenticated empty pages/meta scaffold', () => {
   const { setupWiki } = require(statePath);
-  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'deep wiki foreign scaffold ')));
-  roots.add(root);
+  const home = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'deep wiki foreign scaffold home ')));
+  roots.add(home);
+  const root = path.join(home, 'wiki');
+  fs.mkdirSync(root);
   fs.mkdirSync(path.join(root, 'pages'));
   fs.mkdirSync(path.join(root, '.wiki-meta'));
   assert.throws(
-    () => setupWiki({ wikiRoot: root, now: new Date(TS) }),
+    () => setupWiki({ wikiRoot: root, env: setupEnv(home), now: new Date(TS) }),
     (error) => error.code === 'WIKI_STATE_INVALID',
   );
   assert.deepEqual(fs.readdirSync(root).sort(), ['.wiki-meta', 'pages']);
@@ -2259,11 +2270,13 @@ test('lint fix self-heals a transaction store wedged by an OS metadata file', ()
 
 test('setup refuses a nonempty incompatible target before creating wiki state', () => {
   const { setupWiki } = require(statePath);
-  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'deep wiki incompatible setup ')));
-  roots.add(root);
+  const home = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'deep wiki incompatible setup home ')));
+  roots.add(home);
+  const root = path.join(home, 'wiki');
+  fs.mkdirSync(root);
   fs.writeFileSync(path.join(root, 'foreign.txt'), 'preserve me\n');
   assert.throws(
-    () => setupWiki({ wikiRoot: root, now: new Date(TS) }),
+    () => setupWiki({ wikiRoot: root, env: setupEnv(home), now: new Date(TS) }),
     (error) => error.code === 'WIKI_STATE_INVALID',
   );
   assert.deepEqual(fs.readdirSync(root), ['foreign.txt']);

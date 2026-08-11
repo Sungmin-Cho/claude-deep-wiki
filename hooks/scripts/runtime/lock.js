@@ -45,7 +45,22 @@ function paths(wikiRoot) {
   if (typeof wikiRoot !== 'string' || !path.isAbsolute(wikiRoot)) throw new LockError('LOCK_INVALID', 'wikiRoot must be absolute');
   const meta = path.join(wikiRoot, '.wiki-meta');
   const lockDir = path.join(meta, '.wiki-lock');
-  return { meta, lockDir, ownerPath: path.join(lockDir, 'owner.json') };
+  return { meta, lockDir, ownerPath: path.join(lockDir, 'owner.json'), namespace: '.wiki-lock' };
+}
+
+function pathLockPaths(lockPath) {
+  if (typeof lockPath !== 'string' || !path.isAbsolute(lockPath)) {
+    throw new LockError('LOCK_INVALID', 'lockPath must be absolute');
+  }
+  const lockDir = path.normalize(lockPath);
+  const namespace = path.basename(lockDir);
+  if (!validEntryName(namespace)) throw new LockError('LOCK_INVALID', 'lockPath basename is invalid');
+  return {
+    meta: path.dirname(lockDir),
+    lockDir,
+    ownerPath: path.join(lockDir, 'owner.json'),
+    namespace,
+  };
 }
 
 function identityComponent(value) {
@@ -260,14 +275,19 @@ function identityIsGenerationSealed(identity) {
   return identity !== null && typeof identity.birthtimeNs === 'bigint' && identity.birthtimeNs >= 0n;
 }
 
-function restoreCompleteName(seizure) {
-  const identity = seizure.reservationIdentity;
-  const suffix = path.basename(seizure.reservation).slice('.wiki-lock.'.length);
-  return `.wiki-lock.restore-complete.${identity.dev.toString(16)}.${identity.ino.toString(16)}.${identity.birthtimeNs.toString(16)}.${suffix}`;
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function parseRestoreCompleteIdentity(name) {
-  const match = name.match(/^\.wiki-lock\.restore-complete\.([a-f0-9]+)\.([a-f0-9]+)\.([a-f0-9]+)\./);
+function restoreCompleteName(seizure) {
+  const identity = seizure.reservationIdentity;
+  const namespace = seizure.namespace || '.wiki-lock';
+  const suffix = path.basename(seizure.reservation).slice(`${namespace}.`.length);
+  return `${namespace}.restore-complete.${identity.dev.toString(16)}.${identity.ino.toString(16)}.${identity.birthtimeNs.toString(16)}.${suffix}`;
+}
+
+function parseRestoreCompleteIdentity(name, namespace = '.wiki-lock') {
+  const match = name.match(new RegExp(`^${escapeRegExp(namespace)}\\.restore-complete\\.([a-f0-9]+)\\.([a-f0-9]+)\\.([a-f0-9]+)\\.`));
   if (!match) return null;
   try {
     return {
@@ -286,15 +306,16 @@ function validEntryName(name) {
     && !name.includes('\0') && path.basename(name) === name;
 }
 
-function validateRestoreState(value, reservationName) {
+function validateRestoreState(value, reservationName, namespace = '.wiki-lock') {
+  const reservationPattern = new RegExp(`^${escapeRegExp(namespace)}\\.(?:release|recovery)\\.\\d+\\.[a-f0-9]{32}$`);
   if (!hasExactKeys(value, RESTORE_STATE_KEYS)
       || value.contract_version !== 1 || value.kind !== 'lock-mismatch-restore'
       || typeof value.reservation_name !== 'string'
       || typeof value.complete_name !== 'string'
       || path.basename(value.reservation_name) !== value.reservation_name
       || path.basename(value.complete_name) !== value.complete_name
-      || !/^\.wiki-lock\.(?:release|recovery)\.\d+\.[a-f0-9]{32}$/.test(value.reservation_name)
-      || !value.complete_name.startsWith('.wiki-lock.restore-complete.')
+      || !reservationPattern.test(value.reservation_name)
+      || !value.complete_name.startsWith(`${namespace}.restore-complete.`)
       || !Array.isArray(value.entries)) return null;
   if (reservationName !== value.reservation_name && reservationName !== value.complete_name) return null;
   const seizedIdentity = deserializeIdentity(value.seized_identity);
@@ -323,16 +344,16 @@ function validateRestoreState(value, reservationName) {
   };
 }
 
-function validateTransitionIntent(value, reservationName) {
+function validateTransitionIntent(value, reservationName, namespace = '.wiki-lock') {
   if (!hasExactKeys(value, TRANSITION_INTENT_KEYS)
       || value.contract_version !== 1 || value.kind !== 'lock-seizure-transition'
       || (value.purpose !== 'release' && value.purpose !== 'recovery')
       || typeof value.reservation_name !== 'string'
       || !Number.isInteger(value.pid) || value.pid <= 0
       || typeof value.hostname !== 'string' || value.hostname.length === 0) return null;
-  const nameMatch = value.reservation_name.match(
-    /^\.wiki-lock\.(release|recovery)\.(\d+)\.[a-f0-9]{32}$/,
-  );
+  const nameMatch = value.reservation_name.match(new RegExp(
+    `^${escapeRegExp(namespace)}\\.(release|recovery)\\.(\\d+)\\.[a-f0-9]{32}$`,
+  ));
   if (!nameMatch || value.reservation_name !== reservationName
       || nameMatch[1] !== value.purpose || nameMatch[2] !== String(value.pid)) return null;
   const reservationIdentity = deserializeIdentity(value.reservation_identity);
@@ -348,7 +369,7 @@ function validateTransitionIntent(value, reservationName) {
   };
 }
 
-function readTransitionIntent(fs, reservation) {
+function readTransitionIntent(fs, reservation, namespace = '.wiki-lock') {
   const intentPath = path.join(reservation, TRANSITION_INTENT_FILE);
   const intentIdentity = readFilesystemIdentity(fs, intentPath);
   if (!intentIdentity) {
@@ -369,7 +390,7 @@ function readTransitionIntent(fs, reservation) {
     if (pathIsMissing(fs, intentPath)) return null;
     throw new LockError('LOCK_FILESYSTEM', 'lock transition intent identity changed');
   }
-  const intent = validateTransitionIntent(value, path.basename(reservation));
+  const intent = validateTransitionIntent(value, path.basename(reservation), namespace);
   if (!intent) throw new LockError('LOCK_FILESYSTEM', 'lock transition intent is malformed');
   if (intent.hasLegacyIdentity) {
     throw new LockError('LOCK_FILESYSTEM', 'legacy lock transition identity lacks a generation seal');
@@ -500,10 +521,10 @@ function prepareRestoreState({ fs, lockDir, seizure }) {
     entries,
   };
   writeRestoreState({ fs, seizure: { ...seizure, lockDir }, state, canonicalIdentity: null });
-  return validateRestoreState(state, state.reservation_name);
+  return validateRestoreState(state, state.reservation_name, seizure.namespace);
 }
 
-function readRestoreState(fs, reservation) {
+function readRestoreState(fs, reservation, namespace = '.wiki-lock') {
   const statePath = path.join(reservation, RESTORE_STATE_FILE);
   let value;
   try {
@@ -512,7 +533,7 @@ function readRestoreState(fs, reservation) {
     if (cause.code === 'ENOENT') return null;
     throw new LockError('LOCK_FILESYSTEM', 'lock restore state is unreadable', undefined, cause);
   }
-  const state = validateRestoreState(value, path.basename(reservation));
+  const state = validateRestoreState(value, path.basename(reservation), namespace);
   if (!state) throw new LockError('LOCK_FILESYSTEM', 'lock restore state is malformed');
   return state;
 }
@@ -546,7 +567,7 @@ function canonicalDirectoryForRestore({ fs, lockDir, seizure, state }) {
     })),
   };
   writeRestoreState({ fs, seizure: { ...seizure, lockDir }, state: next, canonicalIdentity: identity });
-  return { state: validateRestoreState(next, next.reservation_name), identity };
+  return { state: validateRestoreState(next, next.reservation_name, seizure.namespace), identity };
 }
 
 function finishRestoreReservation({ fs, meta, seizure, state, restoredIdentity }) {
@@ -612,8 +633,8 @@ function continueRestoreState({ fs, meta, lockDir, seizure, state }) {
   });
 }
 
-function cleanCompletedRestore(fs, meta, name) {
-  const expected = parseRestoreCompleteIdentity(name);
+function cleanCompletedRestore(fs, meta, name, lockDir, namespace) {
+  const expected = parseRestoreCompleteIdentity(name, namespace);
   if (!expected) return;
   const complete = path.join(meta, name);
   if (!sameDirectoryIdentity(fs, complete, expected)) return;
@@ -624,14 +645,13 @@ function cleanCompletedRestore(fs, meta, name) {
     return;
   }
   if (entries.length !== 1 || entries[0] !== RESTORE_STATE_FILE) return;
-  const state = readRestoreState(fs, complete);
+  const state = readRestoreState(fs, complete, namespace);
   if (!state || state.complete_name !== name) return;
   if (restoreCompleteName({
-    reservation: path.join(meta, state.reservation_name), reservationIdentity: expected,
+    reservation: path.join(meta, state.reservation_name), reservationIdentity: expected, namespace,
   }) !== name) return;
   const canonicalIdentity = state.canonicalIdentity;
   if (!canonicalIdentity) return;
-  const lockDir = path.join(meta, '.wiki-lock');
   if (!sameDirectoryIdentity(fs, lockDir, canonicalIdentity)) return;
   for (const entry of state.entries) {
     if (!sameFilesystemIdentity(fs, path.join(lockDir, entry.name), entry.identity)) return;
@@ -646,7 +666,7 @@ function cleanCompletedRestore(fs, meta, name) {
   fs.rmdirSync(complete);
 }
 
-function resumePendingRestores({ fs, meta, lockDir }) {
+function resumePendingRestores({ fs, meta, lockDir, namespace = '.wiki-lock' }) {
   let names;
   try {
     names = fs.readdirSync(meta).sort();
@@ -655,17 +675,17 @@ function resumePendingRestores({ fs, meta, lockDir }) {
     throw new LockError('LOCK_FILESYSTEM', 'cannot inspect lock restore reservations', undefined, cause);
   }
   for (const name of names) {
-    if (name.startsWith('.wiki-lock.restore-complete.')) {
-      cleanCompletedRestore(fs, meta, name);
+    if (name.startsWith(`${namespace}.restore-complete.`)) {
+      cleanCompletedRestore(fs, meta, name, lockDir, namespace);
       continue;
     }
-    if (!/^\.wiki-lock\.(?:release|recovery)\./.test(name)) continue;
+    if (!(new RegExp(`^${escapeRegExp(namespace)}\\.(?:release|recovery)\\.`)).test(name)) continue;
     const reservation = path.join(meta, name);
-    const state = readRestoreState(fs, reservation);
+    const state = readRestoreState(fs, reservation, namespace);
     if (state?.hasLegacyIdentity) {
       throw new LockError('LOCK_FILESYSTEM', 'legacy lock restore identity lacks a generation seal');
     }
-    const intent = readTransitionIntent(fs, reservation);
+    const intent = readTransitionIntent(fs, reservation, namespace);
     const seized = path.join(reservation, 'seized');
     if (!state) {
       if (!pathIsMissing(fs, seized)) {
@@ -727,7 +747,7 @@ function resumePendingRestores({ fs, meta, lockDir }) {
     if (!reservationIdentity || !seizedIdentity) {
       throw new LockError('LOCK_FILESYSTEM', 'lock restore reservation identity is unavailable');
     }
-    if (state.complete_name !== restoreCompleteName({ reservation, reservationIdentity })) {
+    if (state.complete_name !== restoreCompleteName({ reservation, reservationIdentity, namespace })) {
       throw new LockError('LOCK_FILESYSTEM', 'lock restore completion identity is inconsistent');
     }
     if (intent) {
@@ -743,7 +763,7 @@ function resumePendingRestores({ fs, meta, lockDir }) {
         fs,
         meta,
         lockDir,
-        seizure: { reservation, reservationIdentity, seized, seizedIdentity },
+        seizure: { reservation, reservationIdentity, seized, seizedIdentity, namespace },
         state,
       });
     } catch (cause) {
@@ -753,12 +773,12 @@ function resumePendingRestores({ fs, meta, lockDir }) {
   }
 }
 
-function reserveQuarantine({ fs, meta, purpose, randomBytes }) {
+function reserveQuarantine({ fs, meta, purpose, randomBytes, namespace = '.wiki-lock' }) {
   const generate = randomBytes || crypto.randomBytes;
   let collision;
   for (let attempt = 0; attempt < MAX_RESERVATION_ATTEMPTS; attempt += 1) {
     const suffix = generate(16).toString('hex');
-    const reservation = path.join(meta, `.wiki-lock.${purpose}.${process.pid}.${suffix}`);
+    const reservation = path.join(meta, `${namespace}.${purpose}.${process.pid}.${suffix}`);
     try {
       fs.mkdirSync(reservation);
       const reservationIdentity = readDirectoryIdentity(fs, reservation);
@@ -771,6 +791,7 @@ function reserveQuarantine({ fs, meta, purpose, randomBytes }) {
       }
       return {
         reservation,
+        namespace,
         reservationIdentity,
         seized: path.join(reservation, 'seized'),
         seizedPhysical: path.join(reservationPhysical, 'seized'),
@@ -807,8 +828,8 @@ function removeEmptyReservation({ fs, reservation, reservationIdentity, purpose,
   throw new LockError('LOCK_FILESYSTEM', `cannot seize wiki lock for ${purpose}`, undefined, cause);
 }
 
-function seizeLockDirectory({ fs, meta, lockDir, purpose, randomBytes, expectedIdentity }) {
-  const seizure = reserveQuarantine({ fs, meta, purpose, randomBytes });
+function seizeLockDirectory({ fs, meta, lockDir, purpose, randomBytes, expectedIdentity, namespace }) {
+  const seizure = reserveQuarantine({ fs, meta, purpose, randomBytes, namespace });
   let transition;
   try {
     assertDirectoryIdentity(fs, seizure.reservation, seizure.reservationIdentity);
@@ -988,21 +1009,27 @@ function removeRecoveredLock({ fs, lockDir, seizure, candidate }) {
   }
 }
 
-function acquireLock(options = {}) {
-  const { wikiRoot, operation } = options;
+function acquireCurrentWriter(options, location, createParent) {
+  const { operation } = options;
   const fs = options.fs || nodeFs;
   if (typeof operation !== 'string' || operation.trim() === '') throw new LockError('LOCK_INVALID', 'lock operation is required');
-  const { meta, lockDir, ownerPath } = paths(wikiRoot);
-  fs.mkdirSync(meta, { recursive: true });
-  resumePendingRestores({ fs, meta, lockDir });
+  const {
+    meta, lockDir, ownerPath, namespace,
+  } = location;
+  if (createParent) fs.mkdirSync(meta, { recursive: true });
+  else {
+    const parentIdentity = readDirectoryIdentity(fs, meta);
+    if (!parentIdentity) throw new LockError('LOCK_FILESYSTEM', 'lock parent must be an existing physical directory');
+  }
+  resumePendingRestores({ fs, meta, lockDir, namespace });
   try {
     fs.mkdirSync(lockDir);
   } catch (cause) {
     if (cause.code === 'EEXIST' && options.recoverDeadOwner !== false) {
       let recovered = false;
       try {
-        recovered = recoverLock({
-          wikiRoot,
+        recovered = recoverCurrentWriter({
+          location,
           fs,
           staleMs: 0,
           force: true,
@@ -1075,23 +1102,25 @@ function acquireLock(options = {}) {
   }
 }
 
-function assertLockOwner(options = {}) {
-  const { wikiRoot, token } = options;
+function assertCurrentWriter(options, location) {
+  const { token } = options;
   const fs = options.fs || nodeFs;
-  const { ownerPath } = paths(wikiRoot);
+  const { ownerPath } = location;
   const owner = readOwner(ownerPath, fs);
   if (!owner || typeof token !== 'string' || owner.token !== token) throw lockTokenError(owner);
   return owner;
 }
 
-function releaseLock(options = {}) {
-  const { wikiRoot, token } = options;
+function releaseCurrentWriter(options, location) {
+  const { token } = options;
   const fs = options.fs || nodeFs;
-  const { meta, lockDir } = paths(wikiRoot);
-  resumePendingRestores({ fs, meta, lockDir });
-  const expectedOwner = assertLockOwner({ wikiRoot, token, fs });
+  const {
+    meta, lockDir, namespace,
+  } = location;
+  resumePendingRestores({ fs, meta, lockDir, namespace });
+  const expectedOwner = assertCurrentWriter({ token, fs }, location);
   const seizure = seizeLockDirectory({
-    fs, meta, lockDir, purpose: 'release', randomBytes: options.randomBytes,
+    fs, meta, lockDir, namespace, purpose: 'release', randomBytes: options.randomBytes,
   });
   if (!seizure) throw lockTokenError(null);
   try {
@@ -1118,12 +1147,14 @@ function defaultIsPidAlive(pid) {
   }
 }
 
-function recoverLock(options = {}) {
-  const { wikiRoot } = options;
+function recoverCurrentWriter(options = {}) {
+  const { location } = options;
   const fs = options.fs || nodeFs;
-  const { meta, lockDir, ownerPath } = paths(wikiRoot);
+  const {
+    meta, lockDir, ownerPath, namespace,
+  } = location;
   if (options[RECOVERY_AFTER_RESTORE_SCAN] !== true) {
-    resumePendingRestores({ fs, meta, lockDir });
+    resumePendingRestores({ fs, meta, lockDir, namespace });
   }
   const staleMs = options.staleMs;
   if (!Number.isFinite(staleMs) || staleMs < 0) throw new LockError('LOCK_INVALID', 'staleMs must be nonnegative');
@@ -1151,6 +1182,7 @@ function recoverLock(options = {}) {
     fs,
     meta,
     lockDir,
+    namespace,
     purpose: 'recovery',
     randomBytes: options.randomBytes,
     expectedIdentity: candidate.directoryIdentity,
@@ -1167,9 +1199,45 @@ function recoverLock(options = {}) {
   }
 }
 
+function acquireLock(options = {}) {
+  return acquireCurrentWriter(options, paths(options.wikiRoot), true);
+}
+
+function assertLockOwner(options = {}) {
+  return assertCurrentWriter(options, paths(options.wikiRoot));
+}
+
+function releaseLock(options = {}) {
+  return releaseCurrentWriter(options, paths(options.wikiRoot));
+}
+
+function recoverLock(options = {}) {
+  return recoverCurrentWriter({ ...options, location: paths(options.wikiRoot) });
+}
+
+function acquirePathLock(options = {}) {
+  return acquireCurrentWriter(options, pathLockPaths(options.lockPath), false);
+}
+
+function assertPathLockOwner(options = {}) {
+  return assertCurrentWriter(options, pathLockPaths(options.lockPath));
+}
+
+function releasePathLock(options = {}) {
+  return releaseCurrentWriter(options, pathLockPaths(options.lockPath));
+}
+
+function recoverPathLock(options = {}) {
+  return recoverCurrentWriter({ ...options, location: pathLockPaths(options.lockPath) });
+}
+
 module.exports = {
   acquireLock,
   assertLockOwner,
   releaseLock,
   recoverLock,
+  acquirePathLock,
+  assertPathLockOwner,
+  releasePathLock,
+  recoverPathLock,
 };

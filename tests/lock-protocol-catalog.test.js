@@ -6,7 +6,9 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const { acquireLock, releaseLock } = require('../hooks/scripts/runtime/lock.js');
+const {
+  acquireLock, releaseLock, acquirePathLock, releasePathLock,
+} = require('../hooks/scripts/runtime/lock.js');
 const {
   validateSkillCommands,
   SKILL_COMMAND_CONTRACTS,
@@ -32,6 +34,56 @@ test('owner token prevents a foreign release and preserves the live owner', () =
   assert.deepEqual(fs.readFileSync(ownerPath), before);
   releaseLock({ wikiRoot: root, token: owner.token });
   assert.equal(fs.existsSync(path.join(root, '.wiki-meta', '.wiki-lock')), false);
+});
+
+test('the path-parameterized current-writer protocol preserves ownership and proved-dead recovery', () => {
+  const home = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'deep wiki path lock ')));
+  roots.add(home);
+  const lockPath = path.join(home, '.deep-wiki-setup.reserve');
+  const first = acquirePathLock({
+    lockPath,
+    operation: 'setup-authority',
+    hostname: 'same-host',
+    pid: 41001,
+    now: new Date('2026-08-11T00:00:00Z'),
+  });
+  assert.throws(
+    () => acquirePathLock({
+      lockPath,
+      operation: 'setup-authority',
+      hostname: 'same-host',
+      pid: 41002,
+      isPidAlive: () => true,
+      now: new Date('2026-08-11T00:00:01Z'),
+    }),
+    (error) => error.code === 'LOCK_CONTENDED' && error.owner?.token === first.token,
+  );
+  assert.throws(
+    () => acquirePathLock({
+      lockPath,
+      operation: 'setup-authority',
+      hostname: 'other-host',
+      pid: 41003,
+      isPidAlive: () => false,
+      now: new Date('2026-08-11T00:00:02Z'),
+    }),
+    (error) => error.code === 'LOCK_CONTENDED',
+  );
+  const recovered = acquirePathLock({
+    lockPath,
+    operation: 'setup-authority',
+    hostname: 'same-host',
+    pid: 41004,
+    isPidAlive: (pid) => pid !== 41001,
+    now: new Date('2026-08-11T00:00:03Z'),
+  });
+  assert.notEqual(recovered.token, first.token);
+  assert.throws(
+    () => releasePathLock({ lockPath, token: first.token }),
+    (error) => error.code === 'LOCK_TOKEN_MISMATCH',
+  );
+  releasePathLock({ lockPath, token: recovered.token });
+  assert.equal(fs.existsSync(lockPath), false);
 });
 
 test('write-capable skills route lock ownership through the Node runtime', () => {

@@ -757,7 +757,7 @@ test('config aliases across three and four candidates require complete semantic 
   assert.throws(() => resolveConfig(env), (error) => error.code === 'CONFIG_CONFLICT');
 });
 
-test('config aliases reject absent versus explicit-empty legacy autoIngest definitions in either order', () => {
+test('config aliases accept equivalent absent versus explicit-empty legacy autoIngest definitions in either order', () => {
   const { resolveConfig } = runtimeModule('config.js');
   for (const [firstEmpty, secondEmpty] of [[false, true], [true, false]]) {
     const root = temporaryRoot('deep wiki legacy presence alias ');
@@ -769,8 +769,11 @@ test('config aliases reject absent versus explicit-empty legacy autoIngest defin
     write(path.join(codexHome, 'deep-wiki-config.yaml'), secondEmpty
       ? canonicalConfig(wikiRoot)
       : `wiki_root: "${wikiRoot}"\n`);
-    assert.throws(() => resolveConfig({ DEEP_WIKI_CONFIG: explicit, CODEX_HOME: codexHome, HOME: root }),
-      (error) => error.code === 'CONFIG_CONFLICT' && error.message.includes('autoIngestDefined'));
+    const resolved = resolveConfig({ DEEP_WIKI_CONFIG: explicit, CODEX_HOME: codexHome, HOME: root });
+    assert.equal(resolved.migration_required, true);
+    assert.equal(resolved.policy_source, 'global_legacy');
+    assert.equal(resolved.config.autoIngestDefined, true);
+    assert.deepEqual(resolved.config.autoIngest, { ignoreGlobs: [], requireTag: null });
   }
 });
 

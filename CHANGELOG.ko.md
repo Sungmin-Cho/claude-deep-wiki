@@ -7,6 +7,11 @@ deep-wiki의 주요 변경사항을 기록합니다.
 
 ## [Unreleased]
 
+### 수정
+
+- `/wiki-setup`이 scan-window metadata를 만들거나 갱신할 때 배포된 canonical UTC-Z timestamp 형식을 보존합니다.
+- SessionStart와 setup 문서가 `auto_ingest`의 wiki-local `.wiki-meta/.config.json` ownership을 명시하고, global host YAML은 bootstrap/legacy alias로만 유지되며 local/legacy policy 충돌은 fail-closed로 처리됨을 밝힙니다.
+
 ## [1.9.7] — 2026-08-05 (콘텐츠 메타데이터 및 중첩 prune 안전성)
 
 ### 수정

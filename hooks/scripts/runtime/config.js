@@ -829,6 +829,11 @@ function semanticDiff(left, right, prefix = '') {
   return [prefix];
 }
 
+function crossHostComparableConfig(config) {
+  const { autoIngestDefined: ignoredAutoIngestDefined, ...comparable } = config;
+  return comparable;
+}
+
 function canonicalCandidate(candidate, fs, platform) {
   const api = pathApi(platform);
   const normalized = api.normalize(candidate);
@@ -902,7 +907,10 @@ function resolveConfig(env = process.env, options = {}) {
   const first = extant[0];
   const conflicts = [];
   for (const candidate of extant.slice(1)) {
-    const differences = semanticDiff(first.config, candidate.config);
+    const differences = semanticDiff(
+      crossHostComparableConfig(first.config),
+      crossHostComparableConfig(candidate.config),
+    );
     if (differences.length > 0) conflicts.push({ label: candidate.label, differences });
   }
   if (conflicts.length > 0) {
@@ -910,12 +918,15 @@ function resolveConfig(env = process.env, options = {}) {
     const fields = [...new Set(conflicts.flatMap((value) => value.differences))].sort(codePointCompare).join(',');
     throw new ConfigError('CONFIG_CONFLICT', `CONFIG_CONFLICT candidates=${labels} fields=${fields}`);
   }
-  const localConfig = loadWikiLocalConfig(first.config.wikiRoot, { fs, platform });
-  const effective = resolveEffectivePolicy({ globalConfig: first.config, localConfig });
+  const globalConfig = extant.some((candidate) => candidate.config.autoIngestDefined === true)
+    ? deepFreeze({ ...first.config, autoIngestDefined: true })
+    : first.config;
+  const localConfig = loadWikiLocalConfig(globalConfig.wikiRoot, { fs, platform });
+  const effective = resolveEffectivePolicy({ globalConfig, localConfig });
   return {
     path: first.path,
     label: first.label,
-    config: first.config,
+    config: globalConfig,
     local_config_path: localConfig.path,
     policy_source: effective.policySource,
     migration_required: effective.migrationRequired,

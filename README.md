@@ -147,6 +147,8 @@ auto_ingest:
 auto_ingest.ignore_globs: ["**/archive-*.md"]
 ```
 
+Production ownership: wiki-local `.wiki-meta/.config.json` owns `auto_ingest`. The global host YAML `auto_ingest` is only a bootstrap/legacy alias; `/wiki-setup` and SessionStart migrate equivalent legacy policy into the wiki-local file before scanning. Conflicting local and legacy policies fail closed. Stop all hosts before direct edit of either file, keep a backup, then restart one host and let the runtime revalidate. Divergent `CODEX_HOME` or `HOME` values create separate setup-authority domains, so use one physical home when sharing a wiki. Moving an authority-owned wiki requires an explicit stopped-host rebind; rebind resumes require the original `CODEX_HOME` and `DEEP_WIKI_CONFIG` spelling used when the pending rebind was published. Rollback remains backup-only downgrade, not in-place mutation by an older version.
+
 ### Cloud-backed `wiki_root` (iCloud / Google Drive / Dropbox)
 
 If your Obsidian vault lives on a sync-daemon-mounted path, every wiki write wakes the sync client and adds hundreds of milliseconds of latency per `Read`/`Write` — a typical 5–10 page ingest can add 15–30s of pure I/O wait. Recommended workflow:

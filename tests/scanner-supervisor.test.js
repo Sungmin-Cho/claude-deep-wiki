@@ -546,7 +546,11 @@ test('worker rejects malformed or mismatched supervisor policy proof before walk
   const cases = [
     ['missing source', { DEEP_WIKI_EXPECTED_POLICY_SHA256: goodDigest }],
     ['malformed source', { DEEP_WIKI_EXPECTED_POLICY_SOURCE: 'global_legacy,wiki_local', DEEP_WIKI_EXPECTED_POLICY_SHA256: goodDigest }],
-    ['digest mismatch', { DEEP_WIKI_EXPECTED_POLICY_SOURCE: 'default', DEEP_WIKI_EXPECTED_POLICY_SHA256: '0'.repeat(64) }],
+    ['digest mismatch with valid allowed source set', {
+      DEEP_WIKI_EXPECTED_POLICY_SOURCE: 'default',
+      DEEP_WIKI_ALLOWED_POLICY_SOURCES: 'default',
+      DEEP_WIKI_EXPECTED_POLICY_SHA256: '0'.repeat(64),
+    }],
   ];
   for (const [name, proof] of cases) {
     const originalEnv = process.env;

@@ -213,7 +213,9 @@ query_auto_filing:
 
 auto_ingest:
   optional: true
-  config_block: ~/.claude/deep-wiki-config.yaml
+  owner: "wiki-local"
+  config_block: "<wiki_root>/.wiki-meta/.config.json"
+  legacy_alias: "Global host YAML auto_ingest is only a bootstrap/legacy alias read from deep-wiki-config.yaml and migrated to the wiki-local owner when equivalent."
   filters:
     ignore_globs:
       type: list
@@ -223,7 +225,7 @@ auto_ingest:
       type: string
       default: ""
       semantics: "If non-empty, only files whose frontmatter tags contain this tag are auto-detected."
-  default_behavior: "When auto_ingest block is absent or both keys are empty/missing, all modified .md files are detected (v1.1.x behavior)."
+  default_behavior: "When wiki-local auto_ingest is absent, no legacy alias is present, or both keys are empty/missing, all modified .md files are detected (v1.1.x behavior). Equivalent absent versus explicit-empty legacy aliases converge; conflicting local and legacy policies fail closed."
 
 recommended_tools:
   cli:

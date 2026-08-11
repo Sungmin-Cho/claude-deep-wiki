@@ -69,6 +69,7 @@ function targetSeal(fs, target) {
   if (before.isSymbolicLink() || !before.isFile()) {
     throw configError('CONFIG_INVALID', 'wiki-local config must be a regular non-symlink file');
   }
+  if (before.size > 64n * 1024n) throw configError('CONFIG_INVALID', 'wiki-local config exceeds 64 KiB');
   const identity = regularFileIdentity(before);
   if (!identity) throw configError('CONFIG_INVALID', 'wiki-local config identity is unavailable or linked');
   let bytes;

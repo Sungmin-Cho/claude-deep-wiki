@@ -2,6 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -31,6 +32,16 @@ function envFor(home, extra = {}) {
 
 function authorityPath(home) {
   return path.join(home, AUTHORITY_FILE);
+}
+
+function authorityEvidence(record) {
+  const payload = {
+    candidates: record.candidates,
+    candidate_permits: record.candidate_permits,
+    requested_wiki_claim: record.requested_wiki_claim,
+  };
+  if (record.state === 'rebind_pending') payload.allowed_route_created = record.allowed_route_created;
+  return crypto.createHash('sha256').update(Buffer.from(`${JSON.stringify(payload)}\n`, 'utf8')).digest('hex');
 }
 
 function setup(home, wikiRoot, extra = {}) {
@@ -169,6 +180,26 @@ test('a route-created CODEX_HOME candidate below a symlinked ancestor uses one p
   assert.equal(authority.candidates.some((entry) => entry.path === physicalConfig && entry.state === 'present'), true);
   assert.equal(authority.candidate_permits.some((permit) => permit.path === physicalConfig), true);
   assert.equal(setupWiki({ wikiRoot: wiki, configHost: 'codex', env, now: new Date(TS) }).status, 'compatible');
+});
+
+test('setup accepts an absent opposite-host config under a symlinked host dot-directory', () => {
+  const home = fixture('deep wiki symlinked opposite host ');
+  const dotfiles = path.join(home, 'dotfiles');
+  const physicalClaude = path.join(dotfiles, 'claude');
+  fs.mkdirSync(physicalClaude, { recursive: true });
+  fs.symlinkSync(physicalClaude, path.join(home, '.claude'), 'dir');
+  const wiki = path.join(home, 'wiki');
+  const result = setup(home, wiki, { configHost: 'codex' });
+  const authority = loadSetupAuthority(home);
+  const physicalClaudeConfig = path.join(physicalClaude, 'deep-wiki-config.yaml');
+
+  assert.equal(result.config.path, path.join(home, '.codex', 'deep-wiki-config.yaml'));
+  assert.equal(fs.existsSync(physicalClaudeConfig), false);
+  assert.equal(
+    authority.candidates.some((entry) => entry.state === 'absent' && entry.path === physicalClaudeConfig),
+    true,
+  );
+  assert.equal(setup(home, wiki, { configHost: 'codex' }).status, 'compatible');
 });
 
 test('DEEP_WIKI_CONFIG and CODEX_HOME aliases of one route-created file collapse to one physical key', () => {
@@ -648,6 +679,34 @@ test('explicit rebind requires exact old-root authorization and never restores A
   assert.equal(loadSetupAuthority(home).state, 'committed');
   assert.equal(completed.authority.generation, 2);
   assert.equal(completed.authority.wiki_root, fs.realpathSync.native(newWiki));
+});
+
+test('rebind resume consumes allowed_route_created before creating an absent wiki', () => {
+  const home = fixture('deep wiki rebind route-created allowlist ');
+  const oldWiki = path.join(home, 'wiki-a');
+  const newWiki = path.join(home, 'wiki-b');
+  setup(home, oldWiki);
+  fs.rmSync(oldWiki, { recursive: true });
+  fs.writeFileSync(path.join(home, '.codex', 'deep-wiki-config.yaml'), `wiki_root: "${newWiki}"\n`);
+  assert.throws(() => setup(home, newWiki, {
+    rebindAuthorityFrom: oldWiki,
+    faultInjector(boundary) {
+      if (boundary === 'after-rebind-pending') throw new Error('stop after rebind pending');
+    },
+  }), /stop after rebind pending/);
+  const pending = loadSetupAuthority(home);
+  const physicalNewWiki = fs.realpathSync.native(path.dirname(newWiki)) + path.sep + path.basename(newWiki);
+  assert.equal(pending.allowed_route_created.includes(physicalNewWiki), true);
+  pending.allowed_route_created = pending.allowed_route_created.filter((entry) => entry !== physicalNewWiki);
+  pending.evidence_sha256 = authorityEvidence(pending);
+  fs.writeFileSync(authorityPath(home), `${JSON.stringify(pending)}\n`);
+
+  assert.throws(
+    () => setup(home, newWiki, { rebindAuthorityFrom: oldWiki }),
+    (error) => error.code === 'SETUP_AUTHORITY_RECOVERY_REQUIRED',
+  );
+  assert.equal(fs.existsSync(newWiki), false);
+  assert.equal(loadSetupAuthority(home).state, 'rebind_pending');
 });
 
 test('explicit rebind preserves a sealed pre-existing B wiki without inventing a route-created permit', () => {

@@ -206,6 +206,28 @@ test('migration preserves an in-lock A5 edit between its target seal and authori
   assert.equal(fs.readFileSync(input.target, 'utf8'), edited);
 });
 
+test('migration target seal rejects oversized wiki-local config before reading bytes', () => {
+  const input = fixture({ local: `${' '.repeat(64 * 1024)}x` });
+  let oversizedRead = false;
+  const boundedFs = new Proxy(fs, {
+    get(target, property) {
+      if (property === 'readFileSync') return (pathname, ...args) => {
+        if (pathname === input.target && target.lstatSync(pathname, { bigint: true }).size > 64n * 1024n) {
+          oversizedRead = true;
+          throw new Error('oversized read occurred');
+        }
+        return target.readFileSync(pathname, ...args);
+      };
+      return target[property];
+    },
+  });
+
+  assert.throws(() => migration().migrateAutoIngestPolicy({
+    env: input.env, wikiRoot: input.wikiRoot, deadline: deadline(), fs: boundedFs,
+  }), (error) => error.code === 'CONFIG_INVALID' && /64 KiB/.test(error.message));
+  assert.equal(oversizedRead, false);
+});
+
 test('an expired deadline reports already-local when no migration is required', () => {
   const localOnly = fixture({
     legacy: false,

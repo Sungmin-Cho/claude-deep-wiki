@@ -327,6 +327,45 @@ test('1.8.0 release documents the reviewed runtime and evidence boundary', () =>
   assert.match(readText('CHANGELOG.ko.md'), /인증 없는 로컬 Responses fixture/);
 });
 
+test('wiki-local auto-ingest and setup-authority operator docs stay aligned', () => {
+  const schema = readText('skills/wiki-schema/wiki-schema.yaml');
+  assert.match(schema, /config_block:\s+"<wiki_root>\/\.wiki-meta\/\.config\.json"/);
+  assert.match(schema, /legacy_alias:\s+"Global host YAML .*bootstrap\/legacy alias/);
+  assert.match(schema, /owner:\s+"wiki-local"/);
+
+  const englishSurfaces = [
+    'README.md',
+    'skills/wiki-schema/SKILL.md',
+    'skills/wiki-schema/references/storage-layout.md',
+  ];
+  for (const file of englishSurfaces) {
+    const text = readText(file).replace(/\s+/g, ' ');
+    assert.match(text, /wiki-local `\.wiki-meta\/\.config\.json` owns `auto_ingest`/i, file);
+    assert.match(text, /global host YAML `auto_ingest` is only a bootstrap\/legacy alias/i, file);
+    assert.match(text, /conflicting local and legacy policies fail closed/i, file);
+    assert.match(text, /stop all hosts before direct edit/i, file);
+    assert.match(text, /divergent `CODEX_HOME` or `HOME` values create separate setup-authority domains/i, file);
+    assert.match(text, /explicit stopped-host rebind/i, file);
+    assert.match(text, /rebind resumes require the original `CODEX_HOME` and `DEEP_WIKI_CONFIG` spelling/i, file);
+    assert.match(text, /backup-only downgrade/i, file);
+  }
+
+  const korean = readText('README.ko.md').replace(/\s+/g, ' ');
+  assert.match(korean, /wiki-local `\.wiki-meta\/\.config\.json`가 `auto_ingest`를 소유/);
+  assert.match(korean, /global host YAML `auto_ingest`는 bootstrap\/legacy alias/);
+  assert.match(korean, /충돌하는 local 및 legacy policy는 fail closed/);
+  assert.match(korean, /직접 편집 전에는 모든 host를 중지/);
+  assert.match(korean, /서로 다른 `CODEX_HOME` 또는 `HOME` 값은 별도 setup-authority domain/);
+  assert.match(korean, /명시적 stopped-host rebind/);
+  assert.match(korean, /rebind resume에는 원래 `CODEX_HOME` 및 `DEEP_WIKI_CONFIG` spelling/);
+  assert.match(korean, /백업 전용 downgrade/);
+
+  assert.match(readText('CHANGELOG.md'), /wiki-local `\.wiki-meta\/\.config\.json` ownership/);
+  assert.match(readText('CHANGELOG.md'), /canonical UTC-Z timestamp/);
+  assert.match(readText('CHANGELOG.ko.md'), /wiki-local `\.wiki-meta\/\.config\.json` ownership/);
+  assert.match(readText('CHANGELOG.ko.md'), /canonical UTC-Z timestamp/);
+});
+
 test('1.8.0 ships no MCP, native binary, runtime dependency, or shell entrypoint', () => {
   const codexManifest = readJson('.codex-plugin/plugin.json');
   const claudeManifest = readJson('.claude-plugin/plugin.json');

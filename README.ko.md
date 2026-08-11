@@ -147,6 +147,8 @@ auto_ingest:
 auto_ingest.ignore_globs: ["**/archive-*.md"]
 ```
 
+프로덕션 ownership: wiki-local `.wiki-meta/.config.json`가 `auto_ingest`를 소유합니다. global host YAML `auto_ingest`는 bootstrap/legacy alias일 뿐이며, `/wiki-setup`과 SessionStart가 동등한 legacy policy를 스캔 전에 wiki-local 파일로 migration합니다. 충돌하는 local 및 legacy policy는 fail closed합니다. 두 파일을 직접 편집 전에는 모든 host를 중지하고 backup을 만든 뒤, 한 host만 다시 시작해 runtime revalidation을 통과시키세요. 서로 다른 `CODEX_HOME` 또는 `HOME` 값은 별도 setup-authority domain을 만들므로, 같은 wiki를 공유할 때는 하나의 physical home을 사용하세요. authority가 소유한 wiki를 이동하려면 명시적 stopped-host rebind가 필요하며, rebind resume에는 원래 `CODEX_HOME` 및 `DEEP_WIKI_CONFIG` spelling이 필요합니다. Rollback은 계속 백업 전용 downgrade이며, 구버전의 in-place mutation이 아닙니다.
+
 ### 클라우드 백업 `wiki_root` (iCloud / Google Drive / Dropbox)
 
 Obsidian vault가 sync-daemon이 마운트한 경로에 있으면 위키 write마다 sync 클라이언트가 깨어나 `Read`/`Write`당 수백 ms의 지연이 붙습니다 — 일반적인 5–10 페이지 ingest에서 순수 I/O 대기만 15–30초가 추가될 수 있습니다. 권장 워크플로우:

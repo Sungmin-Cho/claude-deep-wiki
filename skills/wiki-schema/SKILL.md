@@ -116,6 +116,20 @@ Valid lifecycle actions are `ingest`, `ingest-skip`, `ingest-repair`,
 `ingest-fail`, `update`, `lint`, `rebuild`, `delete`, `query-filed`, and
 `setup`. Timestamps are ISO 8601 UTC with a `Z` suffix.
 
+## Setup and auto-ingest authority
+
+The wiki-local `.wiki-meta/.config.json` owns `auto_ingest`. The global host YAML
+`auto_ingest` is only a bootstrap/legacy alias; setup and SessionStart migrate
+equivalent legacy policy to the wiki-local owner before scanning. Conflicting
+local and legacy policies fail closed. Stop all hosts before direct edit of
+global YAML or wiki-local JSON, keep a backup, and restart one host so the
+runtime can revalidate. Divergent `CODEX_HOME` or `HOME` values create separate
+setup-authority domains; share one physical home for one authority. Moving an
+authority-owned wiki is an explicit stopped-host rebind, and rebind resumes
+require the original `CODEX_HOME` and `DEEP_WIKI_CONFIG` spelling used for the
+pending rebind. Downgrade remains backup-only downgrade, not older-version
+in-place recovery.
+
 ## Versioning
 
 Before replacement, the transaction stores the previous page under

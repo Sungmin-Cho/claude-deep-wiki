@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `/wiki-setup` now preserves the shipped canonical UTC-Z timestamp format when creating or refreshing scan-window metadata.
+- SessionStart and setup docs now state wiki-local `.wiki-meta/.config.json` ownership for `auto_ingest`, with global host YAML kept only as a bootstrap/legacy alias and conflicting local/legacy policy handled fail-closed.
+
 ## [1.9.7] — 2026-08-05 (content metadata and nested prune safety)
 
 ### Fixed

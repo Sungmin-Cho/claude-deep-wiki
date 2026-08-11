@@ -215,8 +215,8 @@ function sealAbsentPath(pathname, options = {}) {
   while (true) {
     try {
       const stat = fs.lstatSync(cursor, { bigint: true });
-      if (stat.isSymbolicLink() || !stat.isDirectory()) {
-        throw authorityError('SETUP_AUTHORITY_INVALID', 'absence container must be a non-symlink directory');
+      if (!stat.isSymbolicLink() && !stat.isDirectory()) {
+        throw authorityError('SETUP_AUTHORITY_INVALID', 'absence container must resolve to a physical directory');
       }
       let physicalAncestor;
       try { physicalAncestor = api.normalize(realpathNative(fs, cursor)); } catch (cause) {
@@ -758,6 +758,30 @@ function revalidateRequestedWikiClaim(claim, options = {}) {
   }
 }
 
+function assertRebindRouteCreatedSet(record, options = {}) {
+  if (record.state !== 'rebind_pending') return;
+  const platform = options.platform || process.platform;
+  const allowed = new Set(record.allowed_route_created);
+  if (allowed.size !== record.allowed_route_created.length) {
+    throw authorityError('SETUP_AUTHORITY_INVALID', 'rebind route-created allowlist is ambiguous');
+  }
+  const expected = [];
+  if (record.requested_wiki_claim.claim_state === 'absent') expected.push(record.requested_wiki_claim.path);
+  for (const candidate of record.candidates) {
+    if (candidate.state === 'absent') expected.push(candidate.path);
+  }
+  for (const pathname of expected) {
+    if (!record.allowed_route_created.some((entry) => samePath(entry, pathname, platform))) {
+      throw authorityError('SETUP_AUTHORITY_RECOVERY_REQUIRED', 'rebind route-created path is not authorized');
+    }
+  }
+  for (const pathname of record.allowed_route_created) {
+    if (!expected.some((entry) => samePath(entry, pathname, platform))) {
+      throw authorityError('SETUP_AUTHORITY_RECOVERY_REQUIRED', 'rebind route-created allowlist names an unsealed path');
+    }
+  }
+}
+
 function resolvedGlobal(env, fs) {
   try { return resolveConfig(env, { fs }); } catch (cause) {
     if (cause.code === 'CONFIG_NOT_FOUND') return null;
@@ -1045,6 +1069,7 @@ function coordinateSetup(options = {}, actions = {}) {
         authority, authorityEnv, home.path, preflight.selected.target, { fs, platform },
       );
       revalidateRequestedWikiClaim(authority.requested_wiki_claim, { fs, platform });
+      assertRebindRouteCreatedSet(authority, { platform });
       if (authority.state === 'rebind_pending'
           && (authority.selected_target === null
             ? preflight.selected.target !== null

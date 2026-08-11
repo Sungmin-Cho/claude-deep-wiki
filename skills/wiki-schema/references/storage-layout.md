@@ -22,6 +22,21 @@ WIKI_ROOT/
 
 Regular OS-metadata files in content catalogs (`pages/`, `.wiki-meta/sources/`, and `.wiki-meta/.versions/`) are skipped by readers and reported in `ignored_os_metadata`; content-catalog files are never deleted or reclaimed. Junk-named symlinks, directories, and entries whose type cannot be resolved remain fail-closed. `removed_junk` remains transaction-store-only.
 
+## Setup and auto-ingest authority
+
+The wiki-local `.wiki-meta/.config.json` owns `auto_ingest`. The global host YAML
+`auto_ingest` is only a bootstrap/legacy alias; the runtime migrates equivalent
+legacy policy into the wiki-local file before SessionStart scanning. Conflicting
+local and legacy policies fail closed. Stop all hosts before direct edit of
+global YAML, wiki-local JSON, setup authority, or route-created paths, then
+restart one host and let the runtime revalidate. Divergent `CODEX_HOME` or
+`HOME` values create separate setup-authority domains, so a shared wiki should
+use one physical home and one host configuration route. A wiki move is an
+explicit stopped-host rebind; rebind resumes require the original `CODEX_HOME`
+and `DEEP_WIKI_CONFIG` spelling from the pending rebind so the same candidate
+vector is revalidated. Rollback uses backup-only downgrade after current-version
+recovery; older versions do not perform in-place recovery of newer state.
+
 ## Concurrency Lock Protocol
 
 The portable Node runtime uses atomic directory creation as the mutual-

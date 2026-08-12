@@ -1,0 +1,11 @@
+{
+  "exit_code": 0,
+  "detected_count": 1,
+  "expected_files": ["allowed/live.md"],
+  "forbidden_files": ["blocked/drop.md"],
+  "local_config_json": {
+    "auto_ingest": {
+      "ignore_globs": ["blocked/**"]
+    }
+  }
+}

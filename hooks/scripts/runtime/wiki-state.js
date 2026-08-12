@@ -9,7 +9,9 @@ const { readIndexPayload } = require('../read-index-envelope.js');
 const {
   atomicWriteFile, parsePageFrontmatter, readMaybe, sha256, stateError, SHA_RE,
 } = require('./fs-safe.js');
-const { ISO_UTC_RE, resolveConfigWriteTarget } = require('./config.js');
+const { ISO_UTC_RE } = require('./config.js');
+const { migrateAutoIngestPolicy } = require('./config-migration.js');
+const { coordinateSetup } = require('./setup-authority.js');
 const {
   createDeadline, assertBeforeDeadline, remainingMs, DeadlineExceeded,
 } = require('./deadline.js');
@@ -1305,16 +1307,14 @@ function interruptedSetupManifest(root) {
   return null;
 }
 
-function setupWiki(options = {}) {
+function establishWiki(options = {}) {
   const root = options.wikiRoot;
   const deadline = operationDeadline(options);
   if (typeof root !== 'string' || !path.isAbsolute(root)) throw stateError('WIKI_STATE_INVALID', 'wikiRoot must be absolute');
   const targetState = setupTargetState(root);
   if (targetState === 'compatible') {
     const physical = physicalRoot(root);
-    const result = { status: 'compatible', snapshot: snapshotWiki({ wikiRoot: physical, deadline }) };
-    if (options.configHost) result.config = writeSetupConfig(physical, options);
-    return result;
+    return { status: 'compatible', snapshot: snapshotWiki({ wikiRoot: physical, deadline }) };
   }
   fs.mkdirSync(root, { recursive: true });
   const physical = physicalRoot(root);
@@ -1325,6 +1325,10 @@ function setupWiki(options = {}) {
   const owner = acquireLock({ wikiRoot: physical, operation: 'setup', now });
   let result;
   try {
+    if (typeof options.onWikiEstablished === 'function') {
+      options.onWikiEstablished({ physicalRoot: physical, owner });
+      assertLockOwner({ wikiRoot: physical, token: owner.token });
+    }
     if (setupTargetState(physical) === 'compatible') {
       result = { status: 'compatible', snapshot: snapshotWiki({ wikiRoot: physical, deadline }) };
     } else {
@@ -1363,16 +1367,39 @@ function setupWiki(options = {}) {
       assertLockOwner({ wikiRoot: physical, token: owner.token });
     }
   } finally { releaseLock({ wikiRoot: physical, token: owner.token }); }
-  if (options.configHost) result.config = writeSetupConfig(physical, options);
   return result;
 }
 
-function writeSetupConfig(physical, options) {
-  const escaped = physical.replaceAll('\\', '\\\\').replaceAll('"', '\\"');
-  return resolveConfigWriteTarget(options.env || process.env, options.configHost, {
-    desiredConfigText: `wiki_root: "${escaped}"\n`,
-    replaceConfig: options.replaceConfig === true,
+function setupWiki(options = {}) {
+  const now = options.now instanceof Date ? options.now : new Date(options.now || Date.now());
+  const operationId = options.operationId || envelope.generateUlid(now.getTime());
+  const eventId = options.eventId || envelope.generateUlid(now.getTime() + 1);
+  const coordinated = coordinateSetup({
+    ...options,
+    env: options.env || process.env,
+    now,
+    operationId,
+    eventId,
+  }, {
+    establishWiki,
   });
+  const result = {
+    ...coordinated.result,
+    authority: {
+      wiki_root: coordinated.authority.wiki_root,
+      generation: coordinated.authority.generation,
+    },
+  };
+  if (coordinated.config) result.config = coordinated.config;
+  if (coordinated.migrationEligible) {
+    result.migration = migrateAutoIngestPolicy({
+      env: options.env || process.env,
+      wikiRoot: coordinated.authority.wiki_root,
+      deadline: operationDeadline(options),
+      fs: options.fs,
+    });
+  }
+  return result;
 }
 
 function deterministicUlid(timestamp, seed) {
@@ -1806,4 +1833,5 @@ module.exports = {
   cleanupInbox,
   inspectWiki,
   fixWiki,
+  migrateAutoIngestPolicy,
 };

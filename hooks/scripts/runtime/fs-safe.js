@@ -60,7 +60,27 @@ function fileIdentity(stat) {
   if (dev === null || ino === null || mode === null || birthtimeNs === null
       || dev < 0n || ino <= 0n || birthtimeNs < 0n) return null;
   if ((mode & FILE_TYPE_MASK) !== REGULAR_FILE_TYPE) return null;
-  return { dev, ino, birthtimeNs };
+  return { dev, ino, type: mode & FILE_TYPE_MASK, birthtimeNs };
+}
+
+function linkedRegularFileIdentity(stat) {
+  const identity = fileIdentity(stat);
+  const mtimeNs = identityComponent(stat?.mtimeNs);
+  const nlink = identityComponent(stat?.nlink);
+  if (!identity || mtimeNs === null || nlink === null || mtimeNs < 0n || nlink < 1n) return null;
+  return { ...identity, mtimeNs, nlink };
+}
+
+function regularFileIdentity(stat) {
+  const identity = linkedRegularFileIdentity(stat);
+  return identity !== null && identity.nlink === 1n ? identity : null;
+}
+
+function regularFileIdentitiesMatch(left, right) {
+  return left !== null && right !== null
+    && left.dev === right.dev && left.ino === right.ino && left.type === right.type
+    && left.birthtimeNs === right.birthtimeNs && left.mtimeNs === right.mtimeNs
+    && left.nlink === right.nlink;
 }
 
 const DEVICE_LOW_32_MASK = 0xFFFFFFFFn;
@@ -263,5 +283,7 @@ module.exports = {
   parsePageFrontmatter,
   readMaybe,
   stateError,
+  regularFileIdentity,
+  regularFileIdentitiesMatch,
   SHA_RE,
 };

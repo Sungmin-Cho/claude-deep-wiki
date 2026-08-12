@@ -99,6 +99,14 @@ function writeMetaTimestamp(wikiRoot, filename, isoTimestamp) {
   fs.writeFileSync(path.join(metaDir, filename), isoTimestamp, 'utf8');
 }
 
+function writeLocalConfig(wikiRoot, value) {
+  if (value === undefined) return;
+  const metaDir = path.join(wikiRoot, '.wiki-meta');
+  fs.mkdirSync(metaDir, { recursive: true });
+  const source = typeof value === 'string' ? value : `${JSON.stringify(value, null, 2)}\n`;
+  fs.writeFileSync(path.join(metaDir, '.config.json'), source, 'utf8');
+}
+
 const CORPUS = loadFixtureCorpus();
 if (CORPUS.length === 0) {
   throw new Error('No golden fixtures discovered under tests/fixtures/golden/');
@@ -128,7 +136,8 @@ describe('scan-vault-changes.js golden fixtures (M5.5 #3)', () => {
         const wikiPath = fixture.input.wiki_path || 'wiki';
         const vaultRoot = path.join(tmpRoot, vaultPath);
         const wikiRoot = path.join(vaultRoot, wikiPath);
-        fs.mkdirSync(wikiRoot, { recursive: true });
+        if (fixture.input.create_wiki_meta === false) fs.mkdirSync(wikiRoot, { recursive: true });
+        else fs.mkdirSync(path.join(wikiRoot, '.wiki-meta'), { recursive: true });
 
         // Materialize the vault tree BEFORE the config is written so that
         // any mtime adjustments hit real files. Skip if no tree (e.g. the
@@ -141,6 +150,7 @@ describe('scan-vault-changes.js golden fixtures (M5.5 #3)', () => {
         // Pre-seed .last-scan / .pending-scan if requested.
         writeMetaTimestamp(wikiRoot, '.last-scan', fixture.input.last_scan);
         writeMetaTimestamp(wikiRoot, '.pending-scan', fixture.input.pending_scan);
+        writeLocalConfig(wikiRoot, fixture.input.local_config_json);
 
         // Config YAML may reference ${VAULT_ROOT} / ${WIKI_ROOT} so a
         // fixture stays portable across tmpdir paths.
@@ -249,6 +259,28 @@ describe('scan-vault-changes.js golden fixtures (M5.5 #3)', () => {
             got,
             expected.pending_scan_preserved,
             `pending-scan was mutated for ${name}: got=${got}`,
+          );
+        }
+
+        if (expected.local_config_json) {
+          const localConfig = path.join(wikiRoot, '.wiki-meta', '.config.json');
+          assert.equal(
+            fs.existsSync(localConfig),
+            true,
+            `wiki-local config should exist for ${name}`,
+          );
+          assert.deepEqual(
+            JSON.parse(fs.readFileSync(localConfig, 'utf8')),
+            expected.local_config_json,
+            `wiki-local config mismatch for ${name}`,
+          );
+        }
+
+        if (expected.meta_created === true) {
+          assert.equal(
+            fs.existsSync(path.join(wikiRoot, '.wiki-meta')),
+            true,
+            `wiki metadata directory should exist for ${name}`,
           );
         }
       } finally {

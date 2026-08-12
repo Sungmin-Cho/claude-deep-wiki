@@ -4,6 +4,7 @@
   "expected_candidates": [
     "노트/Windows 검증.md"
   ],
+  "local_config_json": "{\n  \"auto_ingest\": {\n    \"ignore_globs\": []\n  }\n}\n",
   "pending_scan": {
     "format": "canonical-utc-z-newline",
     "max_age_ms": 60000

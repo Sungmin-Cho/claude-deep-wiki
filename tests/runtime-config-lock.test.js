@@ -112,6 +112,12 @@ test('parseConfig accepts BOM, CRLF, quoted Windows paths, Unicode, and filters'
   assert.equal(parsed.autoIngest.requireTag, 'project');
 });
 
+test('parseConfig preserves autoIngest presence independently from its normalized empty default', () => {
+  const { parseConfig } = runtimeModule('config.js');
+  assert.equal(parseConfig('wiki_root: /vault\n').autoIngestDefined, false);
+  assert.equal(parseConfig('wiki_root: /vault\nauto_ingest:\n').autoIngestDefined, true);
+});
+
 test('config parser unions block, inline, and dotted filters without treating quoted hashes as comments', () => {
   const { parseConfig } = runtimeModule('config.js');
   const parsed = parseConfig([
@@ -751,6 +757,26 @@ test('config aliases across three and four candidates require complete semantic 
   assert.throws(() => resolveConfig(env), (error) => error.code === 'CONFIG_CONFLICT');
 });
 
+test('config aliases accept equivalent absent versus explicit-empty legacy autoIngest definitions in either order', () => {
+  const { resolveConfig } = runtimeModule('config.js');
+  for (const [firstEmpty, secondEmpty] of [[false, true], [true, false]]) {
+    const root = temporaryRoot('deep wiki legacy presence alias ');
+    const wikiRoot = temporaryRoot('deep wiki legacy presence root ');
+    const explicit = write(path.join(root, 'explicit.yaml'), firstEmpty
+      ? canonicalConfig(wikiRoot)
+      : `wiki_root: "${wikiRoot}"\n`);
+    const codexHome = path.join(root, 'codex');
+    write(path.join(codexHome, 'deep-wiki-config.yaml'), secondEmpty
+      ? canonicalConfig(wikiRoot)
+      : `wiki_root: "${wikiRoot}"\n`);
+    const resolved = resolveConfig({ DEEP_WIKI_CONFIG: explicit, CODEX_HOME: codexHome, HOME: root });
+    assert.equal(resolved.migration_required, true);
+    assert.equal(resolved.policy_source, 'global_legacy');
+    assert.equal(resolved.config.autoIngestDefined, true);
+    assert.deepEqual(resolved.config.autoIngest, { ignoreGlobs: [], requireTag: null });
+  }
+});
+
 test('config pairwise conflicts disclose stable labels and key paths but no values or secrets', () => {
   const { resolveConfig } = runtimeModule('config.js');
   const fields = [
@@ -831,6 +857,7 @@ test('config normalization deep-freezes the complete supported semantic object',
   })), { platform: process.platform, fs, home: os.homedir() });
   assert.deepEqual(value, {
     wikiRoot: fs.realpathSync.native(root),
+    autoIngestDefined: true,
     autoIngest: { requireTag: 'project', ignoreGlobs: ['a/**', 'z/*'] },
     obsidianCli: { enabled: false, vaultPath: null, vaultName: null, wikiPrefix: null },
   });
@@ -1424,6 +1451,24 @@ test('config-write semantic aliases stay byte-identical and conflicting supporte
     replaceConfig: true,
   }), { path: target, status: 'replaced' });
   assert.equal(fs.readFileSync(target, 'utf8'), conflict);
+});
+
+test('config-write preserves empty legacy autoIngest aliases even with replace-config', () => {
+  const { resolveConfigWriteTarget } = runtimeModule('config.js');
+  for (const legacy of ['auto_ingest:\n', 'auto_ingest:\n  ignore_globs: []\n  require_tag:\n']) {
+    const root = temporaryRoot('deep wiki config write legacy presence ');
+    const wikiRoot = path.join(root, 'wiki');
+    fs.mkdirSync(wikiRoot);
+    const target = write(path.join(root, '.codex', 'deep-wiki-config.yaml'), `wiki_root: "${wikiRoot}"\n${legacy}`);
+    const before = fs.readFileSync(target);
+    const desired = `wiki_root: "${wikiRoot}"\n`;
+    assert.deepEqual(resolveConfigWriteTarget({ HOME: root }, 'codex', { desiredConfigText: desired }),
+      { path: target, status: 'alias' });
+    assert.deepEqual(resolveConfigWriteTarget({ HOME: root }, 'codex', {
+      desiredConfigText: desired, replaceConfig: true,
+    }), { path: target, status: 'alias' });
+    assert.deepEqual(fs.readFileSync(target), before);
+  }
 });
 
 test('config-write rejects an existing target with node-property-hidden supported keys before aliasing', () => {
@@ -3941,6 +3986,41 @@ test('runtime CLI exposes config and token-lock commands with stable JSON and ex
   assert.match(help.stdout, /never bypasses owner validity, same-host liveness/);
 });
 
+test('config resolve CLI exposes wiki-local policy metadata without mutating either config', () => {
+  const root = temporaryRoot('deep wiki runtime config resolve metadata ');
+  const wikiRoot = path.join(root, 'Wiki Root');
+  fs.mkdirSync(path.join(wikiRoot, '.wiki-meta'), { recursive: true });
+  const legacy = write(path.join(root, '.codex', 'deep-wiki-config.yaml'), canonicalConfig(wikiRoot, {
+    autoIngest: { ignoreGlobs: ['archive/**'], requireTag: 'project' },
+  }));
+  const local = write(path.join(wikiRoot, '.wiki-meta', '.config.json'), `${JSON.stringify({
+    auto_ingest: { ignore_globs: ['archive/**'], require_tag: 'project' },
+  })}\n`);
+  const before = new Map([legacy, local].map((file) => [file, {
+    bytes: fs.readFileSync(file, 'utf8'),
+    mtimeMs: fs.statSync(file).mtimeMs,
+  }]));
+
+  const result = spawnSync(process.execPath, [cli, 'config', 'resolve', '--json'], {
+    cwd: temporaryRoot('deep wiki resolve unrelated cwd '),
+    env: { ...process.env, HOME: root, CODEX_HOME: '' },
+    encoding: 'utf8',
+    shell: false,
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stderr, '');
+  const output = JSON.parse(result.stdout);
+  assert.equal(output.local_config_path, local);
+  assert.equal(output.policy_source, 'wiki_local_migrated');
+  assert.equal(output.migration_required, false);
+  assert.match(output.policy_digest, /^[a-f0-9]{64}$/);
+  for (const [file, expected] of before) {
+    assert.equal(fs.readFileSync(file, 'utf8'), expected.bytes, file);
+    assert.equal(fs.statSync(file).mtimeMs, expected.mtimeMs, file);
+  }
+});
+
 test('runtime lock status rejects a relative wiki root independently of cwd', () => {
   const first = temporaryRoot('deep wiki status cwd one ');
   const second = temporaryRoot('deep wiki status cwd two ');
@@ -3952,6 +4032,191 @@ test('runtime lock status rejects a relative wiki root independently of cwd', ()
     assert.equal(result.stdout, '');
     assert.match(result.stderr, /^LOCK_INVALID:/);
   }
+});
+
+test('setup CLI maps config and authority safety errors to contract exit 4 without leaking bodies', () => {
+  const cases = [
+    {
+      name: 'CONFIG_INVALID',
+      prepare(root) {
+        write(path.join(root, '.codex', 'deep-wiki-config.yaml'), [
+          'wiki_root: /tmp/secret-invalid-root',
+          'auto_ingest:',
+          '  require_tag: should-not-leak-policy-value',
+          '  require_tag: conflicting-secret-policy-value',
+          '',
+        ].join('\n'));
+        return [cli, 'config', 'resolve', '--json'];
+      },
+      forbidden: ['secret-invalid-root', 'should-not-leak-policy-value', 'conflicting-secret-policy-value'],
+    },
+    {
+      name: 'CONFIG_CONFLICT',
+      prepare(root) {
+        write(path.join(root, '.codex', 'deep-wiki-config.yaml'), canonicalConfig(path.join(root, 'one-secret-root')));
+        write(path.join(root, '.claude', 'deep-wiki-config.yaml'), canonicalConfig(path.join(root, 'two-secret-root')));
+        return [cli, 'config', 'resolve', '--json'];
+      },
+      forbidden: ['one-secret-root', 'two-secret-root'],
+    },
+    {
+      name: 'CONFIG_TARGET_CONFLICT',
+      prepare(root) {
+        const wikiRoot = path.join(root, 'wiki');
+        const codex = write(path.join(root, '.codex', 'deep-wiki-config.yaml'), canonicalConfig(wikiRoot));
+        fs.mkdirSync(path.join(root, '.claude'), { recursive: true });
+        fs.symlinkSync(codex, path.join(root, '.claude', 'deep-wiki-config.yaml'));
+        return [cli, 'setup', '--wiki-root', wikiRoot, '--config-host', 'claude', '--json'];
+      },
+      forbidden: [],
+    },
+    {
+      name: 'SETUP_AUTHORITY_INVALID',
+      prepare(root) {
+        const real = path.join(root, 'real-wiki');
+        const link = path.join(root, 'linked-wiki');
+        fs.mkdirSync(real);
+        fs.symlinkSync(real, link);
+        return [cli, 'setup', '--wiki-root', link, '--config-host', 'codex', '--json'];
+      },
+      forbidden: ['real-wiki'],
+    },
+    {
+      name: 'SETUP_AUTHORITY_CONFLICT',
+      prepare(root) {
+        const oldRoot = path.join(root, 'old-secret-root');
+        const newRoot = path.join(root, 'new-secret-root');
+        const first = spawnSync(process.execPath, [
+          cli, 'setup', '--wiki-root', oldRoot, '--config-host', 'codex', '--json',
+        ], { cwd: root, env: { ...process.env, HOME: root, CODEX_HOME: '' }, encoding: 'utf8', shell: false });
+        assert.equal(first.status, 0, first.stderr);
+        return [cli, 'setup', '--wiki-root', newRoot, '--config-host', 'codex', '--json'];
+      },
+      forbidden: ['old-secret-root', 'new-secret-root'],
+    },
+    {
+      name: 'SETUP_AUTHORITY_RECOVERY_REQUIRED',
+      prepare(root) {
+        const wikiRoot = path.join(root, 'missing-secret-root');
+        const first = spawnSync(process.execPath, [
+          cli, 'setup', '--wiki-root', wikiRoot, '--config-host', 'codex', '--json',
+        ], { cwd: root, env: { ...process.env, HOME: root, CODEX_HOME: '' }, encoding: 'utf8', shell: false });
+        assert.equal(first.status, 0, first.stderr);
+        fs.rmSync(wikiRoot, { recursive: true, force: true });
+        return [cli, 'setup', '--wiki-root', wikiRoot, '--config-host', 'codex', '--json'];
+      },
+      forbidden: ['missing-secret-root'],
+    },
+  ];
+
+  for (const entry of cases) {
+    const root = temporaryRoot(`deep wiki cli ${entry.name} `);
+    const argv = entry.prepare(root);
+    const result = spawnSync(process.execPath, argv, {
+      cwd: root,
+      env: { ...process.env, HOME: root, CODEX_HOME: '' },
+      encoding: 'utf8',
+      shell: false,
+    });
+    assert.equal(result.status, 4, `${entry.name}: ${result.stderr}`);
+    assert.equal(result.stdout, '', entry.name);
+    assert.match(result.stderr, new RegExp(`^${entry.name}:`), entry.name);
+    assert.doesNotMatch(result.stderr, /wiki_root:|auto_ingest:|require_tag|welcome.md|# Welcome/);
+    for (const value of entry.forbidden) assert.equal(result.stderr.includes(value), false, entry.name);
+  }
+});
+
+test('config CLI rejects non-regular candidates before raw reads or requested wiki mutation', () => {
+  const cases = [
+    {
+      name: 'selected directory candidate',
+      command: 'setup',
+      prepare(root) {
+        fs.mkdirSync(path.join(root, '.codex', 'deep-wiki-config.yaml'), { recursive: true });
+        return {
+          argv: [cli, 'setup', '--wiki-root', path.join(root, 'selected-secret-wiki'), '--config-host', 'codex', '--json'],
+          wikiRoot: path.join(root, 'selected-secret-wiki'),
+          forbidden: ['selected-secret-wiki'],
+        };
+      },
+    },
+    {
+      name: 'non-selected directory candidate',
+      command: 'setup',
+      prepare(root) {
+        const wikiRoot = path.join(root, 'non-selected-secret-wiki');
+        write(path.join(root, '.codex', 'deep-wiki-config.yaml'), canonicalConfig(wikiRoot));
+        fs.mkdirSync(path.join(root, '.claude', 'deep-wiki-config.yaml'), { recursive: true });
+        return {
+          argv: [cli, 'setup', '--wiki-root', wikiRoot, '--config-host', 'codex', '--json'],
+          wikiRoot,
+          forbidden: ['non-selected-secret-wiki'],
+        };
+      },
+    },
+    {
+      name: 'config resolve directory candidate',
+      command: 'config',
+      prepare(root) {
+        const wikiRoot = path.join(root, 'resolve-secret-wiki');
+        write(path.join(root, '.codex', 'deep-wiki-config.yaml'), canonicalConfig(wikiRoot));
+        fs.mkdirSync(path.join(root, '.claude', 'deep-wiki-config.yaml'), { recursive: true });
+        return {
+          argv: [cli, 'config', 'resolve', '--json'],
+          wikiRoot,
+          forbidden: ['resolve-secret-wiki'],
+        };
+      },
+    },
+  ];
+
+  for (const entry of cases) {
+    const root = temporaryRoot(`deep wiki ${entry.name} `);
+    const { argv, wikiRoot, forbidden } = entry.prepare(root);
+    const result = spawnSync(process.execPath, argv, {
+      cwd: root,
+      env: { ...process.env, HOME: root, CODEX_HOME: '' },
+      encoding: 'utf8',
+      shell: false,
+    });
+    assert.equal(result.status, 4, `${entry.name}: ${result.stderr}`);
+    assert.equal(result.stdout, '', entry.name);
+    assert.match(result.stderr, /^CONFIG_INVALID:/, entry.name);
+    assert.doesNotMatch(result.stderr, /EISDIR|illegal operation|wiki_root:|auto_ingest:|require_tag/i);
+    for (const value of forbidden) assert.equal(result.stderr.includes(value), false, entry.name);
+    if (entry.command === 'setup') assert.equal(fs.existsSync(wikiRoot), false, entry.name);
+  }
+});
+
+test('setup CLI rejects FIFO config candidates within a bounded read window', { skip: process.platform === 'win32' }, (t) => {
+  const root = temporaryRoot('deep wiki fifo candidate ');
+  const wikiRoot = path.join(root, 'fifo-secret-wiki');
+  write(path.join(root, '.codex', 'deep-wiki-config.yaml'), canonicalConfig(wikiRoot));
+  fs.mkdirSync(path.join(root, '.claude'), { recursive: true });
+  const fifo = path.join(root, '.claude', 'deep-wiki-config.yaml');
+  const mkfifo = spawnSync('mkfifo', [fifo], { cwd: root, encoding: 'utf8', shell: false });
+  if (mkfifo.status !== 0) {
+    t.skip('mkfifo unavailable');
+    return;
+  }
+
+  const result = spawnSync(process.execPath, [
+    cli, 'setup', '--wiki-root', wikiRoot, '--config-host', 'codex', '--json',
+  ], {
+    cwd: root,
+    env: { ...process.env, HOME: root, CODEX_HOME: '' },
+    encoding: 'utf8',
+    shell: false,
+    timeout: 1000,
+    killSignal: 'SIGKILL',
+  });
+
+  assert.notEqual(result.error?.code, 'ETIMEDOUT', result.stderr);
+  assert.equal(result.status, 4, result.stderr);
+  assert.equal(result.stdout, '');
+  assert.match(result.stderr, /^CONFIG_INVALID:/);
+  assert.doesNotMatch(result.stderr, /fifo-secret-wiki|wiki_root:|auto_ingest:|require_tag/i);
+  assert.equal(fs.existsSync(wikiRoot), false);
 });
 
 test('Issue #40 CLI contention emits an exact token-redacted holder', () => {

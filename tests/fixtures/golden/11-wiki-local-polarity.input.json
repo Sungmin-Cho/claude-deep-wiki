@@ -1,0 +1,13 @@
+{
+  "description": "wiki-local auto_ingest policy ignores blocked files while allowing the polarity mate",
+  "vault_tree": {
+    "allowed/live.md": "# live\n",
+    "blocked/drop.md": "# drop\n"
+  },
+  "local_config_json": {
+    "auto_ingest": {
+      "ignore_globs": ["blocked/**"]
+    }
+  },
+  "config_yaml": "wiki_root: ${WIKI_ROOT}\n"
+}

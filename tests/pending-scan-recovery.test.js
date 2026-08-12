@@ -243,4 +243,20 @@ describe('scan-vault-changes.js .pending-scan recovery (M5.5 #5)', () => {
       );
     }
   });
+
+  it('H: invalid wiki-local policy → hook stays silent and does not advance pending-scan', () => {
+    setup = setupHermeticVault();
+    const pendingFile = path.join(setup.wikiRoot, '.wiki-meta', '.pending-scan');
+    fs.writeFileSync(
+      path.join(setup.wikiRoot, '.wiki-meta', '.config.json'),
+      '{"auto_ingest":{"ignore_globs":[1]}}\n',
+      'utf8',
+    );
+
+    const r = runHook(setup.tmp);
+    assert.equal(r.status, 0);
+    assert.equal(r.stdout, '');
+    assert.equal(r.stderr, '');
+    assert.equal(readIfExists(pendingFile), null);
+  });
 });

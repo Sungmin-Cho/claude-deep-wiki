@@ -39,6 +39,7 @@ Usage:
   node scripts/wiki-runtime.js lock release --wiki-root <absolute> --token <token> --json
   node scripts/wiki-runtime.js lock recover --wiki-root <absolute> --stale-ms <integer> [--force] --json
   node scripts/wiki-runtime.js setup --wiki-root <absolute> --config-host <claude|codex> [--replace-config] --json
+  node scripts/wiki-runtime.js setup --rebind-authority-from <old-absolute> --wiki-root <new-absolute> --config-host <claude|codex> --json
   node scripts/wiki-runtime.js probe obsidian --json
   node scripts/wiki-runtime.js obsidian search --query <text> [--limit <n>] --json
   node scripts/wiki-runtime.js obsidian backlinks --path <vault-note-path> --json
@@ -243,12 +244,18 @@ function readManifestFile(file) {
 }
 
 function runSetup(argv) {
-  const flags = wikiFlags(argv, { '--config-host': 'value', '--replace-config': 'boolean' });
+  const flags = wikiFlags(argv, {
+    '--config-host': 'value',
+    '--replace-config': 'boolean',
+    '--rebind-authority-from': 'value',
+  });
   emit(wikiState.setupWiki({
     wikiRoot: flags['--wiki-root'],
     configHost: requireFlag(flags, '--config-host'),
     replaceConfig: flags['--replace-config'] === true,
+    rebindAuthorityFrom: flags['--rebind-authority-from'],
     env: process.env,
+    now: new Date(Math.trunc(Date.now() / 1000) * 1000),
   }));
 }
 
@@ -757,6 +764,9 @@ function exitCode(error) {
   if (['LOCK_CONTENDED', 'LOCK_TOKEN_MISMATCH'].includes(error.code)) return 3;
   if (error.code === 'CONFIG_CONFLICT' || error.code === 'CONFIG_TARGET_CONFLICT'
       || error.code === 'CONFIG_NOT_FOUND' || error.code === 'CONFIG_INVALID'
+      || error.code === 'SETUP_AUTHORITY_INVALID'
+      || error.code === 'SETUP_AUTHORITY_CONFLICT'
+      || error.code === 'SETUP_AUTHORITY_RECOVERY_REQUIRED'
       || error.code === 'LOCK_INVALID' || error.code === 'MANIFEST_INVALID'
       || error.code === 'EXPECTED_HASH_CONFLICT' || error.code === 'TRANSACTION_CANCELLED'
       || error.code === 'WIKI_STATE_INVALID') return 4;

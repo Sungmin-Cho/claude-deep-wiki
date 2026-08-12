@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `/wiki-setup` now emits its setup lifecycle event with the canonical `YYYY-MM-DDTHH:MM:SSZ` timestamp, so the documented setup route no longer fails with `MANIFEST_INVALID`.
+
+### Changed
+
+- `auto_ingest` policy now lives in `<wiki_root>/.wiki-meta/.config.json`; `/wiki-setup` and SessionStart create it by migrating an equivalent global YAML block. `/wiki-setup` also creates `~/.deep-wiki-setup-authority.json` and `~/.deep-wiki-setup.reserve/`. Divergent local/legacy policy and representative invalid local config shapes now fail closed.
+- Operator docs now describe the bootstrap/legacy YAML alias, `CONFIG_CONFLICT` and `CONFIG_INVALID` recovery boundaries, stopped-host direct edits, divergent physical homes, explicit rebind, and backup-only downgrade safety.
+
 ## [1.9.7] — 2026-08-05 (content metadata and nested prune safety)
 
 ### Fixed
@@ -75,7 +84,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The 1.9 backup-only downgrade boundary (`contract_version` 2 in-flight journal is unrecoverable by 1.8.x) is now stated in AGENTS.md, CONTRIBUTING.md, and the README safety-boundary section (EN + KO).
 - The documented release workflow no longer directs maintainers to hand-edit the auto-generated deep-suite README plugin table. It now gives the sequence that actually runs: `release:bump` automates the marketplace and doc-region edits, while the Codex mirror and the workflow-guide version mentions still need hand edits, and committing and pushing the suite remains manual.
-- The optional `.wiki-meta/.config.json` fan-out knobs are no longer presented as runtime configuration in the agent guide — no shipped code reads that file. The declaration remains in `wiki-schema.yaml`, where callers honor it.
+- The optional `.wiki-meta/.config.json` fan-out knobs are no longer presented as runtime configuration in the agent guide. At 1.9.2 release time, no shipped code read that file; the declaration remained in `wiki-schema.yaml`, where callers honored it. Current runtime reads the wiki-local file as the `auto_ingest` owner.
 
 ## [1.9.1] — 2026-07-22
 

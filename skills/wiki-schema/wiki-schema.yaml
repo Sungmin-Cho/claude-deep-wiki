@@ -132,7 +132,7 @@ versions:
 
 a5_fanout:             # v1.4.0+: optional <wiki>/.wiki-meta/.config.json knobs
   location: .wiki-meta/.config.json
-  optional: true       # absence = defaults; no migration needed
+  optional: true       # absence = A5 defaults; the same file may still be created by auto_ingest migration
   loader: "scripts/wiki-runtime.js snapshot"
   knobs:
     a5_fanout_threshold:
@@ -213,7 +213,15 @@ query_auto_filing:
 
 auto_ingest:
   optional: true
-  config_block: ~/.claude/deep-wiki-config.yaml
+  owner: "wiki-local"
+  config_block: "<wiki_root>/.wiki-meta/.config.json"
+  accepted_keys: ["auto_ingest", "a5_fanout_threshold", "a5_worker_timeout_sec"]
+  legacy_alias: "Global host YAML auto_ingest is only a bootstrap/legacy alias read from deep-wiki-config.yaml and migrated to the wiki-local owner when equivalent."
+  migration_trigger: "setup and SessionStart migrate equivalent legacy global YAML auto_ingest into the wiki-local owner before scanning."
+  retained_global_aliases: "Global host YAML remains accepted as bootstrap/legacy alias input until operators remove it after the migrated source is confirmed."
+  invalid_local_fail_closed: "Non-regular file, symlink, duplicate key, invalid UTF-8, and >64 KiB wiki-local config states are CONFIG_INVALID."
+  a5_preservation: "Migration preserves a5_fanout_threshold and a5_worker_timeout_sec while moving only auto_ingest ownership."
+  conflict_recovery: "CONFIG_CONFLICT local-vs-legacy policy values require matching local and legacy values or deleting one policy block while hosts are stopped; CONFIG_CONFLICT candidates=... means cross-host candidate YAML files diverge and require reconciling the named host YAML files."
   filters:
     ignore_globs:
       type: list
@@ -223,7 +231,7 @@ auto_ingest:
       type: string
       default: ""
       semantics: "If non-empty, only files whose frontmatter tags contain this tag are auto-detected."
-  default_behavior: "When auto_ingest block is absent or both keys are empty/missing, all modified .md files are detected (v1.1.x behavior)."
+  default_behavior: "When wiki-local auto_ingest is absent, no legacy alias is present, or both keys are empty/missing, all modified .md files are detected (v1.1.x behavior). Equivalent absent versus explicit-empty legacy aliases converge; conflicting local and legacy policies fail closed."
 
 recommended_tools:
   cli:

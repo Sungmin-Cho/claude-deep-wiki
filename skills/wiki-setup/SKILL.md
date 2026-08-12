@@ -20,8 +20,11 @@ configuration unless the user explicitly authorizes replacement.
 
 ## Procedure
 
-1. Resolve any existing Claude and Codex configuration. A valid existing target
-   is authoritative; conflicting targets are a hard error.
+1. Resolve any existing Claude and Codex configuration. This diagnostic is
+   read-only: it reports the selected global path, wiki-local config path,
+   policy source, migration requirement, and policy digest without writing or
+   migrating config. A valid existing target is authoritative; conflicting
+   targets are a hard error.
 
 <!-- deep-wiki:exec -->
 ```deep-wiki-exec
@@ -42,8 +45,26 @@ configuration unless the user explicitly authorizes replacement.
 ```
 
 The runtime creates the shared layout, seed page, index envelope, lifecycle
-record, and host configuration atomically. A conflict or invalid path must be
-reported without partially claiming setup succeeded.
+record, setup authority record, and host configuration atomically. A conflict
+or invalid path must be reported without partially claiming setup succeeded.
+
+For a stopped-host authority move, use the explicit rebind route only when the
+operator supplies the old root and the old wiki is already absent. This is not
+automatic rollback or restoration; if the route publishes `rebind_pending`, the
+runtime may complete the new root or fail closed for stopped-host recovery.
+A pending rebind resume must use the same `CODEX_HOME` and `DEEP_WIKI_CONFIG`
+spelling used when that pending rebind was published, so the original candidate
+vector is revalidated rather than silently rebound.
+
+<!-- deep-wiki:exec -->
+```deep-wiki-exec
+{"executable":"node","argv":["<plugin_root>/scripts/wiki-runtime.js","setup","--rebind-authority-from","OLD_ABSOLUTE_WIKI_ROOT","--wiki-root","NEW_ABSOLUTE_WIKI_ROOT","--config-host","claude","--json"]}
+```
+
+<!-- deep-wiki:exec -->
+```deep-wiki-exec
+{"executable":"node","argv":["<plugin_root>/scripts/wiki-runtime.js","setup","--rebind-authority-from","OLD_ABSOLUTE_WIKI_ROOT","--wiki-root","NEW_ABSOLUTE_WIKI_ROOT","--config-host","codex","--json"]}
+```
 
 3. Optionally probe for an Obsidian CLI. `found` reports CLI presence;
    `reachable` reports whether a running Obsidian application answered with its

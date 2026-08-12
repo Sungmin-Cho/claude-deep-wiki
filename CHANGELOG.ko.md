@@ -7,6 +7,15 @@ deep-wiki의 주요 변경사항을 기록합니다.
 
 ## [Unreleased]
 
+### 수정
+
+- `/wiki-setup`이 setup lifecycle event를 canonical `YYYY-MM-DDTHH:MM:SSZ` timestamp로 emit하므로, 문서화된 setup route가 더 이상 `MANIFEST_INVALID`로 실패하지 않습니다.
+
+### 변경
+
+- `auto_ingest` policy는 이제 `<wiki_root>/.wiki-meta/.config.json`에 저장됩니다. `/wiki-setup`과 SessionStart가 동등한 global YAML block을 migration해 생성합니다. `/wiki-setup`은 `~/.deep-wiki-setup-authority.json`와 `~/.deep-wiki-setup.reserve/`도 생성합니다. divergent local/legacy policy와 대표 invalid local config shape는 fail closed합니다.
+- Operator 문서는 bootstrap/legacy YAML alias, `CONFIG_CONFLICT` 및 `CONFIG_INVALID` recovery boundary, stopped-host direct edit, divergent physical home, explicit rebind, backup-only downgrade safety를 설명합니다.
+
 ## [1.9.7] — 2026-08-05 (콘텐츠 메타데이터 및 중첩 prune 안전성)
 
 ### 수정
@@ -75,7 +84,7 @@ deep-wiki의 주요 변경사항을 기록합니다.
 
 - 1.9 백업 전용 downgrade 경계(`contract_version` 2 in-flight journal은 1.8.x가 recover 불가)를 AGENTS.md, CONTRIBUTING.md, README 안전 경계 섹션(EN + KO)에 명시했습니다.
 - 문서화된 릴리스 워크플로우가 더 이상 자동 생성되는 deep-suite README 플러그인 표를 직접 편집하도록 안내하지 않습니다. 실제로 실행되는 순서를 제시합니다: `release:bump`가 marketplace와 자동 생성 문서 영역 편집을 자동화하고, Codex 미러와 워크플로우 가이드의 버전 서술은 여전히 수동 편집이 필요하며, suite 커밋·푸시도 수동입니다.
-- 선택적 `.wiki-meta/.config.json` fan-out 노브를 에이전트 가이드에서 런타임 설정처럼 서술하던 부분을 제거했습니다 — 배포되는 코드 중 이 파일을 읽는 곳은 없습니다. 선언은 호출자가 준수하는 `wiki-schema.yaml`에 남습니다.
+- 선택적 `.wiki-meta/.config.json` fan-out 노브를 에이전트 가이드에서 런타임 설정처럼 서술하던 부분을 제거했습니다. 1.9.2 release 시점에는 배포되는 코드 중 이 파일을 읽는 곳이 없었습니다. 선언은 호출자가 준수하는 `wiki-schema.yaml`에 남았고, 현재 runtime은 wiki-local 파일을 `auto_ingest` owner로 읽습니다.
 
 ## [1.9.1] — 2026-07-22
 

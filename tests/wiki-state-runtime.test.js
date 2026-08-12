@@ -9,6 +9,7 @@ const path = require('node:path');
 
 const statePath = '../hooks/scripts/runtime/wiki-state.js';
 const scanWindow = require('../hooks/scripts/runtime/scan-window.js');
+const { migrateAutoIngestPolicy } = require('../hooks/scripts/runtime/config-migration.js');
 const { spawnSync } = require('node:child_process');
 const { acquireLock, releaseLock } = require('../hooks/scripts/runtime/lock.js');
 const { createDeadline } = require('../hooks/scripts/runtime/deadline.js');
@@ -34,6 +35,10 @@ function fixture(prefix = 'deep wiki state Unicode 공간 ') {
   fs.writeFileSync(path.join(root, 'log.md'), '# Wiki Log\n');
   fs.writeFileSync(path.join(root, 'index.md'), '# Wiki Index\n');
   return root;
+}
+
+function setupEnv(home) {
+  return { HOME: home, USERPROFILE: home, CODEX_HOME: '' };
 }
 
 test.after(() => {
@@ -161,10 +166,11 @@ function snapshotTransactionTree(root, operationId = OPERATION_ID) {
 test('wiki-state exports the one state surface and exact shared promotion identity', () => {
   const state = require(statePath);
   assert.deepEqual(Object.keys(state).sort(), [
-    'applyCommit', 'cleanupInbox', 'fixWiki', 'inspectWiki', 'promotePendingScan',
+    'applyCommit', 'cleanupInbox', 'fixWiki', 'inspectWiki', 'migrateAutoIngestPolicy', 'promotePendingScan',
     'recoverTransaction', 'registerIngestFailure', 'setupWiki', 'snapshotWiki',
   ]);
   assert.equal(state.promotePendingScan, scanWindow.promotePendingScan);
+  assert.equal(state.migrateAutoIngestPolicy, migrateAutoIngestPolicy);
   const source = fs.readFileSync(require.resolve(statePath), 'utf8');
   assert.doesNotMatch(source, /(?:writeFile|rename|unlink|rm)(?:Sync)?\([^\n]*(?:\.pending-scan|\.last-scan)/);
 });
@@ -1334,7 +1340,7 @@ test('setup commits a compatible wiki before writing the selected host config ta
   const result = setupWiki({
     wikiRoot: root,
     configHost: 'codex',
-    env: { ...process.env, HOME: home, CODEX_HOME: '' },
+    env: setupEnv(home),
     now: new Date(TS),
     operationId: OPERATION_ID,
     eventId: EVENT_ID,
@@ -1353,6 +1359,7 @@ test('setup resumes its journal after interruption without leaving an incompatib
   const root = path.join(home, 'Interrupted Wiki');
   assert.throws(() => setupWiki({
     wikiRoot: root,
+    env: setupEnv(home),
     now: new Date(TS),
     operationId: OPERATION_ID,
     eventId: EVENT_ID,
@@ -1360,6 +1367,7 @@ test('setup resumes its journal after interruption without leaving an incompatib
   }));
   const result = setupWiki({
     wikiRoot: root,
+    env: setupEnv(home),
     now: new Date(TS),
     operationId: OPERATION_ID,
     eventId: EVENT_ID,
@@ -1375,19 +1383,20 @@ test('setup resumes from its authenticated intent when interrupted before journa
   const root = path.join(home, 'Intent Wiki');
   assert.throws(() => setupWiki({
     wikiRoot: root,
+    env: setupEnv(home),
     now: new Date(TS),
     operationId: OPERATION_ID,
     eventId: EVENT_ID,
     faultInjector(boundary) { if (boundary === 'after-setup-intent') throw new Error('stop'); },
   }));
   assert.equal(fs.existsSync(path.join(root, '.wiki-meta', '.setup-intent.json')), true);
-  const result = setupWiki({ wikiRoot: root, now: new Date(TS) });
+  const result = setupWiki({ wikiRoot: root, env: setupEnv(home), now: new Date(TS) });
   assert.equal(result.operationId, OPERATION_ID);
   assert.equal(fs.existsSync(path.join(root, 'pages', 'welcome.md')), true);
   assert.equal(fs.existsSync(path.join(root, '.wiki-meta', '.setup-intent.json')), false);
 });
 
-test('setup revalidates compatibility after locking when a concurrent setup wins', () => {
+test('setup repeats fresh preflight after reservation when a concurrent setup wins', () => {
   const { setupWiki } = require(statePath);
   const home = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'deep wiki setup race home ')));
   roots.add(home);
@@ -1395,13 +1404,15 @@ test('setup revalidates compatibility after locking when a concurrent setup wins
   let competingResult;
   const result = setupWiki({
     wikiRoot: root,
+    env: setupEnv(home),
     now: new Date(TS),
     operationId: '01JZ7P9Q6MD7S5PB8H4Y40HJ85',
     eventId: '01JZ7P9Q6MD7S5PB8H4Y40HJ86',
     faultInjector(boundary) {
-      if (boundary === 'before-setup-lock') {
+      if (boundary === 'before-setup-reservation') {
         competingResult = setupWiki({
           wikiRoot: root,
+          env: setupEnv(home),
           now: new Date(TS),
           operationId: OPERATION_ID,
           eventId: EVENT_ID,
@@ -1418,15 +1429,106 @@ test('setup revalidates compatibility after locking when a concurrent setup wins
 
 test('setup rejects an unauthenticated empty pages/meta scaffold', () => {
   const { setupWiki } = require(statePath);
-  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'deep wiki foreign scaffold ')));
-  roots.add(root);
+  const home = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'deep wiki foreign scaffold home ')));
+  roots.add(home);
+  const root = path.join(home, 'wiki');
+  fs.mkdirSync(root);
   fs.mkdirSync(path.join(root, 'pages'));
   fs.mkdirSync(path.join(root, '.wiki-meta'));
   assert.throws(
-    () => setupWiki({ wikiRoot: root, now: new Date(TS) }),
+    () => setupWiki({ wikiRoot: root, env: setupEnv(home), now: new Date(TS) }),
     (error) => error.code === 'WIKI_STATE_INVALID',
   );
   assert.deepEqual(fs.readdirSync(root).sort(), ['.wiki-meta', 'pages']);
+});
+
+test('setup CLI exposes only explicit stopped-host rebind and returns public authority generation', () => {
+  const home = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'deep wiki cli rebind home ')));
+  roots.add(home);
+  const oldRoot = path.join(home, 'Old Wiki');
+  const newRoot = path.join(home, 'New Wiki');
+  const env = setupEnv(home);
+
+  const first = spawnSync(process.execPath, [
+    cli, 'setup', '--wiki-root', oldRoot, '--config-host', 'codex', '--json',
+  ], { cwd: home, env, encoding: 'utf8', shell: false });
+  assert.equal(first.status, 0, first.stderr);
+  assert.deepEqual(JSON.parse(first.stdout).authority, {
+    wiki_root: fs.realpathSync.native(oldRoot),
+    generation: 1,
+  });
+
+  fs.rmSync(oldRoot, { recursive: true, force: true });
+  fs.rmSync(path.join(home, '.codex', 'deep-wiki-config.yaml'), { force: true });
+
+  const implicit = spawnSync(process.execPath, [
+    cli, 'setup', '--wiki-root', newRoot, '--config-host', 'codex', '--json',
+  ], { cwd: home, env, encoding: 'utf8', shell: false });
+  assert.equal(implicit.status, 4, implicit.stderr);
+  assert.match(implicit.stderr, /^SETUP_AUTHORITY_CONFLICT:/);
+  assert.equal(fs.existsSync(newRoot), false);
+
+  const explicit = spawnSync(process.execPath, [
+    cli, 'setup', '--rebind-authority-from', oldRoot, '--wiki-root', newRoot,
+    '--config-host', 'codex', '--json',
+  ], { cwd: home, env, encoding: 'utf8', shell: false });
+  assert.equal(explicit.status, 0, explicit.stderr);
+  const result = JSON.parse(explicit.stdout);
+  assert.deepEqual(result.authority, {
+    wiki_root: fs.realpathSync.native(newRoot),
+    generation: 2,
+  });
+  assert.equal(fs.existsSync(path.join(newRoot, 'pages', 'welcome.md')), true);
+});
+
+test('setup rejects unsafe global and selected-target inputs before requested wiki mutation', () => {
+  const { setupWiki } = require(statePath);
+  const cases = [
+    {
+      name: 'invalid global candidate',
+      prepare(home, root) {
+        fs.mkdirSync(path.join(home, '.codex'), { recursive: true });
+        fs.writeFileSync(path.join(home, '.codex', 'deep-wiki-config.yaml'), 'wiki_root:\n  hidden: value\n');
+        return { wikiRoot: root, configHost: 'codex', env: setupEnv(home), now: new Date(TS) };
+      },
+      code: 'CONFIG_INVALID',
+    },
+    {
+      name: 'conflicting global candidates',
+      prepare(home, root) {
+        fs.mkdirSync(path.join(home, '.codex'), { recursive: true });
+        fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+        fs.writeFileSync(path.join(home, '.codex', 'deep-wiki-config.yaml'), `wiki_root: ${JSON.stringify(root)}\n`);
+        fs.writeFileSync(path.join(home, '.claude', 'deep-wiki-config.yaml'), `wiki_root: ${JSON.stringify(path.join(home, 'other'))}\n`);
+        return { wikiRoot: root, configHost: 'codex', env: setupEnv(home), now: new Date(TS) };
+      },
+      code: 'CONFIG_CONFLICT',
+    },
+    {
+      name: 'symlinked selected target under replace-config',
+      prepare(home, root) {
+        const codex = path.join(home, '.codex', 'deep-wiki-config.yaml');
+        fs.mkdirSync(path.dirname(codex), { recursive: true });
+        fs.writeFileSync(codex, `wiki_root: ${JSON.stringify(root)}\n`);
+        fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+        fs.symlinkSync(codex, path.join(home, '.claude', 'deep-wiki-config.yaml'));
+        return {
+          wikiRoot: root, configHost: 'claude', replaceConfig: true,
+          env: setupEnv(home), now: new Date(TS),
+        };
+      },
+      code: 'CONFIG_TARGET_CONFLICT',
+    },
+  ];
+
+  for (const entry of cases) {
+    const home = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), `deep wiki ${entry.name} home `)));
+    roots.add(home);
+    const root = path.join(home, 'requested-wiki');
+    const options = entry.prepare(home, root);
+    assert.throws(() => setupWiki(options), (error) => error.code === entry.code, entry.name);
+    assert.equal(fs.existsSync(root), false, entry.name);
+  }
 });
 
 test('cleaned transactions compact to bounded receipts while preserving idempotent retry', () => {
@@ -2257,11 +2359,13 @@ test('lint fix self-heals a transaction store wedged by an OS metadata file', ()
 
 test('setup refuses a nonempty incompatible target before creating wiki state', () => {
   const { setupWiki } = require(statePath);
-  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'deep wiki incompatible setup ')));
-  roots.add(root);
+  const home = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'deep wiki incompatible setup home ')));
+  roots.add(home);
+  const root = path.join(home, 'wiki');
+  fs.mkdirSync(root);
   fs.writeFileSync(path.join(root, 'foreign.txt'), 'preserve me\n');
   assert.throws(
-    () => setupWiki({ wikiRoot: root, now: new Date(TS) }),
+    () => setupWiki({ wikiRoot: root, env: setupEnv(home), now: new Date(TS) }),
     (error) => error.code === 'WIKI_STATE_INVALID',
   );
   assert.deepEqual(fs.readdirSync(root), ['foreign.txt']);

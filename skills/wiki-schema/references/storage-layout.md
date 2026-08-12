@@ -10,6 +10,7 @@ WIKI_ROOT/
 ├── log.md                         human chronicle
 ├── log.jsonl                      structured lifecycle records
 └── .wiki-meta/
+    ├── .config.json             wiki-local auto-ingest and A5 knob config
     ├── index.json                 envelope-wrapped derived catalog
     ├── sources/                   source provenance YAML
     ├── .versions/                 pre-write page versions, latest three
@@ -21,6 +22,37 @@ WIKI_ROOT/
 ```
 
 Regular OS-metadata files in content catalogs (`pages/`, `.wiki-meta/sources/`, and `.wiki-meta/.versions/`) are skipped by readers and reported in `ignored_os_metadata`; content-catalog files are never deleted or reclaimed. Junk-named symlinks, directories, and entries whose type cannot be resolved remain fail-closed. `removed_junk` remains transaction-store-only.
+
+## Setup and auto-ingest authority
+
+The wiki-local `.wiki-meta/.config.json` owns `auto_ingest`. The global host YAML
+`auto_ingest` is only a bootstrap/legacy alias; the runtime migrates equivalent
+legacy policy into the wiki-local file before SessionStart scanning. Conflicting
+local and legacy policies fail closed. Accepted wiki-local keys are
+`auto_ingest`, `a5_fanout_threshold`, and `a5_worker_timeout_sec`; migration
+preserves A5 keys while moving only `auto_ingest` ownership. The ignore globs
+are vault-relative inside `auto_ingest`. Non-regular file, symlink, duplicate
+key, invalid UTF-8, or >64 KiB wiki-local config state is `CONFIG_INVALID`.
+`CONFIG_CONFLICT` recovery for local-vs-legacy policy values is to make local
+and legacy values match, or delete one policy block while all hosts are stopped.
+`CONFIG_CONFLICT candidates=...` means cross-host candidate YAML files diverge;
+reconcile the named host YAML files while hosts are stopped. Remove legacy YAML
+only after `policy_source=wiki_local_migrated`, then re-resolve and confirm
+`policy_source=wiki_local`.
+
+Stop all hosts before direct edit of global YAML, wiki-local JSON, setup
+authority, or route-created paths, then restart one host and let the runtime
+revalidate. `--replace-config` does not bypass invalid selected-host YAML; the
+selected host file must first be repaired or removed under stopped-host
+conditions. Divergent `CODEX_HOME` or `HOME` values create separate
+setup-authority domains, so a shared wiki should use one physical home and one
+host configuration route. `.deep-wiki-setup-authority.json` and
+`.deep-wiki-setup.reserve` are home authority artifacts, never SessionStart
+config candidates; they live in the physical user home. A wiki move is an explicit
+stopped-host rebind; rebind resumes require the original `CODEX_HOME` and
+`DEEP_WIKI_CONFIG` spelling from the pending rebind so the same candidate vector
+is revalidated. Rollback uses backup-only downgrade after current-version
+recovery; older versions do not perform in-place recovery of newer state.
 
 ## Concurrency Lock Protocol
 

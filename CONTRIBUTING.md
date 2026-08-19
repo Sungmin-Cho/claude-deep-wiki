@@ -2,13 +2,13 @@
 
 Thanks for your interest in improving **deep-wiki** — an LLM-managed markdown wiki for
 persistent knowledge accumulation, part of the
-[claude-deep-suite](https://github.com/Sungmin-Cho/claude-deep-suite).
+[deep-suite](https://github.com/Sungmin-Cho/deep-suite).
 
 ## Development setup
 
 ```bash
-git clone https://github.com/Sungmin-Cho/claude-deep-wiki.git
-cd claude-deep-wiki
+git clone https://github.com/Sungmin-Cho/deep-wiki.git
+cd deep-wiki
 ```
 
 Node 22 is required for development and CI. There are no runtime dependencies — the

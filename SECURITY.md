@@ -9,7 +9,7 @@ version with `jq -r .version .claude-plugin/plugin.json` and see the
 ## Reporting a vulnerability
 
 Please report security issues **privately** via
-[GitHub Security Advisories](https://github.com/Sungmin-Cho/claude-deep-wiki/security/advisories/new)
+[GitHub Security Advisories](https://github.com/Sungmin-Cho/deep-wiki/security/advisories/new)
 rather than opening a public issue.
 
 We aim to acknowledge reports within a few days and will coordinate a fix and a

@@ -19,7 +19,7 @@
 // so a single regression in host-env handling fails loud across all
 // fixtures.
 //
-// Spec: claude-deep-suite/docs/superpowers/plans/
+// Spec: deep-suite/docs/superpowers/plans/
 //         2026-05-12-m5.5-remaining-tests-handoff.md §2 #3
 
 const { spawnSync } = require('node:child_process');

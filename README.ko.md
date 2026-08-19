@@ -2,9 +2,9 @@
 
 # deep-wiki
 
-![version](https://img.shields.io/github/package-json/v/Sungmin-Cho/claude-deep-wiki?label=version)
-![license](https://img.shields.io/github/license/Sungmin-Cho/claude-deep-wiki)
-[![part of deep-suite](https://img.shields.io/badge/part%20of-deep--suite-5b8def)](https://github.com/Sungmin-Cho/claude-deep-suite)
+![version](https://img.shields.io/github/package-json/v/Sungmin-Cho/deep-wiki?label=version)
+![license](https://img.shields.io/github/license/Sungmin-Cho/deep-wiki)
+[![part of deep-suite](https://img.shields.io/badge/part%20of-deep--suite-5b8def)](https://github.com/Sungmin-Cho/deep-suite)
 
 LLM이 관리하는 마크다운 위키 — [Karpathy의 LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) 철학을 Claude Code와 Codex에서 구현한 플러그인입니다.
 
@@ -15,7 +15,7 @@ LLM이 관리하는 마크다운 위키 — [Karpathy의 LLM Wiki](https://gist.
 
 ## deep-suite에서의 역할
 
-deep-wiki는 [deep-suite](https://github.com/Sungmin-Cho/claude-deep-suite)의 **지속적 지식 레이어**입니다. [Harness Engineering](https://martinfowler.com/articles/harness-engineering.html) 2×2 매트릭스에서 **Inferential Guide**로 동작 — 에이전트의 이해를 형성하는 축적된 프로젝트 지식을 제공하며, 반복적인 RAG 쿼리를 복리로 쌓이는 지식 베이스로 대체합니다. 5개의 `/wiki-*` 진입점은 스킬이므로 Claude Code(슬래시 커맨드)에서, 그리고 Codex / Copilot CLI / Gemini CLI / Agent SDK에서 `Skill({ skill: "deep-wiki:wiki-<verb>" })` 형태로 네이티브로 실행됩니다.
+deep-wiki는 [deep-suite](https://github.com/Sungmin-Cho/deep-suite)의 **지속적 지식 레이어**입니다. [Harness Engineering](https://martinfowler.com/articles/harness-engineering.html) 2×2 매트릭스에서 **Inferential Guide**로 동작 — 에이전트의 이해를 형성하는 축적된 프로젝트 지식을 제공하며, 반복적인 RAG 쿼리를 복리로 쌓이는 지식 베이스로 대체합니다. 5개의 `/wiki-*` 진입점은 스킬이므로 Claude Code(슬래시 커맨드)에서, 그리고 Codex / Copilot CLI / Gemini CLI / Agent SDK에서 `Skill({ skill: "deep-wiki:wiki-<verb>" })` 형태로 네이티브로 실행됩니다.
 
 ## 아키텍처
 
@@ -39,7 +39,7 @@ Raw Sources  →  Wiki (markdown pages)  →  Schema (management rules)
 
 ```bash
 # Claude Code
-/plugin marketplace add Sungmin-Cho/claude-deep-suite
+/plugin marketplace add Sungmin-Cho/deep-suite
 /plugin install deep-wiki@claude-deep-suite
 
 # Codex
@@ -49,8 +49,8 @@ codex plugin install deep-wiki
 ### 단독 설치
 
 ```bash
-/plugin marketplace add Sungmin-Cho/claude-deep-wiki
-/plugin install deep-wiki@Sungmin-Cho-claude-deep-wiki
+/plugin marketplace add Sungmin-Cho/deep-wiki
+/plugin install deep-wiki@Sungmin-Cho-deep-wiki
 ```
 
 전제 조건: [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI(또는 Codex)가 설치·구성되어 있어야 합니다.
@@ -287,7 +287,7 @@ deep-work 세션 리포트를 위키로 ingest:
 ## 링크
 
 - [CHANGELOG](CHANGELOG.ko.md) — 릴리스 이력
-- [deep-suite](https://github.com/Sungmin-Cho/claude-deep-suite) — 마켓플레이스와 나머지 플러그인
+- [deep-suite](https://github.com/Sungmin-Cho/deep-suite) — 마켓플레이스와 나머지 플러그인
 - [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 
 ## 라이선스

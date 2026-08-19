@@ -3,7 +3,7 @@
 
 /**
  * validate-envelope-emit.js — Self-test validator for deep-wiki's M3
- * envelope emission. Mirrors the suite-side schema (claude-deep-suite/
+ * envelope emission. Mirrors the suite-side schema (deep-suite/
  * schemas/artifact-envelope.schema.json) without external deps so this
  * works as a release-lint inside the deep-wiki plugin's own test
  * pipeline.
@@ -244,7 +244,7 @@ function validateRoot(obj, errors) {
   validateEnvelopeBlock(obj.envelope, errors);
 
   // Payload shape: minimal — non-null, non-array object. Domain-specific
-  // payload schema lives in claude-deep-suite payload-registry (Phase 3
+  // payload schema lives in deep-suite payload-registry (Phase 3
   // will replace the placeholder at schemas/payload-registry/deep-wiki/
   // index/v1.0.schema.json with the authoritative shape derived from this
   // PR's emit fixture).

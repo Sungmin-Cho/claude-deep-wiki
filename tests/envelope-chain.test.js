@@ -985,7 +985,7 @@ describe('envelope-chain — markdown bash snippet portability (BSD/GNU find —
 describe('envelope-chain — index payload shape gate (round-2 Codex adv HIGH-B PARTIAL ACCEPT)', () => {
   // Defense-in-depth at the writer boundary for the `index` artifact kind:
   // require `pages` to be an array before wrapping. Authoritative payload
-  // schema replacement lives in Phase 3 (claude-deep-suite payload-registry).
+  // schema replacement lives in Phase 3 (deep-suite payload-registry).
   it('rejects payload missing pages array', () => {
     const dir = tmpDir();
     const payload = path.join(dir, 'payload.json');

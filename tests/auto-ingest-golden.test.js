@@ -11,10 +11,10 @@
 // `<name>.expected.json` pair under `tests/fixtures/golden/`. The loader
 // fails loud if one side is missing (catches accidental half-commits).
 //
-// Spec: claude-deep-suite/docs/superpowers/plans/
+// Spec: deep-suite/docs/superpowers/plans/
 //         2026-05-12-m5.5-remaining-tests-handoff.md §2 #3
 //
-// Reference: claude-deep-work tests/phase-guard-golden.test.js (PR #29).
+// Reference: deep-work tests/phase-guard-golden.test.js (PR #29).
 // Helper rationale: see hooks/scripts/test-helpers/run-scan-vault.js.
 
 const { describe, it, test } = require('node:test');

@@ -21,7 +21,7 @@
 // contact with the user's real `~/.claude/deep-wiki-config.yaml` or
 // real Obsidian vault.
 //
-// Spec: claude-deep-suite/docs/superpowers/plans/
+// Spec: deep-suite/docs/superpowers/plans/
 // 2026-05-12-m5.5-remaining-tests-handoff.md §2 #5 (deep-wiki row).
 
 const { describe, it, beforeEach, afterEach } = require('node:test');

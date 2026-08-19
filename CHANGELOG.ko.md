@@ -48,7 +48,7 @@ deep-wiki의 주요 변경사항을 기록합니다.
 
 ### 수정
 
-- 이제 `wiki-runtime lock acquire --json`의 모든 `LOCK_CONTENDED` 결과가 exit code 3, 빈 stdout, 단일한 안정적 JSON stderr envelope로 보고됩니다. 완전하고 canonical한 owner는 token을 제외한 `operation`, `pid`, `hostname`, `acquired_at` 필드의 `holder`로 투영하고, malformed·incomplete·extra-field·ownerless 증거는 `holder: null`로 fail closed합니다. 활성 release transition에서 발생한 경합까지 공개 메시지를 항상 `wiki lock is contended`로 정규화하며, lock 획득·dead-owner 자체 복구·recovery·release·liveness 동작은 변경하지 않습니다([#40](https://github.com/Sungmin-Cho/claude-deep-wiki/issues/40)).
+- 이제 `wiki-runtime lock acquire --json`의 모든 `LOCK_CONTENDED` 결과가 exit code 3, 빈 stdout, 단일한 안정적 JSON stderr envelope로 보고됩니다. 완전하고 canonical한 owner는 token을 제외한 `operation`, `pid`, `hostname`, `acquired_at` 필드의 `holder`로 투영하고, malformed·incomplete·extra-field·ownerless 증거는 `holder: null`로 fail closed합니다. 활성 release transition에서 발생한 경합까지 공개 메시지를 항상 `wiki lock is contended`로 정규화하며, lock 획득·dead-owner 자체 복구·recovery·release·liveness 동작은 변경하지 않습니다([#40](https://github.com/Sungmin-Cho/deep-wiki/issues/40)).
 
 ### 변경
 
@@ -69,7 +69,7 @@ deep-wiki의 주요 변경사항을 기록합니다.
 
 ### 수정
 
-- 이제 sync-drive 트랜잭션 journal이 파일시스템 메타데이터 호출 안에서 멈춰도 `wiki-runtime snapshot`이 무기한 기다리지 않습니다([#39](https://github.com/Sungmin-Cho/claude-deep-wiki/issues/39)). Snapshot 실행을 감독되는 read-only 자식 프로세스로 분리하고, 잠재적으로 멈춘 syscall 바깥에 parent timer를 둡니다. 12초 timer가 발화하면 parent가 worker tree 종료를 요청하고 pipe와 child handle을 분리한 뒤, worker `close`를 기다리거나 복구 증거를 변경하지 않고 실행 가능한 `DEADLINE_EXCEEDED` 안내를 반환합니다. POSIX와 native Windows 모두 실행된 종료 요청을 보수적으로 unconfirmed로 보고하며, launch 또는 요청 실패는 requested도 confirmed도 아닌 상태로 보고합니다. 즉시 읽을 수 없는 journal은 같은 stopped-host/readability 복구 경계와 함께 `TRANSACTION_RECOVERY_REQUIRED`로 fail closed합니다.
+- 이제 sync-drive 트랜잭션 journal이 파일시스템 메타데이터 호출 안에서 멈춰도 `wiki-runtime snapshot`이 무기한 기다리지 않습니다([#39](https://github.com/Sungmin-Cho/deep-wiki/issues/39)). Snapshot 실행을 감독되는 read-only 자식 프로세스로 분리하고, 잠재적으로 멈춘 syscall 바깥에 parent timer를 둡니다. 12초 timer가 발화하면 parent가 worker tree 종료를 요청하고 pipe와 child handle을 분리한 뒤, worker `close`를 기다리거나 복구 증거를 변경하지 않고 실행 가능한 `DEADLINE_EXCEEDED` 안내를 반환합니다. POSIX와 native Windows 모두 실행된 종료 요청을 보수적으로 unconfirmed로 보고하며, launch 또는 요청 실패는 requested도 confirmed도 아닌 상태로 보고합니다. 즉시 읽을 수 없는 journal은 같은 stopped-host/readability 복구 경계와 함께 `TRANSACTION_RECOVERY_REQUIRED`로 fail closed합니다.
 - SessionStart scan-window 영속화를 감독되는 자식 프로세스로 분리했습니다. 시간초과 시 자식 트리 종료 완료를 확인한 뒤 해당 자식 PID와 일치하는 same-host dead lock만 회수하며, 일반 lock 획득도 live·foreign·malformed·ownerless contention을 약화하지 않고 같은 인증된 dead-owner 경우를 자체 복구합니다.
 
 ## [1.9.2] — 2026-07-27 (컨텍스트 다이어트)
@@ -96,7 +96,7 @@ deep-wiki의 주요 변경사항을 기록합니다.
 
 ### 수정
 
-- 대형 vault에서 `wiki-runtime commit`이 단일 논리 커밋을 여러 번의 `transaction recover` 호출로 쪼개던 문제를 해결했습니다 ([#30](https://github.com/Sungmin-Cho/claude-deep-wiki/issues/30) Issue 2). per-commit 비용이 diff가 아니라 카탈로그 크기에 비례했습니다: `buildPlan`이 미변경 page/version/source를 전부 full-byte `before==after` 아티팩트로 seal해서 journal(`atomicWriteFile`의 fsync로 최대 ~14회 재영속)과 staging(2N fsync 쓰기)을 부풀렸고, 이 구간에 deadline 체크가 없어 고정 12초 예산이 staging에서 소진된 뒤 `wiki-state:publish:versions`에서 오해를 부르며 터졌습니다. 이제 미변경 파일은 hash-only `catalog_seal`(`{relative_path, sha256}`)로 기록되어 journal 영속화와 staging이 O(diff)로 떨어지고, 실측된 590·~1,406 페이지 케이스가 단일 커밋에서 12초 안에 여유 있게 완료됩니다.
+- 대형 vault에서 `wiki-runtime commit`이 단일 논리 커밋을 여러 번의 `transaction recover` 호출로 쪼개던 문제를 해결했습니다 ([#30](https://github.com/Sungmin-Cho/deep-wiki/issues/30) Issue 2). per-commit 비용이 diff가 아니라 카탈로그 크기에 비례했습니다: `buildPlan`이 미변경 page/version/source를 전부 full-byte `before==after` 아티팩트로 seal해서 journal(`atomicWriteFile`의 fsync로 최대 ~14회 재영속)과 staging(2N fsync 쓰기)을 부풀렸고, 이 구간에 deadline 체크가 없어 고정 12초 예산이 staging에서 소진된 뒤 `wiki-state:publish:versions`에서 오해를 부르며 터졌습니다. 이제 미변경 파일은 hash-only `catalog_seal`(`{relative_path, sha256}`)로 기록되어 journal 영속화와 staging이 O(diff)로 떨어지고, 실측된 590·~1,406 페이지 케이스가 단일 커밋에서 12초 안에 여유 있게 완료됩니다.
 
 ### 변경
 

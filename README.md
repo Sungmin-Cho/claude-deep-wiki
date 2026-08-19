@@ -2,9 +2,9 @@
 
 # deep-wiki
 
-![version](https://img.shields.io/github/package-json/v/Sungmin-Cho/claude-deep-wiki?label=version)
-![license](https://img.shields.io/github/license/Sungmin-Cho/claude-deep-wiki)
-[![part of deep-suite](https://img.shields.io/badge/part%20of-deep--suite-5b8def)](https://github.com/Sungmin-Cho/claude-deep-suite)
+![version](https://img.shields.io/github/package-json/v/Sungmin-Cho/deep-wiki?label=version)
+![license](https://img.shields.io/github/license/Sungmin-Cho/deep-wiki)
+[![part of deep-suite](https://img.shields.io/badge/part%20of-deep--suite-5b8def)](https://github.com/Sungmin-Cho/deep-suite)
 
 An LLM-managed markdown wiki for persistent knowledge accumulation — a plugin implementation of [Karpathy's LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) philosophy for Claude Code and Codex.
 
@@ -15,7 +15,7 @@ Instead of re-discovering knowledge each time (RAG), deep-wiki **incrementally b
 
 ## Role in deep-suite
 
-deep-wiki is the **persistent knowledge layer** of the [deep-suite](https://github.com/Sungmin-Cho/claude-deep-suite). In the [Harness Engineering](https://martinfowler.com/articles/harness-engineering.html) 2×2 matrix it acts as an **Inferential Guide** — accumulated project knowledge that shapes the agent's understanding, replacing repeated RAG queries with a compounding knowledge base. The 5 `/wiki-*` entry points are skills, so they run natively from Claude Code (slash commands) and from Codex / Copilot CLI / Gemini CLI / the Agent SDK via `Skill({ skill: "deep-wiki:wiki-<verb>" })`.
+deep-wiki is the **persistent knowledge layer** of the [deep-suite](https://github.com/Sungmin-Cho/deep-suite). In the [Harness Engineering](https://martinfowler.com/articles/harness-engineering.html) 2×2 matrix it acts as an **Inferential Guide** — accumulated project knowledge that shapes the agent's understanding, replacing repeated RAG queries with a compounding knowledge base. The 5 `/wiki-*` entry points are skills, so they run natively from Claude Code (slash commands) and from Codex / Copilot CLI / Gemini CLI / the Agent SDK via `Skill({ skill: "deep-wiki:wiki-<verb>" })`.
 
 ## Architecture
 
@@ -39,7 +39,7 @@ Raw Sources  →  Wiki (markdown pages)  →  Schema (management rules)
 
 ```bash
 # Claude Code
-/plugin marketplace add Sungmin-Cho/claude-deep-suite
+/plugin marketplace add Sungmin-Cho/deep-suite
 /plugin install deep-wiki@claude-deep-suite
 
 # Codex
@@ -49,8 +49,8 @@ codex plugin install deep-wiki
 ### Standalone
 
 ```bash
-/plugin marketplace add Sungmin-Cho/claude-deep-wiki
-/plugin install deep-wiki@Sungmin-Cho-claude-deep-wiki
+/plugin marketplace add Sungmin-Cho/deep-wiki
+/plugin install deep-wiki@Sungmin-Cho-deep-wiki
 ```
 
 Prerequisite: the [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI (or Codex) installed and configured.
@@ -288,7 +288,7 @@ The human's job is to curate sources, direct the analysis, ask good questions, a
 ## Links
 
 - [CHANGELOG](CHANGELOG.md) — release history
-- [deep-suite](https://github.com/Sungmin-Cho/claude-deep-suite) — the marketplace and the other plugins
+- [deep-suite](https://github.com/Sungmin-Cho/deep-suite) — the marketplace and the other plugins
 - [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 
 ## License

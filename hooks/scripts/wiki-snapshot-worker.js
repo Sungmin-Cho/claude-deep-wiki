@@ -38,6 +38,21 @@ function parseArguments(argv) {
   return { wikiRoot: path.normalize(values['--wiki-root']), budgetMs };
 }
 
+function snapshotErrorDetail(error) {
+  const operationId = error && error.operationId;
+  if (typeof operationId !== 'string' || operationId.length < 1 || operationId.length > 256
+      || !/^[.]?[A-Za-z0-9._-]+$/.test(operationId)) return null;
+  const method = error.method;
+  if (method !== 'stat' && method !== 'enumeration' && method !== 'none') return null;
+  const estimated = error.estimatedEntries;
+  if (!(estimated === null || (Number.isSafeInteger(estimated) && estimated >= 0))) return null;
+  return {
+    operation_id: operationId,
+    estimated_entries: estimated,
+    method,
+  };
+}
+
 function emit(value) {
   process.stdout.write(`${JSON.stringify(value)}\n`);
 }
@@ -55,13 +70,16 @@ function main(argv = process.argv.slice(2)) {
     });
     return 0;
   } catch (error) {
+    const payload = {
+      code: typeof error.code === 'string' && error.code ? error.code : 'FILESYSTEM',
+      message: error instanceof Error ? error.message : String(error),
+    };
+    const detail = snapshotErrorDetail(error);
+    if (detail) payload.detail = detail;
     emit({
       contract_version: 1,
       status: 'error',
-      error: {
-        code: typeof error.code === 'string' && error.code ? error.code : 'FILESYSTEM',
-        message: error instanceof Error ? error.message : String(error),
-      },
+      error: payload,
     });
     return 1;
   }
@@ -69,4 +87,4 @@ function main(argv = process.argv.slice(2)) {
 
 if (require.main === module) process.exitCode = main();
 
-module.exports = { main, parseArguments };
+module.exports = { main, parseArguments, snapshotErrorDetail };

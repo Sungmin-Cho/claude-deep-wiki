@@ -306,7 +306,31 @@ function runObsidianBridge(argv) {
   }));
 }
 
-function parseSnapshotWorkerOutput(stdout, status) {
+function parseSnapshotWorkerDetail(detail) {
+  if (detail === undefined) return null;
+  if (!detail || typeof detail !== 'object' || Array.isArray(detail)) {
+    throw stateError('WIKI_STATE_FILESYSTEM', 'snapshot worker error violates its contract');
+  }
+  const keys = Object.keys(detail).sort();
+  if (JSON.stringify(keys) !== JSON.stringify(['estimated_entries', 'method', 'operation_id'])) {
+    throw stateError('WIKI_STATE_FILESYSTEM', 'snapshot worker error violates its contract');
+  }
+  const operationId = detail.operation_id;
+  if (typeof operationId !== 'string' || operationId.length < 1 || operationId.length > 256
+      || !/^[.]?[A-Za-z0-9._-]+$/.test(operationId)) {
+    throw stateError('WIKI_STATE_FILESYSTEM', 'snapshot worker error violates its contract');
+  }
+  if (!['stat', 'enumeration', 'none'].includes(detail.method)) {
+    throw stateError('WIKI_STATE_FILESYSTEM', 'snapshot worker error violates its contract');
+  }
+  const estimated = detail.estimated_entries;
+  if (!(estimated === null || (Number.isSafeInteger(estimated) && estimated >= 0))) {
+    throw stateError('WIKI_STATE_FILESYSTEM', 'snapshot worker error violates its contract');
+  }
+  return detail;
+}
+
+function parseSnapshotWorkerOutput(stdout, status, wikiRoot) {
   if (typeof stdout !== 'string' || !stdout.endsWith('\n')
       || stdout.slice(0, -1).includes('\n') || stdout.includes('\r')) {
     throw stateError('WIKI_STATE_FILESYSTEM', 'snapshot worker returned an invalid result');
@@ -327,15 +351,25 @@ function parseSnapshotWorkerOutput(stdout, status) {
     }
     return envelope.snapshot;
   }
+  const errorKeys = Object.keys(envelope.error || {}).sort();
+  const withoutDetail = errorKeys.filter((key) => key !== 'detail');
   if (status !== 1
       || JSON.stringify(keys) !== JSON.stringify(['contract_version', 'error', 'status'])
       || !envelope.error || typeof envelope.error !== 'object' || Array.isArray(envelope.error)
-      || JSON.stringify(Object.keys(envelope.error).sort()) !== JSON.stringify(['code', 'message'])
+      || JSON.stringify(withoutDetail) !== JSON.stringify(['code', 'message'])
       || typeof envelope.error.code !== 'string' || !/^[A-Z][A-Z0-9_]*$/.test(envelope.error.code)
       || typeof envelope.error.message !== 'string' || envelope.error.message.length === 0) {
     throw stateError('WIKI_STATE_FILESYSTEM', 'snapshot worker error violates its contract');
   }
-  throw stateError(envelope.error.code, envelope.error.message);
+  const parsed = parseSnapshotWorkerDetail(envelope.error.detail);
+  const error = stateError(envelope.error.code, envelope.error.message);
+  if (parsed) {
+    error.operationId = parsed.operation_id;
+    error.estimatedEntries = parsed.estimated_entries;
+    error.method = parsed.method;
+  }
+  if (typeof wikiRoot === 'string' && wikiRoot.length > 0) error.wikiRoot = wikiRoot;
+  throw error;
 }
 
 function abandonSnapshotWorker(child) {
@@ -411,7 +445,7 @@ function snapshotDeadlineError(wikiRoot, timeoutMs, terminationState) {
     'DEADLINE_EXCEEDED',
     `snapshot transaction inspection exceeded ${timeoutMs}ms at ${transactions}; `
       + `worker tree ${terminationState}; stop all hosts, restore filesystem readability, `
-      + 'then rerun snapshot before recovery',
+      + 'then rerun snapshot before recovery; if a prior inspection failed with TRANSACTION_OVERSIZED, follow the guidance that error printed',
   );
 }
 
@@ -551,7 +585,7 @@ function runSnapshotWorker(options = {}) {
         return;
       }
       try {
-        const snapshot = parseSnapshotWorkerOutput(Buffer.concat(stdout).toString('utf8'), code);
+        const snapshot = parseSnapshotWorkerOutput(Buffer.concat(stdout).toString('utf8'), code, wikiRoot);
         terminal = true;
         resolve(snapshot);
       } catch (error) {
@@ -832,4 +866,6 @@ module.exports = {
   cleanupRuntimeManifests,
   runSnapshotWorker,
   quarantineStoreEntry,
+  parseSnapshotWorkerOutput,
+  snapshotDeadlineError,
 };

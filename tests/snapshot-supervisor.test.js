@@ -185,6 +185,7 @@ test('snapshot CLI deadline returns without awaiting a blocked worker close and 
   assert.match(result.stderr, /^DEADLINE_EXCEEDED: /);
   assert.match(result.stderr, /stop all hosts/i);
   assert.match(result.stderr, /restore filesystem readability/i);
+  assert.match(result.stderr, /TRANSACTION_OVERSIZED/);
   assert.match(
     result.stderr,
     /termination (?:requested but unconfirmed|could not be requested or confirmed)/i,

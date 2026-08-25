@@ -1097,6 +1097,39 @@ test('quarantineStoreEntry records rollback follow_up and bound wrappers share t
   });
 });
 
+test('snapshot worker detail round-trips and rejects malformed detail', () => {
+  const runtime = require('../scripts/wiki-runtime.js');
+  const worker = require('../hooks/scripts/wiki-snapshot-worker.js');
+  const pruneName = `.prune-161-${'a'.repeat(161)}-1234567890-${'b'.repeat(36)}`;
+  assert.equal(pruneName.length >= 161, true);
+  const detail = worker.snapshotErrorDetail({
+    operationId: pruneName.slice(0, 256),
+    estimatedEntries: 12,
+    method: 'stat',
+  });
+  assert.equal(detail.operation_id.length <= 256, true);
+  const stdout = `${JSON.stringify({
+    contract_version: 1,
+    status: 'error',
+    error: { code: 'TRANSACTION_OVERSIZED', message: 'oversized', detail },
+  })}\n`;
+  assert.throws(
+    () => runtime.parseSnapshotWorkerOutput(stdout, 1, '/wiki'),
+    (error) => error.code === 'TRANSACTION_OVERSIZED'
+      && error.operationId === detail.operation_id
+      && error.wikiRoot === '/wiki',
+  );
+  assert.throws(
+    () => runtime.parseSnapshotWorkerOutput(`${JSON.stringify({
+      contract_version: 1, status: 'error',
+      error: { code: 'X', message: 'm', detail: { operation_id: 'bad space', estimated_entries: 0, method: 'stat' } },
+    })}\n`, 1),
+    (error) => error.code === 'WIKI_STATE_FILESYSTEM',
+  );
+  const deadline = runtime.snapshotDeadlineError('/wiki', 12_000, 'terminated');
+  assert.match(deadline.message, /TRANSACTION_OVERSIZED/);
+});
+
 test('inspectWiki classifies oversized non-prune directories before reading journals', () => {
   const root = wikiFixture();
   const name = `scan-window-ensure-${hex40('88')}`;

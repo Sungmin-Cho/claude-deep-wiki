@@ -317,6 +317,18 @@ function assertRegularFileFence(pathname, label, expected, fsImpl) {
   }
 }
 
+function sourceAbsenceLabel(pathname) {
+  return `.wiki-meta/.transactions/${path.basename(pathname)}`;
+}
+
+function assertExpectedSourceAbsence(pathname, fsImpl) {
+  const label = sourceAbsenceLabel(pathname);
+  const current = physicalDirectoryIdentity(pathname, label, true, fsImpl);
+  if (current !== null) {
+    throw stateError('WIKI_STATE_FILESYSTEM', `${label} reappeared during reservation-only quarantine`);
+  }
+}
+
 function assertQuarantineFence(root, token, captured, options = {}) {
   const fsImpl = options.fs || fs;
   assertLockOwner({ wikiRoot: root, token });
@@ -331,6 +343,9 @@ function assertQuarantineFence(root, token, captured, options = {}) {
     );
   }
   assertDirectoryFence(captured.storePath, '.wiki-meta/.transactions', captured.storeIdentity, fsImpl);
+  if (captured.expectSourceAbsent) {
+    assertExpectedSourceAbsence(captured.sourcePath, fsImpl);
+  }
   if (options.includeSource) {
     assertDirectoryFence(
       captured.sourcePath,
@@ -1176,6 +1191,9 @@ function ensureSealedQuarantineRoot(root, token, captured, options = {}) {
   invokeMarkerFault(options.faultInjector, 'before-root-mkdir');
   assertDirectoryFence(captured.metaPath, '.wiki-meta', captured.metaIdentity, fsImpl);
   assertDirectoryFence(captured.storePath, '.wiki-meta/.transactions', captured.storeIdentity, fsImpl);
+  if (captured.expectSourceAbsent) {
+    assertExpectedSourceAbsence(captured.sourcePath, fsImpl);
+  }
   if (captured.reservationIdentity) {
     assertRegularFileFence(
       captured.reservationPath,
@@ -1414,6 +1432,7 @@ function resumeReservationOnly(context) {
   try {
     const metaPathname = path.join(root, '.wiki-meta');
     const store = path.join(metaPathname, '.transactions');
+    const sourcePath = path.join(store, classified.sourceName);
     const quarantineRoot = path.join(metaPathname, '.quarantine');
     const quarantineIdentity = ensureSealedQuarantineRoot(root, token, {
       metaPath: metaPathname,
@@ -1421,6 +1440,8 @@ function resumeReservationOnly(context) {
       quarantinePath: quarantineRoot,
       storePath: store,
       storeIdentity,
+      sourcePath,
+      expectSourceAbsent: true,
       reservationPath: reservation,
       reservationIdentity,
     }, { fs: fsImpl, faultInjector });
@@ -1438,6 +1459,9 @@ function resumeReservationOnly(context) {
       bundleIdentity: null,
       storePath: store,
       storeIdentity,
+      sourcePath,
+      sourceIdentity: null,
+      expectSourceAbsent: true,
       reservationPath: reservation,
       reservationIdentity,
     };

@@ -13,7 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `/wiki-setup` now emits its setup lifecycle event with the canonical `YYYY-MM-DDTHH:MM:SSZ` timestamp, so the documented setup route no longer fails with `MANIFEST_INVALID`.
 - An oversized leftover transaction directory no longer wedges every runtime inspection with a permanent `DEADLINE_EXCEEDED`. Readers classify it as `TRANSACTION_OVERSIZED`, lock-held writers skip the interior, and isolatable names can be moved with `transaction quarantine` without deleting the tree. SessionStart ensure, lint fix, transaction prune, and transaction quarantine automatically relocate isolatable oversized trees into `.wiki-meta/.quarantine/` bundles that are never auto-deleted; after resolution, stop all hosts and dispose of a bundle manually.
-- `transaction recover --wiki-root … --operation-id … --json` is self-locking when `--lock-token` is omitted, so rollback quarantine `follow_up` is an executable second stage. Callers that already hold a lock may still inject `--lock-token`.
+- `transaction recover --wiki-root … --operation-id … --json` is self-locking when `--lock-token` is omitted, so rollback quarantine `follow_up` is an executable second stage. Callers that already hold a lock may still inject `--lock-token`. A public recover that self-acquired the lock and hits `DEADLINE_EXCEEDED` now emits a tokenless self-locking retry; only token-injected callers receive `--lock-token <token>`.
+- Reservation-only quarantine re-proves that the `.prune-*` source is still absent immediately before creating `.quarantine` and before every later bundle, metadata, or reservation mutation. A reappeared source fails `WIKI_STATE_FILESYSTEM` with canonical source and reservation unmoved.
+- Isolatable `TRANSACTION_OVERSIZED` hints now include a complete `node` invocation of the actual `scripts/wiki-runtime.js` path. Direct and rollback commands each live on independently copyable lines for POSIX and labeled PowerShell.
+- Per-directory prune pressure-probe failures (`EACCES`/`EIO` and other non-ENOENT errors) now travel through `terminal_prune` with accumulated `processed`, `removed`, `complete: false`, and `skipped_oversized`, so lint repair can persist or promote that residue under a still-valid lock before rethrowing.
 
 ### Changed
 

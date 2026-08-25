@@ -649,10 +649,15 @@ function shellQuote(value) {
   return `'${String(value).replace(/'/g, "'\\''")}'`;
 }
 
-function recoverHint(wikiRoot, operationId) {
+function recoverHint(wikiRoot, operationId, options = {}) {
   const root = path.resolve(wikiRoot);
   const label = process.platform === 'win32' ? 'resume with (PowerShell):' : 'resume with:';
-  return `${label}\nnode scripts/wiki-runtime.js transaction recover --wiki-root ${shellQuote(root)} --lock-token <token> --operation-id ${shellQuote(operationId)} --json`;
+  const tokenPart = options.includeLockToken === false ? '' : ' --lock-token <token>';
+  return `${label}\nnode scripts/wiki-runtime.js transaction recover --wiki-root ${shellQuote(root)}${tokenPart} --operation-id ${shellQuote(operationId)} --json`;
+}
+
+function runtimeCommandPrefix() {
+  return `node ${shellQuote(path.resolve(__filename))}`;
 }
 
 function transactionDurablyExists(wikiRoot, operationId) {
@@ -714,19 +719,17 @@ function oversizedHint(error) {
   if (isolatable && root) {
     const quotedRoot = shellQuote(path.resolve(root));
     const quotedName = shellQuote(name);
-    const quarantineCmd = `transaction quarantine --wiki-root ${quotedRoot} --operation-id ${quotedName} --json`;
+    const prefix = runtimeCommandPrefix();
+    const quarantineCmd = `${prefix} transaction quarantine --wiki-root ${quotedRoot} --operation-id ${quotedName} --json`;
     const powershell = process.platform === 'win32';
+    const runLabel = powershell ? 'Run (PowerShell):' : 'Run:';
     if (rollback) {
-      const recover = `node scripts/wiki-runtime.js transaction recover --wiki-root ${quotedRoot} --operation-id ${shellQuote(rollback[1])} --json`;
-      if (powershell) {
-        return `TRANSACTION_OVERSIZED is isolatable as a rollback remnant. Isolate it with (PowerShell): ${quarantineCmd}, then (PowerShell): ${recover}.`;
-      }
-      return `TRANSACTION_OVERSIZED is isolatable as a rollback remnant. Isolate it with ${quarantineCmd}, then ${recover}.`;
+      const recover = `${prefix} transaction recover --wiki-root ${quotedRoot} --operation-id ${shellQuote(rollback[1])} --json`;
+      const isolateLabel = powershell ? 'Isolate it with (PowerShell):' : 'Isolate it with:';
+      const thenLabel = powershell ? 'then (PowerShell):' : 'then:';
+      return `TRANSACTION_OVERSIZED is isolatable as a rollback remnant. ${isolateLabel}\n${quarantineCmd}\n${thenLabel}\n${recover}`;
     }
-    if (powershell) {
-      return `TRANSACTION_OVERSIZED is isolatable. Run (PowerShell): ${quarantineCmd}`;
-    }
-    return `TRANSACTION_OVERSIZED is isolatable. Run ${quarantineCmd}`;
+    return `TRANSACTION_OVERSIZED is isolatable. ${runLabel}\n${quarantineCmd}`;
   }
   if (/^[0-9A-HJKMNP-TV-Z]{26}$/.test(name)) {
     return 'TRANSACTION_OVERSIZED for a pure ULID is not automatically isolatable; stop all hosts, restore filesystem readability, and if recover still cannot read the journal restore the authenticated backup.';
@@ -828,7 +831,9 @@ function runTransaction(argv) {
         });
       } catch (error) {
         if (error.code === 'DEADLINE_EXCEEDED') {
-          error.message = `${error.message} — ${recoverHint(wikiRoot, operationId)}`;
+          error.message = `${error.message} — ${recoverHint(wikiRoot, operationId, {
+            includeLockToken: acquired == null,
+          })}`;
         }
         throw error;
       }

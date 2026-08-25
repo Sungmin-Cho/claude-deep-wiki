@@ -13,7 +13,10 @@ deep-wiki의 주요 변경사항을 기록합니다.
 
 - `/wiki-setup`이 setup lifecycle event를 canonical `YYYY-MM-DDTHH:MM:SSZ` timestamp로 emit하므로, 문서화된 setup route가 더 이상 `MANIFEST_INVALID`로 실패하지 않습니다.
 - oversized leftover transaction directory가 더 이상 모든 runtime inspection을 영구 `DEADLINE_EXCEEDED`로 막지 않습니다. Reader는 `TRANSACTION_OVERSIZED`로 분류하고, lock-held writer는 내부를 건너뛰며, isolatable 이름은 트리를 삭제하지 않고 `transaction quarantine`으로 옮길 수 있습니다. SessionStart ensure, lint fix, transaction prune, transaction quarantine은 isolatable oversized tree를 자동으로 옮깁니다. 번들은 `.wiki-meta/.quarantine/`에 남고 자동 삭제하지 않습니다. 해결 후에는 모든 host를 중지한 뒤 번들을 수동으로 폐기합니다.
-- `transaction recover --wiki-root … --operation-id … --json`은 `--lock-token`이 없으면 self-locking이라 rollback quarantine `follow_up`을 바로 실행할 수 있습니다. 이미 lock을 보유한 호출자는 `--lock-token`을 계속 주입할 수 있습니다.
+- `transaction recover --wiki-root … --operation-id … --json`은 `--lock-token`이 없으면 self-locking이라 rollback quarantine `follow_up`을 바로 실행할 수 있습니다. 이미 lock을 보유한 호출자는 `--lock-token`을 계속 주입할 수 있습니다. self-acquire한 public recover가 `DEADLINE_EXCEEDED`를 만나면 token 없는 self-locking retry를 안내하고, `--lock-token` 힌트는 token을 주입한 내부 호출자에게만 남깁니다.
+- Reservation-only quarantine은 `.quarantine` 생성 직전과 이후 bundle·metadata·reservation mutation마다 `.prune-*` source가 여전히 없는지 다시 증명합니다. source가 다시 나타나면 `WIKI_STATE_FILESYSTEM`으로 실패하고 canonical source와 reservation은 그대로 둡니다.
+- Isolatable `TRANSACTION_OVERSIZED` 힌트는 실제 `scripts/wiki-runtime.js` 경로를 인용한 완전한 `node` 호출을 포함합니다. 직접 명령과 rollback 다단계 명령은 POSIX와 표시된 PowerShell에서 각각 독립적으로 복사할 수 있는 줄에 둡니다.
+- prune의 디렉터리별 pressure probe 실패(`EACCES`/`EIO` 등 non-ENOENT)는 누적된 `processed`, `removed`, `complete: false`, `skipped_oversized`를 담은 `terminal_prune`으로 전달되므로, lint repair가 유효한 lock 아래에서 residue를 persist/promote한 뒤 rethrow할 수 있습니다.
 
 ### 변경
 

@@ -1343,6 +1343,70 @@ test('rollback follow_up quotes a hostile wiki root and remains executable', (t)
   assert.equal(JSON.parse(status.stdout).locked, false);
 });
 
+function posixQuote(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
+function nodeCommandLines(text) {
+  return String(text).split('\n').map((line) => line.trim()).filter((line) => line.startsWith('node '));
+}
+
+test('oversizedHint emits a complete executable runtime command without a synthetic prefix', {
+  skip: process.platform === 'win32' ? 'POSIX exact-command execution; win32 label covered by the platform-mock tests' : false,
+}, (t) => {
+  const probe = spawnSync('bash', ['-c', 'echo ok'], { encoding: 'utf8' });
+  if (probe.status !== 0) { t.skip('bash unavailable for exact-command execution'); return; }
+  const { oversizedHint } = require('../scripts/wiki-runtime.js');
+  const root = fixture('deep wiki oversized hint exec ');
+  const isolatableName = `scan-window-ensure-${'ab'.repeat(20)}`;
+  fs.mkdirSync(path.join(root, '.wiki-meta', '.transactions', isolatableName), { recursive: true });
+  fs.writeFileSync(path.join(root, '.wiki-meta', '.transactions', isolatableName, 'journal.json'), '{}\n');
+  const hint = oversizedHint({
+    code: 'TRANSACTION_OVERSIZED',
+    operationId: isolatableName,
+    wikiRoot: root,
+  });
+  const quotedRuntime = posixQuote(cli);
+  assert.match(hint, /TRANSACTION_OVERSIZED is isolatable\. Run:\nnode /);
+  const commands = nodeCommandLines(hint);
+  assert.equal(commands.length, 1, hint);
+  assert.ok(commands[0].startsWith(`node ${quotedRuntime} transaction quarantine `), commands[0]);
+  const executed = spawnSync('bash', ['-c', commands[0]], { encoding: 'utf8' });
+  assert.notEqual(executed.status, 127, executed.stderr);
+  assert.equal(executed.status, 0, executed.stderr);
+  const payload = JSON.parse(executed.stdout);
+  assert.equal(payload.status, 'quarantined');
+});
+
+test('oversizedHint rollback commands are independently copyable complete runtime invocations', {
+  skip: process.platform === 'win32' ? 'POSIX exact-command execution; win32 label covered by the platform-mock tests' : false,
+}, (t) => {
+  const probe = spawnSync('bash', ['-c', 'echo ok'], { encoding: 'utf8' });
+  if (probe.status !== 0) { t.skip('bash unavailable for exact-command execution'); return; }
+  const { oversizedHint } = require('../scripts/wiki-runtime.js');
+  const root = fixture('deep wiki oversized rollback hint exec ');
+  const rollbackName = `rollback-${OPERATION_ID}`;
+  fs.mkdirSync(path.join(root, '.wiki-meta', '.transactions', rollbackName), { recursive: true });
+  fs.writeFileSync(path.join(root, '.wiki-meta', '.transactions', rollbackName, 'journal.json'), '{}\n');
+  const hint = oversizedHint({
+    code: 'TRANSACTION_OVERSIZED',
+    operationId: rollbackName,
+    wikiRoot: root,
+  });
+  const quotedRuntime = posixQuote(cli);
+  assert.match(hint, /rollback remnant/);
+  const commands = nodeCommandLines(hint);
+  assert.equal(commands.length, 2, hint);
+  assert.ok(commands[0].startsWith(`node ${quotedRuntime} transaction quarantine `), commands[0]);
+  assert.ok(commands[1].startsWith(`node ${quotedRuntime} transaction recover `), commands[1]);
+  assert.equal(commands[1].includes('--lock-token'), false, commands[1]);
+  const quarantined = spawnSync('bash', ['-c', commands[0]], { encoding: 'utf8' });
+  assert.notEqual(quarantined.status, 127, quarantined.stderr);
+  assert.equal(quarantined.status, 0, quarantined.stderr);
+  const recovered = spawnSync('bash', ['-c', commands[1]], { encoding: 'utf8' });
+  assert.notEqual(recovered.status, 127, recovered.stderr);
+});
+
 test('oversizedHint renders a PowerShell-safe literal on win32 for adversarial characters', () => {
   const { oversizedHint } = require('../scripts/wiki-runtime.js');
   const originalDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
@@ -1419,6 +1483,78 @@ test('shellQuote (Windows) round-trips through a real PowerShell when available'
   const result = spawnSync(shell, ['-NoProfile', '-Command', script], { encoding: 'utf8' });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout.trim(), decodePowershellSingleQuoted(wikiRootToken));
+});
+
+test('tokenless recover DEADLINE_EXCEEDED emits a self-locking retry and releases the lock', {
+  skip: process.platform === 'win32' ? 'POSIX hint-label assertion; win32 label covered by the platform-mock tests' : false,
+}, () => {
+  const { main } = require('../scripts/wiki-runtime.js');
+  const wikiRuntimeState = require('../hooks/scripts/runtime/wiki-state.js');
+  const { DeadlineExceeded } = require('../hooks/scripts/runtime/deadline.js');
+  const root = fixture('deep wiki tokenless recover deadline ');
+  const originalRecover = wikiRuntimeState.recoverTransaction;
+  const originalWrite = process.stderr.write;
+  const chunks = [];
+  wikiRuntimeState.recoverTransaction = () => {
+    throw new DeadlineExceeded('transaction-recover');
+  };
+  process.stderr.write = (chunk) => { chunks.push(chunk); return true; };
+  let exitCode;
+  try {
+    exitCode = main([
+      'transaction', 'recover', '--wiki-root', root, '--operation-id', OPERATION_ID, '--json',
+    ]);
+  } finally {
+    wikiRuntimeState.recoverTransaction = originalRecover;
+    process.stderr.write = originalWrite;
+  }
+  assert.equal(exitCode, 5);
+  const stderr = chunks.join('');
+  assert.match(stderr, /DEADLINE_EXCEEDED/);
+  assert.match(stderr, /resume with:\nnode scripts\/wiki-runtime\.js transaction recover /);
+  assert.doesNotMatch(stderr, /--lock-token/);
+  assert.match(stderr, new RegExp(`--wiki-root '${root.replace(/'/g, "'\\\\''")}'`));
+  assert.match(stderr, new RegExp(`--operation-id '${OPERATION_ID}'`));
+  assert.equal(fs.existsSync(path.join(root, '.wiki-meta', '.wiki-lock')), false);
+});
+
+test('token-injected recover DEADLINE_EXCEEDED keeps the lock-token hint and leaves the lock held', {
+  skip: process.platform === 'win32' ? 'POSIX hint-label assertion; win32 label covered by the platform-mock tests' : false,
+}, () => {
+  const { main } = require('../scripts/wiki-runtime.js');
+  const wikiRuntimeState = require('../hooks/scripts/runtime/wiki-state.js');
+  const { DeadlineExceeded } = require('../hooks/scripts/runtime/deadline.js');
+  const root = fixture('deep wiki injected recover deadline ');
+  const owner = acquireLock({ wikiRoot: root, operation: 'injected-recover-deadline', now: new Date(TS) });
+  const originalRecover = wikiRuntimeState.recoverTransaction;
+  const originalWrite = process.stderr.write;
+  const chunks = [];
+  wikiRuntimeState.recoverTransaction = () => {
+    throw new DeadlineExceeded('transaction-recover');
+  };
+  process.stderr.write = (chunk) => { chunks.push(chunk); return true; };
+  let exitCode;
+  try {
+    exitCode = main([
+      'transaction', 'recover',
+      '--wiki-root', root,
+      '--lock-token', owner.token,
+      '--operation-id', OPERATION_ID,
+      '--json',
+    ]);
+  } finally {
+    wikiRuntimeState.recoverTransaction = originalRecover;
+    process.stderr.write = originalWrite;
+  }
+  try {
+    assert.equal(exitCode, 5);
+    const stderr = chunks.join('');
+    assert.match(stderr, /DEADLINE_EXCEEDED/);
+    assert.match(stderr, /--lock-token <token>/);
+    assert.equal(fs.existsSync(path.join(root, '.wiki-meta', '.wiki-lock')), true);
+  } finally {
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
 });
 
 test('commit at a pre-activation deadline instructs a plain rerun instead of an unusable recover hint', { skip: process.platform === 'win32' ? 'POSIX hint-label assertion; win32 label covered by the platform-mock tests' : false }, () => {

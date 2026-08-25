@@ -2281,10 +2281,15 @@ function pruneScanWindowTransactions(options = {}) {
     } else continue;
     if (kind !== 'directory') continue;
     if (entry.name === excludeOperationId) continue;
-    const pressure = inspectPressure(path.join(transactions, entry.name), {
-      deadline,
-      allowEnumeration: false,
-    });
+    let pressure;
+    try {
+      pressure = inspectPressure(path.join(transactions, entry.name), {
+        deadline,
+        allowEnumeration: false,
+      });
+    } catch (error) {
+      throwWithTerminalPrune(error);
+    }
     if (pressure.oversized) {
       skippedOversized.push(entry.name);
       continue;

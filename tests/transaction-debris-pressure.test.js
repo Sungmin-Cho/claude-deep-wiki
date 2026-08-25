@@ -2561,6 +2561,102 @@ test('lint fix persists oversized .activate-* residue instead of returning fixed
   assert.equal(fs.existsSync(path.join(root, '.wiki-meta', '.wiki-lock')), false);
 });
 
+function restoreReservationOnlySource(root, pair, journal) {
+  const sourcePath = seedStoreDirectory(root, pair.pruneName);
+  fs.writeFileSync(path.join(sourcePath, 'journal.json'), journal);
+  return sourcePath;
+}
+
+function assertReservationOnlySourceReappearanceUntouched(
+  root, pair, firstBundle, reservationBytes, sourceJournal,
+) {
+  const sourcePath = path.join(storePath(root), pair.pruneName);
+  assert.equal(fs.existsSync(sourcePath), true);
+  assert.deepEqual(fs.readFileSync(path.join(sourcePath, 'journal.json')), sourceJournal);
+  assert.equal(fs.existsSync(pair.reservation), true);
+  assert.deepEqual(fs.readFileSync(pair.reservation), reservationBytes);
+  const marker = debris.readMaintenanceMarker(root);
+  const complete = (marker && marker.quarantine_bundles || []).filter((record) => record.state === 'complete');
+  assert.equal(complete.length, 1, JSON.stringify(marker));
+  assert.equal(complete[0].bundle, firstBundle);
+  assert.equal(complete[0].state, 'complete');
+  const inventory = debris.listQuarantineBundleNames(root, { deadline: deadline() });
+  for (const bundle of inventory.bundles) {
+    if (bundle === firstBundle) continue;
+    const bundleDir = path.join(markerFixture.quarantinePath(root), bundle);
+    assert.equal(fs.existsSync(path.join(bundleDir, 'reservation')), false);
+    assert.equal(fs.existsSync(path.join(bundleDir, 'tree')), false);
+  }
+}
+
+test('quarantineStoreEntry reservation-only path fail-closes source reappearance at before-root-mkdir', () => {
+  const root = wikiFixture();
+  const pair = seedPrunePair(root, 'c5');
+  const reservationBytes = fs.readFileSync(pair.reservation);
+  const sourceJournal = fs.readFileSync(path.join(storePath(root), pair.pruneName, 'journal.json'));
+  withLock(root, (token) => {
+    const first = quarantine(root, token, pair.pruneName);
+    assert.equal(first.status, 'quarantined');
+    fs.writeFileSync(pair.reservation, reservationBytes);
+    const sourcePath = path.join(storePath(root), pair.pruneName);
+    assert.throws(
+      () => quarantine(root, token, pair.pruneName, quarantineIdentityOptions({
+        randomUUID: () => '01234567-89ab-cdef-0123-456789abcde4',
+        faultInjector(boundary) {
+          if (boundary === 'before-root-mkdir') {
+            restoreReservationOnlySource(root, pair, sourceJournal);
+          }
+        },
+      })),
+      (error) => error.code === 'WIKI_STATE_FILESYSTEM',
+    );
+    assertReservationOnlySourceReappearanceUntouched(
+      root, pair, first.bundle, reservationBytes, sourceJournal,
+    );
+    assert.equal(fs.existsSync(sourcePath), true);
+    const secondBundle = predictedBundleName({
+      uuid: '01234567-89ab-cdef-0123-456789abcde4',
+    });
+    assert.equal(
+      fs.existsSync(path.join(markerFixture.quarantinePath(root), secondBundle)),
+      false,
+    );
+  });
+});
+
+test('quarantineStoreEntry reservation-only path fail-closes source reappearance at later seams', () => {
+  const seams = [
+    ['before-bundle-mkdir', 'b6'],
+    ['before-meta-write', 'b7'],
+    ['before-reservation-rename', 'b8'],
+  ];
+  for (const [boundary, seed] of seams) {
+    const root = wikiFixture();
+    const pair = seedPrunePair(root, seed);
+    const reservationBytes = fs.readFileSync(pair.reservation);
+    const sourceJournal = fs.readFileSync(path.join(storePath(root), pair.pruneName, 'journal.json'));
+    withLock(root, (token) => {
+      const first = quarantine(root, token, pair.pruneName);
+      assert.equal(first.status, 'quarantined');
+      fs.writeFileSync(pair.reservation, reservationBytes);
+      assert.throws(
+        () => quarantine(root, token, pair.pruneName, quarantineIdentityOptions({
+          randomUUID: () => '01234567-89ab-cdef-0123-456789abcde5',
+          faultInjector(name) {
+            if (name === boundary) {
+              restoreReservationOnlySource(root, pair, sourceJournal);
+            }
+          },
+        })),
+        (error) => error.code === 'WIKI_STATE_FILESYSTEM',
+      );
+      assertReservationOnlySourceReappearanceUntouched(
+        root, pair, first.bundle, reservationBytes, sourceJournal,
+      );
+    });
+  }
+});
+
 test('lint fix retains oversized residue when tail prune fails after discovery', () => {
   const root = lintableWikiFixture();
   const name = '.activate-oversized-first';
@@ -2603,5 +2699,52 @@ test('lint fix retains oversized residue when tail prune fails after discovery',
   const marker = debris.readMaintenanceMarker(root);
   assert.ok(marker, 'maintenance marker should retain oversized residue after the later fault');
   assert.ok(marker.skipped_oversized.includes(name), JSON.stringify(marker));
+  assert.equal(fs.existsSync(path.join(root, '.wiki-meta', '.wiki-lock')), false);
+});
+
+test('lint fix retains oversized residue when a later pressure probe throws EACCES/EIO', () => {
+  const root = lintableWikiFixture();
+  const firstName = '.activate-oversized-first';
+  const secondName = '.activate-second-probe';
+  const firstDir = path.join(storePath(root), firstName);
+  const secondDir = path.join(storePath(root), secondName);
+  fs.mkdirSync(firstDir, { recursive: true });
+  fs.mkdirSync(secondDir, { recursive: true });
+  fillOversizedTier1Subdirs(firstDir);
+  fillOversizedTier1Subdirs(secondDir);
+  const original = scanWindow.pruneScanWindowTransactions;
+  scanWindow.pruneScanWindowTransactions = (request) => original({
+    ...request,
+    inspectDirectoryPressure: request.resumableOnly
+      ? request.inspectDirectoryPressure
+      : (pathname, options) => {
+        if (path.basename(pathname) === secondName) {
+          throw Object.assign(new Error('EIO: second pressure probe'), { code: 'EIO' });
+        }
+        return debris.inspectDirectoryPressure(pathname, options);
+      },
+  });
+  try {
+    assert.throws(
+      () => wikiState.fixWiki({ wikiRoot: root, now: new Date('2026-08-25T00:00:00Z') }),
+      (error) => {
+        assert.equal(error.code, 'LINT_MAINTENANCE_FAILED_AFTER_COMMIT');
+        assert.ok(error.terminal_prune, JSON.stringify(error));
+        assert.equal(error.terminal_prune.complete, false);
+        assert.ok(Array.isArray(error.terminal_prune.removed));
+        assert.equal(typeof error.terminal_prune.processed, 'number');
+        assert.ok(
+          error.terminal_prune.skipped_oversized.includes(firstName),
+          JSON.stringify(error.terminal_prune),
+        );
+        return true;
+      },
+    );
+  } finally {
+    scanWindow.pruneScanWindowTransactions = original;
+  }
+  const marker = debris.readMaintenanceMarker(root);
+  assert.ok(marker, 'maintenance marker should persist oversized residue after a later probe fault');
+  assert.ok(marker.skipped_oversized.includes(firstName), JSON.stringify(marker));
   assert.equal(fs.existsSync(path.join(root, '.wiki-meta', '.wiki-lock')), false);
 });

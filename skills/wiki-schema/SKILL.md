@@ -29,6 +29,8 @@ WIKI_ROOT/
     .transaction-receipts/OPERATION_ID.json
     .pending-scan
     .last-scan
+    .quarantine/
+    .runtime/scan-window-maintenance.json
 ```
 
 Pages and source provenance are authoritative. `.wiki-meta/index.json`,

@@ -15,6 +15,8 @@ runtime_authority:
     receipt: .wiki-meta/.transaction-receipts/<operation_id>.json
     recovery_command: transaction recover
     terminal_prune_command: transaction prune
+    transaction_quarantine_command: transaction quarantine
+    terminal_prune_skipped_oversized_field: skipped_oversized
     terminal_prune_scope: validated-cleaned-scan-window-only
     terminal_prune_bounded: true
     terminal_prune_completion_field: complete

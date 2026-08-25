@@ -48,6 +48,16 @@ intervention before generic transaction cleanup mutates a sibling.
 {"executable":"node","argv":["<plugin_root>/scripts/wiki-runtime.js","lint","fix","--wiki-root","ABSOLUTE_WIKI_ROOT","--json"]}
 ```
 
+The JSON result also carries `skipped_oversized` on prune-family results and, on
+`lint inspect`, informational `maintenance_residue` (isolation bundles and
+maintenance events). `maintenance_residue` does not flip `ok`. Isolated
+oversized trees live under `.wiki-meta/.quarantine/` and are never auto-deleted.
+
+If inspection fails with `TRANSACTION_OVERSIZED`, follow the class-specific
+guidance: isolatable scan-window and `.prune-*` names use
+`transaction quarantine`; `rollback-<ULID>` needs quarantine then recover of the
+external ULID; a pure ULID is stopped-host / authenticated-backup only.
+
 The JSON result also carries `removed_junk` — the OS/sync-client metadata files this invocation
 reclaimed from the transaction store — and `removed_junk_complete`. Rerun while
 `removed_junk_complete` is `false`: recognized metadata remains, either because one bounded pass
@@ -102,4 +112,11 @@ same-host liveness validation.
 <!-- deep-wiki:exec -->
 ```deep-wiki-exec
 {"executable":"node","argv":["<plugin_root>/scripts/wiki-runtime.js","lock","recover","--wiki-root","ABSOLUTE_WIKI_ROOT","--stale-ms","300000","--json"]}
+```
+
+To isolate an oversized store entry without deleting it:
+
+<!-- deep-wiki:exec -->
+```deep-wiki-exec
+{"executable":"node","argv":["<plugin_root>/scripts/wiki-runtime.js","transaction","quarantine","--wiki-root","ABSOLUTE_WIKI_ROOT","--operation-id","OPERATION_ID","--json"]}
 ```

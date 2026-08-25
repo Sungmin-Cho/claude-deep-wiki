@@ -18,8 +18,19 @@ WIKI_ROOT/
     ├── .transactions/            recoverable per-operation journals
     ├── .transaction-receipts/    terminal operation receipts
     ├── .pending-scan              pending detection window
-    └── .last-scan                 monotonic committed window
+    ├── .last-scan                 monotonic committed window
+    ├── .quarantine/               oversized-transaction isolation bundles
+    └── .runtime/scan-window-maintenance.json
+                                   engine-owned durable maintenance marker
 ```
+
+Three different "quarantine" areas exist and must not be confused:
+
+1. Terminal-prune quarantine: `<store>/.prune-*` directories created by `pruneScanWindowTransactions`.
+2. Transaction quarantine bundles: `.wiki-meta/.quarantine/<stamp>-<pid>-<uuid>/` created by `transaction quarantine` for oversized store entries. Bundles are never auto-deleted.
+3. Inbox quarantine: `.wiki-meta/.inbox/.quarantine/` used by `cleanupInbox`.
+
+The only file the engine creates under `.wiki-meta/.runtime` and intentionally leaves after ordinary cleanup is `scan-window-maintenance.json`. Authenticated partial setup may keep that directory when it contains exactly that marker or is empty.
 
 Regular OS-metadata files in content catalogs (`pages/`, `.wiki-meta/sources/`, and `.wiki-meta/.versions/`) are skipped by readers and reported in `ignored_os_metadata`; content-catalog files are never deleted or reclaimed. Junk-named symlinks, directories, and entries whose type cannot be resolved remain fail-closed. `removed_junk` remains transaction-store-only.
 
@@ -115,7 +126,10 @@ non-regular representation remains a recovery condition and is never followed
 or removed.
 Repeat the command while `complete` is `false` to traverse more than one bounded
 pass. `complete: true` means every entry listed for that pass was inspected; it
-does not claim that ambiguous entries were removed.
+does not claim that ambiguous entries were removed. Prune also reports
+`skipped_oversized` for store directories that D1 classified as oversized
+without entering them. `lint inspect` exposes the same class plus isolation
+history as informational `maintenance_residue` without flipping `ok`.
 Ensure deletion additionally requires strict marker authority. Exact canonical
 UTC-Z plus LF, one-link regular non-symlink marker files are accepted; lstat
 `ENOENT` alone is absent. Either initial-invalid marker suppresses every

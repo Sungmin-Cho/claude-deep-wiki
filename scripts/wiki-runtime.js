@@ -718,7 +718,10 @@ function oversizedHint(error) {
     }
     return `TRANSACTION_OVERSIZED is isolatable. Run transaction quarantine --wiki-root ${quotedRoot} --operation-id ${quotedName} --json`;
   }
-  return 'TRANSACTION_OVERSIZED for a pure ULID is not automatically isolatable; stop all hosts, restore filesystem readability, and if recover still cannot read the journal restore the authenticated backup.';
+  if (/^[0-9A-HJKMNP-TV-Z]{26}$/.test(name)) {
+    return 'TRANSACTION_OVERSIZED for a pure ULID is not automatically isolatable; stop all hosts, restore filesystem readability, and if recover still cannot read the journal restore the authenticated backup.';
+  }
+  return 'TRANSACTION_OVERSIZED is not automatically isolatable; stop all hosts, restore filesystem readability, then rerun.';
 }
 
 function runTransaction(argv) {

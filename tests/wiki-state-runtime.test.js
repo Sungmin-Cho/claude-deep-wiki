@@ -1247,8 +1247,18 @@ test('oversizedHint reuses the isolatable predicate and quotes every argv value'
     operationId: '.prune-oversized',
     wikiRoot: '/tmp/wiki',
   });
-  assert.match(pruneHint, /pure ULID is not automatically isolatable|not automatically isolatable/);
+  assert.match(pruneHint, /not automatically isolatable/);
+  assert.doesNotMatch(pruneHint, /pure ULID/);
   assert.equal(pruneHint.includes('transaction quarantine'), false);
+  const otherHint = runtime.oversizedHint({
+    code: 'TRANSACTION_OVERSIZED',
+    operationId: 'not-a-transaction',
+    wikiRoot: `/tmp/deep wiki; touch ${sentinel}`,
+  });
+  assert.match(otherHint, /not automatically isolatable/);
+  assert.doesNotMatch(otherHint, /pure ULID/);
+  assert.equal(otherHint.includes('transaction quarantine'), false);
+  assert.equal(fs.existsSync(sentinel), false);
 
   const rollbackHint = runtime.oversizedHint({
     code: 'TRANSACTION_OVERSIZED',

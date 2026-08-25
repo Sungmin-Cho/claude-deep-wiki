@@ -1097,6 +1097,23 @@ test('quarantineStoreEntry records rollback follow_up and bound wrappers share t
   });
 });
 
+test('wiki-state pre-entry gates refuse oversized leftover transaction directories', () => {
+  const root = wikiFixture();
+  const name = '01JZ7P9Q6MD7S5PB8H4Y40HJ83';
+  const directory = path.join(storePath(root), name);
+  fs.mkdirSync(directory, { recursive: true });
+  for (let index = 0; index < 600; index += 1) fs.writeFileSync(path.join(directory, `n${index}`), '');
+  fs.writeFileSync(path.join(directory, 'journal.json'), `${JSON.stringify({
+    engine: 'wiki-state',
+    manifest: { operation: 'setup' },
+    transitions: [],
+  })}\n`);
+  assert.throws(
+    () => wikiState.snapshotWiki({ wikiRoot: root }),
+    (error) => error.code === 'TRANSACTION_OVERSIZED' || error.code === 'TRANSACTION_RECOVERY_REQUIRED',
+  );
+});
+
 test('apply and recover fail fast on oversized self-id before journal read', () => {
   const root = wikiFixture();
   const operationId = `scan-window-ensure-${hex40('77')}`;

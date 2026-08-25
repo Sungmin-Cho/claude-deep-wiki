@@ -20,6 +20,8 @@ const scanWindow = require('./scan-window.js');
 const {
   sweepTransactionDebris, validateTombstoneV1, isReclaimableJunkEntry,
   assertTransactionStoreAnchored, quarantineStoreEntry: quarantineStoreEntryPrimitive,
+  inspectDirectoryPressure, resolveUnknownDirent, readMaintenanceMarker,
+  listQuarantineBundleNames,
 } = require('./transaction-debris.js');
 
 const { promotePendingScan } = scanWindow;
@@ -301,8 +303,24 @@ function readReceipt(locations, manifestHash) {
   return receipt;
 }
 
+function assertTransactionNotOversized(root, name, options = {}) {
+  const pathname = path.join(root, '.wiki-meta', '.transactions', name);
+  const pressure = (options.inspectDirectoryPressure || inspectDirectoryPressure)(pathname, {
+    deadline: options.deadline,
+    allowEnumeration: false,
+  });
+  if (!pressure.oversized) return pressure;
+  const error = stateError('TRANSACTION_OVERSIZED', `transaction directory ${name} is oversized`);
+  error.operationId = name;
+  error.estimatedEntries = pressure.estimatedEntries;
+  error.method = pressure.method;
+  error.wikiRoot = root;
+  throw error;
+}
+
 function compactReceiptTransaction(root, token, locations, receipt) {
   if (!fs.existsSync(locations.transaction)) return;
+  assertTransactionNotOversized(root, path.basename(locations.transaction));
   assertTransactionStoreAnchored(root);
   const journal = readJournal(locations.journal);
   if (!journal) {
@@ -915,6 +933,7 @@ function transactionCancelled(tombstone) {
 }
 
 function teardownCancelledTransaction(root, token, locations, tombstone, faultInjector) {
+  assertTransactionNotOversized(root, path.basename(locations.transaction));
   const assertOwner = () => assertLockOwner({ wikiRoot: root, token });
   for (const entry of fs.readdirSync(locations.transaction)) {
     if (entry === 'cancelled.json') continue;
@@ -964,6 +983,7 @@ function cancelTransaction(root, token, locations, journal, faultInjector, deadl
 }
 
 function cleanupTransaction(root, token, locations, journal, faultInjector) {
+  assertTransactionNotOversized(root, path.basename(locations.transaction));
   if (!journal.transitions.includes('cleaned')) {
     invokeFault(faultInjector, 'before-cleanup');
     assertLockOwner({ wikiRoot: root, token });
@@ -1300,6 +1320,7 @@ function interruptedSetupManifest(root) {
   for (const entry of entries) {
     if (entry.name.startsWith('.activate-')) continue;
     if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+    assertTransactionNotOversized(root, entry.name);
     const journal = readJournal(path.join(transactions, entry.name, 'journal.json'));
     if (journal?.engine === 'wiki-state' && journal.manifest?.operation === 'setup'
         && !journal.transitions?.includes('committed')) return journal.manifest;

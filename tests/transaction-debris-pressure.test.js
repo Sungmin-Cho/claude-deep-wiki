@@ -1832,3 +1832,228 @@ test('lint inspect prints a quoted isolatable oversizedHint and never mentions a
   }
   assert.doesNotMatch(spawned.stderr, /\$\(/);
 });
+
+function lintableWikiFixture() {
+  const root = wikiFixture();
+  fs.mkdirSync(path.join(root, 'pages'));
+  fs.mkdirSync(path.join(root, '.wiki-meta', 'sources'), { recursive: true });
+  fs.mkdirSync(path.join(root, '.wiki-meta', '.versions'));
+  fs.writeFileSync(path.join(root, 'log.jsonl'), '');
+  fs.writeFileSync(path.join(root, 'log.md'), '# Wiki Log\n');
+  fs.writeFileSync(path.join(root, 'index.md'), '# Wiki Index\n');
+  return root;
+}
+
+function withNtfsShapedStat(directories, fn) {
+  const original = fs.lstatSync;
+  const targets = new Set(directories.map((directory) => path.resolve(directory)));
+  fs.lstatSync = function lstatSync(pathname, options) {
+    const stat = original.call(fs, pathname, options);
+    if (!targets.has(path.resolve(String(pathname)))) return stat;
+    const bigint = Boolean(options && options.bigint);
+    return new Proxy(stat, {
+      get(target, property, receiver) {
+        if (property === 'nlink') return bigint ? 1n : 1;
+        if (property === 'size') return bigint ? 0n : 0;
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+  };
+  try { return fn(); }
+  finally { fs.lstatSync = original; }
+}
+
+function withReaddirOrder(directory, orderedNames, fn) {
+  const original = fs.readdirSync;
+  const resolved = path.resolve(directory);
+  fs.readdirSync = function readdirSync(target, options) {
+    const entries = original.call(fs, target, options);
+    if (path.resolve(String(target)) !== resolved || !Array.isArray(entries)) return entries;
+    const withTypes = Boolean(options && options.withFileTypes);
+    const rank = new Map(orderedNames.map((name, index) => [name, index]));
+    return [...entries].sort((left, right) => {
+      const leftName = withTypes ? left.name : left;
+      const rightName = withTypes ? right.name : right;
+      const leftRank = rank.has(leftName) ? rank.get(leftName) : orderedNames.length;
+      const rightRank = rank.has(rightName) ? rank.get(rightName) : orderedNames.length;
+      return leftRank - rightRank;
+    });
+  };
+  try { return fn(); }
+  finally { fs.readdirSync = original; }
+}
+
+test('fixWiki quarantines no-stat-signal isolatable oversized directories in one call', () => {
+  const root = lintableWikiFixture();
+  const first = `scan-window-ensure-${hex40('f1')}`;
+  const second = `scan-window-ensure-${hex40('f2')}`;
+  const firstDir = seedStoreDirectory(root, first);
+  const secondDir = seedStoreDirectory(root, second);
+  fillOversizedLiveEntries(firstDir);
+  fillOversizedLiveEntries(secondDir);
+  const ntfsFs = {
+    lstatSync() {
+      return { nlink: 1n, size: 0n, isDirectory: () => true, isSymbolicLink: () => false };
+    },
+    opendirSync: (...args) => fs.opendirSync(...args),
+  };
+  const noSignal = inspect(firstDir, { allowEnumeration: false, fs: ntfsFs });
+  assert.equal(noSignal.oversized, false);
+  const enumerated = inspect(firstDir, { allowEnumeration: true, fs: ntfsFs });
+  assert.equal(enumerated.oversized, true);
+  assert.equal(enumerated.method, 'enumeration');
+  assert.equal(enumerated.estimatedEntries, debris.PRESSURE_ENTRY_CAP + 1);
+
+  const result = withNtfsShapedStat([firstDir, secondDir], () => withReaddirOrder(
+    storePath(root),
+    [first, second],
+    () => wikiState.fixWiki({ wikiRoot: root, now: new Date('2026-08-25T00:00:00Z') }),
+  ));
+  assert.equal(result.status, 'fixed');
+  assert.equal(fs.existsSync(path.join(storePath(root), first)), false);
+  assert.equal(fs.existsSync(path.join(storePath(root), second)), false);
+  const inventory = debris.listQuarantineBundleNames(root, { deadline: deadline() });
+  assert.equal(inventory.count, 2);
+});
+
+test('fixWiki mixed no-signal isolatable and pure ULID preserves TRANSACTION_OVERSIZED', () => {
+  const root = lintableWikiFixture();
+  const isolatable = `scan-window-ensure-${hex40('f3')}`;
+  const ulid = '01JZ7P9Q6MD7S5PB8H4Y40HJ83';
+  const isolatableDir = seedStoreDirectory(root, isolatable);
+  const ulidDir = seedStoreDirectory(root, ulid);
+  fillOversizedLiveEntries(isolatableDir);
+  fillOversizedLiveEntries(ulidDir);
+  assert.throws(
+    () => withNtfsShapedStat([isolatableDir, ulidDir], () => withReaddirOrder(
+      storePath(root),
+      [isolatable, ulid],
+      () => wikiState.fixWiki({ wikiRoot: root, now: new Date('2026-08-25T00:00:00Z') }),
+    )),
+    (error) => error.code === 'TRANSACTION_OVERSIZED'
+      && error.operationId === ulid
+      && error.code !== 'WIKI_STATE_INVALID',
+  );
+  assert.equal(fs.existsSync(path.join(storePath(root), isolatable)), false);
+  assert.equal(fs.existsSync(path.join(storePath(root), ulid)), true);
+  const inventory = debris.listQuarantineBundleNames(root, { deadline: deadline() });
+  assert.equal(inventory.count, 1);
+});
+
+test('promoteOversizedNames treats K as an attempt cap and stops after a failing first attempt', () => {
+  const root = wikiFixture();
+  const first = `scan-window-ensure-${hex40('a1')}`;
+  const second = `scan-window-ensure-${hex40('a2')}`;
+  seedStoreDirectory(root, first);
+  seedStoreDirectory(root, second);
+  let attempts = 0;
+  let uuidSerial = 0;
+  withLock(root, (token) => {
+    const result = debris.promoteOversizedNames({
+      wikiRoot: root,
+      token,
+      names: [first, second],
+      parsePruneName,
+      limit: 1,
+      classification: { method: 'stat', estimated_entries: null },
+      reason: 'oversized',
+      now: new Date('2026-08-25T00:00:00Z'),
+      pid: '1',
+      randomUUID: () => {
+        uuidSerial += 1;
+        return `01234567-89ab-cdef-0123-456789abcde${uuidSerial}`;
+      },
+      faultInjector(boundary) {
+        if (boundary === 'before-rename') {
+          attempts += 1;
+          throw new Error('first-attempt-fail');
+        }
+      },
+    });
+    assert.equal(attempts, 1);
+    assert.equal(result.attempted, 1);
+    assert.deepEqual(result.promoted, []);
+    assert.deepEqual(result.skipped_oversized, [first, second]);
+    assert.equal(result.failures.length, 1);
+    assert.equal(result.failures[0].name, first);
+    assert.equal(fs.existsSync(path.join(storePath(root), first)), true);
+    assert.equal(fs.existsSync(path.join(storePath(root), second)), true);
+  });
+});
+
+test('promoteOversizedNames records a post-tree incomplete move instead of skipped source', () => {
+  const root = wikiFixture();
+  const name = `scan-window-ensure-${hex40('c1')}`;
+  seedStoreDirectory(root, name);
+  withLock(root, (token) => {
+    const result = debris.promoteOversizedNames({
+      wikiRoot: root,
+      token,
+      names: [name],
+      parsePruneName,
+      classification: { method: 'stat', estimated_entries: null },
+      reason: 'oversized',
+      now: new Date('2026-08-25T00:00:00Z'),
+      pid: '1',
+      randomUUID: () => '01234567-89ab-cdef-0123-456789abcdef',
+      faultInjector(boundary) {
+        if (boundary === 'after-tree-identity') throw new Error('post-tree-fail');
+      },
+    });
+    assert.equal(fs.existsSync(path.join(storePath(root), name)), false);
+    assert.equal(result.skipped_oversized.includes(name), false);
+    assert.equal(result.promoted.includes(name), false);
+    assert.equal(result.incomplete.length, 1);
+    assert.equal(result.incomplete[0].name, name);
+    assert.equal(result.incomplete[0].state, 'incomplete');
+    assert.equal(result.incomplete[0].committed, true);
+    const marker = debris.readMaintenanceMarker(root);
+    assert.equal(marker.skipped_oversized.includes(name), false);
+    assert.equal(marker.quarantine_bundles.length, 1);
+    assert.equal(marker.quarantine_bundles[0].state, 'incomplete');
+    assert.equal(marker.quarantine_bundles[0].source_name, name);
+    const inventory = debris.listQuarantineBundleNames(root, { deadline: deadline() });
+    assert.equal(inventory.bundles.includes(marker.quarantine_bundles[0].bundle), true);
+    const tree = path.join(markerFixture.quarantinePath(root), marker.quarantine_bundles[0].bundle, 'tree');
+    assert.equal(fs.existsSync(tree), true);
+  });
+});
+
+test('promoteOversizedNames with zero names does not create or rewrite .runtime', () => {
+  const emptyRoot = wikiFixture();
+  withLock(emptyRoot, (token) => {
+    const result = debris.promoteOversizedNames({
+      wikiRoot: emptyRoot,
+      token,
+      names: [],
+      parsePruneName,
+      classification: { method: 'stat', estimated_entries: null },
+      reason: 'oversized',
+      now: new Date('2026-08-25T00:00:00Z'),
+    });
+    assert.deepEqual(result.promoted, []);
+    assert.deepEqual(result.skipped_oversized, []);
+    assert.equal(fs.existsSync(markerFixture.runtimePath(emptyRoot)), false);
+    assert.equal(debris.readMaintenanceMarker(emptyRoot), null);
+  });
+
+  const seeded = wikiFixture();
+  withLock(seeded, (token) => {
+    debris.writeMaintenanceMarker(seeded, token, (marker) => {
+      marker.promoted.push(`scan-window-ensure-${hex40('ee')}`);
+      return marker;
+    }, { now: new Date('2026-08-25T00:00:00Z') });
+    const before = fs.readFileSync(markerFixture.markerPath(seeded));
+    debris.promoteOversizedNames({
+      wikiRoot: seeded,
+      token,
+      names: [],
+      parsePruneName,
+      classification: { method: 'stat', estimated_entries: null },
+      reason: 'oversized',
+      now: new Date('2026-08-25T01:00:00Z'),
+    });
+    assert.deepEqual(fs.readFileSync(markerFixture.markerPath(seeded)), before);
+  });
+});

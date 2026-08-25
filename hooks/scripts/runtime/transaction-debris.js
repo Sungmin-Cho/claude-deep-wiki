@@ -1126,6 +1126,24 @@ function followUpFor(name) {
   return `transaction recover --operation-id ${match[1]}`;
 }
 
+function attachIncompleteQuarantine(error, bundle, sourceName) {
+  if (error && typeof error === 'object') {
+    error.quarantine = {
+      committed: true,
+      state: 'incomplete',
+      bundle,
+      source_name: sourceName,
+    };
+  }
+  return error;
+}
+
+function isCommittedIncomplete(error) {
+  return Boolean(error && error.quarantine
+    && error.quarantine.committed === true
+    && error.quarantine.state === 'incomplete');
+}
+
 function directoryIdentity(pathname, label, fsImpl) {
   return physicalDirectoryIdentity(pathname, label, false, fsImpl);
 }
@@ -1310,7 +1328,7 @@ function quarantineStoreEntry(options = {}) {
         bundle, source_name: classified.sourceName, state: 'incomplete', at: canonicalUtcZ(now),
       }), { fs: fsImpl });
     } catch { /* inventory remains the source of truth */ }
-    throw error;
+    throw attachIncompleteQuarantine(error, bundle, classified.sourceName);
   }
 }
 
@@ -1397,6 +1415,7 @@ function resumeReservationOnly(context) {
           bundle, source_name: classified.sourceName, state: 'incomplete', at: canonicalUtcZ(now), resume: true,
         }), { fs: fsImpl });
       } catch { /* inventory remains the source of truth */ }
+      throw attachIncompleteQuarantine(error, bundle, classified.sourceName);
     }
     throw error;
   }
@@ -1413,7 +1432,10 @@ function promoteOversizedNames(options = {}) {
   const cap = options.limit === undefined ? QUARANTINE_PROMOTION_LIMIT : options.limit;
   const promoted = [];
   const remaining = [];
+  const incomplete = [];
   const failures = [];
+  const attemptedNames = [];
+  let attempted = 0;
   let telemetryError = null;
   const seen = new Set();
 
@@ -1430,10 +1452,12 @@ function promoteOversizedNames(options = {}) {
         throw error;
       }
     }
-    if (promoted.length >= cap || !isIsolatableStoreName(name, parsePruneName)) {
+    if (attempted >= cap || !isIsolatableStoreName(name, parsePruneName)) {
       remaining.push(name);
       continue;
     }
+    attempted += 1;
+    attemptedNames.push(name);
     try {
       quarantineStoreEntry({
         wikiRoot: root,
@@ -1449,6 +1473,17 @@ function promoteOversizedNames(options = {}) {
         faultInjector,
       });
     } catch (error) {
+      if (isCommittedIncomplete(error)) {
+        incomplete.push({
+          name,
+          bundle: error.quarantine.bundle,
+          state: 'incomplete',
+          committed: true,
+          code: error.code || 'QUARANTINE_INCOMPLETE',
+        });
+        failures.push({ name, code: error.code || 'QUARANTINE_INCOMPLETE' });
+        continue;
+      }
       remaining.push(name);
       failures.push({ name, code: error.code || 'PROMOTION_FAIL' });
       continue;
@@ -1460,16 +1495,36 @@ function promoteOversizedNames(options = {}) {
     }
   }
 
+  const result = {
+    promoted,
+    skipped_oversized: remaining,
+    incomplete,
+    failures,
+    attempted,
+    attempted_names: attemptedNames,
+    telemetry_error: telemetryError,
+  };
+  if (promoted.length === 0 && remaining.length === 0 && incomplete.length === 0
+      && failures.length === 0 && !telemetryError) {
+    return result;
+  }
+
   try {
     writeMaintenanceMarker(root, token, (marker) => {
       for (const name of promoted) {
         if (!marker.promoted.includes(name)) marker.promoted.push(name);
         marker.skipped_oversized = marker.skipped_oversized.filter((entry) => entry !== name);
       }
+      for (const item of incomplete) {
+        marker.skipped_oversized = marker.skipped_oversized.filter((entry) => entry !== item.name);
+        const code = String(item.code || 'QUARANTINE_INCOMPLETE').replace(/[^A-Z_]/g, '_') || 'QUARANTINE_INCOMPLETE';
+        marker.prune_failures.push({ code, at: canonicalUtcZ(options.now || new Date()) });
+      }
       for (const name of remaining) {
         if (!marker.skipped_oversized.includes(name)) marker.skipped_oversized.push(name);
       }
       for (const failure of failures) {
+        if (incomplete.some((item) => item.name === failure.name)) continue;
         const code = String(failure.code || 'PROMOTION_FAIL').replace(/[^A-Z_]/g, '_') || 'PROMOTION_FAIL';
         marker.prune_failures.push({ code, at: canonicalUtcZ(options.now || new Date()) });
       }
@@ -1483,6 +1538,7 @@ function promoteOversizedNames(options = {}) {
     }, { fs: options.fs });
   } catch (error) {
     telemetryError = telemetryError || error.code || error.message || 'PROMOTION_TELEMETRY';
+    result.telemetry_error = telemetryError;
     try {
       writeMaintenanceMarker(root, token, (marker) => {
         marker.prune_failures.push({
@@ -1494,12 +1550,7 @@ function promoteOversizedNames(options = {}) {
     } catch { /* held lock; caller still sees telemetry_error */ }
   }
 
-  return {
-    promoted,
-    skipped_oversized: remaining,
-    failures,
-    telemetry_error: telemetryError,
-  };
+  return result;
 }
 
 module.exports = {

@@ -22,6 +22,7 @@ const {
   assertTransactionStoreAnchored, quarantineStoreEntry: quarantineStoreEntryPrimitive,
   inspectDirectoryPressure, resolveUnknownDirent, readMaintenanceMarker,
   listQuarantineBundleNames, isIsolatableStoreName, promoteOversizedNames,
+  QUARANTINE_PROMOTION_LIMIT,
 } = require('./transaction-debris.js');
 
 const { promotePendingScan } = scanWindow;
@@ -1731,38 +1732,62 @@ function fixWiki(options = {}) {
     } catch (initial) {
       if (initial.code === 'TRANSACTION_OVERSIZED') {
         const store = path.join(root, '.wiki-meta', '.transactions');
-        let entries = [];
-        try { entries = fs.readdirSync(store, { withFileTypes: true }); }
-        catch { throw initial; }
-        const names = [];
-        for (const entry of entries) {
-          if (deadline) {
-            try { assertBeforeDeadline(deadline, `lint-fix-oversized:${entry.name}`); }
-            catch (error) {
-              if (error.code === 'DEADLINE_EXCEEDED') break;
-              throw error;
-            }
+        const parsePruneName = scanWindow.operationIdFromPruneName;
+        const tried = new Set();
+        let remainingAttempts = QUARANTINE_PROMOTION_LIMIT;
+        let current = initial;
+        for (;;) {
+          if (remainingAttempts <= 0) throw current;
+          const names = [];
+          if (typeof current.operationId === 'string'
+              && !tried.has(current.operationId)
+              && isIsolatableStoreName(current.operationId, parsePruneName)) {
+            names.push(current.operationId);
           }
-          if (!isIsolatableStoreName(entry.name, scanWindow.operationIdFromPruneName)) continue;
-          const pressure = inspectDirectoryPressure(path.join(store, entry.name), {
+          let entries = [];
+          try { entries = fs.readdirSync(store, { withFileTypes: true }); }
+          catch { throw current; }
+          for (const entry of entries) {
+            if (deadline) {
+              try { assertBeforeDeadline(deadline, `lint-fix-oversized:${entry.name}`); }
+              catch (error) {
+                if (error.code === 'DEADLINE_EXCEEDED') break;
+                throw error;
+              }
+            }
+            if (tried.has(entry.name) || names.includes(entry.name)) continue;
+            if (!isIsolatableStoreName(entry.name, parsePruneName)) continue;
+            const pressure = inspectDirectoryPressure(path.join(store, entry.name), {
+              deadline,
+              allowEnumeration: false,
+            });
+            if (pressure.oversized) names.push(entry.name);
+          }
+          if (names.length === 0) throw current;
+          const promotion = promoteOversizedNames({
+            wikiRoot: root,
+            token: owner.token,
+            names,
+            parsePruneName,
+            classification: {
+              method: current.method || 'stat',
+              estimated_entries: current.estimatedEntries ?? null,
+            },
+            reason: 'oversized',
             deadline,
-            allowEnumeration: false,
+            limit: remainingAttempts,
           });
-          if (pressure.oversized) names.push(entry.name);
+          remainingAttempts -= promotion.attempted || 0;
+          for (const name of promotion.attempted_names || []) tried.add(name);
+          if ((promotion.attempted || 0) === 0) throw current;
+          try {
+            before = inspectWiki({ wikiRoot: root, deadline });
+            break;
+          } catch (retry) {
+            if (retry.code !== 'TRANSACTION_OVERSIZED') throw retry;
+            current = retry;
+          }
         }
-        promoteOversizedNames({
-          wikiRoot: root,
-          token: owner.token,
-          names,
-          parsePruneName: scanWindow.operationIdFromPruneName,
-          classification: {
-            method: initial.method || 'stat',
-            estimated_entries: initial.estimatedEntries ?? null,
-          },
-          reason: 'oversized',
-          deadline,
-        });
-        before = inspectWiki({ wikiRoot: root, deadline });
       } else if (initial.code !== 'TRANSACTION_RECOVERY_REQUIRED') throw initial;
       else {
       try {

@@ -1812,6 +1812,7 @@ function applyScanWindowTransition(options = {}) {
   assertPersistenceDeadline(options.deadline, 'transaction-entry');
   const adapter = adapterFor(physicalRoot, operationId, options.journalAdapter);
   const control = adapter[DEFAULT_ADAPTER_CONTROL];
+  let skippedOversized = [];
   if (control) {
     const assertOwner = () => assertLockOwner({ wikiRoot: physicalRoot, token });
     const maintenanceDeadline = options.deadline
@@ -1822,10 +1823,25 @@ function applyScanWindowTransition(options = {}) {
       deadline: maintenanceDeadline,
     });
     control.prepareDebrisSweep(assertOwner);
-    sweepTransactionDebris(physicalRoot, token, {
+    const debrisReport = sweepTransactionDebris(physicalRoot, token, {
       deadline: maintenanceDeadline,
       classes: ['activation', 'plain', 'junk'],
+      inspectDirectoryPressure: options.inspectDirectoryPressure,
     });
+    skippedOversized = [...(debrisReport.skipped_oversized || [])];
+  }
+  const selfPath = path.join(physicalRoot, '.wiki-meta', '.transactions', operationId);
+  const selfPressure = (options.inspectDirectoryPressure || inspectDirectoryPressure)(selfPath, {
+    deadline: options.deadline,
+    allowEnumeration: false,
+  });
+  if (selfPressure.oversized) {
+    const error = scanError('TRANSACTION_OVERSIZED', `scan-window transaction ${operationId} is oversized`);
+    error.operationId = operationId;
+    error.estimatedEntries = selfPressure.estimatedEntries;
+    error.method = selfPressure.method;
+    error.wikiRoot = physicalRoot;
+    throw error;
   }
   const transactionOptions = { ...options, wikiRoot: physicalRoot, token };
   let journal = adapter.readJournal();
@@ -1860,7 +1876,9 @@ function applyScanWindowTransition(options = {}) {
   }
   const cleaned = journal.transitions.includes('cleaned');
   verifyDestinationStates(adapter, journal, cleaned);
-  if (cleaned) return { status: journal.result_status, operationId, journal };
+  if (cleaned) {
+    return { status: journal.result_status, operationId, journal, maintenance: { skipped_oversized: skippedOversized } };
+  }
   stageTransaction(adapter, journal, transactionOptions);
   verifyStages(adapter, journal);
   applyDestination(adapter, journal, transactionOptions, 'last');
@@ -1870,13 +1888,26 @@ function applyScanWindowTransition(options = {}) {
   invokeFault(options.faultInjector, 'after-scan-window-committed');
   assertPersistenceDeadline(options.deadline, 'scan-window-committed:after-fault');
   cleanTransaction(adapter, journal, transactionOptions);
-  return { status: journal.result_status, operationId, journal };
+  return { status: journal.result_status, operationId, journal, maintenance: { skipped_oversized: skippedOversized } };
 }
 
 function recoverScanWindowTransaction(options = {}) {
   const physicalRoot = physicalWikiRoot(options.wikiRoot);
   const operationId = validateOperationId(options.operationId);
   assertLockOwner({ wikiRoot: physicalRoot, token: options.token });
+  const recoverPath = path.join(physicalRoot, '.wiki-meta', '.transactions', operationId);
+  const recoverPressure = (options.inspectDirectoryPressure || inspectDirectoryPressure)(recoverPath, {
+    deadline: options.deadline,
+    allowEnumeration: false,
+  });
+  if (recoverPressure.oversized) {
+    const error = scanError('TRANSACTION_OVERSIZED', `scan-window transaction ${operationId} is oversized`);
+    error.operationId = operationId;
+    error.estimatedEntries = recoverPressure.estimatedEntries;
+    error.method = recoverPressure.method;
+    error.wikiRoot = physicalRoot;
+    throw error;
+  }
   const adapter = adapterFor(physicalRoot, operationId, options.journalAdapter);
   const journal = validateJournal(adapter.readJournal(), operationId, physicalRoot);
   return applyScanWindowTransition({
@@ -2694,6 +2725,7 @@ function promotePendingScan(options = {}) {
     operationId,
     lastScan: timestampFromBytes(lastBytes),
     pendingPreserved: pendingBytes !== null,
+    maintenance: applied.maintenance || { skipped_oversized: [] },
   };
 }
 

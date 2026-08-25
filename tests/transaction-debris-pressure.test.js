@@ -1097,6 +1097,36 @@ test('quarantineStoreEntry records rollback follow_up and bound wrappers share t
   });
 });
 
+test('apply and recover fail fast on oversized self-id before journal read', () => {
+  const root = wikiFixture();
+  const operationId = `scan-window-ensure-${hex40('77')}`;
+  seedStoreDirectory(root, operationId);
+  withLock(root, (token) => {
+    const inspect = () => ({ oversized: true, method: 'stat', estimatedEntries: 700 });
+    assert.throws(
+      () => scanWindow.applyScanWindowTransition({
+        wikiRoot: root,
+        token,
+        operationId,
+        plan: scanWindow.planScanWindowTransition({ wikiRoot: root, kind: 'ensure', proposed: '2026-08-25T00:00:00Z' }),
+        inspectDirectoryPressure: inspect,
+        deadline: deadline(),
+      }),
+      (error) => error.code === 'TRANSACTION_OVERSIZED' && error.wikiRoot === root,
+    );
+    assert.throws(
+      () => scanWindow.recoverScanWindowTransaction({
+        wikiRoot: root,
+        token,
+        operationId,
+        inspectDirectoryPressure: inspect,
+        deadline: deadline(),
+      }),
+      (error) => error.code === 'TRANSACTION_OVERSIZED' && error.operationId === operationId,
+    );
+  });
+});
+
 test('prune reports oversized directories in skipped_oversized without journal lookup', () => {
   const root = wikiFixture();
   fs.mkdirSync(storePath(root), { recursive: true });

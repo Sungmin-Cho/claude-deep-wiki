@@ -60,7 +60,7 @@ linters iterate that map, so a skill missing from it is never argv-validated by 
 `<plugin_root>/tests/plugin-contract.test.js` pins fourteen phrases drawn from the bullets below across
 `README.md`, this file, `CONTRIBUTING.md` and `SECURITY.md` (with a Korean mirror in
 `README.ko.md`). That covers the load-bearing wording, not every clause: the
-version-specific detail — `contract_version` 2, the 1.8 → 1.7.1 and 1.9 → 1.8.2 pairs, the
+version-specific detail — `contract_version` 2, the 1.8 → 1.7.1, 1.9 → 1.8.2 and 1.10 → 1.9.x pairs, the
 Windows plugin-root pre-expansion — is asserted by **no doc test**, so the prose can rot
 even while the behaviour holds (`<plugin_root>/tests/wiki-state-runtime.test.js` does pin the journal's
 `contract_version`). Change any of it only when the evidence changes.
@@ -83,8 +83,10 @@ even while the behaviour holds (`<plugin_root>/tests/wiki-state-runtime.test.js`
   OS-level no-egress certification.
 - Rollback is a backup-only downgrade: stop all hosts, let the current version finish
   recovery, restore the authenticated pre-upgrade backup, then start the older one
-  (1.8 → 1.7.1, 1.9 → 1.8.2). A 1.9 in-flight journal uses `contract_version` 2, which
+  (1.8 → 1.7.1, 1.9 → 1.8.2, 1.10 → 1.9.x). A 1.9 in-flight journal uses `contract_version` 2, which
   1.8.x cannot recover, so an interrupted 1.9 commit must be completed with 1.9 first.
+  A post-1.10 rollback is likewise backup-only: stop all hosts, let 1.10 finish
+  recovery, restore the authenticated pre-upgrade backup, then start 1.9.x.
 
 ## Conventions
 

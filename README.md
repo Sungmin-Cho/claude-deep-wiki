@@ -276,7 +276,8 @@ Ingest deep-work session reports into the wiki:
   downgrade before starting 1.7.1. The same applies to 1.9: after a 1.9 write,
   recover with 1.9 while stopped, restore the authenticated pre-upgrade backup,
   then start 1.8.2 — a 1.9 in-flight journal (`contract_version` 2) cannot be
-  recovered by 1.8.x.
+  recovered by 1.8.x. After a 1.10 write, recover with 1.10 while stopped,
+  restore the authenticated pre-upgrade backup, then start 1.9.x.
 
 ## Philosophy
 

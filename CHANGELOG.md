@@ -7,14 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.0] — 2026-08-25 (oversized transaction isolation)
+
 ### Fixed
 
 - `/wiki-setup` now emits its setup lifecycle event with the canonical `YYYY-MM-DDTHH:MM:SSZ` timestamp, so the documented setup route no longer fails with `MANIFEST_INVALID`.
+- An oversized leftover transaction directory no longer wedges every runtime inspection with a permanent `DEADLINE_EXCEEDED`. Readers classify it as `TRANSACTION_OVERSIZED`, lock-held writers skip the interior, and isolatable names can be moved with `transaction quarantine` without deleting the tree.
 
 ### Changed
 
 - `auto_ingest` policy now lives in `<wiki_root>/.wiki-meta/.config.json`; `/wiki-setup` and SessionStart create it by migrating an equivalent global YAML block. `/wiki-setup` also creates `~/.deep-wiki-setup-authority.json` and `~/.deep-wiki-setup.reserve/`. Divergent local/legacy policy and representative invalid local config shapes now fail closed.
 - Operator docs now describe the bootstrap/legacy YAML alias, `CONFIG_CONFLICT` and `CONFIG_INVALID` recovery boundaries, stopped-host direct edits, divergent physical homes, explicit rebind, and backup-only downgrade safety.
+- Lint inspect reports isolation history in informational `maintenance_residue` without flipping `ok`. Partial setup accepts `.quarantine` and a validated engine-owned `.runtime/scan-window-maintenance.json`.
 
 ## [1.9.7] — 2026-08-05 (content metadata and nested prune safety)
 

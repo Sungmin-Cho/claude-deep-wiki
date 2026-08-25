@@ -7,14 +7,18 @@ deep-wiki의 주요 변경사항을 기록합니다.
 
 ## [Unreleased]
 
+## [1.10.0] — 2026-08-25 (oversized 트랜잭션 격리)
+
 ### 수정
 
 - `/wiki-setup`이 setup lifecycle event를 canonical `YYYY-MM-DDTHH:MM:SSZ` timestamp로 emit하므로, 문서화된 setup route가 더 이상 `MANIFEST_INVALID`로 실패하지 않습니다.
+- oversized leftover transaction directory가 더 이상 모든 runtime inspection을 영구 `DEADLINE_EXCEEDED`로 막지 않습니다. Reader는 `TRANSACTION_OVERSIZED`로 분류하고, lock-held writer는 내부를 건너뛰며, isolatable 이름은 트리를 삭제하지 않고 `transaction quarantine`으로 옮길 수 있습니다.
 
 ### 변경
 
 - `auto_ingest` policy는 이제 `<wiki_root>/.wiki-meta/.config.json`에 저장됩니다. `/wiki-setup`과 SessionStart가 동등한 global YAML block을 migration해 생성합니다. `/wiki-setup`은 `~/.deep-wiki-setup-authority.json`와 `~/.deep-wiki-setup.reserve/`도 생성합니다. divergent local/legacy policy와 대표 invalid local config shape는 fail closed합니다.
 - Operator 문서는 bootstrap/legacy YAML alias, `CONFIG_CONFLICT` 및 `CONFIG_INVALID` recovery boundary, stopped-host direct edit, divergent physical home, explicit rebind, backup-only downgrade safety를 설명합니다.
+- lint inspect는 isolation 이력을 informational `maintenance_residue`로 보고하며 `ok`를 뒤집지 않습니다. Partial setup은 `.quarantine`과 검증된 engine-owned `.runtime/scan-window-maintenance.json`을 허용합니다.
 
 ## [1.9.7] — 2026-08-05 (콘텐츠 메타데이터 및 중첩 prune 안전성)
 

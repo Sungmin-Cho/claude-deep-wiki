@@ -45,6 +45,8 @@ files**:
   Windows 11, arbitrary-user-machine, or OS-level no-egress certification.
 - After any 1.8 write, a backup-only downgrade is required: stop all hosts, recover
   with 1.8, restore the authenticated pre-upgrade backup, then start 1.7.1.
+- After any 1.10 write, a backup-only downgrade is required: stop all hosts, recover
+  with 1.10, restore the authenticated pre-upgrade backup, then start 1.9.x.
 
 When reporting, please indicate which runtime (Claude Code or Codex) and the affected
 version.

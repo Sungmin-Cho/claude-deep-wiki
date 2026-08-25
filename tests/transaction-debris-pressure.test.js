@@ -903,6 +903,20 @@ function seedStoreDirectory(root, name) {
   return directory;
 }
 
+function fillOversizedLiveEntries(directory) {
+  const count = debris.PRESSURE_ENTRY_CAP + 1;
+  for (let index = 0; index < count; index += 1) {
+    fs.writeFileSync(path.join(directory, `e${String(index).padStart(5, '0')}`), '');
+  }
+}
+
+function fillOversizedTier1Subdirs(directory) {
+  const count = debris.PRESSURE_NLINK_THRESHOLD + 1;
+  for (let index = 0; index < count; index += 1) {
+    fs.mkdirSync(path.join(directory, `d${String(index).padStart(4, '0')}`));
+  }
+}
+
 function parsePruneName(name) {
   return scanWindow.operationIdFromPruneName(name);
 }
@@ -1143,7 +1157,7 @@ test('inspectWiki classifies oversized non-prune directories before reading jour
   const name = `scan-window-ensure-${hex40('88')}`;
   seedStoreDirectory(root, name);
   const directory = path.join(storePath(root), name);
-  for (let index = 0; index < 600; index += 1) fs.writeFileSync(path.join(directory, `x${index}`), '');
+  fillOversizedLiveEntries(directory);
   assert.throws(
     () => wikiState.inspectWiki({ wikiRoot: root }),
     (error) => error.code === 'TRANSACTION_OVERSIZED'
@@ -1157,7 +1171,7 @@ test('wiki-state pre-entry gates refuse oversized leftover transaction directori
   const name = '01JZ7P9Q6MD7S5PB8H4Y40HJ83';
   const directory = path.join(storePath(root), name);
   fs.mkdirSync(directory, { recursive: true });
-  for (let index = 0; index < 600; index += 1) fs.writeFileSync(path.join(directory, `n${index}`), '');
+  fillOversizedTier1Subdirs(directory);
   fs.writeFileSync(path.join(directory, 'journal.json'), `${JSON.stringify({
     engine: 'wiki-state',
     manifest: { operation: 'setup' },

@@ -1314,8 +1314,8 @@ test('rollback quarantine follow_up is a self-locking recover that snapshot can 
   assert.match(payload.follow_up, /--wiki-root/);
   assert.doesNotMatch(payload.follow_up, /--lock-token/);
 
-  const recovered = spawnSync(process.execPath, [cli, ...payload.follow_up_argv], {
-    encoding: 'utf8', shell: false,
+  const recovered = spawnSync('bash', ['-c', payload.follow_up], {
+    cwd: os.tmpdir(), encoding: 'utf8', shell: false,
   });
   assert.equal(recovered.status, 0, recovered.stderr);
 
@@ -1345,13 +1345,13 @@ test('rollback follow_up quotes a hostile wiki root and remains executable', (t)
   ], { encoding: 'utf8', shell: false });
   assert.equal(quarantined.status, 0, quarantined.stderr);
   const payload = JSON.parse(quarantined.stdout);
-  const argv = shellArgvAfterPrefix(payload.follow_up, 'node scripts/wiki-runtime.js transaction recover ');
+  const argv = shellArgvAfterPrefix(payload.follow_up, `node ${posixQuote(cli)} transaction recover `);
   assert.equal(argAfterFlag(argv, '--wiki-root'), path.resolve(root));
   assert.equal(argAfterFlag(argv, '--operation-id'), OPERATION_ID);
   assert.equal(argv.includes('--lock-token'), false);
 
-  const recovered = spawnSync(process.execPath, [cli, ...payload.follow_up_argv], {
-    encoding: 'utf8', shell: false,
+  const recovered = spawnSync('bash', ['-c', payload.follow_up], {
+    cwd: os.tmpdir(), encoding: 'utf8', shell: false,
   });
   assert.equal(recovered.status, 0, recovered.stderr);
   const snapshot = spawnSync(process.execPath, [
@@ -1466,6 +1466,7 @@ test('rollback follow_up is labeled (PowerShell) on win32 and round-trips quotin
   try {
     const command = debris.followUpRecoverCommand('C:\\Deep Wiki & evil "quoted"', OPERATION_ID);
     assert.match(command, /\(PowerShell\)/);
+    assert.ok(command.includes(`node '${cli.replace(/'/g, "''")}' transaction recover `), command);
     const argv = debris.followUpRecoverArgv('C:\\Deep Wiki & evil "quoted"', OPERATION_ID);
     assert.deepEqual(argv, [
       'transaction', 'recover',

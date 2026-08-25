@@ -1159,7 +1159,8 @@ function followUpRecoverArgv(wikiRoot, operationId) {
 function renderFollowUpCommand(argv) {
   const root = argv[argv.indexOf('--wiki-root') + 1];
   const operationId = argv[argv.indexOf('--operation-id') + 1];
-  const command = `node scripts/wiki-runtime.js transaction recover --wiki-root ${shellQuote(root)} --operation-id ${shellQuote(operationId)} --json`;
+  const runtime = path.resolve(__dirname, '../../../scripts/wiki-runtime.js');
+  const command = `node ${shellQuote(runtime)} transaction recover --wiki-root ${shellQuote(root)} --operation-id ${shellQuote(operationId)} --json`;
   if (process.platform === 'win32') return `resume with (PowerShell):\n${command}`;
   return command;
 }

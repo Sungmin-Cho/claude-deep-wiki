@@ -3,11 +3,22 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
-const { remainingMs } = require('./deadline.js');
+const { assertBeforeDeadline, remainingMs } = require('./deadline.js');
 const { readMaybe, stateError } = require('./fs-safe.js');
 const { assertLockOwner } = require('./lock.js');
 
 const SWEEP_RESERVE_MS = 10_000;
+// Threshold principle: ≥100× a healthy store entry (~9 children) and ≤1/10 of
+// the observed 65k-entry pathology. Size uses 48 bytes/dirent so cap × 48 =
+// 196608 (pathology 2,097,120 is 1/10.67). nlink 512 is 512× a traditional
+// Unix dir (nlink ~2); APFS reports nlink = 2 + file count, so a healthy
+// 9-file dir is still nlink ~11 and cap+1 already exceeds 512 — that is a
+// usable tier-1 signal, not a false positive. Option overrides exist for
+// tests; four-platform CI may revise the constants, not the principle.
+const PRESSURE_ENTRY_CAP = 4096;
+const PRESSURE_SIZE_THRESHOLD = 196608;
+const PRESSURE_NLINK_THRESHOLD = 512;
+const PRESSURE_BYTES_PER_ENTRY = 48n;
 const FILE_TYPE_MASK = 0o170000n;
 const DIRECTORY_TYPE = 0o040000n;
 const ULID_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/;
@@ -48,6 +59,94 @@ function isTransactionStoreJunkName(name) {
 // unrecognized entry: it is refused, never followed and never removed. This predicate is shared
 // by lock-free catalog readers and the transaction-store sweep; `true` authorizes classification,
 // not removal anywhere outside .wiki-meta/.transactions/.
+function toBigInt(value) {
+  if (typeof value === 'bigint') return value;
+  if (typeof value === 'number' && Number.isSafeInteger(value)) return BigInt(value);
+  throw new TypeError('directory pressure stat fields must be integers');
+}
+
+function inspectDirectoryPressure(pathname, options = {}) {
+  const fsImpl = options.fs || fs;
+  const entryCap = options.entryCap === undefined ? PRESSURE_ENTRY_CAP : options.entryCap;
+  const sizeThreshold = toBigInt(options.sizeThreshold === undefined
+    ? PRESSURE_SIZE_THRESHOLD : options.sizeThreshold);
+  const nlinkThreshold = toBigInt(options.nlinkThreshold === undefined
+    ? PRESSURE_NLINK_THRESHOLD : options.nlinkThreshold);
+  const allowEnumeration = options.allowEnumeration === true;
+  const { deadline } = options;
+
+  let stat;
+  try {
+    stat = fsImpl.lstatSync(pathname, { bigint: true });
+  } catch (error) {
+    if (error.code === 'ENOENT') return { oversized: false, method: 'none', estimatedEntries: null };
+    throw stateError('WIKI_STATE_FILESYSTEM', 'directory pressure identity is unavailable', error);
+  }
+
+  const size = toBigInt(stat.size);
+  const nlink = toBigInt(stat.nlink);
+  const sizeHit = size > sizeThreshold;
+  const nlinkHit = nlink > nlinkThreshold;
+  if (sizeHit || nlinkHit) {
+    return {
+      oversized: true,
+      method: 'stat',
+      estimatedEntries: sizeHit ? Number(size / PRESSURE_BYTES_PER_ENTRY) : Number(nlink),
+    };
+  }
+
+  if (!allowEnumeration) return { oversized: false, method: 'none', estimatedEntries: null };
+
+  let dir;
+  try {
+    dir = fsImpl.opendirSync(pathname);
+  } catch (error) {
+    if (error.code === 'ENOENT') return { oversized: false, method: 'none', estimatedEntries: null };
+    throw stateError('WIKI_STATE_FILESYSTEM', 'directory pressure identity is unavailable', error);
+  }
+
+  let count = 0;
+  try {
+    for (;;) {
+      const entry = dir.readSync();
+      if (entry === null) break;
+      assertBeforeDeadline(deadline, `directory-pressure:${pathname}`);
+      count += 1;
+      if (count > entryCap) break;
+    }
+  } finally {
+    try { dir.closeSync(); } catch { /* preserve the primary error */ }
+  }
+
+  return {
+    oversized: count > entryCap,
+    method: 'enumeration',
+    estimatedEntries: count,
+  };
+}
+
+function direntTypeUnknown(entry) {
+  return !entry.isFile() && !entry.isDirectory() && !entry.isSymbolicLink()
+    && !entry.isBlockDevice() && !entry.isCharacterDevice()
+    && !entry.isFIFO() && !entry.isSocket();
+}
+
+function kindFromStat(stat) {
+  if (stat.isSymbolicLink()) return 'symlink';
+  if (stat.isDirectory()) return 'directory';
+  return 'other';
+}
+
+function resolveUnknownDirent(directory, entry, fsImpl = fs) {
+  if (entry.isSymbolicLink()) return { kind: 'symlink' };
+  if (entry.isDirectory()) return { kind: 'directory' };
+  if (!direntTypeUnknown(entry)) return { kind: 'other' };
+  let stat;
+  try { stat = fsImpl.lstatSync(path.join(directory, entry.name)); }
+  catch { return { kind: 'unresolved' }; }
+  return { kind: kindFromStat(stat) };
+}
+
 function isReclaimableJunkEntry(entry, directory = null) {
   if (!isTransactionStoreJunkName(entry.name)) return false;
   if (entry.isFile() && !entry.isSymbolicLink()) return true;
@@ -375,7 +474,12 @@ function assertTransactionStoreAnchored(root) {
 
 module.exports = {
   SWEEP_RESERVE_MS,
+  PRESSURE_ENTRY_CAP,
+  PRESSURE_SIZE_THRESHOLD,
+  PRESSURE_NLINK_THRESHOLD,
   assertTransactionStoreAnchored,
+  inspectDirectoryPressure,
+  resolveUnknownDirent,
   validateTombstoneV1,
   sweepTransactionDebris,
   isTransactionStoreJunkName,

@@ -351,19 +351,50 @@ function inspectTransactions(root, allowedOperationId = null, deadline = operati
   for (const entry of entries) {
     assertBeforeDeadline(deadline, `wiki-state:inspect-transaction:${entry.name}`);
     if (entry.name.startsWith('.activate-') && entry.isDirectory() && !entry.isSymbolicLink()) continue;
-    if (!entry.isDirectory() || entry.isSymbolicLink()) {
+    let kind;
+    if (entry.isSymbolicLink()) kind = 'symlink';
+    else if (entry.isDirectory()) kind = 'directory';
+    else if (!entry.isFile() && !entry.isBlockDevice() && !entry.isCharacterDevice()
+        && !entry.isFIFO() && !entry.isSocket()) {
+      kind = resolveUnknownDirent(directory, entry).kind;
+    } else kind = 'other';
+    if (kind !== 'directory') {
       // Recognized OS/sync-client metadata is inert debris, not lost transaction state. Readers
       // run lock-free and cannot remove it; the lock-held debris sweep reclaims it.
       if (isReclaimableJunkEntry(entry, directory)) continue;
       throw stateError('TRANSACTION_RECOVERY_REQUIRED', 'transaction store contains a non-directory entry');
     }
+    const transaction = path.join(directory, entry.name);
     if (entry.name.startsWith('.prune-')) {
+      const prunePressure = inspectDirectoryPressure(transaction, {
+        deadline,
+        allowEnumeration: false,
+      });
+      if (prunePressure.oversized) {
+        const error = stateError('TRANSACTION_OVERSIZED', `transaction directory ${entry.name} is oversized`);
+        error.operationId = entry.name;
+        error.estimatedEntries = prunePressure.estimatedEntries;
+        error.method = prunePressure.method;
+        error.wikiRoot = root;
+        throw error;
+      }
       throw stateError(
         'TRANSACTION_RECOVERY_REQUIRED',
         'a terminal scan-window prune quarantine requires recovery; run wiki-lint --fix, and if it makes no progress stop all hosts and follow the stopped-host procedure',
       );
     }
-    const transaction = path.join(directory, entry.name);
+    const livePressure = inspectDirectoryPressure(transaction, {
+      deadline,
+      allowEnumeration: true,
+    });
+    if (livePressure.oversized) {
+      const error = stateError('TRANSACTION_OVERSIZED', `transaction directory ${entry.name} is oversized`);
+      error.operationId = entry.name;
+      error.estimatedEntries = livePressure.estimatedEntries;
+      error.method = livePressure.method;
+      error.wikiRoot = root;
+      throw error;
+    }
     const journalPath = path.join(transaction, 'journal.json');
     let journal;
     try { journal = readJournal(journalPath); }

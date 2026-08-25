@@ -1097,6 +1097,20 @@ test('quarantineStoreEntry records rollback follow_up and bound wrappers share t
   });
 });
 
+test('inspectWiki classifies oversized non-prune directories before reading journals', () => {
+  const root = wikiFixture();
+  const name = `scan-window-ensure-${hex40('88')}`;
+  seedStoreDirectory(root, name);
+  const directory = path.join(storePath(root), name);
+  for (let index = 0; index < 600; index += 1) fs.writeFileSync(path.join(directory, `x${index}`), '');
+  assert.throws(
+    () => wikiState.inspectWiki({ wikiRoot: root }),
+    (error) => error.code === 'TRANSACTION_OVERSIZED'
+      && error.operationId === name
+      && error.wikiRoot === root,
+  );
+});
+
 test('wiki-state pre-entry gates refuse oversized leftover transaction directories', () => {
   const root = wikiFixture();
   const name = '01JZ7P9Q6MD7S5PB8H4Y40HJ83';

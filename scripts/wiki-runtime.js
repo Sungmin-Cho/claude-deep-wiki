@@ -707,13 +707,16 @@ function quarantineStoreEntry(options = {}) {
 function oversizedHint(error) {
   const name = error.operationId || '';
   const root = error.wikiRoot;
-  const isolatable = /^(?:scan-window-ensure-[0-9a-f]{40}|scan-window-cli-[0-9a-f]{40}|lint-repair-[0-9a-f]{40}|rollback-[0-9A-HJKMNP-TV-Z]{26}|\.prune-)/.test(name);
+  const { isIsolatableStoreName } = require(path.join(runtimeRoot, 'transaction-debris.js'));
+  const isolatable = isIsolatableStoreName(name, scanWindow.operationIdFromPruneName);
   const rollback = /^rollback-([0-9A-HJKMNP-TV-Z]{26})$/.exec(name);
-  if (rollback && root) {
-    return `TRANSACTION_OVERSIZED is isolatable as a rollback remnant. Isolate it with transaction quarantine --wiki-root ${root} --operation-id ${name} --json, then transaction recover --operation-id ${rollback[1]}.`;
-  }
   if (isolatable && root) {
-    return `TRANSACTION_OVERSIZED is isolatable. Run transaction quarantine --wiki-root ${root} --operation-id ${name} --json`;
+    const quotedRoot = shellQuote(path.resolve(root));
+    const quotedName = shellQuote(name);
+    if (rollback) {
+      return `TRANSACTION_OVERSIZED is isolatable as a rollback remnant. Isolate it with transaction quarantine --wiki-root ${quotedRoot} --operation-id ${quotedName} --json, then transaction recover --operation-id ${shellQuote(rollback[1])}.`;
+    }
+    return `TRANSACTION_OVERSIZED is isolatable. Run transaction quarantine --wiki-root ${quotedRoot} --operation-id ${quotedName} --json`;
   }
   return 'TRANSACTION_OVERSIZED for a pure ULID is not automatically isolatable; stop all hosts, restore filesystem readability, and if recover still cannot read the journal restore the authenticated backup.';
 }
@@ -758,29 +761,31 @@ function runTransaction(argv) {
     }
     const token = requireFlag(flags, '--lock-token');
     const wikiRoot = flags['--wiki-root'];
+    const deadline = createDeadline({ budgetMs: 12_000 });
     const pruneResult = scanWindow.pruneScanWindowTransactions({
       wikiRoot,
       token,
       maxAgeDays,
       limit: 64,
-      deadline: createDeadline({ budgetMs: 12_000 }),
+      deadline,
     });
     const skipped = pruneResult.skipped_oversized || [];
-    let promoted = 0;
-    for (const name of skipped) {
-      if (promoted >= 8) break;
-      try {
-        scanWindow.quarantineStoreEntry({
-          wikiRoot,
-          token,
-          name,
-          classification: { method: 'stat', estimated_entries: null },
-          reason: 'oversized',
-        });
-        promoted += 1;
-      } catch { /* demote to leftover skipped_oversized */ }
-    }
-    emit(pruneResult);
+    const promotion = scanWindow.promoteOversizedNames({
+      wikiRoot,
+      token,
+      names: skipped,
+      classification: { method: 'stat', estimated_entries: null },
+      reason: 'oversized',
+      deadline,
+      limit: 8,
+    });
+    emit({
+      ...pruneResult,
+      skipped_oversized: promotion.skipped_oversized,
+      promoted: promotion.promoted,
+      promotion_failures: promotion.failures,
+      telemetry_error: promotion.telemetry_error || undefined,
+    });
     return;
   }
   if (command === 'recover') {
@@ -925,6 +930,7 @@ module.exports = {
   main,
   recoverHint,
   commitRetryHint,
+  oversizedHint,
   cleanupRuntimeManifests,
   runSnapshotWorker,
   quarantineStoreEntry,

@@ -24,6 +24,7 @@ const {
   inspectDirectoryPressure,
   resolveUnknownDirent,
   writeMaintenanceMarker,
+  promoteOversizedNames: promoteOversizedNamesPrimitive,
 } = require('./transaction-debris.js');
 
 const sleepArray = new Int32Array(new SharedArrayBuffer(4));
@@ -2169,12 +2170,16 @@ function pruneScanWindowTransactions(options = {}) {
   const skippedOversized = [];
   const inspectPressure = options.inspectDirectoryPressure || inspectDirectoryPressure;
   for (const entry of entries) {
-    if (removed.length + nestedJunkAttempts.attempts >= limit
-        || remainingMs(deadline) < PRUNE_RESERVE_MS) {
+    if (remainingMs(deadline) < PRUNE_RESERVE_MS) {
       complete = false;
       break;
     }
+    const atMutationLimit = removed.length + nestedJunkAttempts.attempts >= limit;
     if (entry.isFile()) {
+      if (atMutationLimit) {
+        complete = false;
+        continue;
+      }
       const reservation = path.join(transactions, entry.name);
       let reservationIdentity;
       let reservationBytes;
@@ -2279,6 +2284,10 @@ function pruneScanWindowTransactions(options = {}) {
     });
     if (pressure.oversized) {
       skippedOversized.push(entry.name);
+      continue;
+    }
+    if (atMutationLimit) {
+      complete = false;
       continue;
     }
     if (entry.name.startsWith('.prune-')) {
@@ -2723,33 +2732,16 @@ function ensurePendingScan(options = {}) {
       ...((applied.maintenance && applied.maintenance.skipped_oversized) || []),
       ...(pruneResult.skipped_oversized || []),
     ];
-    const attempted = new Set();
-    let promoted = 0;
-    for (const name of skipped) {
-      if (promoted >= AUTOMATIC_PRUNE_LIMIT || attempted.has(name)) continue;
-      attempted.add(name);
-      try {
-        quarantineStoreEntry({
-          wikiRoot: physicalRoot,
-          token: owner.token,
-          name,
-          classification: { method: 'stat', estimated_entries: null },
-          reason: 'oversized',
-        });
-        promoted += 1;
-        writeMaintenanceMarker(physicalRoot, owner.token, (marker) => {
-          marker.promoted.push(name);
-          return marker;
-        });
-      } catch {
-        try {
-          writeMaintenanceMarker(physicalRoot, owner.token, (marker) => {
-            if (!marker.skipped_oversized.includes(name)) marker.skipped_oversized.push(name);
-            return marker;
-          });
-        } catch { /* marker is best-effort */ }
-      }
-    }
+    promoteOversizedNamesPrimitive({
+      wikiRoot: physicalRoot,
+      token: owner.token,
+      names: skipped,
+      parsePruneName: operationIdFromPruneName,
+      classification: { method: 'stat', estimated_entries: null },
+      reason: 'oversized',
+      deadline: options.deadline,
+      limit: AUTOMATIC_PRUNE_LIMIT,
+    });
   } catch (error) {
     result = { status: 'deferred', reason: error.code || 'SCAN_WINDOW_FILESYSTEM' };
   } finally {
@@ -2801,12 +2793,20 @@ function quarantineStoreEntry(options = {}) {
   });
 }
 
+function promoteOversizedNames(options = {}) {
+  return promoteOversizedNamesPrimitive({
+    ...options,
+    parsePruneName: options.parsePruneName || operationIdFromPruneName,
+  });
+}
+
 module.exports = {
   assertPruneTransactionNamesSupported,
   ensurePendingScan,
   inspectPruneMarkers,
   operationIdFromPruneName,
   promotePendingScan,
+  promoteOversizedNames,
   pruneScanWindowTransactions,
   recoverScanWindowTransaction,
   planScanWindowTransition,

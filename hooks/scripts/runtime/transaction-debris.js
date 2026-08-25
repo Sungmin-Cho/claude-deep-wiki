@@ -31,6 +31,7 @@ const MAINTENANCE_MARKER_MAX_BYTES = 65536;
 const MAINTENANCE_MARKER_BASENAME = 'scan-window-maintenance.json';
 const QUARANTINE_BUNDLE_NAME_RE = /^[0-9]{8}T[0-9]{6}Z-[0-9]{1,10}-[0-9a-f]{32}$/;
 const QUARANTINE_INVENTORY_DISPLAY_LIMIT = 64;
+const QUARANTINE_PROMOTION_LIMIT = 8;
 const QUARANTINE_BUNDLE_CAP = 64;
 const PROMOTED_CAP = 32;
 const SKIPPED_OVERSIZED_CAP = 32;
@@ -530,6 +531,13 @@ function sweepTransactionDebris(root, token, options = {}) {
     else if (direntTypeUnknown(entry)) kind = resolveUnknownDirent(transactions, entry, options.fs || fs).kind;
     else continue;
     if (kind !== 'directory') continue;
+    if (deadline) {
+      try { assertBeforeDeadline(deadline, `debris-pressure:${entry.name}`); }
+      catch (error) {
+        if (error.code === 'DEADLINE_EXCEEDED') break;
+        throw error;
+      }
+    }
     const transaction = path.join(transactions, entry.name);
     const pressure = inspectPressure(transaction, {
       deadline,
@@ -1062,6 +1070,16 @@ function listQuarantineBundleNames(root, options = {}) {
   };
 }
 
+function isIsolatableStoreName(name, parsePruneName) {
+  try {
+    classifyQuarantineName(name, parsePruneName);
+    return true;
+  } catch (error) {
+    if (error.code === 'WIKI_STATE_INVALID' || error.code === 'SCAN_WINDOW_INVALID') return false;
+    throw error;
+  }
+}
+
 function classifyQuarantineName(name, parsePruneName) {
   if (typeof name !== 'string' || name.length === 0 || path.basename(name) !== name) {
     throw stateError('WIKI_STATE_INVALID', 'quarantine target name is invalid');
@@ -1384,6 +1402,106 @@ function resumeReservationOnly(context) {
   }
 }
 
+function promoteOversizedNames(options = {}) {
+  const root = options.wikiRoot;
+  const token = options.token;
+  const names = Array.isArray(options.names) ? options.names : [];
+  const parsePruneName = options.parsePruneName;
+  const classification = options.classification || { method: 'stat', estimated_entries: null };
+  const reason = options.reason === 'operator' ? 'operator' : 'oversized';
+  const { deadline, faultInjector } = options;
+  const cap = options.limit === undefined ? QUARANTINE_PROMOTION_LIMIT : options.limit;
+  const promoted = [];
+  const remaining = [];
+  const failures = [];
+  let telemetryError = null;
+  const seen = new Set();
+
+  for (const name of names) {
+    if (typeof name !== 'string' || seen.has(name)) continue;
+    seen.add(name);
+    if (deadline) {
+      try { assertBeforeDeadline(deadline, `quarantine-promote:${name}`); }
+      catch (error) {
+        if (error.code === 'DEADLINE_EXCEEDED') {
+          remaining.push(name);
+          continue;
+        }
+        throw error;
+      }
+    }
+    if (promoted.length >= cap || !isIsolatableStoreName(name, parsePruneName)) {
+      remaining.push(name);
+      continue;
+    }
+    try {
+      quarantineStoreEntry({
+        wikiRoot: root,
+        token,
+        name,
+        parsePruneName,
+        classification,
+        reason,
+        now: options.now,
+        pid: options.pid,
+        randomUUID: options.randomUUID,
+        fs: options.fs,
+        faultInjector,
+      });
+    } catch (error) {
+      remaining.push(name);
+      failures.push({ name, code: error.code || 'PROMOTION_FAIL' });
+      continue;
+    }
+    promoted.push(name);
+    try { invokeMarkerFault(faultInjector, 'after-promote-move'); }
+    catch (error) {
+      telemetryError = error.message || error.code || 'PROMOTION_TELEMETRY';
+    }
+  }
+
+  try {
+    writeMaintenanceMarker(root, token, (marker) => {
+      for (const name of promoted) {
+        if (!marker.promoted.includes(name)) marker.promoted.push(name);
+        marker.skipped_oversized = marker.skipped_oversized.filter((entry) => entry !== name);
+      }
+      for (const name of remaining) {
+        if (!marker.skipped_oversized.includes(name)) marker.skipped_oversized.push(name);
+      }
+      for (const failure of failures) {
+        const code = String(failure.code || 'PROMOTION_FAIL').replace(/[^A-Z_]/g, '_') || 'PROMOTION_FAIL';
+        marker.prune_failures.push({ code, at: canonicalUtcZ(options.now || new Date()) });
+      }
+      if (telemetryError) {
+        marker.prune_failures.push({
+          code: 'PROMOTION_TELEMETRY',
+          at: canonicalUtcZ(options.now || new Date()),
+        });
+      }
+      return marker;
+    }, { fs: options.fs });
+  } catch (error) {
+    telemetryError = telemetryError || error.code || error.message || 'PROMOTION_TELEMETRY';
+    try {
+      writeMaintenanceMarker(root, token, (marker) => {
+        marker.prune_failures.push({
+          code: 'PROMOTION_TELEMETRY',
+          at: canonicalUtcZ(options.now || new Date()),
+        });
+        return marker;
+      }, { fs: options.fs });
+    } catch { /* held lock; caller still sees telemetry_error */ }
+  }
+
+  return {
+    promoted,
+    skipped_oversized: remaining,
+    failures,
+    telemetry_error: telemetryError,
+  };
+}
+
 module.exports = {
   SWEEP_RESERVE_MS,
   PRESSURE_ENTRY_CAP,
@@ -1391,6 +1509,7 @@ module.exports = {
   PRESSURE_NLINK_THRESHOLD,
   MAINTENANCE_MARKER_MAX_BYTES,
   QUARANTINE_BUNDLE_NAME_RE,
+  QUARANTINE_PROMOTION_LIMIT,
   assertTransactionStoreAnchored,
   inspectDirectoryPressure,
   resolveUnknownDirent,
@@ -1399,6 +1518,8 @@ module.exports = {
   upsertQuarantineBundle,
   removePendingQuarantineBundle,
   listQuarantineBundleNames,
+  isIsolatableStoreName,
+  promoteOversizedNames,
   quarantineStoreEntry,
   validateTombstoneV1,
   sweepTransactionDebris,

@@ -1201,6 +1201,96 @@ test('shellQuote renders a PowerShell-safe literal on win32 for adversarial char
   }
 });
 
+test('oversizedHint reuses the isolatable predicate and quotes every argv value', (t) => {
+  const probe = spawnSync('bash', ['-c', 'echo ok'], { encoding: 'utf8' });
+  if (probe.status !== 0) { t.skip('bash unavailable for POSIX shell-quoting verification'); return; }
+  const runtime = require('../scripts/wiki-runtime.js');
+  const debris = require('../hooks/scripts/runtime/transaction-debris.js');
+  const sentinelDir = fs.mkdtempSync(path.join(os.tmpdir(), 'deep-wiki-hint-sentinel-'));
+  roots.add(sentinelDir);
+  const sentinel = path.join(sentinelDir, 'SIDE_EFFECT');
+  const adversarial = [
+    `/tmp/deep wiki has space`,
+    `/tmp/deep wiki has"quote`,
+    `/tmp/deep wiki has'quote`,
+    `/tmp/deep wiki $(printf shell-injection-probe)`,
+    `/tmp/deep wiki; touch ${sentinel}`,
+    `/tmp/deep wiki & echo amp`,
+    `/tmp/deep wiki %PATH%`,
+    `/tmp/deep wiki has\nnewline`,
+  ];
+  const isolatableName = `scan-window-ensure-${'ab'.repeat(20)}`;
+  for (const value of adversarial) {
+    const hint = runtime.oversizedHint({
+      code: 'TRANSACTION_OVERSIZED',
+      operationId: isolatableName,
+      wikiRoot: value,
+    });
+    assert.match(hint, /transaction quarantine/);
+    const commandLine = hint.slice(hint.indexOf('transaction quarantine'));
+    const argv = shellArgvAfterPrefix(`node scripts/wiki-runtime.js ${commandLine}`, 'node scripts/wiki-runtime.js transaction quarantine ');
+    assert.equal(argAfterFlag(argv, '--wiki-root'), path.resolve(value));
+    assert.equal(argAfterFlag(argv, '--operation-id'), isolatableName);
+  }
+  assert.equal(fs.existsSync(sentinel), false);
+
+  const ulidHint = runtime.oversizedHint({
+    code: 'TRANSACTION_OVERSIZED',
+    operationId: OPERATION_ID,
+    wikiRoot: '/tmp/wiki',
+  });
+  assert.match(ulidHint, /pure ULID is not automatically isolatable/);
+  assert.equal(ulidHint.includes('transaction quarantine'), false);
+  assert.equal(debris.isIsolatableStoreName('.prune-oversized', scanWindow.operationIdFromPruneName), false);
+  const pruneHint = runtime.oversizedHint({
+    code: 'TRANSACTION_OVERSIZED',
+    operationId: '.prune-oversized',
+    wikiRoot: '/tmp/wiki',
+  });
+  assert.match(pruneHint, /pure ULID is not automatically isolatable|not automatically isolatable/);
+  assert.equal(pruneHint.includes('transaction quarantine'), false);
+
+  const rollbackHint = runtime.oversizedHint({
+    code: 'TRANSACTION_OVERSIZED',
+    operationId: 'rollback-01JZ7P9Q6MD7S5PB8H4Y40HJ83',
+    wikiRoot: `/tmp/deep wiki; touch ${sentinel}`,
+  });
+  assert.match(rollbackHint, /rollback remnant/);
+  assert.match(rollbackHint, /transaction recover/);
+  assert.equal(fs.existsSync(sentinel), false);
+});
+
+test('oversizedHint renders a PowerShell-safe literal on win32 for adversarial characters', () => {
+  const { oversizedHint } = require('../scripts/wiki-runtime.js');
+  const originalDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
+  Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+  try {
+    const adversarial = [
+      'C:\\Deep Wiki has space',
+      'C:\\Deep Wiki & evil',
+      'C:\\Deep Wiki %PATH%',
+      'C:\\Deep Wiki "quoted"',
+      "C:\\Deep Wiki has'quote",
+      'C:\\Deep Wiki ^caret',
+      'C:\\Deep Wiki\nnewline',
+    ];
+    const isolatableName = `scan-window-ensure-${'cd'.repeat(20)}`;
+    for (const value of adversarial) {
+      const hint = oversizedHint({
+        code: 'TRANSACTION_OVERSIZED',
+        operationId: isolatableName,
+        wikiRoot: value,
+      });
+      const wikiRootValue = decodePowershellSingleQuoted(extractQuotedFlagValue(hint, '--wiki-root'));
+      assert.equal(wikiRootValue, path.resolve(value));
+      const operationIdValue = decodePowershellSingleQuoted(extractQuotedFlagValue(hint, '--operation-id'));
+      assert.equal(operationIdValue, isolatableName);
+    }
+  } finally {
+    Object.defineProperty(process, 'platform', originalDescriptor);
+  }
+});
+
 test('shellQuote (Windows) round-trips through a real PowerShell when available', (t) => {
   const shell = process.platform === 'win32' ? 'powershell.exe' : 'pwsh';
   const probe = spawnSync(shell, ['-NoProfile', '-Command', 'Write-Output ok'], { encoding: 'utf8' });

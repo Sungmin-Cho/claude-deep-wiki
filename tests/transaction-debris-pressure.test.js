@@ -1607,3 +1607,122 @@ test('listQuarantineBundleNames fail-closes capture-to-readdir replacement as id
   );
   assert.equal(fs.readFileSync(path.join(external, 'SENTINEL'), 'utf8'), 'keep\n');
 });
+
+test('isIsolatableStoreName matches classifyQuarantineName and rejects pure ULIDs', () => {
+  const parse = parsePruneName;
+  const pruneId = `scan-window-ensure-${hex40('11')}`;
+  const isolatable = [
+    `scan-window-ensure-${hex40('ab')}`,
+    `scan-window-cli-${hex40('cd')}`,
+    `lint-repair-${hex40('ef')}`,
+    'rollback-01JZ7P9Q6MD7S5PB8H4Y40HJ83',
+    `.prune-${pruneId.length}-${pruneId}-1-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee`,
+  ];
+  for (const name of isolatable) {
+    assert.equal(debris.isIsolatableStoreName(name, parse), true, name);
+  }
+  assert.equal(debris.isIsolatableStoreName('01JZ7P9Q6MD7S5PB8H4Y40HJ83', parse), false);
+  assert.equal(debris.isIsolatableStoreName('.prune-3-abc-1-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', parse), false);
+  assert.equal(debris.isIsolatableStoreName('not-a-transaction', parse), false);
+});
+
+test('fixWiki quarantines isolatable oversized names and preserves TRANSACTION_OVERSIZED for mixed ULIDs', () => {
+  const root = wikiFixture();
+  const isolatable = `scan-window-ensure-${hex40('aa')}`;
+  const ulid = '01JZ7P9Q6MD7S5PB8H4Y40HJ83';
+  seedStoreDirectory(root, isolatable);
+  seedStoreDirectory(root, ulid);
+  fillOversizedTier1Subdirs(path.join(storePath(root), isolatable));
+  fillOversizedTier1Subdirs(path.join(storePath(root), ulid));
+  assert.throws(
+    () => wikiState.fixWiki({ wikiRoot: root, now: new Date('2026-08-25T00:00:00Z') }),
+    (error) => error.code === 'TRANSACTION_OVERSIZED'
+      && error.operationId === ulid
+      && error.code !== 'WIKI_STATE_INVALID',
+  );
+  assert.equal(fs.existsSync(path.join(storePath(root), isolatable)), false);
+  assert.equal(fs.existsSync(path.join(storePath(root), ulid)), true);
+  const inventory = debris.listQuarantineBundleNames(root, { deadline: deadline() });
+  assert.equal(inventory.count >= 1, true);
+});
+
+test('sweep checks the deadline before each tier-1 probe and leaves unprocessed names durable', () => {
+  const root = wikiFixture();
+  const store = storePath(root);
+  fs.mkdirSync(store, { recursive: true });
+  const first = '.activate-oversized-a';
+  const second = '.activate-oversized-b';
+  for (const name of [first, second]) fs.mkdirSync(path.join(store, name));
+  let nowMs = 0;
+  const probes = [];
+  withLock(root, (token) => {
+    const result = debris.sweepTransactionDebris(root, token, {
+      deadline: createDeadline({ budgetMs: 20, clock: { nowMs() { return nowMs; } } }),
+      limit: 8,
+      inspectDirectoryPressure(pathname) {
+        probes.push(path.basename(pathname));
+        nowMs = 50;
+        return { oversized: true, method: 'stat', estimatedEntries: 600 };
+      },
+    });
+    assert.deepEqual(result.skipped_oversized, [first]);
+    assert.deepEqual(probes, [first]);
+    assert.equal(fs.existsSync(path.join(store, second)), true);
+  });
+});
+
+test('promoteOversizedNames records a completed move as promoted when telemetry write fails', () => {
+  const root = wikiFixture();
+  const name = `scan-window-ensure-${hex40('bb')}`;
+  seedStoreDirectory(root, name);
+  withLock(root, (token) => {
+    const result = debris.promoteOversizedNames({
+      wikiRoot: root,
+      token,
+      names: [name],
+      parsePruneName,
+      classification: { method: 'stat', estimated_entries: null },
+      reason: 'oversized',
+      now: new Date('2026-08-25T00:00:00Z'),
+      pid: '1',
+      randomUUID: () => '01234567-89ab-cdef-0123-456789abcdef',
+      faultInjector(boundary) {
+        if (boundary === 'after-promote-move') throw new Error('telemetry-fail');
+      },
+    });
+    assert.deepEqual(result.promoted, [name]);
+    assert.deepEqual(result.skipped_oversized, []);
+    assert.equal(result.telemetry_error, 'telemetry-fail');
+    assert.equal(fs.existsSync(path.join(storePath(root), name)), false);
+    const marker = debris.readMaintenanceMarker(root);
+    assert.equal(marker.promoted.includes(name) || marker.prune_failures.length > 0, true);
+    assert.equal(marker.skipped_oversized.includes(name), false);
+  });
+});
+
+test('promoteOversizedNames stops at the deadline and leaves remaining names durable', () => {
+  const root = wikiFixture();
+  const first = `scan-window-ensure-${hex40('cc')}`;
+  const second = `scan-window-ensure-${hex40('dd')}`;
+  seedStoreDirectory(root, first);
+  seedStoreDirectory(root, second);
+  let nowMs = 0;
+  withLock(root, (token) => {
+    const result = debris.promoteOversizedNames({
+      wikiRoot: root,
+      token,
+      names: [first, second],
+      parsePruneName,
+      classification: { method: 'stat', estimated_entries: null },
+      reason: 'oversized',
+      deadline: createDeadline({ budgetMs: 20, clock: { nowMs() { return nowMs; } } }),
+      faultInjector(boundary) {
+        if (boundary === 'after-promote-move') nowMs = 50;
+      },
+    });
+    assert.deepEqual(result.promoted, [first]);
+    assert.deepEqual(result.skipped_oversized, [second]);
+    assert.equal(fs.existsSync(path.join(storePath(root), first)), false);
+    assert.equal(fs.existsSync(path.join(storePath(root), second)), true);
+  });
+});

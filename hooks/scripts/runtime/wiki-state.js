@@ -21,7 +21,7 @@ const {
   sweepTransactionDebris, validateTombstoneV1, isReclaimableJunkEntry,
   assertTransactionStoreAnchored, quarantineStoreEntry: quarantineStoreEntryPrimitive,
   inspectDirectoryPressure, resolveUnknownDirent, readMaintenanceMarker,
-  listQuarantineBundleNames,
+  listQuarantineBundleNames, isIsolatableStoreName, promoteOversizedNames,
 } = require('./transaction-debris.js');
 
 const { promotePendingScan } = scanWindow;
@@ -1727,25 +1727,38 @@ function fixWiki(options = {}) {
       before = inspectWiki({ wikiRoot: root, deadline });
     } catch (initial) {
       if (initial.code === 'TRANSACTION_OVERSIZED') {
-        const attempted = new Set();
-        let promoted = 0;
-        while (promoted < 8) {
-          let current;
-          try { current = inspectWiki({ wikiRoot: root, deadline }); break; }
-          catch (error) {
-            if (error.code !== 'TRANSACTION_OVERSIZED' || !error.operationId) throw error;
-            if (attempted.has(error.operationId)) throw error;
-            attempted.add(error.operationId);
-            quarantineStoreEntry({
-              wikiRoot: root,
-              token: owner.token,
-              name: error.operationId,
-              classification: { method: error.method || 'stat', estimated_entries: error.estimatedEntries ?? null },
-              reason: 'oversized',
-            });
-            promoted += 1;
+        const store = path.join(root, '.wiki-meta', '.transactions');
+        let entries = [];
+        try { entries = fs.readdirSync(store, { withFileTypes: true }); }
+        catch { throw initial; }
+        const names = [];
+        for (const entry of entries) {
+          if (deadline) {
+            try { assertBeforeDeadline(deadline, `lint-fix-oversized:${entry.name}`); }
+            catch (error) {
+              if (error.code === 'DEADLINE_EXCEEDED') break;
+              throw error;
+            }
           }
+          if (!isIsolatableStoreName(entry.name, scanWindow.operationIdFromPruneName)) continue;
+          const pressure = inspectDirectoryPressure(path.join(store, entry.name), {
+            deadline,
+            allowEnumeration: false,
+          });
+          if (pressure.oversized) names.push(entry.name);
         }
+        promoteOversizedNames({
+          wikiRoot: root,
+          token: owner.token,
+          names,
+          parsePruneName: scanWindow.operationIdFromPruneName,
+          classification: {
+            method: initial.method || 'stat',
+            estimated_entries: initial.estimatedEntries ?? null,
+          },
+          reason: 'oversized',
+          deadline,
+        });
         before = inspectWiki({ wikiRoot: root, deadline });
       } else if (initial.code !== 'TRANSACTION_RECOVERY_REQUIRED') throw initial;
       else {

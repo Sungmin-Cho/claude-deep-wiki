@@ -10,6 +10,7 @@ const {
   descriptorMatchesPathIdentity,
   readMaybe,
   regularFileIdentity,
+  regularFileIdentitiesMatch,
   stateError,
 } = require('./fs-safe.js');
 const { assertLockOwner } = require('./lock.js');
@@ -284,8 +285,115 @@ function transactionStoreAnchor(root, transactions) {
 }
 
 function identityUnchanged(current, expected) {
-  return current !== null && current.dev === expected.dev && current.ino === expected.ino
+  return current !== null && expected != null && current.dev === expected.dev && current.ino === expected.ino
     && current.birthtimeNs === expected.birthtimeNs;
+}
+
+function captureRegularFileIdentity(pathname, label, allowMissing, fsImpl) {
+  let stat;
+  try { stat = fsImpl.lstatSync(pathname, { bigint: true }); }
+  catch (error) {
+    if (allowMissing && error.code === 'ENOENT') return null;
+    throw stateError('WIKI_STATE_FILESYSTEM', `${label} identity is unavailable`, error);
+  }
+  const identity = regularFileIdentity(stat);
+  if (!identity) {
+    if (allowMissing) return null;
+    throw stateError('WIKI_STATE_FILESYSTEM', `${label} must be a physical regular file`);
+  }
+  return identity;
+}
+
+function assertDirectoryFence(pathname, label, expected, fsImpl) {
+  if (!identityUnchanged(physicalDirectoryIdentity(pathname, label, true, fsImpl), expected)) {
+    throw stateError('WIKI_STATE_FILESYSTEM', `${label} identity changed mid-quarantine`);
+  }
+}
+
+function assertRegularFileFence(pathname, label, expected, fsImpl) {
+  const current = captureRegularFileIdentity(pathname, label, true, fsImpl);
+  if (!regularFileIdentitiesMatch(current, expected)) {
+    throw stateError('WIKI_STATE_FILESYSTEM', `${label} identity changed mid-quarantine`);
+  }
+}
+
+function assertQuarantineFence(root, token, captured, options = {}) {
+  const fsImpl = options.fs || fs;
+  assertLockOwner({ wikiRoot: root, token });
+  assertDirectoryFence(captured.metaPath, '.wiki-meta', captured.metaIdentity, fsImpl);
+  assertDirectoryFence(captured.quarantinePath, '.wiki-meta/.quarantine', captured.quarantineIdentity, fsImpl);
+  if (captured.bundleIdentity) {
+    assertDirectoryFence(
+      captured.bundlePath,
+      `.wiki-meta/.quarantine/${path.basename(captured.bundlePath)}`,
+      captured.bundleIdentity,
+      fsImpl,
+    );
+  }
+  assertDirectoryFence(captured.storePath, '.wiki-meta/.transactions', captured.storeIdentity, fsImpl);
+  if (options.includeSource) {
+    assertDirectoryFence(
+      captured.sourcePath,
+      `.wiki-meta/.transactions/${path.basename(captured.sourcePath)}`,
+      captured.sourceIdentity,
+      fsImpl,
+    );
+  }
+  if (options.includeReservation) {
+    assertRegularFileFence(
+      captured.reservationPath,
+      'quarantine reservation',
+      captured.reservationIdentity,
+      fsImpl,
+    );
+  }
+}
+
+function unlinkIdleMaintenanceMarker(root, token, destination, fsImpl, faultInjector) {
+  const meta = path.join(root, '.wiki-meta');
+  const runtime = path.join(meta, '.runtime');
+  const metaIdentity = physicalDirectoryIdentity(meta, '.wiki-meta', false, fsImpl);
+  const runtimeIdentity = physicalDirectoryIdentity(runtime, '.wiki-meta/.runtime', false, fsImpl);
+  const leafIdentity = captureRegularFileIdentity(
+    destination,
+    '.wiki-meta/.runtime/scan-window-maintenance.json',
+    true,
+    fsImpl,
+  );
+  if (leafIdentity === null) return;
+  invokeMarkerFault(faultInjector, 'before-idle-unlink');
+  assertLockOwner({ wikiRoot: root, token });
+  if (!identityUnchanged(physicalDirectoryIdentity(meta, '.wiki-meta', true, fsImpl), metaIdentity)
+      || !identityUnchanged(physicalDirectoryIdentity(runtime, '.wiki-meta/.runtime', true, fsImpl), runtimeIdentity)) {
+    throw stateError('WIKI_STATE_FILESYSTEM', '.wiki-meta/.runtime identity changed mid-unlink');
+  }
+  const currentLeaf = captureRegularFileIdentity(
+    destination,
+    '.wiki-meta/.runtime/scan-window-maintenance.json',
+    true,
+    fsImpl,
+  );
+  if (!regularFileIdentitiesMatch(currentLeaf, leafIdentity)) {
+    throw stateError(
+      'WIKI_STATE_FILESYSTEM',
+      '.wiki-meta/.runtime/scan-window-maintenance.json identity changed mid-unlink',
+    );
+  }
+  try { fsImpl.unlinkSync(destination); }
+  catch (error) {
+    if (error.code === 'ENOENT') {
+      throw stateError(
+        'WIKI_STATE_FILESYSTEM',
+        '.wiki-meta/.runtime/scan-window-maintenance.json identity changed mid-unlink',
+        error,
+      );
+    }
+    throw error;
+  }
+  if (!identityUnchanged(physicalDirectoryIdentity(meta, '.wiki-meta', true, fsImpl), metaIdentity)
+      || !identityUnchanged(physicalDirectoryIdentity(runtime, '.wiki-meta/.runtime', true, fsImpl), runtimeIdentity)) {
+    throw stateError('WIKI_STATE_FILESYSTEM', '.wiki-meta/.runtime identity changed mid-unlink');
+  }
 }
 
 function assertAnchorUnchanged(root, transactions, anchor) {
@@ -831,10 +939,7 @@ function writeMaintenanceMarker(root, token, mutate, options = {}) {
   capMarkerArrays(next);
   const destination = markerFilePath(root);
   if (isIdleMarker(next)) {
-    try { fsImpl.rmSync(destination, { force: true }); }
-    catch (error) {
-      if (error.code !== 'ENOENT') throw error;
-    }
+    unlinkIdleMaintenanceMarker(root, token, destination, fsImpl, options.faultInjector);
     return next;
   }
   const bytes = fitMarkerToBudget(next, maxBytes, options.onEvict);
@@ -899,10 +1004,20 @@ function listQuarantineBundleNames(root, options = {}) {
     };
   }
 
+  invokeMarkerFault(faultInjector, 'before-readdir');
+  const metaBeforeRead = physicalDirectoryIdentity(meta, '.wiki-meta', true, fsImpl);
+  const quarantineBeforeRead = physicalDirectoryIdentity(quarantine, '.wiki-meta/.quarantine', true, fsImpl);
+  if (!identityUnchanged(metaBeforeRead, metaIdentity)
+      || !identityUnchanged(quarantineBeforeRead, quarantineIdentity)) {
+    throw stateError('WIKI_STATE_FILESYSTEM', '.wiki-meta/.quarantine identity changed mid-inventory');
+  }
+
   let entries;
   try { entries = fsImpl.readdirSync(quarantine, { withFileTypes: true }); }
   catch (error) {
-    if (error.code === 'ENOENT') return emptyInventoryResult();
+    if (error.code === 'ENOENT') {
+      throw stateError('WIKI_STATE_FILESYSTEM', '.wiki-meta/.quarantine identity changed mid-inventory', error);
+    }
     throw stateError('WIKI_STATE_FILESYSTEM', '.wiki-meta/.quarantine identity is unavailable', error);
   }
   invokeMarkerFault(faultInjector, 'after-readdir');
@@ -997,29 +1112,21 @@ function directoryIdentity(pathname, label, fsImpl) {
   return physicalDirectoryIdentity(pathname, label, false, fsImpl);
 }
 
-function writeQuarantineMeta(destination, payload, token, root, fsImpl) {
+function writeQuarantineMeta(destination, payload, token, root, fsImpl, seal) {
   const bytes = Buffer.from(`${JSON.stringify(payload)}\n`, 'utf8');
+  const runSeal = typeof seal === 'function'
+    ? seal
+    : () => assertLockOwner({ wikiRoot: root, token });
   atomicWriteFile(destination, bytes, {
     fs: fsImpl,
     createParent: false,
-    beforeRename: () => assertLockOwner({ wikiRoot: root, token }),
-    beforePublish: () => assertLockOwner({ wikiRoot: root, token }),
+    beforeRename: runSeal,
+    beforePublish: runSeal,
   });
 }
 
 function reservationPath(store, embeddedId) {
   return path.join(store, embeddedId);
-}
-
-function lstatRegularFile(pathname, fsImpl) {
-  let stat;
-  try { stat = fsImpl.lstatSync(pathname, { bigint: true }); }
-  catch (error) {
-    if (error.code === 'ENOENT') return null;
-    throw error;
-  }
-  if (!stat.isFile() || stat.isSymbolicLink()) return null;
-  return stat;
 }
 
 function quarantineStoreEntry(options = {}) {
@@ -1039,23 +1146,24 @@ function quarantineStoreEntry(options = {}) {
   assertLockOwner({ wikiRoot: root, token });
   const store = path.join(root, '.wiki-meta', '.transactions');
   assertTransactionStoreAnchored(root);
-  const metaIdentity = directoryIdentity(path.join(root, '.wiki-meta'), '.wiki-meta', fsImpl);
+  const metaPathname = path.join(root, '.wiki-meta');
+  const metaIdentity = directoryIdentity(metaPathname, '.wiki-meta', fsImpl);
   const storeIdentity = directoryIdentity(store, '.wiki-meta/.transactions', fsImpl);
   const source = path.join(store, classified.sourceName);
   const reservation = classified.kind === 'prune' ? reservationPath(store, classified.embeddedId) : null;
 
-  let sourceIdentity = null;
-  try { sourceIdentity = physicalDirectoryIdentity(source, `.wiki-meta/.transactions/${classified.sourceName}`, true, fsImpl); }
-  catch (error) {
-    throw error;
-  }
-  const reservationStat = reservation ? lstatRegularFile(reservation, fsImpl) : null;
+  const sourceIdentity = physicalDirectoryIdentity(
+    source, `.wiki-meta/.transactions/${classified.sourceName}`, true, fsImpl,
+  );
+  const reservationIdentity = reservation
+    ? captureRegularFileIdentity(reservation, 'quarantine reservation', true, fsImpl)
+    : null;
 
-  if (sourceIdentity === null && classified.kind === 'prune' && reservationStat) {
+  if (sourceIdentity === null && classified.kind === 'prune' && reservationIdentity) {
     return resumeReservationOnly({
       root, token, fsImpl, now, pid, randomUUID, faultInjector,
       classified, reason, classification, followUp,
-      metaIdentity, storeIdentity, reservation,
+      metaIdentity, storeIdentity, reservation, reservationIdentity,
     });
   }
   if (sourceIdentity === null) {
@@ -1065,7 +1173,7 @@ function quarantineStoreEntry(options = {}) {
   const bundle = makeBundleName(now, pid, randomUUID);
   const at = canonicalUtcZ(now);
   assertLockOwner({ wikiRoot: root, token });
-  if (!identityUnchanged(physicalDirectoryIdentity(path.join(root, '.wiki-meta'), '.wiki-meta', true, fsImpl), metaIdentity)) {
+  if (!identityUnchanged(physicalDirectoryIdentity(metaPathname, '.wiki-meta', true, fsImpl), metaIdentity)) {
     throw stateError('WIKI_STATE_FILESYSTEM', '.wiki-meta identity changed mid-quarantine');
   }
   const quarantineRoot = path.join(root, '.wiki-meta', '.quarantine');
@@ -1080,6 +1188,21 @@ function quarantineStoreEntry(options = {}) {
 
   const bundleDir = path.join(quarantineRoot, bundle);
   const tree = path.join(bundleDir, 'tree');
+  const captured = {
+    metaPath: metaPathname,
+    metaIdentity,
+    quarantinePath: quarantineRoot,
+    quarantineIdentity,
+    bundlePath: bundleDir,
+    bundleIdentity: null,
+    storePath: store,
+    storeIdentity,
+    sourcePath: source,
+    sourceIdentity,
+    reservationPath: reservation,
+    reservationIdentity,
+  };
+  const fence = (extras = {}) => assertQuarantineFence(root, token, captured, { fs: fsImpl, ...extras });
   const metaPayload = {
     schema: 1,
     quarantined_at: at,
@@ -1096,14 +1219,20 @@ function quarantineStoreEntry(options = {}) {
   try {
     invokeMarkerFault(faultInjector, 'before-bundle-mkdir');
     fsImpl.mkdirSync(bundleDir, { recursive: false });
-    writeQuarantineMeta(path.join(bundleDir, 'quarantine.meta.json'), metaPayload, token, root, fsImpl);
+    captured.bundleIdentity = directoryIdentity(
+      bundleDir, `.wiki-meta/.quarantine/${bundle}`, fsImpl,
+    );
+    invokeMarkerFault(faultInjector, 'after-bundle-mkdir');
+    invokeMarkerFault(faultInjector, 'before-meta-write');
+    fence({ includeSource: true });
+    writeQuarantineMeta(
+      path.join(bundleDir, 'quarantine.meta.json'), metaPayload, token, root, fsImpl,
+      () => fence({ includeSource: true }),
+    );
+    invokeMarkerFault(faultInjector, 'after-meta-write');
+    fence({ includeSource: true });
     invokeMarkerFault(faultInjector, 'before-rename');
-    assertLockOwner({ wikiRoot: root, token });
-    if (!identityUnchanged(physicalDirectoryIdentity(source, `.wiki-meta/.transactions/${classified.sourceName}`, true, fsImpl), sourceIdentity)
-        || !identityUnchanged(physicalDirectoryIdentity(quarantineRoot, '.wiki-meta/.quarantine', true, fsImpl), quarantineIdentity)
-        || !identityUnchanged(physicalDirectoryIdentity(store, '.wiki-meta/.transactions', true, fsImpl), storeIdentity)) {
-      throw stateError('WIKI_STATE_FILESYSTEM', 'quarantine source identity changed before rename');
-    }
+    fence({ includeSource: true });
     try { fsImpl.renameSync(source, tree); }
     catch (error) {
       if (error.code === 'EXDEV') {
@@ -1121,7 +1250,7 @@ function quarantineStoreEntry(options = {}) {
   invokeMarkerFault(faultInjector, 'after-rename');
 
   try {
-    assertLockOwner({ wikiRoot: root, token });
+    fence();
     const treeIdentity = directoryIdentity(tree, `.wiki-meta/.quarantine/${bundle}/tree`, fsImpl);
     if (!identityUnchanged(treeIdentity, sourceIdentity)) {
       throw stateError('WIKI_STATE_FILESYSTEM', 'quarantine tree identity does not match the captured source');
@@ -1136,18 +1265,19 @@ function quarantineStoreEntry(options = {}) {
     invokeMarkerFault(faultInjector, 'before-reservation-rename');
 
     let paired = false;
-    if (reservation) {
-      const currentReservation = lstatRegularFile(reservation, fsImpl);
-      if (currentReservation) {
-        fsImpl.renameSync(reservation, path.join(bundleDir, 'reservation'));
-        paired = true;
-      }
+    if (reservationIdentity) {
+      fence({ includeReservation: true });
+      const destination = path.join(bundleDir, 'reservation');
+      fsImpl.renameSync(reservation, destination);
+      assertRegularFileFence(destination, 'quarantine reservation', reservationIdentity, fsImpl);
+      fence();
+      paired = true;
     }
     if (paired) {
       writeQuarantineMeta(path.join(bundleDir, 'quarantine.meta.json'), {
         ...metaPayload,
         paired_reservation: true,
-      }, token, root, fsImpl);
+      }, token, root, fsImpl, () => fence());
     }
 
     writeMaintenanceMarker(root, token, (marker) => upsertQuarantineBundle(marker, {
@@ -1170,16 +1300,18 @@ function resumeReservationOnly(context) {
   const {
     root, token, fsImpl, now, pid, randomUUID, faultInjector,
     classified, reason, classification, followUp,
-    reservation,
+    metaIdentity, storeIdentity, reservation, reservationIdentity,
   } = context;
   const bundle = makeBundleName(now, pid, randomUUID);
   const at = canonicalUtcZ(now);
   let renamed = false;
   try {
-    const quarantineRoot = path.join(root, '.wiki-meta', '.quarantine');
+    const metaPathname = path.join(root, '.wiki-meta');
+    const store = path.join(metaPathname, '.transactions');
+    const quarantineRoot = path.join(metaPathname, '.quarantine');
     try { fsImpl.mkdirSync(quarantineRoot, { recursive: false }); }
     catch (error) { if (error.code !== 'EEXIST') throw error; }
-    directoryIdentity(quarantineRoot, '.wiki-meta/.quarantine', fsImpl);
+    const quarantineIdentity = directoryIdentity(quarantineRoot, '.wiki-meta/.quarantine', fsImpl);
     writeMaintenanceMarker(root, token, (marker) => upsertQuarantineBundle(marker, {
       bundle, source_name: classified.sourceName, state: 'pending', at, resume: true,
     }), { fs: fsImpl });
@@ -1187,6 +1319,20 @@ function resumeReservationOnly(context) {
     invokeMarkerFault(faultInjector, 'before-bundle-mkdir');
     const bundleDir = path.join(quarantineRoot, bundle);
     fsImpl.mkdirSync(bundleDir, { recursive: false });
+    const captured = {
+      metaPath: metaPathname,
+      metaIdentity,
+      quarantinePath: quarantineRoot,
+      quarantineIdentity,
+      bundlePath: bundleDir,
+      bundleIdentity: directoryIdentity(bundleDir, `.wiki-meta/.quarantine/${bundle}`, fsImpl),
+      storePath: store,
+      storeIdentity,
+      reservationPath: reservation,
+      reservationIdentity,
+    };
+    const fence = (extras = {}) => assertQuarantineFence(root, token, captured, { fs: fsImpl, ...extras });
+    invokeMarkerFault(faultInjector, 'after-bundle-mkdir');
     const metaPayload = {
       schema: 1,
       quarantined_at: at,
@@ -1200,11 +1346,22 @@ function resumeReservationOnly(context) {
       resume: true,
     };
     if (followUp) metaPayload.follow_up = followUp;
-    writeQuarantineMeta(path.join(bundleDir, 'quarantine.meta.json'), metaPayload, token, root, fsImpl);
+    invokeMarkerFault(faultInjector, 'before-meta-write');
+    fence({ includeReservation: true });
+    writeQuarantineMeta(
+      path.join(bundleDir, 'quarantine.meta.json'), metaPayload, token, root, fsImpl,
+      () => fence({ includeReservation: true }),
+    );
+    invokeMarkerFault(faultInjector, 'after-meta-write');
+    fence({ includeReservation: true });
     invokeMarkerFault(faultInjector, 'before-rename');
     invokeMarkerFault(faultInjector, 'before-reservation-rename');
-    fsImpl.renameSync(reservation, path.join(bundleDir, 'reservation'));
+    fence({ includeReservation: true });
+    const destination = path.join(bundleDir, 'reservation');
+    fsImpl.renameSync(reservation, destination);
     renamed = true;
+    assertRegularFileFence(destination, 'quarantine reservation', reservationIdentity, fsImpl);
+    fence();
     writeMaintenanceMarker(root, token, (marker) => upsertQuarantineBundle(marker, {
       bundle, source_name: classified.sourceName, state: 'complete', at: canonicalUtcZ(now), resume: true,
     }), { fs: fsImpl });

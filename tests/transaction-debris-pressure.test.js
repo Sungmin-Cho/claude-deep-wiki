@@ -936,6 +936,56 @@ function quarantine(root, token, name, extras = {}) {
   });
 }
 
+function predictedBundleName({
+  now = new Date('2026-08-25T00:00:00Z'),
+  pid = '1',
+  uuid = '01234567-89ab-cdef-0123-456789abcdef',
+} = {}) {
+  const stamp = now.toISOString().replace(/\.\d{3}Z$/, 'Z').replaceAll('-', '').replaceAll(':', '');
+  return `${stamp}-${pid}-${uuid.replaceAll('-', '')}`;
+}
+
+function quarantineIdentityOptions(extras = {}) {
+  return {
+    now: extras.now || new Date('2026-08-25T00:00:00Z'),
+    pid: extras.pid || '1',
+    randomUUID: extras.randomUUID || (() => '01234567-89ab-cdef-0123-456789abcdef'),
+    faultInjector: extras.faultInjector,
+  };
+}
+
+function seedPrunePair(root, seed = '33') {
+  const operationId = `scan-window-ensure-${hex40(seed)}`;
+  const pruneName = `.prune-${operationId.length}-${operationId}-2-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee`;
+  seedStoreDirectory(root, pruneName);
+  const reservation = path.join(storePath(root), operationId);
+  fs.writeFileSync(reservation, '{"reservation":true}\n');
+  return { operationId, pruneName, reservation };
+}
+
+function replaceWithKindedSymlink(source, kind, secret, root) {
+  const displaced = `${source}.displaced`;
+  const target = kind === 'internal'
+    ? path.join(root, secret)
+    : path.join(temporaryDirectory(), secret);
+  if (kind !== 'dangling') {
+    fs.mkdirSync(target, { recursive: true });
+    fs.writeFileSync(path.join(target, 'SENTINEL'), 'keep\n');
+  }
+  try { fs.renameSync(source, displaced); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
+  fs.symlinkSync(target, source);
+  return { displaced, target };
+}
+
+function assertSentinelUnchanged(kind, target) {
+  if (kind === 'dangling') return;
+  assert.equal(fs.readFileSync(path.join(target, 'SENTINEL'), 'utf8'), 'keep\n');
+  assert.equal(fs.existsSync(path.join(target, 'tree')), false);
+  assert.equal(fs.existsSync(path.join(target, 'reservation')), false);
+  assert.equal(fs.existsSync(path.join(target, 'quarantine.meta.json')), false);
+}
+
 test('quarantineStoreEntry accepts the four isolatable classes and a well-formed .prune-* name', () => {
   const root = wikiFixture();
   const names = [
@@ -1289,4 +1339,271 @@ test('generated quarantine bundle names match the shared inventory regex', () =>
   });
 });
 
+test('quarantineStoreEntry fail-closes bundle symlink replacement at metadata and tree-rename seams', () => {
+  const seams = ['before-meta-write', 'after-meta-write', 'before-rename'];
+  for (const seam of seams) {
+    for (const kind of ['internal', 'external', 'dangling']) {
+      const root = wikiFixture();
+      const secret = `bundle-secret-${seam}-${kind}-${Date.now()}`;
+      const name = `scan-window-ensure-${hex40('ab')}`;
+      const sourcePath = seedStoreDirectory(root, name);
+      const journal = fs.readFileSync(path.join(sourcePath, 'journal.json'));
+      const bundle = predictedBundleName();
+      const bundleDir = path.join(markerFixture.quarantinePath(root), bundle);
+      withLock(root, (token) => {
+        let replacement;
+        assert.throws(
+          () => quarantine(root, token, name, quarantineIdentityOptions({
+            faultInjector(boundary) {
+              if (boundary === seam) {
+                replacement = replaceWithKindedSymlink(bundleDir, kind, secret, root);
+              }
+            },
+          })),
+          (error) => {
+            assert.equal(error.code, 'WIKI_STATE_FILESYSTEM');
+            assertNoSecret(error, secret);
+            return true;
+          },
+        );
+        assert.ok(replacement);
+        assertSentinelUnchanged(kind, replacement.target);
+        assert.equal(fs.existsSync(sourcePath), true);
+        assert.deepEqual(fs.readFileSync(path.join(sourcePath, 'journal.json')), journal);
+      });
+    }
+  }
+});
 
+test('quarantineStoreEntry fail-closes bundle symlink replacement at reservation-rename seams', () => {
+  const seams = ['after-rename', 'before-reservation-rename'];
+  for (const seam of seams) {
+    for (const kind of ['internal', 'external', 'dangling']) {
+      const root = wikiFixture();
+      const secret = `reservation-secret-${seam}-${kind}-${Date.now()}`;
+      const pair = seedPrunePair(root, 'cd');
+      const bundle = predictedBundleName();
+      const bundleDir = path.join(markerFixture.quarantinePath(root), bundle);
+      withLock(root, (token) => {
+        let replacement;
+        assert.throws(
+          () => quarantine(root, token, pair.pruneName, quarantineIdentityOptions({
+            faultInjector(boundary) {
+              if (boundary === seam) {
+                replacement = replaceWithKindedSymlink(bundleDir, kind, secret, root);
+              }
+            },
+          })),
+          (error) => {
+            assert.equal(error.code, 'WIKI_STATE_FILESYSTEM');
+            assertNoSecret(error, secret);
+            return true;
+          },
+        );
+        assert.ok(replacement);
+        assertSentinelUnchanged(kind, replacement.target);
+        assert.equal(fs.existsSync(pair.reservation), true);
+        assert.equal(fs.readFileSync(pair.reservation, 'utf8'), '{"reservation":true}\n');
+        const displacedTree = path.join(replacement.displaced, 'tree');
+        assert.equal(fs.existsSync(displacedTree), true);
+        assert.equal(fs.existsSync(path.join(storePath(root), pair.pruneName)), false);
+      });
+    }
+  }
+});
+
+test('quarantineStoreEntry refuses a replaced reservation inode before the paired rename', () => {
+  const root = wikiFixture();
+  const pair = seedPrunePair(root, 'ef');
+  const original = fs.readFileSync(pair.reservation);
+  withLock(root, (token) => {
+    assert.throws(
+      () => quarantine(root, token, pair.pruneName, {
+        faultInjector(boundary) {
+          if (boundary === 'before-reservation-rename') {
+            const displaced = `${pair.reservation}.orig`;
+            fs.renameSync(pair.reservation, displaced);
+            fs.writeFileSync(pair.reservation, 'replacement-inode\n');
+          }
+        },
+      }),
+      (error) => error.code === 'WIKI_STATE_FILESYSTEM',
+    );
+    assert.equal(fs.existsSync(`${pair.reservation}.orig`), true);
+    assert.deepEqual(fs.readFileSync(`${pair.reservation}.orig`), original);
+    assert.equal(fs.readFileSync(pair.reservation, 'utf8'), 'replacement-inode\n');
+  });
+});
+
+test('quarantineStoreEntry refuses owner loss before the tree rename', () => {
+  const root = wikiFixture();
+  const name = `scan-window-ensure-${hex40('11')}`;
+  const sourcePath = seedStoreDirectory(root, name);
+  const owner = acquireLock({
+    wikiRoot: root,
+    operation: 'pressure-marker-test',
+    now: new Date('2026-08-25T00:00:00Z'),
+  });
+  try {
+    assert.throws(
+      () => quarantine(root, owner.token, name, {
+        faultInjector(boundary) {
+          if (boundary === 'before-rename') {
+            releaseLock({ wikiRoot: root, token: owner.token });
+          }
+        },
+      }),
+      (error) => error.code === 'LOCK_TOKEN_MISMATCH',
+    );
+    assert.equal(fs.existsSync(sourcePath), true);
+  } finally {
+    try { releaseLock({ wikiRoot: root, token: owner.token }); } catch { /* already released */ }
+  }
+});
+
+test('quarantineStoreEntry refuses owner loss before the reservation-only rename', () => {
+  const root = wikiFixture();
+  const pair = seedPrunePair(root, '22');
+  const owner = acquireLock({
+    wikiRoot: root,
+    operation: 'pressure-marker-test',
+    now: new Date('2026-08-25T00:00:00Z'),
+  });
+  try {
+    const first = quarantine(root, owner.token, pair.pruneName);
+    assert.equal(first.status, 'quarantined');
+    fs.writeFileSync(pair.reservation, '{"reservation":true}\n');
+    assert.throws(
+      () => quarantine(root, owner.token, pair.pruneName, {
+        faultInjector(boundary) {
+          if (boundary === 'before-reservation-rename') {
+            releaseLock({ wikiRoot: root, token: owner.token });
+          }
+        },
+      }),
+      (error) => error.code === 'LOCK_TOKEN_MISMATCH',
+    );
+    assert.equal(fs.existsSync(pair.reservation), true);
+  } finally {
+    try { releaseLock({ wikiRoot: root, token: owner.token }); } catch { /* already released */ }
+  }
+});
+
+test('quarantineStoreEntry reservation-only path refuses a replaced reservation inode', () => {
+  const root = wikiFixture();
+  const pair = seedPrunePair(root, '44');
+  withLock(root, (token) => {
+    const first = quarantine(root, token, pair.pruneName);
+    assert.equal(first.status, 'quarantined');
+    fs.writeFileSync(pair.reservation, '{"reservation":true}\n');
+    const original = fs.readFileSync(pair.reservation);
+    assert.throws(
+      () => quarantine(root, token, pair.pruneName, {
+        faultInjector(boundary) {
+          if (boundary === 'before-reservation-rename') {
+            const displaced = `${pair.reservation}.orig`;
+            fs.renameSync(pair.reservation, displaced);
+            fs.writeFileSync(pair.reservation, 'resume-replacement\n');
+          }
+        },
+      }),
+      (error) => error.code === 'WIKI_STATE_FILESYSTEM',
+    );
+    assert.equal(fs.existsSync(`${pair.reservation}.orig`), true);
+    assert.deepEqual(fs.readFileSync(`${pair.reservation}.orig`), original);
+    assert.equal(fs.readFileSync(pair.reservation, 'utf8'), 'resume-replacement\n');
+  });
+});
+
+test('writeMaintenanceMarker idle unlink fail-closes parent and leaf swaps', () => {
+  for (const kind of ['parent', 'leaf-file', 'leaf-symlink']) {
+    const root = wikiFixture();
+    const secret = `idle-secret-${kind}-${Date.now()}`;
+    const external = path.join(temporaryDirectory(), secret);
+    fs.mkdirSync(external, { recursive: true });
+    fs.writeFileSync(path.join(external, 'SENTINEL'), 'keep\n');
+    withLock(root, (token) => {
+      debris.writeMaintenanceMarker(root, token, (current) => {
+        current.promoted = ['once'];
+        return current;
+      });
+      const original = fs.readFileSync(markerFixture.markerPath(root));
+      const runtime = markerFixture.runtimePath(root);
+      const marker = markerFixture.markerPath(root);
+      assert.throws(
+        () => debris.writeMaintenanceMarker(root, token, (current) => {
+          current.promoted = [];
+          return current;
+        }, {
+          faultInjector(boundary) {
+            if (boundary !== 'before-idle-unlink') return;
+            if (kind === 'parent') {
+              const displaced = `${runtime}.displaced`;
+              fs.renameSync(runtime, displaced);
+              fs.symlinkSync(external, runtime);
+            } else if (kind === 'leaf-file') {
+              const displaced = `${marker}.displaced`;
+              fs.renameSync(marker, displaced);
+              fs.writeFileSync(marker, 'not-the-captured-marker\n');
+            } else {
+              const displaced = `${marker}.displaced`;
+              fs.renameSync(marker, displaced);
+              fs.symlinkSync(path.join(external, 'SENTINEL'), marker);
+            }
+          },
+        }),
+        (error) => error.code === 'WIKI_STATE_FILESYSTEM',
+      );
+      assert.equal(fs.readFileSync(path.join(external, 'SENTINEL'), 'utf8'), 'keep\n');
+      if (kind === 'parent') {
+        assert.deepEqual(fs.readFileSync(path.join(`${runtime}.displaced`, 'scan-window-maintenance.json')), original);
+      } else {
+        assert.deepEqual(fs.readFileSync(`${marker}.displaced`), original);
+        assert.equal(fs.existsSync(marker) || fs.lstatSync(marker).isSymbolicLink(), true);
+      }
+    });
+  }
+});
+
+test('listQuarantineBundleNames fail-closes capture-to-readdir removal as identity drift', () => {
+  const root = wikiFixture();
+  const quarantine = markerFixture.quarantinePath(root);
+  fs.mkdirSync(path.join(quarantine, markerFixture.bundleName({}, 0)), { recursive: true });
+  assert.throws(
+    () => debris.listQuarantineBundleNames(root, {
+      deadline: deadline(),
+      faultInjector(boundary) {
+        if (boundary === 'before-readdir') fs.rmSync(quarantine, { recursive: true, force: true });
+      },
+    }),
+    (error) => error.code === 'WIKI_STATE_FILESYSTEM' && /identity changed mid-inventory/.test(error.message),
+  );
+});
+
+test('listQuarantineBundleNames fail-closes capture-to-readdir replacement as identity drift', () => {
+  const root = wikiFixture();
+  const quarantine = markerFixture.quarantinePath(root);
+  fs.mkdirSync(path.join(quarantine, markerFixture.bundleName({}, 0)), { recursive: true });
+  const secret = `inventory-secret-${Date.now()}`;
+  const external = path.join(temporaryDirectory(), secret);
+  fs.mkdirSync(external);
+  fs.writeFileSync(path.join(external, 'SENTINEL'), 'keep\n');
+  assert.throws(
+    () => debris.listQuarantineBundleNames(root, {
+      deadline: deadline(),
+      faultInjector(boundary) {
+        if (boundary === 'before-readdir') {
+          fs.rmSync(quarantine, { recursive: true, force: true });
+          fs.symlinkSync(external, quarantine);
+        }
+      },
+    }),
+    (error) => {
+      assert.equal(error.code, 'WIKI_STATE_FILESYSTEM');
+      assert.match(error.message, /identity changed mid-inventory|must be a physical directory|escapes/);
+      assertNoSecret(error, secret);
+      return true;
+    },
+  );
+  assert.equal(fs.readFileSync(path.join(external, 'SENTINEL'), 'utf8'), 'keep\n');
+});

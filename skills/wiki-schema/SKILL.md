@@ -77,7 +77,9 @@ One manifest-backed commit owns page writes, version backups, source records,
 catalog refresh, and lifecycle records. The runtime writes a journal intent,
 applies expected-hash-guarded changes, and records terminal state. An
 interruption is resolved with `wiki-runtime.js transaction recover` using the
-same owner token and operation ID; a caller never creates split mutations.
+same operation ID. A caller that already holds the lock injects `--lock-token`;
+the public operator form omits the token and self-locks. A caller never creates
+split mutations.
 The shared terminal pruner has three callers: `scan-window ensure`,
 `wiki-lint --fix`, and the singular operator command `wiki-runtime.js
 transaction prune`. Ordinary selection removes only fully validated, terminal

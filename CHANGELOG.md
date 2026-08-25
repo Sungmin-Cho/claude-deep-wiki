@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `/wiki-setup` now emits its setup lifecycle event with the canonical `YYYY-MM-DDTHH:MM:SSZ` timestamp, so the documented setup route no longer fails with `MANIFEST_INVALID`.
 - An oversized leftover transaction directory no longer wedges every runtime inspection with a permanent `DEADLINE_EXCEEDED`. Readers classify it as `TRANSACTION_OVERSIZED`, lock-held writers skip the interior, and isolatable names can be moved with `transaction quarantine` without deleting the tree.
+- `transaction recover --wiki-root … --operation-id … --json` is self-locking when `--lock-token` is omitted, so rollback quarantine `follow_up` is an executable second stage. Callers that already hold a lock may still inject `--lock-token`.
 
 ### Changed
 

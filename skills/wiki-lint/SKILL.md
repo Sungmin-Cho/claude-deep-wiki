@@ -55,8 +55,10 @@ oversized trees live under `.wiki-meta/.quarantine/` and are never auto-deleted.
 
 If inspection fails with `TRANSACTION_OVERSIZED`, follow the class-specific
 guidance: isolatable scan-window and `.prune-*` names use
-`transaction quarantine`; `rollback-<ULID>` needs quarantine then recover of the
-external ULID; a pure ULID is stopped-host / authenticated-backup only.
+`transaction quarantine`; `rollback-<ULID>` needs quarantine then a self-locking
+`transaction recover --wiki-root … --operation-id <ULID> --json` of the external
+ULID (omit `--lock-token`; an authenticated token remains valid for an already
+held lock); a pure ULID is stopped-host / authenticated-backup only.
 
 The JSON result also carries `removed_junk` — the OS/sync-client metadata files this invocation
 reclaimed from the transaction store — and `removed_junk_complete`. Rerun while
@@ -119,4 +121,13 @@ To isolate an oversized store entry without deleting it:
 <!-- deep-wiki:exec -->
 ```deep-wiki-exec
 {"executable":"node","argv":["<plugin_root>/scripts/wiki-runtime.js","transaction","quarantine","--wiki-root","ABSOLUTE_WIKI_ROOT","--operation-id","OPERATION_ID","--json"]}
+```
+
+After isolating a `rollback-<ULID>` remnant, recover the embedded ULID without
+holding a prior lock token. `--lock-token` remains accepted for an already
+authenticated owner.
+
+<!-- deep-wiki:exec -->
+```deep-wiki-exec
+{"executable":"node","argv":["<plugin_root>/scripts/wiki-runtime.js","transaction","recover","--wiki-root","ABSOLUTE_WIKI_ROOT","--operation-id","01JZ7P9Q6MD7S5PB8H4Y40HJ80","--json"]}
 ```

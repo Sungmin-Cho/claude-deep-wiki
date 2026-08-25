@@ -438,6 +438,7 @@ const SKILL_COMMAND_CONTRACTS = {
     ['lock', 'status', '--wiki-root', null, '--json'],
     ['lock', 'recover', '--wiki-root', null, '--stale-ms', null, '--json'],
     ['transaction', 'quarantine', '--wiki-root', null, '--operation-id', null, '--json'],
+    ['transaction', 'recover', '--wiki-root', null, '--operation-id', null, '--json'],
   ] },
   'wiki-rebuild': { commands: [
     ['lock', 'acquire', '--wiki-root', null, '--operation', 'rebuild', '--json'],

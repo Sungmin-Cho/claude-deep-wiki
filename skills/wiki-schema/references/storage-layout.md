@@ -93,9 +93,11 @@ otherwise `lock recover` remains the explicit operator route.
 A manifest-backed `commit` writes one operation intent beneath
 `.wiki-meta/.transactions/<operation_id>/journal.json`, verifies expected hashes, applies all page,
 version, provenance, catalog, and lifecycle changes, then records a terminal
-state. `transaction recover` accepts the same operation ID and owner token and
-is idempotent. It either completes the recorded operation or restores the
-pre-operation state; it never invents a new action.
+state. `transaction recover --wiki-root … --operation-id … --json` is
+self-locking when `--lock-token` is omitted, and still accepts an authenticated
+owner token from a caller that already holds the lock. It is idempotent: it
+either completes the recorded operation or restores the pre-operation state; it
+never invents a new action.
 
 The shared bounded terminal cleanup operation is called by
 `scan-window ensure`, `wiki-lint --fix`, and the singular operator

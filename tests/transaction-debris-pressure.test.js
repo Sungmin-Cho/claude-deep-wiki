@@ -935,6 +935,26 @@ function quarantine(root, token, name, extras = {}) {
     faultInjector: extras.faultInjector,
     randomUUID: extras.randomUUID,
     pid: extras.pid,
+    fs: extras.fs,
+  });
+}
+
+function fsRestoringSourceOnCompleteMarkerStage(onSecondMarkerTemp) {
+  let markerTemps = 0;
+  return new Proxy(fs, {
+    get(target, prop) {
+      if (prop === 'openSync') {
+        return (file, flags, mode) => {
+          if (typeof file === 'string'
+              && path.basename(file).startsWith('.scan-window-maintenance.json.tmp.')) {
+            markerTemps += 1;
+            if (markerTemps === 2) onSecondMarkerTemp();
+          }
+          return target.openSync(file, flags, mode);
+        };
+      }
+      return target[prop];
+    },
   });
 }
 
@@ -953,6 +973,7 @@ function quarantineIdentityOptions(extras = {}) {
     pid: extras.pid || '1',
     randomUUID: extras.randomUUID || (() => '01234567-89ab-cdef-0123-456789abcdef'),
     faultInjector: extras.faultInjector,
+    fs: extras.fs,
   };
 }
 
@@ -2655,6 +2676,56 @@ test('quarantineStoreEntry reservation-only path fail-closes source reappearance
       );
     });
   }
+});
+
+test('quarantineStoreEntry reservation-only complete publish fail-closes source reappearance', () => {
+  const root = wikiFixture();
+  const pair = seedPrunePair(root, 'c9');
+  const reservationBytes = fs.readFileSync(pair.reservation);
+  const sourceJournal = fs.readFileSync(path.join(storePath(root), pair.pruneName, 'journal.json'));
+  const secondUuid = '01234567-89ab-cdef-0123-456789abcde6';
+  const secondBundle = predictedBundleName({ uuid: secondUuid });
+  withLock(root, (token) => {
+    const first = quarantine(root, token, pair.pruneName);
+    assert.equal(first.status, 'quarantined');
+    fs.writeFileSync(pair.reservation, reservationBytes);
+    const injected = fsRestoringSourceOnCompleteMarkerStage(() => {
+      restoreReservationOnlySource(root, pair, sourceJournal);
+    });
+    assert.throws(
+      () => quarantine(root, token, pair.pruneName, quarantineIdentityOptions({
+        randomUUID: () => secondUuid,
+        fs: injected,
+      })),
+      (error) => {
+        assert.equal(error.code, 'WIKI_STATE_FILESYSTEM');
+        assert.match(error.message, /reappeared during reservation-only quarantine/);
+        assert.equal(error.quarantine && error.quarantine.committed, true);
+        assert.equal(error.quarantine.state, 'incomplete');
+        assert.equal(error.quarantine.bundle, secondBundle);
+        return true;
+      },
+    );
+    const sourcePath = path.join(storePath(root), pair.pruneName);
+    assert.equal(fs.existsSync(sourcePath), true);
+    assert.deepEqual(fs.readFileSync(path.join(sourcePath, 'journal.json')), sourceJournal);
+    assert.equal(fs.existsSync(pair.reservation), false);
+    const bundleDir = path.join(markerFixture.quarantinePath(root), secondBundle);
+    assert.equal(fs.existsSync(path.join(bundleDir, 'reservation')), true);
+    assert.deepEqual(fs.readFileSync(path.join(bundleDir, 'reservation')), reservationBytes);
+    assert.equal(fs.existsSync(path.join(bundleDir, 'tree')), false);
+    const marker = debris.readMaintenanceMarker(root);
+    const records = marker && marker.quarantine_bundles || [];
+    const complete = records.filter((record) => record.state === 'complete');
+    assert.equal(complete.length, 1, JSON.stringify(marker));
+    assert.equal(complete[0].bundle, first.bundle);
+    const second = records.find((record) => record.bundle === secondBundle);
+    assert.ok(second, JSON.stringify(marker));
+    assert.equal(second.state, 'incomplete');
+    const inventory = debris.listQuarantineBundleNames(root, { deadline: deadline() });
+    assert.equal(inventory.bundles.includes(first.bundle), true);
+    assert.equal(inventory.bundles.includes(secondBundle), true);
+  });
 });
 
 test('lint fix retains oversized residue when tail prune fails after discovery', () => {

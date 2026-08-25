@@ -1499,10 +1499,9 @@ function resumeReservationOnly(context) {
     fsImpl.renameSync(reservation, destination);
     renamed = true;
     assertRegularFileFence(destination, 'quarantine reservation', reservationIdentity, fsImpl);
-    fence();
     writeMaintenanceMarker(root, token, (marker) => upsertQuarantineBundle(marker, {
       bundle, source_name: classified.sourceName, state: 'complete', at: canonicalUtcZ(now), resume: true,
-    }), { fs: fsImpl });
+    }), { fs: fsImpl, beforePublish: () => fence() });
     const result = { status: 'quarantined', bundle, resumed: true };
     if (followUp) result.follow_up = followUp;
     if (followUpArgv) result.follow_up_argv = followUpArgv;

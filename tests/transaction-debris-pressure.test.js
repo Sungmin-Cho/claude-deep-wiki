@@ -1097,6 +1097,24 @@ test('quarantineStoreEntry records rollback follow_up and bound wrappers share t
   });
 });
 
+test('prune reports oversized directories in skipped_oversized without journal lookup', () => {
+  const root = wikiFixture();
+  fs.mkdirSync(storePath(root), { recursive: true });
+  fs.mkdirSync(path.join(storePath(root), 'scan-window-ensure-oversize'));
+  withLock(root, (token) => {
+    const result = scanWindow.pruneScanWindowTransactions({
+      wikiRoot: root,
+      token,
+      maxAgeDays: 0,
+      limit: 8,
+      deadline: deadline(),
+      inspectDirectoryPressure: () => ({ oversized: true, method: 'stat', estimatedEntries: 900 }),
+    });
+    assert.deepEqual(result.skipped_oversized, ['scan-window-ensure-oversize']);
+    assert.equal(result.processed, 0);
+  });
+});
+
 test('sweep reports oversized directories without entering them and still reports after the pass limit', () => {
   const root = wikiFixture();
   const store = path.join(root, '.wiki-meta', '.transactions');

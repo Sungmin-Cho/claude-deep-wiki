@@ -326,7 +326,7 @@ test('OUTER-PRUNE-1 Case 05 missing child deadline expiry returns incomplete', (
   try {
     assert.deepEqual(
       pruneOuterObservation(root, owner.token, modules().createDeadline({ clock, budgetMs: 1_000 })),
-      { processed: 0, removed: [], complete: false },
+      { processed: 0, removed: [], complete: false, skipped_oversized: [] },
     );
     assert.equal(matchingCalls, 2);
   } finally {
@@ -364,7 +364,7 @@ test('OUTER-PRUNE-1 Case 06 missing child deadline wins owner loss', () => {
   try {
     assert.deepEqual(
       pruneOuterObservation(root, owner.token, modules().createDeadline({ clock, budgetMs: 1_000 })),
-      { processed: 0, removed: [], complete: false },
+      { processed: 0, removed: [], complete: false, skipped_oversized: [] },
     );
     assert.equal(lockDestroyed, true);
     assert.equal(matchingCalls, 2);
@@ -501,7 +501,7 @@ test('OUTER-PRUNE-1 Case 10 present child deadline wins deferred enumeration err
   try {
     assert.deepEqual(
       pruneOuterObservation(root, owner.token, modules().createDeadline({ clock, budgetMs: 1_000 })),
-      { processed: 0, removed: [], complete: false },
+      { processed: 0, removed: [], complete: false, skipped_oversized: [] },
     );
     assert.equal(matchingReads, 2);
   } finally {
@@ -953,7 +953,7 @@ test('resumable-only pruning validates its selector and preserves ordinary clean
       now: new Date(T3),
       deadline: createDeadline({ budgetMs: 12_000 }),
       resumableOnly: true,
-    }), { processed: 0, removed: [], complete: true });
+    }), { processed: 0, removed: [], complete: true, skipped_oversized: [] });
   } finally {
     releaseLock({ wikiRoot: root, token: owner.token });
   }
@@ -1076,7 +1076,7 @@ test('either invalid scan-window marker suppresses every ensure status for the w
         kinds: ['ensure'],
         now: pruneClock(root),
         deadline: createDeadline({ budgetMs: 12_000 }),
-      }), { processed: 0, removed: [], complete: true });
+      }), { processed: 0, removed: [], complete: true, skipped_oversized: [] });
     } finally {
       releaseLock({ wikiRoot: root, token: pruneOwner.token });
     }
@@ -1568,7 +1568,7 @@ test('terminal prune reclaims regular metadata from cleaned transactions and qua
       fs.writeFileSync(path.join(operationDirectory, '.DS_Store'), 'finder\n');
     });
     const result = prune(root, operationId);
-    assert.deepEqual(result, { processed: 1, removed: [operationId], complete: true });
+    assert.deepEqual(result, { processed: 1, removed: [operationId], complete: true, skipped_oversized: [] });
     assert.equal(fs.existsSync(operationDirectory), false);
   });
 
@@ -1588,9 +1588,9 @@ test('terminal prune reclaims regular metadata from cleaned transactions and qua
         throw new Error('leave journal-bearing quarantine');
       },
     });
-    assert.deepEqual(interrupted, { processed: 0, removed: [], complete: true });
+    assert.deepEqual(interrupted, { processed: 0, removed: [], complete: true, skipped_oversized: [] });
     const result = prune(root, operationId, { resumableOnly: true });
-    assert.deepEqual(result, { processed: 1, removed: [operationId], complete: true });
+    assert.deepEqual(result, { processed: 1, removed: [operationId], complete: true, skipped_oversized: [] });
     assert.equal(fs.existsSync(metaPath(root, path.join('.transactions', quarantine.name))), false);
   });
 
@@ -1606,13 +1606,13 @@ test('terminal prune reclaims regular metadata from cleaned transactions and qua
         throw new Error('leave empty quarantine');
       },
     });
-    assert.deepEqual(interrupted, { processed: 0, removed: [], complete: true });
+    assert.deepEqual(interrupted, { processed: 0, removed: [], complete: true, skipped_oversized: [] });
     fs.writeFileSync(
       metaPath(root, path.join('.transactions', quarantine.name, '._finder')),
       'appledouble\n',
     );
     const result = prune(root, operationId, { resumableOnly: true });
-    assert.deepEqual(result, { processed: 1, removed: [operationId], complete: true });
+    assert.deepEqual(result, { processed: 1, removed: [operationId], complete: true, skipped_oversized: [] });
     assert.equal(fs.existsSync(metaPath(root, path.join('.transactions', quarantine.name))), false);
   });
 
@@ -1710,7 +1710,7 @@ process.stdout.write(JSON.stringify(result));`,
         }
       },
     });
-    assert.deepEqual(result, { processed: 1, removed: [operationId], complete: true });
+    assert.deepEqual(result, { processed: 1, removed: [operationId], complete: true, skipped_oversized: [] });
     assert.equal(firstInjected, true);
     assert.equal(secondInjected, true);
     assert.deepEqual(attempts, ['nested-junk-remove:1', 'nested-junk-remove:2']);
@@ -1801,7 +1801,7 @@ process.stdout.write(JSON.stringify(result));`,
         },
       })
     ));
-    assert.deepEqual(leaveHeld, { processed: 0, removed: [], complete: true });
+    assert.deepEqual(leaveHeld, { processed: 0, removed: [], complete: true, skipped_oversized: [] });
     assert.ok(quarantine);
     fs.writeFileSync(
       metaPath(root, path.join('.transactions', quarantine.name, '.DS_Store')),
@@ -1861,7 +1861,7 @@ const result=sw.pruneScanWindowTransactions({wikiRoot:process.argv[3],token:proc
       limit: 1,
       faultInjector(boundary) { boundaries.push(boundary); },
     });
-    assert.deepEqual(first, { processed: 0, removed: [], complete: false });
+    assert.deepEqual(first, { processed: 0, removed: [], complete: false, skipped_oversized: [] });
     assert.equal(fs.existsSync(path.join(operationDirectory, '.DS_Store')), false);
     assert.equal(fs.existsSync(path.join(operationDirectory, 'journal.json')), true);
     assert.equal(boundaries.includes('before-transaction-quarantine-rename'), false);
@@ -1893,7 +1893,7 @@ const result=sw.pruneScanWindowTransactions({wikiRoot:process.argv[3],token:proc
         if (boundary === 'after-nested-junk-unlink') nowMs = 800;
       },
     });
-    assert.deepEqual(result, { processed: 0, removed: [], complete: false });
+    assert.deepEqual(result, { processed: 0, removed: [], complete: false, skipped_oversized: [] });
     assert.equal(fs.existsSync(path.join(operationDirectory, '.DS_Store')), false);
     assert.equal(fs.existsSync(path.join(operationDirectory, 'journal.json')), true);
     assert.equal(boundaries.includes('before-transaction-quarantine-rename'), false);
@@ -1929,7 +1929,7 @@ const result=sw.pruneScanWindowTransactions({wikiRoot:process.argv[3],token:proc
       },
     });
     assert.equal(replaced, true);
-    assert.deepEqual(result, { processed: 0, removed: [], complete: true });
+    assert.deepEqual(result, { processed: 0, removed: [], complete: true, skipped_oversized: [] });
     assert.deepEqual(semanticNames, ['.DS_Store', 'journal.json']);
     assert.equal(fs.lstatSync(path.join(operationDirectory, '.DS_Store')).isSymbolicLink(), true);
     assert.equal(fs.readFileSync(outside, 'utf8'), 'outside sentinel\n');
@@ -1958,7 +1958,7 @@ const result=sw.pruneScanWindowTransactions({wikiRoot:process.argv[3],token:proc
         replaced = true;
       },
     });
-    assert.deepEqual(result, { processed: 0, removed: [], complete: false });
+    assert.deepEqual(result, { processed: 0, removed: [], complete: false, skipped_oversized: [] });
     assert.deepEqual(attempts, ['nested-junk-remove:1', 'nested-junk-remove:2']);
     assert.equal(fs.existsSync(path.join(operationDirectory, '.DS_Store')), false);
     assert.equal(fs.existsSync(path.join(operationDirectory, 'journal.json')), true);
@@ -2800,7 +2800,7 @@ test('transaction pruning preserves noncanonical terminal journal bytes', () => 
       now: pruneNow,
       deadline: createDeadline({ budgetMs: 12_000 }),
     });
-    assert.deepEqual(result, { processed: 0, removed: [], complete: true });
+    assert.deepEqual(result, { processed: 0, removed: [], complete: true, skipped_oversized: [] });
   } finally {
     releaseLock({ wikiRoot: root, token: owner.token });
   }
@@ -3690,7 +3690,7 @@ test('transaction pruning reports incomplete traversal when its reserve expires 
     fs.readFileSync = originalReadFile;
   }
   assert.equal(advanced, true);
-  assert.deepEqual(first, { processed: 0, removed: [], complete: false });
+  assert.deepEqual(first, { processed: 0, removed: [], complete: false, skipped_oversized: [] });
   assert.equal(fs.existsSync(old), true);
 
   try {
@@ -3702,7 +3702,7 @@ test('transaction pruning reports incomplete traversal when its reserve expires 
       now: pruneNow,
       deadline: createDeadline({ budgetMs: 12_000 }),
     });
-    assert.deepEqual(second, { processed: 1, removed: [oldId], complete: true });
+    assert.deepEqual(second, { processed: 1, removed: [oldId], complete: true, skipped_oversized: [] });
   } finally {
     releaseLock({ wikiRoot: root, token: owner.token });
   }
@@ -3743,7 +3743,7 @@ test('transaction prune stops between recoverable cleanup phases when cumulative
       now: pruneNow,
       deadline: createDeadline({ clock, budgetMs: 1_000 }),
     });
-    assert.deepEqual(first, { processed: 0, removed: [], complete: false });
+    assert.deepEqual(first, { processed: 0, removed: [], complete: false, skipped_oversized: [] });
     const preserved = fs.readdirSync(transactions, { recursive: true })
       .map((relative) => path.join(transactions, relative))
       .some((pathname) => {
@@ -3826,7 +3826,7 @@ test('transaction prune bounds cumulative filesystem discovery after its deadlin
     releaseLock({ wikiRoot: root, token: owner.token });
   }
 
-  assert.deepEqual(result, { processed: 0, removed: [], complete: false });
+  assert.deepEqual(result, { processed: 0, removed: [], complete: false, skipped_oversized: [] });
   assert.ok(clock.nowMs() <= 2_000, `discovery stopped at ${clock.nowMs()} ms`);
   assert.deepEqual(fs.readFileSync(journal), journalBytes);
   assert.deepEqual(fs.readdirSync(transaction), ['journal.json']);
@@ -3885,7 +3885,7 @@ test('transaction prune returns incomplete when its deadline expires during owne
     releaseLock({ wikiRoot: root, token: owner.token });
   }
 
-  assert.deepEqual(result, { processed: 0, removed: [], complete: false });
+  assert.deepEqual(result, { processed: 0, removed: [], complete: false, skipped_oversized: [] });
   assert.equal(clock.nowMs(), 1_400);
   assert.deepEqual(fs.readFileSync(journal), journalBytes);
   assert.deepEqual(fs.readdirSync(transaction), ['journal.json']);
@@ -3939,7 +3939,7 @@ test('transaction prune does not wrap deadline expiry during final journal valid
     releaseLock({ wikiRoot: root, token: owner.token });
   }
 
-  assert.deepEqual(result, { processed: 0, removed: [], complete: false });
+  assert.deepEqual(result, { processed: 0, removed: [], complete: false, skipped_oversized: [] });
   assert.equal(clock.nowMs(), 1_000);
   assert.deepEqual(fs.readFileSync(journal), journalBytes);
   assert.deepEqual(fs.readdirSync(transaction), ['journal.json']);
@@ -3992,7 +3992,7 @@ test('transaction prune checks its deadline within guarded parent validation', (
     releaseLock({ wikiRoot: root, token: owner.token });
   }
 
-  assert.deepEqual(result, { processed: 0, removed: [], complete: false });
+  assert.deepEqual(result, { processed: 0, removed: [], complete: false, skipped_oversized: [] });
   assert.ok(clock.nowMs() <= 1_500, `guarded validation stopped at ${clock.nowMs()} ms`);
   assert.deepEqual(fs.readFileSync(journal), journalBytes);
   assert.deepEqual(fs.readdirSync(transaction), ['journal.json']);

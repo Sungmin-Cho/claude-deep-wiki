@@ -18,7 +18,12 @@ const {
   assertLockOwner,
   releaseLock,
 } = require('./lock.js');
-const { sweepTransactionDebris, quarantineStoreEntry: quarantineStoreEntryPrimitive } = require('./transaction-debris.js');
+const {
+  sweepTransactionDebris,
+  quarantineStoreEntry: quarantineStoreEntryPrimitive,
+  inspectDirectoryPressure,
+  resolveUnknownDirent,
+} = require('./transaction-debris.js');
 
 const sleepArray = new Int32Array(new SharedArrayBuffer(4));
 const STAGES = ['pending-before', 'pending-after', 'last-before', 'last-after'];
@@ -2012,7 +2017,7 @@ function pruneScanWindowTransactions(options = {}) {
     };
     if (transactionsIdentity === null) {
       closeOuterObservation(null);
-      return { processed: 0, removed: [], complete: true };
+      return { processed: 0, removed: [], complete: true, skipped_oversized: [] };
     }
     assertBudget();
     try {
@@ -2025,7 +2030,7 @@ function pruneScanWindowTransactions(options = {}) {
     closeOuterObservation(enumerationError);
   } catch (error) {
     if (error.code === 'DEADLINE_EXCEEDED') {
-      return { processed: 0, removed: [], complete: false };
+      return { processed: 0, removed: [], complete: false, skipped_oversized: [] };
     }
     throw error;
   }
@@ -2129,6 +2134,8 @@ function pruneScanWindowTransactions(options = {}) {
   };
 
   let complete = true;
+  const skippedOversized = [];
+  const inspectPressure = options.inspectDirectoryPressure || inspectDirectoryPressure;
   for (const entry of entries) {
     if (removed.length + nestedJunkAttempts.attempts >= limit
         || remainingMs(deadline) < PRUNE_RESERVE_MS) {
@@ -2225,8 +2232,23 @@ function pruneScanWindowTransactions(options = {}) {
       }
       continue;
     }
-    if (!entry.isDirectory() || entry.isSymbolicLink()
-        || entry.name === excludeOperationId) continue;
+    let kind;
+    if (entry.isSymbolicLink()) continue;
+    if (entry.isDirectory()) kind = 'directory';
+    else if (!entry.isFile() && !entry.isBlockDevice() && !entry.isCharacterDevice()
+        && !entry.isFIFO() && !entry.isSocket()) {
+      kind = resolveUnknownDirent(transactions, entry).kind;
+    } else continue;
+    if (kind !== 'directory') continue;
+    if (entry.name === excludeOperationId) continue;
+    const pressure = inspectPressure(path.join(transactions, entry.name), {
+      deadline,
+      allowEnumeration: false,
+    });
+    if (pressure.oversized) {
+      skippedOversized.push(entry.name);
+      continue;
+    }
     if (entry.name.startsWith('.prune-')) {
       const quarantine = path.join(transactions, entry.name);
       const quarantinedJournal = path.join(quarantine, 'journal.json');
@@ -2563,7 +2585,7 @@ function pruneScanWindowTransactions(options = {}) {
       throwWithTerminalPrune(error);
     }
   }
-  return { processed: removed.length, removed, complete };
+  return { processed: removed.length, removed, complete, skipped_oversized: skippedOversized };
 }
 
 function deterministicEnsureId(wikiRoot, proposed) {

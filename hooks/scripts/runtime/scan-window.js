@@ -23,6 +23,7 @@ const {
   quarantineStoreEntry: quarantineStoreEntryPrimitive,
   inspectDirectoryPressure,
   resolveUnknownDirent,
+  writeMaintenanceMarker,
 } = require('./transaction-debris.js');
 
 const sleepArray = new Int32Array(new SharedArrayBuffer(4));
@@ -2664,17 +2665,41 @@ function ensurePendingScan(options = {}) {
       kind: 'ensure',
       proposed: options.proposed,
     });
-    const applied = applyScanWindowTransition({
-      wikiRoot: physicalRoot,
-      token: owner.token,
-      plan,
-      operationId,
-      faultInjector: options.faultInjector,
-      deadline: options.deadline,
-    });
-    result = { status: applied.status, operationId };
+    let applied;
     try {
-      pruneScanWindowTransactions({
+      applied = applyScanWindowTransition({
+        wikiRoot: physicalRoot,
+        token: owner.token,
+        plan,
+        operationId,
+        faultInjector: options.faultInjector,
+        deadline: options.deadline,
+        inspectDirectoryPressure: options.inspectDirectoryPressure,
+      });
+    } catch (error) {
+      if (error.code === 'TRANSACTION_OVERSIZED' && error.operationId === operationId) {
+        quarantineStoreEntry({
+          wikiRoot: physicalRoot,
+          token: owner.token,
+          name: operationId,
+          classification: { method: error.method || 'stat', estimated_entries: error.estimatedEntries ?? null },
+          reason: 'oversized',
+        });
+        applied = applyScanWindowTransition({
+          wikiRoot: physicalRoot,
+          token: owner.token,
+          plan,
+          operationId,
+          faultInjector: options.faultInjector,
+          deadline: options.deadline,
+          inspectDirectoryPressure: options.inspectDirectoryPressure,
+        });
+      } else throw error;
+    }
+    result = { status: applied.status, operationId };
+    let pruneResult = { skipped_oversized: [] };
+    try {
+      pruneResult = pruneScanWindowTransactions({
         wikiRoot: physicalRoot,
         token: owner.token,
         maxAgeDays: 0,
@@ -2683,8 +2708,48 @@ function ensurePendingScan(options = {}) {
         deadline: options.deadline,
         kinds: ['ensure'],
         excludeOperationId: operationId,
+        inspectDirectoryPressure: options.inspectDirectoryPressure,
       });
-    } catch { /* terminal maintenance never suppresses the persisted scan window */ }
+    } catch (error) {
+      result.prune_failure = error.code || 'SCAN_WINDOW_FILESYSTEM';
+      try {
+        writeMaintenanceMarker(physicalRoot, owner.token, (marker) => {
+          marker.prune_failures.push({ code: String(error.code || 'SCAN_WINDOW_FILESYSTEM').replace(/[^A-Z_]/g, '_') || 'PRUNE_FAIL', at: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z') });
+          return marker;
+        });
+      } catch { /* marker is best-effort */ }
+    }
+    const skipped = [
+      ...((applied.maintenance && applied.maintenance.skipped_oversized) || []),
+      ...(pruneResult.skipped_oversized || []),
+    ];
+    const attempted = new Set();
+    let promoted = 0;
+    for (const name of skipped) {
+      if (promoted >= AUTOMATIC_PRUNE_LIMIT || attempted.has(name)) continue;
+      attempted.add(name);
+      try {
+        quarantineStoreEntry({
+          wikiRoot: physicalRoot,
+          token: owner.token,
+          name,
+          classification: { method: 'stat', estimated_entries: null },
+          reason: 'oversized',
+        });
+        promoted += 1;
+        writeMaintenanceMarker(physicalRoot, owner.token, (marker) => {
+          marker.promoted.push(name);
+          return marker;
+        });
+      } catch {
+        try {
+          writeMaintenanceMarker(physicalRoot, owner.token, (marker) => {
+            if (!marker.skipped_oversized.includes(name)) marker.skipped_oversized.push(name);
+            return marker;
+          });
+        } catch { /* marker is best-effort */ }
+      }
+    }
   } catch (error) {
     result = { status: 'deferred', reason: error.code || 'SCAN_WINDOW_FILESYSTEM' };
   } finally {

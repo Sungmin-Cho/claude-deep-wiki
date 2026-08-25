@@ -48,6 +48,7 @@ Usage:
   node scripts/wiki-runtime.js commit --wiki-root <absolute> --lock-token <token> --manifest-file <absolute-json> --json
   node scripts/wiki-runtime.js transaction recover --wiki-root <absolute> --lock-token <token> --operation-id <id> --json
   node scripts/wiki-runtime.js transaction prune --wiki-root <absolute> --lock-token <token> --max-age-days <integer> --json
+  node scripts/wiki-runtime.js transaction quarantine --wiki-root <absolute> --operation-id <id-or-prune-name> --json
   node scripts/wiki-runtime.js index read --wiki-root <absolute> --json
   node scripts/wiki-runtime.js scan-window promote --wiki-root <absolute> --lock-token <token> --expected <UTC-Z> --json
   node scripts/wiki-runtime.js scan-window fail --wiki-root <absolute> --lock-token <token> --source <slug> --json
@@ -703,8 +704,48 @@ function quarantineStoreEntry(options = {}) {
   return scanWindow.quarantineStoreEntry(options);
 }
 
+function oversizedHint(error) {
+  const name = error.operationId || '';
+  const root = error.wikiRoot;
+  const isolatable = /^(?:scan-window-ensure-[0-9a-f]{40}|scan-window-cli-[0-9a-f]{40}|lint-repair-[0-9a-f]{40}|rollback-[0-9A-HJKMNP-TV-Z]{26}|\.prune-)/.test(name);
+  const rollback = /^rollback-([0-9A-HJKMNP-TV-Z]{26})$/.exec(name);
+  if (rollback && root) {
+    return `TRANSACTION_OVERSIZED is isolatable as a rollback remnant. Isolate it with transaction quarantine --wiki-root ${root} --operation-id ${name} --json, then transaction recover --operation-id ${rollback[1]}.`;
+  }
+  if (isolatable && root) {
+    return `TRANSACTION_OVERSIZED is isolatable. Run transaction quarantine --wiki-root ${root} --operation-id ${name} --json`;
+  }
+  return 'TRANSACTION_OVERSIZED for a pure ULID is not automatically isolatable; stop all hosts, restore filesystem readability, and if recover still cannot read the journal restore the authenticated backup.';
+}
+
 function runTransaction(argv) {
   const command = argv[0];
+  if (command === 'quarantine') {
+    const flags = wikiFlags(argv.slice(1), { '--operation-id': 'value' });
+    const wikiRoot = flags['--wiki-root'];
+    let owner;
+    try {
+      owner = acquireLock({ wikiRoot, operation: 'transaction-quarantine' });
+    } catch (error) {
+      if (error.code === 'LOCK_CONTENDED') {
+        emit({ status: 'skipped', reason: 'LOCK_CONTENDED' });
+        return;
+      }
+      throw error;
+    }
+    try {
+      emit(quarantineStoreEntry({
+        wikiRoot,
+        token: owner.token,
+        name: requireFlag(flags, '--operation-id'),
+        classification: { method: 'none', estimated_entries: null },
+        reason: 'operator',
+      }));
+    } finally {
+      releaseLock({ wikiRoot, token: owner.token });
+    }
+    return;
+  }
   if (command === 'prune') {
     const flags = wikiFlags(argv.slice(1), {
       '--lock-token': 'value',
@@ -715,13 +756,31 @@ function runTransaction(argv) {
     if (!/^\d+$/.test(raw) || !Number.isSafeInteger(maxAgeDays)) {
       throw new UsageError('--max-age-days must be a nonnegative safe integer');
     }
-    emit(scanWindow.pruneScanWindowTransactions({
-      wikiRoot: flags['--wiki-root'],
-      token: requireFlag(flags, '--lock-token'),
+    const token = requireFlag(flags, '--lock-token');
+    const wikiRoot = flags['--wiki-root'];
+    const pruneResult = scanWindow.pruneScanWindowTransactions({
+      wikiRoot,
+      token,
       maxAgeDays,
       limit: 64,
       deadline: createDeadline({ budgetMs: 12_000 }),
-    }));
+    });
+    const skipped = pruneResult.skipped_oversized || [];
+    let promoted = 0;
+    for (const name of skipped) {
+      if (promoted >= 8) break;
+      try {
+        scanWindow.quarantineStoreEntry({
+          wikiRoot,
+          token,
+          name,
+          classification: { method: 'stat', estimated_entries: null },
+          reason: 'oversized',
+        });
+        promoted += 1;
+      } catch { /* demote to leftover skipped_oversized */ }
+    }
+    emit(pruneResult);
     return;
   }
   if (command === 'recover') {
@@ -748,7 +807,7 @@ function runTransaction(argv) {
     }
     return;
   }
-  throw new UsageError('transaction requires recover or prune');
+  throw new UsageError('transaction requires recover, prune, or quarantine');
 }
 
 function runIndex(argv) {
@@ -813,6 +872,9 @@ function exitCode(error) {
 
 function reportMainError(error) {
   emitError(error);
+  if (error && error.code === 'TRANSACTION_OVERSIZED') {
+    process.stderr.write(`${oversizedHint(error)}\n`);
+  }
   return exitCode(error);
 }
 

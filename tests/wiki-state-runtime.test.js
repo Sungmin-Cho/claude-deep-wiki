@@ -1079,6 +1079,18 @@ function extractQuotedFlagValue(commandLine, flag) {
   throw new Error(`unterminated quoted value for ${flag}`);
 }
 
+function posixQuote(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
+function nodeCommandLines(text) {
+  return String(text).split('\n').map((line) => line.trim()).filter((line) => line.startsWith('node '));
+}
+
+function recoverRuntimePrefix() {
+  return `node ${posixQuote(cli)} `;
+}
+
 test('recover hint is appended to a DEADLINE_EXCEEDED commit failure and exit code stays 5', { skip: process.platform === 'win32' ? 'POSIX hint-label assertion; win32 label covered by the platform-mock tests' : false }, () => {
   const { main, recoverHint } = require('../scripts/wiki-runtime.js');
   const wikiRuntimeState = require('../hooks/scripts/runtime/wiki-state.js');
@@ -1090,7 +1102,7 @@ test('recover hint is appended to a DEADLINE_EXCEEDED commit failure and exit co
 
   assert.equal(
     recoverHint(root, OPERATION_ID),
-    `resume with:\nnode scripts/wiki-runtime.js transaction recover --wiki-root '${root}' --lock-token <token> --operation-id '${OPERATION_ID}' --json`,
+    `resume with:\n${recoverRuntimePrefix()}transaction recover --wiki-root '${root}' --lock-token <token> --operation-id '${OPERATION_ID}' --json`,
   );
 
   const originalApplyCommit = wikiRuntimeState.applyCommit;
@@ -1119,7 +1131,7 @@ test('recover hint is appended to a DEADLINE_EXCEEDED commit failure and exit co
     'DEADLINE_EXCEEDED: DEADLINE_EXCEEDED at wiki-state:catalog-seal:pages/x.md — resume with:\n',
   ));
   assert.ok(stderr.includes(
-    `node scripts/wiki-runtime.js transaction recover --wiki-root '${root}' --lock-token <token> --operation-id '${OPERATION_ID}' --json`,
+    `${recoverRuntimePrefix()}transaction recover --wiki-root '${root}' --lock-token <token> --operation-id '${OPERATION_ID}' --json`,
   ));
 });
 
@@ -1138,7 +1150,7 @@ test('recoverHint shell-escapes adversarial wiki roots and operation ids', (t) =
   for (const value of adversarial) {
     const hint = recoverHint(value, value);
     const commandLine = hint.slice(hint.indexOf('\n') + 1);
-    const argv = shellArgvAfterPrefix(commandLine, 'node scripts/wiki-runtime.js transaction recover ');
+    const argv = shellArgvAfterPrefix(commandLine, `${recoverRuntimePrefix()}transaction recover `);
     assert.equal(argAfterFlag(argv, '--wiki-root'), path.resolve(value));
     assert.equal(argAfterFlag(argv, '--operation-id'), value);
   }
@@ -1179,14 +1191,23 @@ test('shellQuote renders a PowerShell-safe literal on win32 for adversarial char
       'C:\\Deep Wiki ^caret',
       'C:\\Deep Wiki\nnewline',
     ];
+    const quotedRuntime = `'${cli.replace(/'/g, "''")}'`;
     for (const value of adversarial) {
       const hint = recoverHint(value, value);
       assert.ok(hint.startsWith('resume with (PowerShell):\n'), hint);
       const commandLine = hint.split('\n').slice(1).join('\n');
+      assert.ok(commandLine.startsWith(`node ${quotedRuntime} transaction recover `), commandLine);
+      assert.match(commandLine, /--lock-token <token>/);
       const wikiRootValue = decodePowershellSingleQuoted(extractQuotedFlagValue(commandLine, '--wiki-root'));
       assert.equal(wikiRootValue, path.resolve(value));
       const operationIdValue = decodePowershellSingleQuoted(extractQuotedFlagValue(commandLine, '--operation-id'));
       assert.equal(operationIdValue, value);
+
+      const tokenless = recoverHint(value, value, { includeLockToken: false });
+      assert.ok(tokenless.startsWith('resume with (PowerShell):\n'), tokenless);
+      const tokenlessLine = tokenless.split('\n').slice(1).join('\n');
+      assert.ok(tokenlessLine.startsWith(`node ${quotedRuntime} transaction recover `), tokenlessLine);
+      assert.equal(tokenlessLine.includes('--lock-token'), false);
 
       const retryHint = commitRetryHint(value, value);
       assert.ok(retryHint.startsWith('rerun with (PowerShell):\n'), retryHint);
@@ -1342,14 +1363,6 @@ test('rollback follow_up quotes a hostile wiki root and remains executable', (t)
   ], { encoding: 'utf8', shell: false });
   assert.equal(JSON.parse(status.stdout).locked, false);
 });
-
-function posixQuote(value) {
-  return `'${String(value).replace(/'/g, "'\\''")}'`;
-}
-
-function nodeCommandLines(text) {
-  return String(text).split('\n').map((line) => line.trim()).filter((line) => line.startsWith('node '));
-}
 
 test('oversizedHint emits a complete executable runtime command without a synthetic prefix', {
   skip: process.platform === 'win32' ? 'POSIX exact-command execution; win32 label covered by the platform-mock tests' : false,
@@ -1511,7 +1524,7 @@ test('tokenless recover DEADLINE_EXCEEDED emits a self-locking retry and release
   assert.equal(exitCode, 5);
   const stderr = chunks.join('');
   assert.match(stderr, /DEADLINE_EXCEEDED/);
-  assert.match(stderr, /resume with:\nnode scripts\/wiki-runtime\.js transaction recover /);
+  assert.ok(stderr.includes(`resume with:\n${recoverRuntimePrefix()}transaction recover `), stderr);
   assert.doesNotMatch(stderr, /--lock-token/);
   assert.match(stderr, new RegExp(`--wiki-root '${root.replace(/'/g, "'\\\\''")}'`));
   assert.match(stderr, new RegExp(`--operation-id '${OPERATION_ID}'`));
@@ -1550,11 +1563,41 @@ test('token-injected recover DEADLINE_EXCEEDED keeps the lock-token hint and lea
     assert.equal(exitCode, 5);
     const stderr = chunks.join('');
     assert.match(stderr, /DEADLINE_EXCEEDED/);
+    assert.ok(stderr.includes(`resume with:\n${recoverRuntimePrefix()}transaction recover `), stderr);
     assert.match(stderr, /--lock-token <token>/);
     assert.equal(fs.existsSync(path.join(root, '.wiki-meta', '.wiki-lock')), true);
   } finally {
     releaseLock({ wikiRoot: root, token: owner.token });
   }
+});
+
+test('tokenless recoverHint executes the exact emitted retry from a non-plugin cwd', {
+  skip: process.platform === 'win32' ? 'POSIX exact-command execution; win32 label covered by the platform-mock tests' : false,
+}, (t) => {
+  const probe = spawnSync('bash', ['-c', 'echo ok'], { encoding: 'utf8' });
+  if (probe.status !== 0) { t.skip('bash unavailable for exact-command execution'); return; }
+  const { recoverHint } = require('../scripts/wiki-runtime.js');
+  const root = fixture('deep wiki tokenless recover exec ');
+  stageInterrupted(root, manifest());
+  const hint = recoverHint(root, OPERATION_ID, { includeLockToken: false });
+  const commands = nodeCommandLines(hint);
+  assert.equal(commands.length, 1, hint);
+  assert.ok(commands[0].startsWith(`${recoverRuntimePrefix()}transaction recover `), commands[0]);
+  assert.equal(commands[0].includes('--lock-token'), false, commands[0]);
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'deep-wiki-non-plugin-cwd-'));
+  roots.add(outside);
+  const executed = spawnSync('bash', ['-c', commands[0]], {
+    encoding: 'utf8',
+    cwd: outside,
+    shell: false,
+  });
+  assert.notEqual(executed.status, 127, executed.stderr);
+  assert.doesNotMatch(executed.stderr, /MODULE_NOT_FOUND/);
+  assert.equal(executed.status, 0, `${executed.stdout}\n${executed.stderr}`);
+  const payload = JSON.parse(executed.stdout);
+  assert.equal(typeof payload, 'object');
+  assert.notEqual(payload, null);
+  assert.equal(fs.existsSync(transactionPath(root)), false);
 });
 
 test('commit at a pre-activation deadline instructs a plain rerun instead of an unusable recover hint', { skip: process.platform === 'win32' ? 'POSIX hint-label assertion; win32 label covered by the platform-mock tests' : false }, () => {

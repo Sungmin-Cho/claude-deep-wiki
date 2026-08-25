@@ -653,7 +653,7 @@ function recoverHint(wikiRoot, operationId, options = {}) {
   const root = path.resolve(wikiRoot);
   const label = process.platform === 'win32' ? 'resume with (PowerShell):' : 'resume with:';
   const tokenPart = options.includeLockToken === false ? '' : ' --lock-token <token>';
-  return `${label}\nnode scripts/wiki-runtime.js transaction recover --wiki-root ${shellQuote(root)}${tokenPart} --operation-id ${shellQuote(operationId)} --json`;
+  return `${label}\n${runtimeCommandPrefix()} transaction recover --wiki-root ${shellQuote(root)}${tokenPart} --operation-id ${shellQuote(operationId)} --json`;
 }
 
 function runtimeCommandPrefix() {

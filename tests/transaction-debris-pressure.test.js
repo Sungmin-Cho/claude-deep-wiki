@@ -2819,3 +2819,297 @@ test('lint fix retains oversized residue when a later pressure probe throws EACC
   assert.ok(marker.skipped_oversized.includes(firstName), JSON.stringify(marker));
   assert.equal(fs.existsSync(path.join(root, '.wiki-meta', '.wiki-lock')), false);
 });
+
+// --- issue-54 review fix8 ---
+// Finding 1: `ensureRuntimeDirectory` proved `.wiki-meta` once and then created `.runtime`
+// without re-proving the captured parent, so a symlink substitution at that seam created an
+// external directory before the post-creation physical check rejected the path.
+
+function writeProbeMarker(root, token, extras = {}) {
+  return debris.writeMaintenanceMarker(root, token, (marker) => {
+    marker.promoted.push('scan-window-ensure-fix8-probe');
+    return marker;
+  }, extras);
+}
+
+test('writeMaintenanceMarker fail-closes a .wiki-meta swap before .runtime creation', () => {
+  for (const kind of ['internal', 'external', 'dangling']) {
+    const root = wikiFixture();
+    const secret = `runtime-mkdir-${kind}-${process.pid}`;
+    withLock(root, (token) => {
+      let replacement;
+      try {
+        assert.throws(
+          () => writeProbeMarker(root, token, {
+            faultInjector(boundary) {
+              if (boundary === 'before-runtime-mkdir') {
+                replacement = replaceWithKindedSymlink(path.join(root, '.wiki-meta'), kind, secret, root);
+              }
+            },
+          }),
+          (error) => {
+            assert.equal(error.code, 'WIKI_STATE_FILESYSTEM', error.code);
+            assertNoSecret(error, secret);
+            return true;
+          },
+        );
+        assert.ok(replacement, 'the swap seam must exist');
+        assertSentinelUnchanged(kind, replacement.target);
+        if (kind === 'dangling') {
+          assert.equal(fs.existsSync(replacement.target), false);
+        } else {
+          assert.equal(fs.existsSync(path.join(replacement.target, '.runtime')), false);
+        }
+        assert.equal(fs.existsSync(path.join(replacement.displaced, '.runtime')), false);
+      } finally {
+        restoreWikiMeta(root, replacement);
+      }
+    });
+  }
+});
+
+test('writeMaintenanceMarker fail-closes a .wiki-meta swap after .runtime creation', () => {
+  for (const kind of ['internal', 'external', 'dangling']) {
+    const root = wikiFixture();
+    const secret = `runtime-post-${kind}-${process.pid}`;
+    withLock(root, (token) => {
+      let replacement;
+      try {
+        assert.throws(
+          () => writeProbeMarker(root, token, {
+            faultInjector(boundary) {
+              if (boundary === 'after-runtime-mkdir') {
+                replacement = replaceWithKindedSymlink(path.join(root, '.wiki-meta'), kind, secret, root);
+              }
+            },
+          }),
+          (error) => {
+            assert.equal(error.code, 'WIKI_STATE_FILESYSTEM', error.code);
+            assertNoSecret(error, secret);
+            return true;
+          },
+        );
+        assert.ok(replacement, 'the post-creation swap seam must exist');
+        assertSentinelUnchanged(kind, replacement.target);
+        if (kind !== 'dangling') {
+          assert.equal(fs.existsSync(path.join(replacement.target, '.runtime')), false);
+        }
+        assert.equal(fs.existsSync(path.join(replacement.displaced, '.runtime')), true);
+        assert.equal(
+          fs.existsSync(path.join(replacement.displaced, '.runtime', markerFixture.MARKER_BASENAME)),
+          false,
+        );
+      } finally {
+        restoreWikiMeta(root, replacement);
+      }
+    });
+  }
+});
+
+test('writeMaintenanceMarker re-proves lock ownership around .runtime creation', () => {
+  for (const boundary of ['before-runtime-mkdir', 'after-runtime-mkdir']) {
+    const root = wikiFixture();
+    const owner = acquireLock({
+      wikiRoot: root,
+      operation: 'pressure-marker-test',
+      now: new Date('2026-08-25T00:00:00Z'),
+    });
+    try {
+      assert.throws(
+        () => writeProbeMarker(root, owner.token, {
+          faultInjector(name) {
+            if (name === boundary) releaseLock({ wikiRoot: root, token: owner.token });
+          },
+        }),
+        (error) => error.code === 'LOCK_TOKEN_MISMATCH',
+      );
+      assert.equal(fs.existsSync(markerFixture.markerPath(root)), false);
+      if (boundary === 'before-runtime-mkdir') {
+        assert.equal(fs.existsSync(markerFixture.runtimePath(root)), false);
+      }
+    } finally {
+      try { releaseLock({ wikiRoot: root, token: owner.token }); } catch { /* already released */ }
+    }
+  }
+});
+
+// Finding 2: normal quarantine published its terminal `complete` marker with no evidence-level
+// seal, so a source reappearance or a moved-leaf substitution at the publish seam still returned
+// and persisted `complete`.
+
+function seedNormalQuarantineSource(root, seed) {
+  const name = `scan-window-ensure-${hex40(seed)}`;
+  const sourcePath = seedStoreDirectory(root, name);
+  return { name, sourcePath, journal: fs.readFileSync(path.join(sourcePath, 'journal.json')) };
+}
+
+function assertNoCompleteRecord(root, bundle) {
+  const marker = debris.readMaintenanceMarker(root);
+  const records = (marker && marker.quarantine_bundles) || [];
+  assert.equal(records.filter((record) => record.state === 'complete').length, 0, JSON.stringify(marker));
+  const record = records.find((row) => row.bundle === bundle);
+  assert.ok(record, JSON.stringify(marker));
+  assert.equal(record.state, 'incomplete');
+}
+
+test('quarantineStoreEntry complete publish fail-closes source reappearance', () => {
+  const root = wikiFixture();
+  const seeded = seedNormalQuarantineSource(root, 'f1');
+  const bundle = predictedBundleName();
+  withLock(root, (token) => {
+    const injected = fsRestoringSourceOnCompleteMarkerStage(() => {
+      const restored = seedStoreDirectory(root, seeded.name);
+      fs.writeFileSync(path.join(restored, 'journal.json'), seeded.journal);
+    });
+    assert.throws(
+      () => quarantine(root, token, seeded.name, quarantineIdentityOptions({ fs: injected })),
+      (error) => {
+        assert.equal(error.code, 'WIKI_STATE_FILESYSTEM', error.code);
+        assert.match(error.message, /reappeared during quarantine/);
+        assert.equal(error.quarantine && error.quarantine.committed, true);
+        assert.equal(error.quarantine.state, 'incomplete');
+        assert.equal(error.quarantine.bundle, bundle);
+        return true;
+      },
+    );
+    assertNoCompleteRecord(root, bundle);
+    assert.equal(fs.existsSync(path.join(markerFixture.quarantinePath(root), bundle, 'tree')), true);
+    assert.equal(fs.existsSync(seeded.sourcePath), true);
+  });
+});
+
+test('quarantineStoreEntry complete publish fail-closes a replaced moved tree', () => {
+  const root = wikiFixture();
+  const seeded = seedNormalQuarantineSource(root, 'f2');
+  const bundle = predictedBundleName();
+  const tree = path.join(markerFixture.quarantinePath(root), bundle, 'tree');
+  withLock(root, (token) => {
+    const injected = fsRestoringSourceOnCompleteMarkerStage(() => {
+      fs.renameSync(tree, `${tree}.displaced`);
+      fs.mkdirSync(tree);
+    });
+    assert.throws(
+      () => quarantine(root, token, seeded.name, quarantineIdentityOptions({ fs: injected })),
+      (error) => {
+        assert.equal(error.code, 'WIKI_STATE_FILESYSTEM', error.code);
+        assert.match(error.message, /tree identity changed mid-quarantine/);
+        assert.equal(error.quarantine && error.quarantine.state, 'incomplete');
+        return true;
+      },
+    );
+    assertNoCompleteRecord(root, bundle);
+    assert.deepEqual(
+      fs.readFileSync(path.join(`${tree}.displaced`, 'journal.json')),
+      seeded.journal,
+    );
+  });
+});
+
+test('quarantineStoreEntry complete publish fail-closes a replaced moved reservation', () => {
+  const root = wikiFixture();
+  const pair = seedPrunePair(root, 'f3');
+  const reservationBytes = fs.readFileSync(pair.reservation);
+  const bundle = predictedBundleName();
+  const moved = path.join(markerFixture.quarantinePath(root), bundle, 'reservation');
+  withLock(root, (token) => {
+    const injected = fsRestoringSourceOnCompleteMarkerStage(() => {
+      fs.renameSync(moved, `${moved}.displaced`);
+      fs.writeFileSync(moved, 'substituted\n');
+    });
+    assert.throws(
+      () => quarantine(root, token, pair.pruneName, quarantineIdentityOptions({ fs: injected })),
+      (error) => {
+        assert.equal(error.code, 'WIKI_STATE_FILESYSTEM', error.code);
+        assert.match(error.message, /moved reservation identity changed mid-quarantine/);
+        assert.equal(error.quarantine && error.quarantine.state, 'incomplete');
+        return true;
+      },
+    );
+    assertNoCompleteRecord(root, bundle);
+    assert.deepEqual(fs.readFileSync(`${moved}.displaced`), reservationBytes);
+  });
+});
+
+test('quarantineStoreEntry still completes a paired .prune-* quarantine', () => {
+  const root = wikiFixture();
+  const pair = seedPrunePair(root, 'f4');
+  const reservationBytes = fs.readFileSync(pair.reservation);
+  const bundle = predictedBundleName();
+  withLock(root, (token) => {
+    const result = quarantine(root, token, pair.pruneName, quarantineIdentityOptions({}));
+    assert.equal(result.status, 'quarantined');
+    assert.equal(result.bundle, bundle);
+    const bundleDir = path.join(markerFixture.quarantinePath(root), bundle);
+    assert.deepEqual(fs.readFileSync(path.join(bundleDir, 'reservation')), reservationBytes);
+    const meta = JSON.parse(fs.readFileSync(path.join(bundleDir, 'quarantine.meta.json'), 'utf8'));
+    assert.equal(meta.paired_reservation, true);
+    const marker = debris.readMaintenanceMarker(root);
+    const record = marker.quarantine_bundles.find((row) => row.bundle === bundle);
+    assert.equal(record.state, 'complete');
+  });
+});
+
+// Finding 3: reservation-only recovery persisted `paired_reservation: true` before the commit
+// point, so an interrupted resume left a directly inventoried bundle claiming a reservation it
+// never received.
+
+function resumeFixture(root, seed) {
+  const pair = seedPrunePair(root, seed);
+  const reservationBytes = fs.readFileSync(pair.reservation);
+  return { pair, reservationBytes };
+}
+
+test('reservation-only resume persists paired_reservation false until the rename commits', () => {
+  const root = wikiFixture();
+  const { pair, reservationBytes } = resumeFixture(root, 'f5');
+  const secondUuid = '01234567-89ab-cdef-0123-456789abcdf1';
+  const secondBundle = predictedBundleName({ uuid: secondUuid });
+  withLock(root, (token) => {
+    const first = quarantine(root, token, pair.pruneName);
+    assert.equal(first.status, 'quarantined');
+    fs.writeFileSync(pair.reservation, reservationBytes);
+    assert.throws(
+      () => quarantine(root, token, pair.pruneName, quarantineIdentityOptions({
+        randomUUID: () => secondUuid,
+        faultInjector(boundary) {
+          if (boundary === 'before-reservation-rename') {
+            throw Object.assign(new Error('injected resume stop'), { code: 'INJECTED_STOP' });
+          }
+        },
+      })),
+      (error) => error.code === 'INJECTED_STOP',
+    );
+    const bundleDir = path.join(markerFixture.quarantinePath(root), secondBundle);
+    const meta = JSON.parse(fs.readFileSync(path.join(bundleDir, 'quarantine.meta.json'), 'utf8'));
+    assert.equal(meta.paired_reservation, false, JSON.stringify(meta));
+    assert.equal(meta.resume, true);
+    assert.equal(fs.existsSync(path.join(bundleDir, 'reservation')), false);
+    assert.equal(fs.existsSync(pair.reservation), true);
+    assert.deepEqual(fs.readFileSync(pair.reservation), reservationBytes);
+  });
+});
+
+test('reservation-only resume rewrites paired_reservation true after the reservation is sealed', () => {
+  const root = wikiFixture();
+  const { pair, reservationBytes } = resumeFixture(root, 'f6');
+  const secondUuid = '01234567-89ab-cdef-0123-456789abcdf2';
+  const secondBundle = predictedBundleName({ uuid: secondUuid });
+  withLock(root, (token) => {
+    const first = quarantine(root, token, pair.pruneName);
+    assert.equal(first.status, 'quarantined');
+    fs.writeFileSync(pair.reservation, reservationBytes);
+    const resumed = quarantine(root, token, pair.pruneName, quarantineIdentityOptions({
+      randomUUID: () => secondUuid,
+    }));
+    assert.equal(resumed.resumed, true);
+    assert.equal(resumed.bundle, secondBundle);
+    const bundleDir = path.join(markerFixture.quarantinePath(root), secondBundle);
+    const meta = JSON.parse(fs.readFileSync(path.join(bundleDir, 'quarantine.meta.json'), 'utf8'));
+    assert.equal(meta.paired_reservation, true, JSON.stringify(meta));
+    assert.equal(meta.resume, true);
+    assert.deepEqual(fs.readFileSync(path.join(bundleDir, 'reservation')), reservationBytes);
+    const marker = debris.readMaintenanceMarker(root);
+    const record = marker.quarantine_bundles.find((row) => row.bundle === secondBundle);
+    assert.equal(record.state, 'complete');
+  });
+});

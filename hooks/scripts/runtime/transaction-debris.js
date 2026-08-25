@@ -321,11 +321,11 @@ function sourceAbsenceLabel(pathname) {
   return `.wiki-meta/.transactions/${path.basename(pathname)}`;
 }
 
-function assertExpectedSourceAbsence(pathname, fsImpl) {
+function assertExpectedSourceAbsence(pathname, fsImpl, context = 'reservation-only quarantine') {
   const label = sourceAbsenceLabel(pathname);
   const current = physicalDirectoryIdentity(pathname, label, true, fsImpl);
   if (current !== null) {
-    throw stateError('WIKI_STATE_FILESYSTEM', `${label} reappeared during reservation-only quarantine`);
+    throw stateError('WIKI_STATE_FILESYSTEM', `${label} reappeared during ${context}`);
   }
 }
 
@@ -344,7 +344,21 @@ function assertQuarantineFence(root, token, captured, options = {}) {
   }
   assertDirectoryFence(captured.storePath, '.wiki-meta/.transactions', captured.storeIdentity, fsImpl);
   if (captured.expectSourceAbsent) {
-    assertExpectedSourceAbsence(captured.sourcePath, fsImpl);
+    assertExpectedSourceAbsence(captured.sourcePath, fsImpl, captured.sourceAbsenceContext);
+  }
+  // Once a leaf has been renamed into the bundle it becomes the evidence this call is about to
+  // declare `complete`, so every later proof binds it. Without these two the terminal marker
+  // could publish `complete` over a substituted tree or reservation.
+  if (captured.movedTreeIdentity) {
+    assertDirectoryFence(captured.treePath, captured.treeLabel, captured.movedTreeIdentity, fsImpl);
+  }
+  if (captured.movedReservationIdentity) {
+    assertRegularFileFence(
+      captured.movedReservationPath,
+      'quarantine moved reservation',
+      captured.movedReservationIdentity,
+      fsImpl,
+    );
   }
   if (options.includeSource) {
     assertDirectoryFence(
@@ -931,16 +945,35 @@ function readMaintenanceMarker(root, options = {}) {
   }
 }
 
-function ensureRuntimeDirectory(root, fsImpl) {
+// `mkdirSync` resolves `.wiki-meta` through whatever that name points at when the syscall runs,
+// so proving the parent once and then creating `.runtime` leaves a seam where substituting
+// `.wiki-meta` for a symlink creates the directory outside the wiki before the post-creation
+// physical check can reject the path. Re-proving the captured parent identity and the lock owner
+// immediately before and after the creation closes that seam; the residual window between the
+// re-proof and the syscall itself is the platform's (Node exposes no `mkdirat`), the same class
+// the marker reader accepts.
+function assertRuntimeParentUnchanged(root, token, meta, expected, fsImpl) {
+  if (!identityUnchanged(physicalDirectoryIdentity(meta, '.wiki-meta', true, fsImpl), expected)) {
+    throw stateError('WIKI_STATE_FILESYSTEM', '.wiki-meta identity changed mid-runtime-create');
+  }
+  assertLockOwner({ wikiRoot: root, token });
+}
+
+function ensureRuntimeDirectory(root, fsImpl, options = {}) {
+  const { token, faultInjector } = options;
   const meta = path.join(root, '.wiki-meta');
-  physicalDirectoryIdentity(meta, '.wiki-meta', false, fsImpl);
+  const metaIdentity = physicalDirectoryIdentity(meta, '.wiki-meta', false, fsImpl);
   const runtime = path.join(meta, '.runtime');
+  invokeMarkerFault(faultInjector, 'before-runtime-mkdir');
+  assertRuntimeParentUnchanged(root, token, meta, metaIdentity, fsImpl);
   try { fsImpl.mkdirSync(runtime, { recursive: false }); }
   catch (error) {
     if (error.code !== 'EEXIST') {
       throw stateError('WIKI_STATE_FILESYSTEM', '.wiki-meta/.runtime identity is unavailable', error);
     }
   }
+  invokeMarkerFault(faultInjector, 'after-runtime-mkdir');
+  assertRuntimeParentUnchanged(root, token, meta, metaIdentity, fsImpl);
   return physicalDirectoryIdentity(runtime, '.wiki-meta/.runtime', false, fsImpl);
 }
 
@@ -950,7 +983,7 @@ function writeMaintenanceMarker(root, token, mutate, options = {}) {
   const maxBytes = options.maxBytes === undefined ? MAINTENANCE_MARKER_MAX_BYTES : options.maxBytes;
   const now = options.now || new Date();
   assertLockOwner({ wikiRoot: root, token });
-  ensureRuntimeDirectory(root, fsImpl);
+  ensureRuntimeDirectory(root, fsImpl, { token, faultInjector: options.faultInjector });
   const current = readMaintenanceMarker(root, { fs: fsImpl, faultInjector: options.faultInjector })
     || emptyMaintenanceMarker(canonicalUtcZ(now));
   const draft = cloneMarker(current);
@@ -1371,6 +1404,12 @@ function quarantineStoreEntry(options = {}) {
     throw error;
   }
 
+  // The rename is the commit point: from here the source must be absent and the moved tree is
+  // the captured identity, so the fence switches expectations rather than keeping the pre-rename
+  // source proof that no longer describes the disk.
+  captured.sourceIdentity = null;
+  captured.expectSourceAbsent = true;
+  captured.sourceAbsenceContext = 'quarantine';
   invokeMarkerFault(faultInjector, 'after-rename');
 
   try {
@@ -1379,12 +1418,9 @@ function quarantineStoreEntry(options = {}) {
     if (!identityUnchanged(treeIdentity, sourceIdentity)) {
       throw stateError('WIKI_STATE_FILESYSTEM', 'quarantine tree identity does not match the captured source');
     }
-    try {
-      fsImpl.lstatSync(source);
-      throw stateError('WIKI_STATE_FILESYSTEM', 'quarantine source still exists after rename');
-    } catch (error) {
-      if (error.code !== 'ENOENT') throw error;
-    }
+    captured.treePath = tree;
+    captured.treeLabel = `.wiki-meta/.quarantine/${bundle}/tree`;
+    captured.movedTreeIdentity = treeIdentity;
     invokeMarkerFault(faultInjector, 'after-tree-identity');
     invokeMarkerFault(faultInjector, 'before-reservation-rename');
 
@@ -1394,6 +1430,10 @@ function quarantineStoreEntry(options = {}) {
       const destination = path.join(bundleDir, 'reservation');
       fsImpl.renameSync(reservation, destination);
       assertRegularFileFence(destination, 'quarantine reservation', reservationIdentity, fsImpl);
+      captured.movedReservationPath = destination;
+      captured.movedReservationIdentity = reservationIdentity;
+      captured.reservationPath = null;
+      captured.reservationIdentity = null;
       fence();
       paired = true;
     }
@@ -1406,7 +1446,7 @@ function quarantineStoreEntry(options = {}) {
 
     writeMaintenanceMarker(root, token, (marker) => upsertQuarantineBundle(marker, {
       bundle, source_name: classified.sourceName, state: 'complete', at: canonicalUtcZ(now),
-    }), { fs: fsImpl });
+    }), { fs: fsImpl, beforePublish: () => fence() });
     const result = { status: 'quarantined', bundle };
     if (followUp) result.follow_up = followUp;
     if (followUpArgv) result.follow_up_argv = followUpArgv;
@@ -1481,7 +1521,10 @@ function resumeReservationOnly(context) {
         estimated_entries: classification.estimated_entries ?? null,
       },
       reason,
-      paired_reservation: true,
+      // The reservation rename below is this bundle's commit point, so the durable metadata must
+      // not claim the pairing before it exists: an interrupted resume leaves a directly
+      // inventoried bundle, and that bundle's meta is the only account of what it holds.
+      paired_reservation: false,
       resume: true,
     };
     attachFollowUpMetadata(metaPayload, followUp, followUpArgv);
@@ -1500,6 +1543,16 @@ function resumeReservationOnly(context) {
     fsImpl.renameSync(reservation, destination);
     renamed = true;
     assertRegularFileFence(destination, 'quarantine reservation', reservationIdentity, fsImpl);
+    captured.movedReservationPath = destination;
+    captured.movedReservationIdentity = reservationIdentity;
+    captured.reservationPath = null;
+    captured.reservationIdentity = null;
+    fence();
+    writeQuarantineMeta(
+      path.join(bundleDir, 'quarantine.meta.json'),
+      { ...metaPayload, paired_reservation: true },
+      token, root, fsImpl, () => fence(),
+    );
     writeMaintenanceMarker(root, token, (marker) => upsertQuarantineBundle(marker, {
       bundle, source_name: classified.sourceName, state: 'complete', at: canonicalUtcZ(now), resume: true,
     }), { fs: fsImpl, beforePublish: () => fence() });

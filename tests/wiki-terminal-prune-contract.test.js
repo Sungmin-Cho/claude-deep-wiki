@@ -78,8 +78,8 @@ test('public contracts name every terminal-prune caller and preserve recovery au
   );
   assert.match(lint, /stop all hosts and correct the marker before rerunning/i);
   assert.match(lint, /reservation-\.prune|reservation.*prune/i);
-  assert.equal((lint.match(/^```deep-wiki-exec$/gm) || []).length, 4);
-  assert.equal((lint.match(/^<!-- deep-wiki:exec -->$/gm) || []).length, 4);
+  assert.equal((lint.match(/^```deep-wiki-exec$/gm) || []).length, 5);
+  assert.equal((lint.match(/^<!-- deep-wiki:exec -->$/gm) || []).length, 5);
   assert.match(storage, /transaction recover/);
   assert.match(storage, /stopped-host/);
   assert.match(storage, /direct-child.*metadata.*owner.*directory\s+identity/is);

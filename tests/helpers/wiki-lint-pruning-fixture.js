@@ -187,7 +187,7 @@ function createPreservedEnsureQuarantineResidue(root) {
       },
     });
     assert.equal(reached, true);
-    assert.deepEqual(seeded, { processed: 0, removed: [], complete: false });
+    assert.deepEqual(seeded, { processed: 0, removed: [], complete: false, skipped_oversized: [] });
   } finally {
     releaseLock({ wikiRoot: root, token: owner.token });
   }

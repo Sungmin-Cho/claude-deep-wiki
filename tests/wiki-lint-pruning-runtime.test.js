@@ -427,6 +427,7 @@ test('kind-filtered recovery ignores protected ensure quarantine residue', () =>
       processed: 1,
       removed: [promoted.operationId],
       complete: true,
+      skipped_oversized: [],
     });
   } finally {
     releaseLock({ wikiRoot: root, token: owner.token });
@@ -1038,6 +1039,7 @@ test('post-final-unlink fences report the current committed prune', async (t) =>
         processed: 1,
         removed: [operationId],
         complete: false,
+        skipped_oversized: [],
       });
       return;
     }

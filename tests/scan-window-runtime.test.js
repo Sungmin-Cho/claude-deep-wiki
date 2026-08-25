@@ -1660,6 +1660,7 @@ process.stdout.write(JSON.stringify(result));`,
         processed: 0,
         removed: [],
         complete: false,
+        skipped_oversized: [],
       });
     } finally {
       releaseLock({ wikiRoot: root, token: owner.token });
@@ -1668,6 +1669,7 @@ process.stdout.write(JSON.stringify(result));`,
       processed: 1,
       removed: [operationId],
       complete: true,
+      skipped_oversized: [],
     });
   });
 
@@ -1764,6 +1766,7 @@ process.stdout.write(JSON.stringify(result));`,
           processed: 0,
           removed: [],
           complete: false,
+          skipped_oversized: [],
         });
       } finally {
         releaseLock({ wikiRoot: root, token: owner.token });
@@ -1773,6 +1776,7 @@ process.stdout.write(JSON.stringify(result));`,
         processed: 1,
         removed: [operationId],
         complete: true,
+        skipped_oversized: [],
       });
     });
   }
@@ -1835,6 +1839,7 @@ const result=sw.pruneScanWindowTransactions({wikiRoot:process.argv[3],token:proc
         processed: 1,
         removed: [laterOperation],
         complete: false,
+        skipped_oversized: [],
       });
     } finally {
       releaseLock({ wikiRoot: root, token: owner.token });
@@ -1843,6 +1848,7 @@ const result=sw.pruneScanWindowTransactions({wikiRoot:process.argv[3],token:proc
       processed: 1,
       removed: [heldOperation],
       complete: true,
+      skipped_oversized: [],
     });
   });
 
@@ -1870,6 +1876,7 @@ const result=sw.pruneScanWindowTransactions({wikiRoot:process.argv[3],token:proc
       processed: 1,
       removed: [operationId],
       complete: true,
+      skipped_oversized: [],
     });
   });
 
@@ -1966,6 +1973,7 @@ const result=sw.pruneScanWindowTransactions({wikiRoot:process.argv[3],token:proc
       processed: 1,
       removed: [operationId],
       complete: true,
+      skipped_oversized: [],
     });
   });
 
@@ -3768,6 +3776,7 @@ test('transaction prune stops between recoverable cleanup phases when cumulative
       processed: 1,
       removed: [completed.operationId],
       complete: true,
+      skipped_oversized: [],
     });
   } finally {
     releaseLock({ wikiRoot: root, token: owner.token });

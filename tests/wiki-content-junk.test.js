@@ -502,6 +502,11 @@ test('T8 report shape, collector errors, lstat omission, sorting, and deadline p
   assert.deepEqual(state.inspectWiki({ wikiRoot: cleanRoot }), {
     ok: true, pages: 1, events: 1, issues: [],
     ignored_os_metadata: { pages: [], sources: [], versions: [] },
+    maintenance_residue: {
+      prune_failures: [], promoted: [], skipped_oversized: [], quarantine_bundles: [],
+      bundles: [], count: 0, truncated: false, unexpected: 0,
+      oversized: false, method: 'none', estimated_entries: null,
+    },
   });
 
   const populatedRoot = fixture('deep wiki AppleDouble T8 populated ');

@@ -1130,6 +1130,14 @@ test('snapshot worker detail round-trips and rejects malformed detail', () => {
   assert.match(deadline.message, /TRANSACTION_OVERSIZED/);
 });
 
+test('inspectWiki exposes maintenance_residue without affecting ok', () => {
+  const root = wikiFixture();
+  const inspected = wikiState.inspectWiki({ wikiRoot: root });
+  assert.equal(inspected.ok, true);
+  assert.deepEqual(inspected.maintenance_residue.bundles, []);
+  assert.equal(Object.hasOwn(inspected, 'maintenance_residue'), true);
+});
+
 test('inspectWiki classifies oversized non-prune directories before reading journals', () => {
   const root = wikiFixture();
   const name = `scan-window-ensure-${hex40('88')}`;

@@ -1300,6 +1300,23 @@ function writeSetupIntent(root, token, manifest) {
   return value;
 }
 
+function assertValidRuntimeMarkerDirectory(root, runtimePath) {
+  let stat;
+  try { stat = fs.lstatSync(runtimePath); }
+  catch (error) {
+    throw stateError('WIKI_STATE_INVALID', 'partial setup contains unexpected metadata', error);
+  }
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw stateError('WIKI_STATE_INVALID', 'partial setup contains unexpected metadata');
+  }
+  const names = fs.readdirSync(runtimePath);
+  if (names.length === 0) return;
+  if (names.length !== 1 || names[0] !== 'scan-window-maintenance.json') {
+    throw stateError('WIKI_STATE_INVALID', 'partial setup contains unexpected metadata');
+  }
+  readMaintenanceMarker(root);
+}
+
 function setupTargetState(root) {
   if (!fs.existsSync(root)) return 'new';
   const stat = fs.lstatSync(root);
@@ -1327,10 +1344,17 @@ function setupTargetState(root) {
   if (fs.existsSync(meta)) {
     const allowedMeta = new Set([
       'sources', '.versions', '.transactions', '.transaction-receipts', '.wiki-lock', 'index.json',
-      '.setup-intent.json',
+      '.setup-intent.json', '.quarantine',
     ]);
-    if (fs.readdirSync(meta).some((entry) => !allowedMeta.has(entry))) {
-      throw stateError('WIKI_STATE_INVALID', 'partial setup contains unexpected metadata');
+    const metaNames = fs.readdirSync(meta);
+    for (const entry of metaNames) {
+      if (entry === '.runtime') {
+        assertValidRuntimeMarkerDirectory(root, path.join(meta, '.runtime'));
+        continue;
+      }
+      if (!allowedMeta.has(entry)) {
+        throw stateError('WIKI_STATE_INVALID', 'partial setup contains unexpected metadata');
+      }
     }
   }
   const authenticated = interruptedSetupManifest(root) !== null || readSetupIntent(root) !== null;
@@ -1617,12 +1641,28 @@ function inspectWiki(options = {}) {
     sources: collectIgnoredOsMetadata(path.join(root, '.wiki-meta', 'sources'), 'sources', deadline),
     versions: collectIgnoredOsMetadata(path.join(root, '.wiki-meta', '.versions'), 'versions', deadline),
   };
+  const marker = readMaintenanceMarker(root);
+  const inventory = listQuarantineBundleNames(root, { deadline });
+  const maintenance_residue = {
+    prune_failures: marker ? marker.prune_failures : [],
+    promoted: marker ? marker.promoted : [],
+    skipped_oversized: marker ? marker.skipped_oversized : [],
+    quarantine_bundles: marker ? marker.quarantine_bundles : [],
+    bundles: inventory.bundles,
+    count: inventory.count,
+    truncated: inventory.truncated,
+    unexpected: inventory.unexpected,
+    oversized: inventory.oversized,
+    method: inventory.method,
+    estimated_entries: inventory.estimated_entries,
+  };
   return {
     ok: issues.length === 0,
     pages: snapshot.pages.length,
     events: snapshot.events.length,
     issues,
     ignored_os_metadata,
+    maintenance_residue,
   };
 }
 
@@ -1686,7 +1726,29 @@ function fixWiki(options = {}) {
     try {
       before = inspectWiki({ wikiRoot: root, deadline });
     } catch (initial) {
-      if (initial.code !== 'TRANSACTION_RECOVERY_REQUIRED') throw initial;
+      if (initial.code === 'TRANSACTION_OVERSIZED') {
+        const attempted = new Set();
+        let promoted = 0;
+        while (promoted < 8) {
+          let current;
+          try { current = inspectWiki({ wikiRoot: root, deadline }); break; }
+          catch (error) {
+            if (error.code !== 'TRANSACTION_OVERSIZED' || !error.operationId) throw error;
+            if (attempted.has(error.operationId)) throw error;
+            attempted.add(error.operationId);
+            quarantineStoreEntry({
+              wikiRoot: root,
+              token: owner.token,
+              name: error.operationId,
+              classification: { method: error.method || 'stat', estimated_entries: error.estimatedEntries ?? null },
+              reason: 'oversized',
+            });
+            promoted += 1;
+          }
+        }
+        before = inspectWiki({ wikiRoot: root, deadline });
+      } else if (initial.code !== 'TRANSACTION_RECOVERY_REQUIRED') throw initial;
+      else {
       try {
         recovery = prune('recovery', 64);
       } catch (recoveryError) {
@@ -1732,6 +1794,7 @@ function fixWiki(options = {}) {
         );
         wrapped.terminal_prune = recovery;
         throw wrapped;
+      }
       }
     }
     const pendingBytes = readMaybe(path.join(root, '.wiki-meta', '.pending-scan'));

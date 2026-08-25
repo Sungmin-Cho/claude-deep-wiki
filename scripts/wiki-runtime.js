@@ -46,6 +46,7 @@ Usage:
   node scripts/wiki-runtime.js obsidian tags --json
   node scripts/wiki-runtime.js snapshot --wiki-root <absolute> --json
   node scripts/wiki-runtime.js commit --wiki-root <absolute> --lock-token <token> --manifest-file <absolute-json> --json
+  node scripts/wiki-runtime.js transaction recover --wiki-root <absolute> --operation-id <id> --json
   node scripts/wiki-runtime.js transaction recover --wiki-root <absolute> --lock-token <token> --operation-id <id> --json
   node scripts/wiki-runtime.js transaction prune --wiki-root <absolute> --lock-token <token> --max-age-days <integer> --json
   node scripts/wiki-runtime.js transaction quarantine --wiki-root <absolute> --operation-id <id-or-prune-name> --json
@@ -714,7 +715,8 @@ function oversizedHint(error) {
     const quotedRoot = shellQuote(path.resolve(root));
     const quotedName = shellQuote(name);
     if (rollback) {
-      return `TRANSACTION_OVERSIZED is isolatable as a rollback remnant. Isolate it with transaction quarantine --wiki-root ${quotedRoot} --operation-id ${quotedName} --json, then transaction recover --operation-id ${shellQuote(rollback[1])}.`;
+      const recover = `node scripts/wiki-runtime.js transaction recover --wiki-root ${quotedRoot} --operation-id ${shellQuote(rollback[1])} --json`;
+      return `TRANSACTION_OVERSIZED is isolatable as a rollback remnant. Isolate it with transaction quarantine --wiki-root ${quotedRoot} --operation-id ${quotedName} --json, then ${recover}.`;
     }
     return `TRANSACTION_OVERSIZED is isolatable. Run transaction quarantine --wiki-root ${quotedRoot} --operation-id ${quotedName} --json`;
   }
@@ -793,25 +795,44 @@ function runTransaction(argv) {
   }
   if (command === 'recover') {
     const flags = wikiFlags(argv.slice(1), { '--lock-token': 'value', '--operation-id': 'value' });
-    const token = requireFlag(flags, '--lock-token');
     const operationId = requireFlag(flags, '--operation-id');
-    let result;
-    try {
-      result = wikiState.recoverTransaction({
-        wikiRoot: flags['--wiki-root'], token, operationId,
-      });
-    } catch (error) {
-      if (error.code === 'DEADLINE_EXCEEDED') {
-        error.message = `${error.message} — ${recoverHint(flags['--wiki-root'], operationId)}`;
+    const wikiRoot = flags['--wiki-root'];
+    const injected = flags['--lock-token'];
+    let token = injected;
+    let acquired = null;
+    if (!injected) {
+      try {
+        acquired = acquireLock({ wikiRoot, operation: 'transaction-recover' });
+      } catch (error) {
+        if (error.code === 'LOCK_CONTENDED') {
+          emit({ status: 'skipped', reason: 'LOCK_CONTENDED' });
+          return;
+        }
+        throw error;
       }
-      throw error;
+      token = acquired.token;
     }
-    emit(result);
     try {
-      cleanupRuntimeManifests(flags['--wiki-root'], token, operationId);
-    } catch (error) {
-      if (error.code !== 'LOCK_TOKEN_MISMATCH') throw error;
-      process.stderr.write(`WARNING: runtime manifest cleanup skipped after lock ownership changed: ${error.message}\n`);
+      let result;
+      try {
+        result = wikiState.recoverTransaction({
+          wikiRoot, token, operationId,
+        });
+      } catch (error) {
+        if (error.code === 'DEADLINE_EXCEEDED') {
+          error.message = `${error.message} — ${recoverHint(wikiRoot, operationId)}`;
+        }
+        throw error;
+      }
+      emit(result);
+      try {
+        cleanupRuntimeManifests(wikiRoot, token, operationId);
+      } catch (error) {
+        if (error.code !== 'LOCK_TOKEN_MISMATCH') throw error;
+        process.stderr.write(`WARNING: runtime manifest cleanup skipped after lock ownership changed: ${error.message}\n`);
+      }
+    } finally {
+      if (acquired) releaseLock({ wikiRoot, token: acquired.token });
     }
     return;
   }

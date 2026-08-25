@@ -1135,6 +1135,12 @@ test('quarantineStoreEntry records rollback follow_up and bound wrappers share t
   withLock(root, (token) => {
     const result = quarantine(root, token, name);
     assert.match(result.follow_up, /01JZ7P9Q6MD7S5PB8H4Y40HJ83/);
+    assert.match(result.follow_up, /transaction recover/);
+    assert.match(result.follow_up, /--wiki-root/);
+    assert.doesNotMatch(result.follow_up, /--lock-token/);
+    assert.deepEqual(result.follow_up_argv, [
+      'transaction', 'recover', '--wiki-root', root, '--operation-id', '01JZ7P9Q6MD7S5PB8H4Y40HJ83', '--json',
+    ]);
     const cliName = `scan-window-cli-${hex40('44')}`;
     seedStoreDirectory(root, cliName);
     const viaScan = scanWindow.quarantineStoreEntry({
@@ -2056,4 +2062,350 @@ test('promoteOversizedNames with zero names does not create or rewrite .runtime'
     });
     assert.deepEqual(fs.readFileSync(markerFixture.markerPath(seeded)), before);
   });
+});
+
+function withUnknownStoreDirents(store, names, fn) {
+  const original = fs.readdirSync;
+  const resolved = path.resolve(store);
+  const wanted = new Set(names);
+  fs.readdirSync = function readdirSync(target, options) {
+    const entries = original.call(fs, target, options);
+    if (path.resolve(String(target)) !== resolved || !Array.isArray(entries)) return entries;
+    if (!(options && options.withFileTypes)) return entries;
+    return entries.map((entry) => (wanted.has(entry.name) ? fakeDirent(entry.name) : entry));
+  };
+  try { return fn(); }
+  finally { fs.readdirSync = original; }
+}
+
+function activationInteriorCalls(store, name) {
+  const directory = path.resolve(store, name);
+  const calls = [];
+  const record = (kind, target) => {
+    if (path.resolve(String(target)) === directory) calls.push(kind);
+  };
+  return {
+    calls,
+    fs: {
+      ...fs,
+      readdirSync(target, options) {
+        record('readdirSync', target);
+        return fs.readdirSync(target, options);
+      },
+      opendirSync(target, options) {
+        record('opendirSync', target);
+        return fs.opendirSync(target, options);
+      },
+      lstatSync(target, options) {
+        if (path.resolve(path.dirname(String(target))) === directory) calls.push('child-lstat');
+        return fs.lstatSync(target, options);
+      },
+      readFileSync(target, options) {
+        if (path.resolve(path.dirname(String(target))) === directory) calls.push('readFileSync');
+        return fs.readFileSync(target, options);
+      },
+    },
+  };
+}
+
+function countActivationInterior(directory, fn) {
+  const resolved = path.resolve(directory);
+  const calls = { opendirSync: 0, readdirSync: 0, childLookup: 0 };
+  const originalOpendir = fs.opendirSync;
+  const originalReaddir = fs.readdirSync;
+  const originalLstat = fs.lstatSync;
+  const originalReadFile = fs.readFileSync;
+  fs.opendirSync = function opendirSync(target, ...rest) {
+    if (path.resolve(String(target)) === resolved) calls.opendirSync += 1;
+    return originalOpendir.call(fs, target, ...rest);
+  };
+  fs.readdirSync = function readdirSync(target, ...rest) {
+    if (path.resolve(String(target)) === resolved) calls.readdirSync += 1;
+    return originalReaddir.call(fs, target, ...rest);
+  };
+  fs.lstatSync = function lstatSync(target, ...rest) {
+    if (path.resolve(path.dirname(String(target))) === resolved) calls.childLookup += 1;
+    return originalLstat.call(fs, target, ...rest);
+  };
+  fs.readFileSync = function readFileSync(target, ...rest) {
+    if (path.resolve(path.dirname(String(target))) === resolved) calls.childLookup += 1;
+    return originalReadFile.call(fs, target, ...rest);
+  };
+  try { return { result: fn(), calls }; }
+  finally {
+    fs.opendirSync = originalOpendir;
+    fs.readdirSync = originalReaddir;
+    fs.lstatSync = originalLstat;
+    fs.readFileSync = originalReadFile;
+  }
+}
+
+test('inspectWiki skips DT_UNKNOWN .activate-* directories before pressure or interior access', () => {
+  const root = lintableWikiFixture();
+  const name = '.activate-unknown-reader';
+  const directory = path.join(storePath(root), name);
+  fs.mkdirSync(directory, { recursive: true });
+  fillOversizedLiveEntries(directory);
+  const observed = withNtfsShapedStat([directory], () => withUnknownStoreDirents(
+    storePath(root),
+    [name],
+    () => countActivationInterior(directory, () => wikiState.inspectWiki({ wikiRoot: root })),
+  ));
+  assert.equal(observed.result.ok, true);
+  assert.equal(observed.calls.opendirSync, 0);
+  assert.equal(observed.calls.readdirSync, 0);
+  assert.equal(observed.calls.childLookup, 0);
+});
+
+test('sweep skips DT_UNKNOWN .activate-* directories before pressure or interior access', () => {
+  const root = wikiFixture();
+  const store = storePath(root);
+  const name = '.activate-unknown-sweep';
+  const directory = path.join(store, name);
+  fs.mkdirSync(directory, { recursive: true });
+  fillOversizedLiveEntries(directory);
+  const { fs: spy, calls } = activationInteriorCalls(store, name);
+  let probed = 0;
+  withLock(root, (token) => {
+    const result = withNtfsShapedStat([directory], () => withUnknownStoreDirents(store, [name], () => (
+      debris.sweepTransactionDebris(root, token, {
+        deadline: deadline(),
+        limit: 8,
+        inspectDirectoryPressure() {
+          probed += 1;
+          return { oversized: false, method: 'none', estimatedEntries: null };
+        },
+        fs: spy,
+      })
+    )));
+    assert.equal(probed, 0);
+    assert.equal(result.skipped_oversized.includes(name), false);
+    assert.equal(result.processed, 0);
+    assert.equal(fs.existsSync(directory), true);
+    assert.deepEqual(calls, []);
+  });
+});
+
+test('prune reports DT_UNKNOWN oversized .activate-* without interior access', () => {
+  const root = wikiFixture();
+  const store = storePath(root);
+  const name = '.activate-unknown-prune';
+  const directory = path.join(store, name);
+  fs.mkdirSync(directory, { recursive: true });
+  fillOversizedLiveEntries(directory);
+  withLock(root, (token) => {
+    const observed = withUnknownStoreDirents(store, [name], () => countActivationInterior(directory, () => (
+      scanWindow.pruneScanWindowTransactions({
+        wikiRoot: root,
+        token,
+        maxAgeDays: 0,
+        limit: 8,
+        deadline: deadline(),
+        inspectDirectoryPressure: () => ({ oversized: true, method: 'stat', estimatedEntries: 900 }),
+      })
+    )));
+    assert.deepEqual(observed.result.skipped_oversized, [name]);
+    assert.equal(observed.result.processed, 0);
+    assert.equal(observed.calls.opendirSync, 0);
+    assert.equal(observed.calls.readdirSync, 0);
+    assert.equal(observed.calls.childLookup, 0);
+  });
+});
+
+test('prune skips DT_UNKNOWN no-stat-signal .activate-* before pressure or interior access', () => {
+  const root = wikiFixture();
+  const store = storePath(root);
+  const name = '.activate-unknown-prune-nosignal';
+  const directory = path.join(store, name);
+  fs.mkdirSync(directory, { recursive: true });
+  fillOversizedLiveEntries(directory);
+  let probed = 0;
+  withLock(root, (token) => {
+    const observed = withNtfsShapedStat([directory], () => withUnknownStoreDirents(store, [name], () => (
+      countActivationInterior(directory, () => scanWindow.pruneScanWindowTransactions({
+        wikiRoot: root,
+        token,
+        maxAgeDays: 0,
+        limit: 8,
+        deadline: deadline(),
+        inspectDirectoryPressure() {
+          probed += 1;
+          return { oversized: false, method: 'none', estimatedEntries: null };
+        },
+      }))
+    )));
+    assert.equal(observed.result.skipped_oversized.includes(name), false);
+    assert.equal(observed.result.processed, 0);
+    assert.equal(fs.existsSync(directory), true);
+    assert.equal(observed.calls.opendirSync, 0);
+    assert.equal(observed.calls.readdirSync, 0);
+    assert.equal(observed.calls.childLookup, 0);
+    assert.equal(probed === 0 || probed === 1, true);
+  });
+});
+
+test('quarantineStoreEntry fail-closes .quarantine root-swap at before-bundle-mkdir', () => {
+  for (const kind of ['internal', 'external', 'dangling']) {
+    const root = wikiFixture();
+    const secret = `mkdir-secret-${kind}-${Date.now()}`;
+    const name = `scan-window-ensure-${hex40('a1')}`;
+    const sourcePath = seedStoreDirectory(root, name);
+    const journal = fs.readFileSync(path.join(sourcePath, 'journal.json'));
+    const quarantineRoot = markerFixture.quarantinePath(root);
+    const bundle = predictedBundleName();
+    withLock(root, (token) => {
+      let replacement;
+      assert.throws(
+        () => quarantine(root, token, name, quarantineIdentityOptions({
+          faultInjector(boundary) {
+            if (boundary === 'before-bundle-mkdir') {
+              replacement = replaceWithKindedSymlink(quarantineRoot, kind, secret, root);
+            }
+          },
+        })),
+        (error) => {
+          assert.equal(error.code, 'WIKI_STATE_FILESYSTEM');
+          assertNoSecret(error, secret);
+          return true;
+        },
+      );
+      assert.ok(replacement);
+      assertSentinelUnchanged(kind, replacement.target);
+      assert.equal(fs.existsSync(sourcePath), true);
+      assert.deepEqual(fs.readFileSync(path.join(sourcePath, 'journal.json')), journal);
+      if (kind !== 'dangling') {
+        assert.equal(fs.existsSync(path.join(replacement.target, bundle)), false);
+      }
+    });
+  }
+});
+
+test('quarantineStoreEntry reservation-only path fail-closes .quarantine root-swap at before-bundle-mkdir', () => {
+  for (const kind of ['internal', 'external', 'dangling']) {
+    const root = wikiFixture();
+    const secret = `resume-mkdir-${kind}-${Date.now()}`;
+    const pair = seedPrunePair(root, 'a2');
+    const reservationBytes = fs.readFileSync(pair.reservation);
+    const quarantineRoot = markerFixture.quarantinePath(root);
+    const bundle = predictedBundleName({
+      uuid: '01234567-89ab-cdef-0123-456789abcde2',
+    });
+    withLock(root, (token) => {
+      const first = quarantine(root, token, pair.pruneName);
+      assert.equal(first.status, 'quarantined');
+      fs.writeFileSync(pair.reservation, reservationBytes);
+      let replacement;
+      assert.throws(
+        () => quarantine(root, token, pair.pruneName, quarantineIdentityOptions({
+          randomUUID: () => '01234567-89ab-cdef-0123-456789abcde2',
+          faultInjector(boundary) {
+            if (boundary === 'before-bundle-mkdir') {
+              replacement = replaceWithKindedSymlink(quarantineRoot, kind, secret, root);
+            }
+          },
+        })),
+        (error) => {
+          assert.equal(error.code, 'WIKI_STATE_FILESYSTEM');
+          assertNoSecret(error, secret);
+          return true;
+        },
+      );
+      assert.ok(replacement);
+      assertSentinelUnchanged(kind, replacement.target);
+      assert.equal(fs.existsSync(pair.reservation), true);
+      assert.deepEqual(fs.readFileSync(pair.reservation), reservationBytes);
+      if (kind !== 'dangling') {
+        assert.equal(fs.existsSync(path.join(replacement.target, bundle)), false);
+      }
+    });
+  }
+});
+
+function replaceReservationWith(kind, reservation, root) {
+  const original = fs.readFileSync(reservation);
+  if (kind === 'symlink') {
+    const target = path.join(root, `reservation-link-${path.basename(reservation)}`);
+    fs.writeFileSync(target, original);
+    fs.unlinkSync(reservation);
+    fs.symlinkSync(target, reservation);
+  } else if (kind === 'directory') {
+    fs.unlinkSync(reservation);
+    fs.mkdirSync(reservation);
+    fs.writeFileSync(path.join(reservation, 'inside'), original);
+  } else if (kind === 'hardlink') {
+    const extra = `${reservation}.hard`;
+    fs.linkSync(reservation, extra);
+  }
+  return original;
+}
+
+test('quarantineStoreEntry refuses a present non-regular paired reservation before mutation', () => {
+  const seeds = { symlink: 'b1', directory: 'b2', hardlink: 'b3' };
+  for (const kind of ['symlink', 'directory', 'hardlink']) {
+    const root = wikiFixture();
+    const pair = seedPrunePair(root, seeds[kind]);
+    const original = replaceReservationWith(kind, pair.reservation, root);
+    if (kind === 'hardlink' && fs.lstatSync(pair.reservation).nlink < 2) continue;
+    const sourcePath = path.join(storePath(root), pair.pruneName);
+    const sourceBytes = fs.readFileSync(path.join(sourcePath, 'journal.json'));
+    withLock(root, (token) => {
+      assert.throws(
+        () => quarantine(root, token, pair.pruneName),
+        (error) => error.code === 'WIKI_STATE_FILESYSTEM',
+      );
+      assert.equal(fs.existsSync(sourcePath), true);
+      assert.deepEqual(fs.readFileSync(path.join(sourcePath, 'journal.json')), sourceBytes);
+      if (kind === 'directory') {
+        assert.equal(fs.statSync(pair.reservation).isDirectory(), true);
+      } else if (kind === 'symlink') {
+        assert.equal(fs.lstatSync(pair.reservation).isSymbolicLink(), true);
+      } else {
+        assert.deepEqual(fs.readFileSync(pair.reservation), original);
+        assert.equal(fs.lstatSync(pair.reservation).nlink >= 2, true);
+      }
+    });
+  }
+});
+
+test('quarantineStoreEntry reservation-only path refuses a present non-regular reservation before mutation', () => {
+  const seeds = { symlink: 'c1', directory: 'c2', hardlink: 'c3' };
+  for (const kind of ['symlink', 'directory', 'hardlink']) {
+    const root = wikiFixture();
+    const pair = seedPrunePair(root, seeds[kind]);
+    withLock(root, (token) => {
+      const first = quarantine(root, token, pair.pruneName);
+      assert.equal(first.status, 'quarantined');
+      fs.writeFileSync(pair.reservation, '{"reservation":true}\n');
+      const original = replaceReservationWith(kind, pair.reservation, root);
+      if (kind === 'hardlink' && fs.lstatSync(pair.reservation).nlink < 2) return;
+      assert.throws(
+        () => quarantine(root, token, pair.pruneName),
+        (error) => error.code === 'WIKI_STATE_FILESYSTEM',
+      );
+      if (kind === 'directory') {
+        assert.equal(fs.statSync(pair.reservation).isDirectory(), true);
+      } else if (kind === 'symlink') {
+        assert.equal(fs.lstatSync(pair.reservation).isSymbolicLink(), true);
+      } else {
+        assert.deepEqual(fs.readFileSync(pair.reservation), original);
+        assert.equal(fs.lstatSync(pair.reservation).nlink >= 2, true);
+      }
+    });
+  }
+});
+
+test('lint fix persists oversized .activate-* residue instead of returning fixed with a silent loss', () => {
+  const root = lintableWikiFixture();
+  const name = '.activate-oversized-residue';
+  const directory = path.join(storePath(root), name);
+  fs.mkdirSync(directory, { recursive: true });
+  fillOversizedTier1Subdirs(directory);
+  const result = wikiState.fixWiki({ wikiRoot: root, now: new Date('2026-08-25T00:00:00Z') });
+  assert.equal(result.status, 'fixed');
+  assert.equal(fs.existsSync(directory), true);
+  assert.ok(result.terminal_prune.skipped_oversized.includes(name), JSON.stringify(result.terminal_prune));
+  const marker = debris.readMaintenanceMarker(root);
+  assert.ok(marker, 'maintenance marker should record ineligible residue');
+  assert.ok(marker.skipped_oversized.includes(name), JSON.stringify(marker));
+  assert.equal(fs.existsSync(path.join(root, '.wiki-meta', '.wiki-lock')), false);
 });

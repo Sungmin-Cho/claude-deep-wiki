@@ -299,7 +299,6 @@ function captureRegularFileIdentity(pathname, label, allowMissing, fsImpl) {
   }
   const identity = regularFileIdentity(stat);
   if (!identity) {
-    if (allowMissing) return null;
     throw stateError('WIKI_STATE_FILESYSTEM', `${label} must be a physical regular file`);
   }
   return identity;
@@ -527,10 +526,14 @@ function sweepTransactionDebris(root, token, options = {}) {
   for (const entry of entries) {
     if (entry.isSymbolicLink()) continue;
     let kind;
+    let resolvedUnknown = false;
     if (entry.isDirectory()) kind = 'directory';
-    else if (direntTypeUnknown(entry)) kind = resolveUnknownDirent(transactions, entry, options.fs || fs).kind;
-    else continue;
+    else if (direntTypeUnknown(entry)) {
+      kind = resolveUnknownDirent(transactions, entry, options.fs || fs).kind;
+      resolvedUnknown = true;
+    } else continue;
     if (kind !== 'directory') continue;
+    if (resolvedUnknown && entry.name.startsWith('.activate-')) continue;
     if (deadline) {
       try { assertBeforeDeadline(deadline, `debris-pressure:${entry.name}`); }
       catch (error) {
@@ -1120,10 +1123,36 @@ function makeBundleName(now, pid, randomUUID) {
   return bundle;
 }
 
-function followUpFor(name) {
+function powershellQuote(value) {
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+function shellQuote(value) {
+  if (process.platform === 'win32') return powershellQuote(value);
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
+function followUpRecoverArgv(wikiRoot, operationId) {
+  return [
+    'transaction', 'recover',
+    '--wiki-root', path.resolve(wikiRoot),
+    '--operation-id', operationId,
+    '--json',
+  ];
+}
+
+function followUpRecoverCommand(wikiRoot, operationId) {
+  const root = path.resolve(wikiRoot);
+  return `node scripts/wiki-runtime.js transaction recover --wiki-root ${shellQuote(root)} --operation-id ${shellQuote(operationId)} --json`;
+}
+
+function followUpFor(name, wikiRoot) {
   const match = ULID_FOLLOW_RE.exec(name);
-  if (!match) return undefined;
-  return `transaction recover --operation-id ${match[1]}`;
+  if (!match || typeof wikiRoot !== 'string' || wikiRoot.length === 0) return undefined;
+  return {
+    follow_up: followUpRecoverCommand(wikiRoot, match[1]),
+    follow_up_argv: followUpRecoverArgv(wikiRoot, match[1]),
+  };
 }
 
 function attachIncompleteQuarantine(error, bundle, sourceName) {
@@ -1176,8 +1205,10 @@ function quarantineStoreEntry(options = {}) {
   const classified = classifyQuarantineName(options.name, options.parsePruneName);
   const reason = options.reason === 'oversized' || options.reason === 'operator' ? options.reason : 'operator';
   const classification = options.classification || { method: 'none', estimated_entries: null };
-  const followUp = followUpFor(classified.kind === 'prune' ? classified.embeddedId : classified.sourceName)
-    || followUpFor(classified.sourceName);
+  const follow = followUpFor(classified.kind === 'prune' ? classified.embeddedId : classified.sourceName, root)
+    || followUpFor(classified.sourceName, root);
+  const followUp = follow && follow.follow_up;
+  const followUpArgv = follow && follow.follow_up_argv;
 
   assertLockOwner({ wikiRoot: root, token });
   const store = path.join(root, '.wiki-meta', '.transactions');
@@ -1198,7 +1229,7 @@ function quarantineStoreEntry(options = {}) {
   if (sourceIdentity === null && classified.kind === 'prune' && reservationIdentity) {
     return resumeReservationOnly({
       root, token, fsImpl, now, pid, randomUUID, faultInjector,
-      classified, reason, classification, followUp,
+      classified, reason, classification, followUp, followUpArgv,
       metaIdentity, storeIdentity, reservation, reservationIdentity,
     });
   }
@@ -1254,6 +1285,7 @@ function quarantineStoreEntry(options = {}) {
 
   try {
     invokeMarkerFault(faultInjector, 'before-bundle-mkdir');
+    fence({ includeSource: true });
     fsImpl.mkdirSync(bundleDir, { recursive: false });
     captured.bundleIdentity = directoryIdentity(
       bundleDir, `.wiki-meta/.quarantine/${bundle}`, fsImpl,
@@ -1321,6 +1353,7 @@ function quarantineStoreEntry(options = {}) {
     }), { fs: fsImpl });
     const result = { status: 'quarantined', bundle };
     if (followUp) result.follow_up = followUp;
+    if (followUpArgv) result.follow_up_argv = followUpArgv;
     return result;
   } catch (error) {
     try {
@@ -1335,7 +1368,7 @@ function quarantineStoreEntry(options = {}) {
 function resumeReservationOnly(context) {
   const {
     root, token, fsImpl, now, pid, randomUUID, faultInjector,
-    classified, reason, classification, followUp,
+    classified, reason, classification, followUp, followUpArgv,
     metaIdentity, storeIdentity, reservation, reservationIdentity,
   } = context;
   const bundle = makeBundleName(now, pid, randomUUID);
@@ -1352,22 +1385,24 @@ function resumeReservationOnly(context) {
       bundle, source_name: classified.sourceName, state: 'pending', at, resume: true,
     }), { fs: fsImpl });
     invokeMarkerFault(faultInjector, 'after-write-ahead');
-    invokeMarkerFault(faultInjector, 'before-bundle-mkdir');
     const bundleDir = path.join(quarantineRoot, bundle);
-    fsImpl.mkdirSync(bundleDir, { recursive: false });
     const captured = {
       metaPath: metaPathname,
       metaIdentity,
       quarantinePath: quarantineRoot,
       quarantineIdentity,
       bundlePath: bundleDir,
-      bundleIdentity: directoryIdentity(bundleDir, `.wiki-meta/.quarantine/${bundle}`, fsImpl),
+      bundleIdentity: null,
       storePath: store,
       storeIdentity,
       reservationPath: reservation,
       reservationIdentity,
     };
     const fence = (extras = {}) => assertQuarantineFence(root, token, captured, { fs: fsImpl, ...extras });
+    invokeMarkerFault(faultInjector, 'before-bundle-mkdir');
+    fence({ includeReservation: true });
+    fsImpl.mkdirSync(bundleDir, { recursive: false });
+    captured.bundleIdentity = directoryIdentity(bundleDir, `.wiki-meta/.quarantine/${bundle}`, fsImpl);
     invokeMarkerFault(faultInjector, 'after-bundle-mkdir');
     const metaPayload = {
       schema: 1,
@@ -1403,6 +1438,7 @@ function resumeReservationOnly(context) {
     }), { fs: fsImpl });
     const result = { status: 'quarantined', bundle, resumed: true };
     if (followUp) result.follow_up = followUp;
+    if (followUpArgv) result.follow_up_argv = followUpArgv;
     return result;
   } catch (error) {
     if (!renamed) {
@@ -1576,4 +1612,6 @@ module.exports = {
   sweepTransactionDebris,
   isTransactionStoreJunkName,
   isReclaimableJunkEntry,
+  followUpRecoverCommand,
+  followUpRecoverArgv,
 };

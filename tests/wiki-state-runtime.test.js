@@ -1267,7 +1267,80 @@ test('oversizedHint reuses the isolatable predicate and quotes every argv value'
   });
   assert.match(rollbackHint, /rollback remnant/);
   assert.match(rollbackHint, /transaction recover/);
+  assert.match(rollbackHint, /--wiki-root/);
+  assert.match(rollbackHint, /--operation-id/);
+  assert.doesNotMatch(rollbackHint, /then transaction recover --operation-id/);
   assert.equal(fs.existsSync(sentinel), false);
+});
+
+test('rollback quarantine follow_up is a self-locking recover that snapshot can execute', () => {
+  const root = fixture('deep wiki rollback follow up ');
+  stageInterrupted(root, manifest());
+  const rollbackName = `rollback-${OPERATION_ID}`;
+  fs.mkdirSync(path.join(root, '.wiki-meta', '.transactions', rollbackName), { recursive: true });
+  fs.writeFileSync(path.join(root, '.wiki-meta', '.transactions', rollbackName, 'journal.json'), '{}\n');
+
+  const quarantined = spawnSync(process.execPath, [
+    cli, 'transaction', 'quarantine',
+    '--wiki-root', root, '--operation-id', rollbackName, '--json',
+  ], { encoding: 'utf8', shell: false });
+  assert.equal(quarantined.status, 0, quarantined.stderr);
+  const payload = JSON.parse(quarantined.stdout);
+  assert.equal(payload.status, 'quarantined');
+  assert.deepEqual(payload.follow_up_argv, [
+    'transaction', 'recover', '--wiki-root', root, '--operation-id', OPERATION_ID, '--json',
+  ]);
+  assert.match(payload.follow_up, /--wiki-root/);
+  assert.doesNotMatch(payload.follow_up, /--lock-token/);
+
+  const recovered = spawnSync(process.execPath, [cli, ...payload.follow_up_argv], {
+    encoding: 'utf8', shell: false,
+  });
+  assert.equal(recovered.status, 0, recovered.stderr);
+
+  const snapshot = spawnSync(process.execPath, [
+    cli, 'snapshot', '--wiki-root', root, '--json',
+  ], { encoding: 'utf8', shell: false });
+  assert.equal(snapshot.status, 0, snapshot.stderr);
+
+  const status = spawnSync(process.execPath, [
+    cli, 'lock', 'status', '--wiki-root', root, '--json',
+  ], { encoding: 'utf8', shell: false });
+  assert.equal(status.status, 0, status.stderr);
+  assert.equal(JSON.parse(status.stdout).locked, false);
+});
+
+test('rollback follow_up quotes a hostile wiki root and remains executable', (t) => {
+  const probe = spawnSync('bash', ['-c', 'echo ok'], { encoding: 'utf8' });
+  if (probe.status !== 0) { t.skip('bash unavailable for POSIX shell-quoting verification'); return; }
+  const root = fixture('deep wiki follow \'up $(printf injected) ');
+  stageInterrupted(root, manifest());
+  const rollbackName = `rollback-${OPERATION_ID}`;
+  fs.mkdirSync(path.join(root, '.wiki-meta', '.transactions', rollbackName), { recursive: true });
+  fs.writeFileSync(path.join(root, '.wiki-meta', '.transactions', rollbackName, 'journal.json'), '{}\n');
+  const quarantined = spawnSync(process.execPath, [
+    cli, 'transaction', 'quarantine',
+    '--wiki-root', root, '--operation-id', rollbackName, '--json',
+  ], { encoding: 'utf8', shell: false });
+  assert.equal(quarantined.status, 0, quarantined.stderr);
+  const payload = JSON.parse(quarantined.stdout);
+  const argv = shellArgvAfterPrefix(payload.follow_up, 'node scripts/wiki-runtime.js transaction recover ');
+  assert.equal(argAfterFlag(argv, '--wiki-root'), path.resolve(root));
+  assert.equal(argAfterFlag(argv, '--operation-id'), OPERATION_ID);
+  assert.equal(argv.includes('--lock-token'), false);
+
+  const recovered = spawnSync(process.execPath, [cli, ...payload.follow_up_argv], {
+    encoding: 'utf8', shell: false,
+  });
+  assert.equal(recovered.status, 0, recovered.stderr);
+  const snapshot = spawnSync(process.execPath, [
+    cli, 'snapshot', '--wiki-root', root, '--json',
+  ], { encoding: 'utf8', shell: false });
+  assert.equal(snapshot.status, 0, snapshot.stderr);
+  const status = spawnSync(process.execPath, [
+    cli, 'lock', 'status', '--wiki-root', root, '--json',
+  ], { encoding: 'utf8', shell: false });
+  assert.equal(JSON.parse(status.stdout).locked, false);
 });
 
 test('oversizedHint renders a PowerShell-safe literal on win32 for adversarial characters', () => {

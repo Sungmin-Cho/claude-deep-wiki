@@ -351,7 +351,6 @@ function inspectTransactions(root, allowedOperationId = null, deadline = operati
   catch (error) { if (error.code === 'ENOENT') return; throw error; }
   for (const entry of entries) {
     assertBeforeDeadline(deadline, `wiki-state:inspect-transaction:${entry.name}`);
-    if (entry.name.startsWith('.activate-') && entry.isDirectory() && !entry.isSymbolicLink()) continue;
     let kind;
     if (entry.isSymbolicLink()) kind = 'symlink';
     else if (entry.isDirectory()) kind = 'directory';
@@ -359,6 +358,7 @@ function inspectTransactions(root, allowedOperationId = null, deadline = operati
         && !entry.isFIFO() && !entry.isSocket()) {
       kind = resolveUnknownDirent(directory, entry).kind;
     } else kind = 'other';
+    if (kind === 'directory' && entry.name.startsWith('.activate-')) continue;
     if (kind !== 'directory') {
       // Recognized OS/sync-client metadata is inert debris, not lost transaction state. Readers
       // run lock-free and cannot remove it; the lock-held debris sweep reclaims it.
@@ -1377,8 +1377,15 @@ function interruptedSetupManifest(root) {
   try { entries = fs.readdirSync(transactions, { withFileTypes: true }); }
   catch (error) { if (error.code === 'ENOENT') return null; throw error; }
   for (const entry of entries) {
-    if (entry.name.startsWith('.activate-')) continue;
-    if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+    let kind;
+    if (entry.isSymbolicLink()) kind = 'symlink';
+    else if (entry.isDirectory()) kind = 'directory';
+    else if (!entry.isFile() && !entry.isBlockDevice() && !entry.isCharacterDevice()
+        && !entry.isFIFO() && !entry.isSocket()) {
+      kind = resolveUnknownDirent(transactions, entry).kind;
+    } else kind = 'other';
+    if (kind === 'directory' && entry.name.startsWith('.activate-')) continue;
+    if (kind !== 'directory') continue;
     assertTransactionNotOversized(root, entry.name);
     const journal = readJournal(path.join(transactions, entry.name, 'journal.json'));
     if (journal?.engine === 'wiki-state' && journal.manifest?.operation === 'setup'
@@ -1933,6 +1940,7 @@ function fixWiki(options = {}) {
           processed: recovery.processed,
           removed: [...recovery.removed],
           complete: false,
+          skipped_oversized: [...(recovery.skipped_oversized || [])],
         };
       }
       else {
@@ -1940,14 +1948,32 @@ function fixWiki(options = {}) {
           processed: recovery.processed + tailError.terminal_prune.processed,
           removed: recovery.removed.concat(tailError.terminal_prune.removed),
           complete: false,
+          skipped_oversized: [
+            ...(recovery.skipped_oversized || []),
+            ...(tailError.terminal_prune.skipped_oversized || []),
+          ],
         };
       }
       throw wrapped;
     }
+    const skipped = [...new Set([
+      ...(recovery.skipped_oversized || []),
+      ...(tail.skipped_oversized || []),
+    ])];
+    const promotion = promoteOversizedNames({
+      wikiRoot: root,
+      token: owner.token,
+      names: skipped,
+      parsePruneName: scanWindow.operationIdFromPruneName,
+      classification: { method: 'stat', estimated_entries: null },
+      reason: 'oversized',
+      deadline,
+    });
     const terminalPrune = {
       processed: recovery.processed + tail.processed,
       removed: recovery.removed.concat(tail.removed),
       complete: recovery.complete && tail.complete,
+      skipped_oversized: promotion.skipped_oversized,
     };
     if (suppressEnsurePrune) {
       terminalPrune.suppressed_reason = 'initial-invalid-scan-marker';

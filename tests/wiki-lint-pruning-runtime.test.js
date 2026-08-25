@@ -152,6 +152,7 @@ test('lint fix reports only reclaimed no-op ensure evidence and preserves unprom
     processed: 1,
     removed: [statuses.get('preserved')],
     complete: true,
+    skipped_oversized: [],
   });
   assert.equal(completedEnsureCount(root), 1);
   assert.equal(fs.existsSync(path.join(
@@ -205,6 +206,7 @@ test('lint repair carries either initially invalid marker as whole-pass ensure s
         processed: 0,
         removed: [],
         complete: true,
+        skipped_oversized: [],
         suppressed_reason: 'initial-invalid-scan-marker',
       });
     });
@@ -230,6 +232,7 @@ test('lint repair canonicalizes its text predicate and reports sticky invalid-ma
     processed: 0,
     removed: [],
     complete: true,
+    skipped_oversized: [],
     suppressed_reason: 'initial-invalid-scan-marker',
   });
 
@@ -238,6 +241,7 @@ test('lint repair canonicalizes its text predicate and reports sticky invalid-ma
     processed: 1,
     removed: [statuses.get('preserved')],
     complete: true,
+    skipped_oversized: [],
   });
   assert.equal(completedEnsureCount(root), 1);
   assert.equal(fs.existsSync(path.join(
@@ -265,6 +269,7 @@ test('lint repair preserves a physically ambiguous invalid marker for stopped-ho
     processed: 0,
     removed: [],
     complete: true,
+    skipped_oversized: [],
     suppressed_reason: 'initial-invalid-scan-marker',
   });
 });
@@ -394,6 +399,7 @@ test('lint fix recovers quarantine-only promote and repair residue before inspec
         processed: 1,
         removed: [residue.operationId],
         complete: true,
+        skipped_oversized: [],
       });
       assert.equal(fs.existsSync(residue.quarantine), false);
       assert.equal(fs.existsSync(path.join(root, '.wiki-meta', '.wiki-lock')), false);
@@ -612,6 +618,7 @@ test('positive recovery and post-commit maintenance failure expose both truthful
         processed: 1,
         removed: ['blocking-entry'],
         complete: false,
+        skipped_oversized: [],
       }) === undefined
       && error.lint_result?.status === 'fixed');
   } finally {
@@ -1313,6 +1320,7 @@ test('lint recovery plus ordinary tail share one aggregate limit of 64 real tran
     processed: 64,
     removed: preservedIds,
     complete: false,
+    skipped_oversized: [],
   });
   assert.equal(completedEnsureCount(root), 1);
 
@@ -1321,6 +1329,7 @@ test('lint recovery plus ordinary tail share one aggregate limit of 64 real tran
     processed: 0,
     removed: [],
     complete: true,
+    skipped_oversized: [],
   });
   assert.equal(completedEnsureCount(root), 1);
   assert.equal(fs.existsSync(path.join(root, '.wiki-meta', '.wiki-lock')), false);

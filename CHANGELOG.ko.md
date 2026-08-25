@@ -12,7 +12,7 @@ deep-wiki의 주요 변경사항을 기록합니다.
 ### 수정
 
 - `/wiki-setup`이 setup lifecycle event를 canonical `YYYY-MM-DDTHH:MM:SSZ` timestamp로 emit하므로, 문서화된 setup route가 더 이상 `MANIFEST_INVALID`로 실패하지 않습니다.
-- oversized leftover transaction directory가 더 이상 모든 runtime inspection을 영구 `DEADLINE_EXCEEDED`로 막지 않습니다. Reader는 `TRANSACTION_OVERSIZED`로 분류하고, lock-held writer는 내부를 건너뛰며, isolatable 이름은 트리를 삭제하지 않고 `transaction quarantine`으로 옮길 수 있습니다.
+- oversized leftover transaction directory가 더 이상 모든 runtime inspection을 영구 `DEADLINE_EXCEEDED`로 막지 않습니다. Reader는 `TRANSACTION_OVERSIZED`로 분류하고, lock-held writer는 내부를 건너뛰며, isolatable 이름은 트리를 삭제하지 않고 `transaction quarantine`으로 옮길 수 있습니다. SessionStart ensure, lint fix, transaction prune, transaction quarantine은 isolatable oversized tree를 자동으로 옮깁니다. 번들은 `.wiki-meta/.quarantine/`에 남고 자동 삭제하지 않습니다. 해결 후에는 모든 host를 중지한 뒤 번들을 수동으로 폐기합니다.
 - `transaction recover --wiki-root … --operation-id … --json`은 `--lock-token`이 없으면 self-locking이라 rollback quarantine `follow_up`을 바로 실행할 수 있습니다. 이미 lock을 보유한 호출자는 `--lock-token`을 계속 주입할 수 있습니다.
 
 ### 변경

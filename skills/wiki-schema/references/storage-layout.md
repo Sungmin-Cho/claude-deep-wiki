@@ -27,7 +27,7 @@ WIKI_ROOT/
 Three different "quarantine" areas exist and must not be confused:
 
 1. Terminal-prune quarantine: `<store>/.prune-*` directories created by `pruneScanWindowTransactions`.
-2. Transaction quarantine bundles: `.wiki-meta/.quarantine/<stamp>-<pid>-<uuid>/` created by `transaction quarantine` for oversized store entries. Bundles are never auto-deleted.
+2. Transaction quarantine bundles: `.wiki-meta/.quarantine/<stamp>-<pid>-<uuid>/` created automatically by SessionStart ensure, `wiki-lint --fix`, and `transaction prune` when they promote isolatable oversized store entries, and by the operator command `transaction quarantine`. Bundles are never auto-deleted. After the oversized tree is resolved, stop all hosts and dispose of the bundle directory manually; do not delete `.wiki-meta/.quarantine/` while any host is live.
 3. Inbox quarantine: `.wiki-meta/.inbox/.quarantine/` used by `cleanupInbox`.
 
 The only file the engine creates under `.wiki-meta/.runtime` and intentionally leaves after ordinary cleanup is `scan-window-maintenance.json`. Authenticated partial setup may keep that directory when it contains exactly that marker or is empty.
@@ -95,7 +95,10 @@ A manifest-backed `commit` writes one operation intent beneath
 version, provenance, catalog, and lifecycle changes, then records a terminal
 state. `transaction recover --wiki-root … --operation-id … --json` is
 self-locking when `--lock-token` is omitted, and still accepts an authenticated
-owner token from a caller that already holds the lock. It is idempotent: it
+owner token from a caller that already holds the lock. Rollback quarantine
+bundles persist platform-neutral `follow_up_argv`; the rendered `follow_up`
+string is a host-local convenience generated from that argv so a cross-OS
+reader can re-render. It is idempotent: it
 either completes the recorded operation or restores the pre-operation state; it
 never invents a new action.
 

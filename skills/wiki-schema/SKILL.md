@@ -82,7 +82,10 @@ the public operator form omits the token and self-locks. A caller never creates
 split mutations.
 The shared terminal pruner has three callers: `scan-window ensure`,
 `wiki-lint --fix`, and the singular operator command `wiki-runtime.js
-transaction prune`. Ordinary selection removes only fully validated, terminal
+transaction prune`. Oversized isolatable store entries are relocated into
+`.wiki-meta/.quarantine/` bundles by those three callers plus the operator
+command `transaction quarantine`. Bundles are never auto-deleted; after
+resolution, stop all hosts and dispose of a bundle directory manually. Ordinary selection removes only fully validated, terminal
 scan-window journals older than the requested age while the caller still owns
 the lock. The lint recovery pass may bypass that ordinary age test only for
 authenticated residue from an already-started prune; it does not broaden

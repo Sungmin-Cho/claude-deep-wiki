@@ -52,6 +52,9 @@ The JSON result also carries `skipped_oversized` on prune-family results and, on
 `lint inspect`, informational `maintenance_residue` (isolation bundles and
 maintenance events). `maintenance_residue` does not flip `ok`. Isolated
 oversized trees live under `.wiki-meta/.quarantine/` and are never auto-deleted.
+SessionStart ensure, `lint fix`, `transaction prune`, and `transaction
+quarantine` can all create those bundles. After the tree is resolved, stop all
+hosts and dispose of the bundle directory manually.
 
 If inspection fails with `TRANSACTION_OVERSIZED`, follow the class-specific
 guidance: isolatable scan-window and `.prune-*` names use
@@ -129,5 +132,5 @@ authenticated owner.
 
 <!-- deep-wiki:exec -->
 ```deep-wiki-exec
-{"executable":"node","argv":["<plugin_root>/scripts/wiki-runtime.js","transaction","recover","--wiki-root","ABSOLUTE_WIKI_ROOT","--operation-id","01JZ7P9Q6MD7S5PB8H4Y40HJ80","--json"]}
+{"executable":"node","argv":["<plugin_root>/scripts/wiki-runtime.js","transaction","recover","--wiki-root","ABSOLUTE_WIKI_ROOT","--operation-id","OPERATION_ULID","--json"]}
 ```

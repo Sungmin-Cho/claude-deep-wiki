@@ -415,6 +415,9 @@ test('wiki-local auto-ingest and setup-authority operator docs stay aligned', ()
   assert.match(changelogCurrent, /Divergent local\/legacy policy and representative invalid local config shapes now fail closed/);
   assert.match(changelogCurrent, /TRANSACTION_OVERSIZED/);
   assert.match(changelogCurrent, /transaction quarantine/);
+  assert.match(changelogCurrent, /SessionStart ensure, lint fix, transaction prune, and transaction quarantine/);
+  assert.match(changelogCurrent, /automatically relocate isolatable oversized trees/);
+  assert.match(changelogCurrent, /never auto-deleted/);
 
   const changelogHistorical = readText('CHANGELOG.md');
   assert.doesNotMatch(changelogHistorical, /no shipped code reads that file/);
@@ -429,6 +432,9 @@ test('wiki-local auto-ingest and setup-authority operator docs stay aligned', ()
   assert.match(koreanChangelogCurrent, /divergent local\/legacy policy와 대표 invalid local config shape는 fail closed/);
   assert.match(koreanChangelogCurrent, /TRANSACTION_OVERSIZED/);
   assert.match(koreanChangelogCurrent, /transaction quarantine/);
+  assert.match(koreanChangelogCurrent, /SessionStart ensure, lint fix, transaction prune, transaction quarantine/);
+  assert.match(koreanChangelogCurrent, /isolatable oversized tree를 자동으로 옮깁니다/);
+  assert.match(koreanChangelogCurrent, /자동 삭제하지 않습니다/);
 
   const koreanChangelogHistorical = readText('CHANGELOG.ko.md');
   assert.doesNotMatch(koreanChangelogHistorical, /배포되는 코드 중 이 파일을 읽는 곳은 없습니다/);

@@ -86,6 +86,29 @@ test('public contracts name every terminal-prune caller and preserve recovery au
   assert.match(storage, /non-regular.*recovery/i);
 });
 
+test('quarantine bundle contracts name every creator, durable paths, and recovery placeholders', () => {
+  const lint = read('skills/wiki-lint/SKILL.md');
+  const schema = read('skills/wiki-schema/SKILL.md');
+  const storage = read('skills/wiki-schema/references/storage-layout.md');
+  const machine = read('skills/wiki-schema/wiki-schema.yaml');
+  for (const source of [schema, storage, machine]) {
+    assert.match(source, /scan-window ensure/);
+    assert.match(source, /wiki-lint --fix/);
+    assert.match(source, /transaction prune/);
+    assert.match(source, /transaction quarantine/);
+  }
+  assert.match(storage, /SessionStart ensure|scan-window ensure/);
+  assert.match(storage, /never auto-deleted|are never auto-deleted/);
+  assert.match(storage, /stop(?:ped)? all hosts/i);
+  assert.match(machine, /\.wiki-meta\/\.quarantine\//);
+  assert.match(machine, /\.wiki-meta\/\.runtime\/scan-window-maintenance\.json/);
+  assert.match(lint, /"OPERATION_ULID"/);
+  assert.doesNotMatch(
+    lint.slice(lint.indexOf('transaction","recover"')),
+    /01JZ7P9Q6MD7S5PB8H4Y40HJ80/,
+  );
+});
+
 test('content catalog metadata documentation is bounded and fail-closed', () => {
   const lint = read('skills/wiki-lint/SKILL.md');
   const storage = read('skills/wiki-schema/references/storage-layout.md');

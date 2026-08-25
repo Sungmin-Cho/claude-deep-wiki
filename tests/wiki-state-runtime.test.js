@@ -1532,6 +1532,127 @@ test('setup rejects an unauthenticated empty pages/meta scaffold', () => {
   assert.deepEqual(fs.readdirSync(root).sort(), ['.wiki-meta', 'pages']);
 });
 
+test('authenticated partial setup accepts .quarantine and a valid .runtime marker and keeps the marker', () => {
+  const { setupWiki } = require(statePath);
+  const markerFixture = require('./helpers/maintenance-marker-fixture.js');
+  const home = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'deep wiki partial runtime home ')));
+  roots.add(home);
+  const root = path.join(home, 'Partial Wiki');
+  assert.throws(() => setupWiki({
+    wikiRoot: root,
+    env: setupEnv(home),
+    now: new Date(TS),
+    operationId: OPERATION_ID,
+    eventId: EVENT_ID,
+    faultInjector(boundary) { if (boundary === 'after-setup-intent') throw new Error('stop'); },
+  }));
+  markerFixture.ensureRuntime(root);
+  markerFixture.writeRawMarker(root, markerFixture.canonicalMarkerBytes(markerFixture.emptyMarker({
+    promoted: ['scan-window-ensure-aa'],
+  })));
+  fs.mkdirSync(markerFixture.quarantinePath(root), { recursive: true });
+  const result = setupWiki({ wikiRoot: root, env: setupEnv(home), now: new Date(TS) });
+  assert.equal(result.operationId, OPERATION_ID);
+  assert.equal(fs.existsSync(path.join(root, 'pages', 'welcome.md')), true);
+  assert.equal(fs.existsSync(markerFixture.markerPath(root)), true);
+});
+
+test('unauthenticated partial setup with a valid .runtime is still rejected as not authenticated', () => {
+  const { setupWiki } = require(statePath);
+  const markerFixture = require('./helpers/maintenance-marker-fixture.js');
+  const home = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'deep wiki unauth runtime home ')));
+  roots.add(home);
+  const root = path.join(home, 'wiki');
+  fs.mkdirSync(root);
+  fs.mkdirSync(path.join(root, 'pages'));
+  fs.mkdirSync(path.join(root, '.wiki-meta'));
+  markerFixture.ensureRuntime(root);
+  markerFixture.writeRawMarker(root, markerFixture.canonicalMarkerBytes(markerFixture.emptyMarker({
+    promoted: ['keep'],
+  })));
+  assert.throws(
+    () => setupWiki({ wikiRoot: root, env: setupEnv(home), now: new Date(TS) }),
+    (error) => error.code === 'WIKI_STATE_INVALID'
+      && /not authenticated by setup intent or journal/.test(error.message),
+  );
+});
+
+test('authenticated partial setup rejects invalid .runtime and .quarantine shapes', () => {
+  const { setupWiki } = require(statePath);
+  const markerFixture = require('./helpers/maintenance-marker-fixture.js');
+  const cases = [
+    {
+      name: 'runtime-symlink',
+      plant(root) {
+        const target = path.join(root, 'runtime-target');
+        fs.mkdirSync(target);
+        fs.symlinkSync(target, markerFixture.runtimePath(root));
+      },
+    },
+    {
+      name: 'runtime-file',
+      plant(root) {
+        fs.writeFileSync(markerFixture.runtimePath(root), 'not-a-directory\n');
+      },
+    },
+    {
+      name: 'runtime-extra-name',
+      plant(root) {
+        markerFixture.ensureRuntime(root);
+        fs.writeFileSync(path.join(markerFixture.runtimePath(root), 'leftover-manifest.json'), '{}\n');
+      },
+    },
+    {
+      name: 'marker-symlink',
+      plant(root) {
+        markerFixture.ensureRuntime(root);
+        const target = path.join(root, 'marker-target.json');
+        fs.writeFileSync(target, '{}\n');
+        fs.symlinkSync(target, markerFixture.markerPath(root));
+      },
+    },
+    {
+      name: 'marker-json-broken',
+      plant(root) {
+        markerFixture.writeRawMarker(root, Buffer.from('{not json\n'));
+      },
+    },
+    {
+      name: 'marker-operation-id',
+      plant(root) {
+        markerFixture.writeRawMarker(root, Buffer.from(`${JSON.stringify({
+          schema: 1,
+          updated_at: '2026-08-25T00:00:00Z',
+          operation_id: 'nope',
+          prune_failures: [],
+          promoted: [],
+          skipped_oversized: [],
+          quarantine_bundles: [],
+        })}\n`));
+      },
+    },
+  ];
+  for (const item of cases) {
+    const home = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), `deep wiki partial ${item.name} `)));
+    roots.add(home);
+    const root = path.join(home, 'Partial Wiki');
+    assert.throws(() => setupWiki({
+      wikiRoot: root,
+      env: setupEnv(home),
+      now: new Date(TS),
+      operationId: OPERATION_ID,
+      eventId: EVENT_ID,
+      faultInjector(boundary) { if (boundary === 'after-setup-intent') throw new Error('stop'); },
+    }));
+    item.plant(root);
+    assert.throws(
+      () => setupWiki({ wikiRoot: root, env: setupEnv(home), now: new Date(TS) }),
+      (error) => error.code === 'WIKI_STATE_INVALID',
+      item.name,
+    );
+  }
+});
+
 test('setup CLI exposes only explicit stopped-host rebind and returns public authority generation', () => {
   const home = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'deep wiki cli rebind home ')));
   roots.add(home);

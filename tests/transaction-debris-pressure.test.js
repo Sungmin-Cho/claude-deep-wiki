@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { spawnSync } = require('node:child_process');
 
 const debris = require('../hooks/scripts/runtime/transaction-debris.js');
 const fsSafe = require('../hooks/scripts/runtime/fs-safe.js');
@@ -1221,7 +1222,7 @@ test('wiki-state pre-entry gates refuse oversized leftover transaction directori
   const name = '01JZ7P9Q6MD7S5PB8H4Y40HJ83';
   const directory = path.join(storePath(root), name);
   fs.mkdirSync(directory, { recursive: true });
-  fillOversizedTier1Subdirs(directory);
+  fillOversizedLiveEntries(directory);
   fs.writeFileSync(path.join(directory, 'journal.json'), `${JSON.stringify({
     engine: 'wiki-state',
     manifest: { operation: 'setup' },
@@ -1229,7 +1230,9 @@ test('wiki-state pre-entry gates refuse oversized leftover transaction directori
   })}\n`);
   assert.throws(
     () => wikiState.snapshotWiki({ wikiRoot: root }),
-    (error) => error.code === 'TRANSACTION_OVERSIZED' || error.code === 'TRANSACTION_RECOVERY_REQUIRED',
+    (error) => error.code === 'TRANSACTION_OVERSIZED'
+      && error.operationId === name
+      && error.wikiRoot === root,
   );
 });
 
@@ -1725,4 +1728,107 @@ test('promoteOversizedNames stops at the deadline and leaves remaining names dur
     assert.equal(fs.existsSync(path.join(storePath(root), first)), false);
     assert.equal(fs.existsSync(path.join(storePath(root), second)), true);
   });
+});
+
+const CLI = path.resolve(__dirname, '..', 'scripts', 'wiki-runtime.js');
+
+test('ensurePendingScan promotes isolatable oversized debris and records a durable marker', () => {
+  const root = wikiFixture();
+  fs.mkdirSync(storePath(root), { recursive: true });
+  const orphan = `scan-window-ensure-${hex40('99')}`;
+  seedStoreDirectory(root, orphan);
+  const result = scanWindow.ensurePendingScan({
+    wikiRoot: root,
+    proposed: '2026-08-25T01:00:00Z',
+    now: new Date('2026-08-25T01:00:00Z'),
+    deadline: deadline(),
+    inspectDirectoryPressure(pathname) {
+      return path.basename(pathname) === orphan
+        ? { oversized: true, method: 'stat', estimatedEntries: 800 }
+        : { oversized: false, method: 'none', estimatedEntries: null };
+    },
+  });
+  assert.notEqual(result.status, 'deferred');
+  assert.equal(fs.existsSync(path.join(storePath(root), orphan)), false);
+  const marker = debris.readMaintenanceMarker(root);
+  assert.equal(marker.promoted.includes(orphan), true);
+  const inventory = debris.listQuarantineBundleNames(root, { deadline: deadline() });
+  assert.equal(inventory.count >= 1, true);
+});
+
+test('ensurePendingScan leaves no-signal oversized names durable for a later pass', () => {
+  const root = wikiFixture();
+  fs.mkdirSync(storePath(root), { recursive: true });
+  const orphan = `scan-window-ensure-${hex40('98')}`;
+  seedStoreDirectory(root, orphan);
+  scanWindow.ensurePendingScan({
+    wikiRoot: root,
+    proposed: '2026-08-25T02:00:00Z',
+    now: new Date('2026-08-25T02:00:00Z'),
+    deadline: deadline(),
+    inspectDirectoryPressure() {
+      return { oversized: false, method: 'none', estimatedEntries: null };
+    },
+  });
+  assert.equal(fs.existsSync(path.join(storePath(root), orphan)), true);
+});
+
+test('transaction quarantine CLI isolates an oversized name and inspectWiki never joins bundle children', () => {
+  const root = wikiFixture();
+  const name = `scan-window-ensure-${hex40('97')}`;
+  seedStoreDirectory(root, name);
+  const spawned = spawnSync(process.execPath, [
+    CLI, 'transaction', 'quarantine',
+    '--wiki-root', root, '--operation-id', name, '--json',
+  ], { encoding: 'utf8', shell: false });
+  assert.equal(spawned.status, 0, spawned.stderr);
+  const payload = JSON.parse(spawned.stdout);
+  assert.equal(payload.status, 'quarantined');
+  assert.equal(fs.existsSync(path.join(storePath(root), name)), false);
+  const quarantine = markerFixture.quarantinePath(root);
+  const calls = [];
+  const originalReaddir = fs.readdirSync;
+  const originalLstat = fs.lstatSync;
+  const originalOpen = fs.openSync;
+  const originalReadFile = fs.readFileSync;
+  fs.readdirSync = (target, options) => { calls.push(String(target)); return originalReaddir.call(fs, target, options); };
+  fs.lstatSync = (target, options) => { calls.push(String(target)); return originalLstat.call(fs, target, options); };
+  fs.openSync = (target, ...rest) => { calls.push(String(target)); return originalOpen.call(fs, target, ...rest); };
+  fs.readFileSync = (target, ...rest) => { calls.push(String(target)); return originalReadFile.call(fs, target, ...rest); };
+  let inspected;
+  try { inspected = wikiState.inspectWiki({ wikiRoot: root }); }
+  finally {
+    fs.readdirSync = originalReaddir;
+    fs.lstatSync = originalLstat;
+    fs.openSync = originalOpen;
+    fs.readFileSync = originalReadFile;
+  }
+  assert.equal(inspected.ok, true);
+  assert.equal(inspected.maintenance_residue.bundles.includes(payload.bundle), true);
+  const interior = calls.filter((target) => {
+    const relative = path.relative(quarantine, target);
+    return relative !== '' && !relative.startsWith('..') && relative.split(path.sep).length > 1;
+  });
+  assert.deepEqual(interior, []);
+});
+
+test('lint inspect prints a quoted isolatable oversizedHint and never mentions a side-effect sentinel', () => {
+  const root = wikiFixture();
+  const name = `scan-window-ensure-${hex40('96')}`;
+  seedStoreDirectory(root, name);
+  fillOversizedLiveEntries(path.join(storePath(root), name));
+  const spawned = spawnSync(process.execPath, [
+    CLI, 'lint', 'inspect', '--wiki-root', root, '--json',
+  ], { encoding: 'utf8', shell: false });
+  assert.notEqual(spawned.status, 0);
+  assert.match(spawned.stderr, /TRANSACTION_OVERSIZED/);
+  assert.match(spawned.stderr, /transaction quarantine/);
+  if (process.platform === 'win32') {
+    assert.match(spawned.stderr, /--wiki-root '/);
+    assert.match(spawned.stderr, /--operation-id '/);
+  } else {
+    assert.match(spawned.stderr, new RegExp(`--wiki-root '${root.replaceAll("'", "'\\\\''")}'`));
+    assert.match(spawned.stderr, new RegExp(`--operation-id '${name}'`));
+  }
+  assert.doesNotMatch(spawned.stderr, /\$\(/);
 });

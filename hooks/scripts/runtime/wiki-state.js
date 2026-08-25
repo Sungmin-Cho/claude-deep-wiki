@@ -1314,7 +1314,10 @@ function assertValidRuntimeMarkerDirectory(root, runtimePath) {
   if (names.length !== 1 || names[0] !== 'scan-window-maintenance.json') {
     throw stateError('WIKI_STATE_INVALID', 'partial setup contains unexpected metadata');
   }
-  readMaintenanceMarker(root);
+  try { readMaintenanceMarker(root); }
+  catch (error) {
+    throw stateError('WIKI_STATE_INVALID', 'partial setup contains unexpected metadata', error);
+  }
 }
 
 function setupTargetState(root) {

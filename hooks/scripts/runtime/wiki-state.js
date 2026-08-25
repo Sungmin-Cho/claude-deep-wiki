@@ -19,7 +19,7 @@ const { acquireLock, assertLockOwner, releaseLock } = require('./lock.js');
 const scanWindow = require('./scan-window.js');
 const {
   sweepTransactionDebris, validateTombstoneV1, isReclaimableJunkEntry,
-  assertTransactionStoreAnchored,
+  assertTransactionStoreAnchored, quarantineStoreEntry: quarantineStoreEntryPrimitive,
 } = require('./transaction-debris.js');
 
 const { promotePendingScan } = scanWindow;
@@ -1823,6 +1823,13 @@ function fixWiki(options = {}) {
   }
 }
 
+function quarantineStoreEntry(options = {}) {
+  return quarantineStoreEntryPrimitive({
+    ...options,
+    parsePruneName: options.parsePruneName || scanWindow.operationIdFromPruneName,
+  });
+}
+
 module.exports = {
   setupWiki,
   snapshotWiki,
@@ -1834,4 +1841,5 @@ module.exports = {
   inspectWiki,
   fixWiki,
   migrateAutoIngestPolicy,
+  quarantineStoreEntry,
 };

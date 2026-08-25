@@ -885,3 +885,230 @@ test('listQuarantineBundleNames truncates after 64 names', () => {
   assert.equal(result.truncated, true);
 });
 
+const scanWindow = require('../hooks/scripts/runtime/scan-window.js');
+const wikiState = require('../hooks/scripts/runtime/wiki-state.js');
+
+function hex40(seed = 'aa') {
+  return seed.repeat(40).slice(0, 40);
+}
+
+function storePath(root) {
+  return path.join(root, '.wiki-meta', '.transactions');
+}
+
+function seedStoreDirectory(root, name) {
+  const directory = path.join(storePath(root), name);
+  fs.mkdirSync(directory, { recursive: true });
+  fs.writeFileSync(path.join(directory, 'journal.json'), '{}\n');
+  return directory;
+}
+
+function parsePruneName(name) {
+  return scanWindow.operationIdFromPruneName(name);
+}
+
+function quarantine(root, token, name, extras = {}) {
+  return debris.quarantineStoreEntry({
+    wikiRoot: root,
+    token,
+    name,
+    classification: extras.classification || { method: 'none', estimated_entries: null },
+    reason: extras.reason || 'operator',
+    now: extras.now || new Date('2026-08-25T00:00:00Z'),
+    parsePruneName,
+    faultInjector: extras.faultInjector,
+    randomUUID: extras.randomUUID,
+    pid: extras.pid,
+  });
+}
+
+test('quarantineStoreEntry accepts the four isolatable classes and a well-formed .prune-* name', () => {
+  const root = wikiFixture();
+  const names = [
+    `scan-window-ensure-${hex40('ab')}`,
+    `scan-window-cli-${hex40('cd')}`,
+    `lint-repair-${hex40('ef')}`,
+    'rollback-01JZ7P9Q6MD7S5PB8H4Y40HJ83',
+  ];
+  const pruneId = `scan-window-ensure-${hex40('11')}`;
+  const pruneName = `.prune-${pruneId.length}-${pruneId}-1-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee`;
+  withLock(root, (token) => {
+    for (const name of [...names, pruneName]) {
+      seedStoreDirectory(root, name);
+      const result = quarantine(root, token, name);
+      assert.equal(result.status, 'quarantined');
+      assert.equal(debris.QUARANTINE_BUNDLE_NAME_RE.test(result.bundle), true);
+      const tree = path.join(markerFixture.quarantinePath(root), result.bundle, 'tree');
+      assert.equal(fs.existsSync(tree), true);
+      assert.equal(fs.existsSync(path.join(storePath(root), name)), false);
+      const metaRel = path.join('.wiki-meta', '.quarantine', result.bundle, 'quarantine.meta.json');
+      assert.equal(metaRel.length < 128, true);
+    }
+  });
+});
+
+test('quarantineStoreEntry rejects traversal, pure ULID, random names, and malformed .prune-* before lstat', () => {
+  const root = wikiFixture();
+  const rejects = [
+    'a..b',
+    '01JZ7P9Q6MD7S5PB8H4Y40HJ83',
+    'not-a-transaction',
+    `.prune-3-abc-1-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee`,
+    `.prune-40-${hex40('aa')}-1-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/../../x`,
+  ];
+  withLock(root, (token) => {
+    for (const name of rejects) {
+      let lstatCalls = 0;
+      const spy = {
+        lstatSync(...args) { lstatCalls += 1; return fs.lstatSync(...args); },
+        renameSync() { throw new Error('rename must not run'); },
+      };
+      assert.throws(
+        () => debris.quarantineStoreEntry({
+          wikiRoot: root, token, name, parsePruneName,
+          classification: { method: 'none', estimated_entries: null },
+          reason: 'operator',
+          fs: spy,
+        }),
+        (error) => error.code === 'WIKI_STATE_INVALID' || error.code === 'SCAN_WINDOW_INVALID',
+      );
+      assert.equal(lstatCalls, 0, name);
+    }
+  });
+});
+
+test('quarantineStoreEntry fail-closes a .quarantine symlink', () => {
+  const secret = `q-target-${Date.now()}`;
+  const root = wikiFixture();
+  const target = path.join(temporaryDirectory(), secret);
+  fs.mkdirSync(target);
+  fs.mkdirSync(markerFixture.metaPath(root), { recursive: true });
+  fs.mkdirSync(storePath(root), { recursive: true });
+  fs.symlinkSync(target, markerFixture.quarantinePath(root));
+  const name = `scan-window-ensure-${hex40('99')}`;
+  seedStoreDirectory(root, name);
+  withLock(root, (token) => {
+    assert.throws(
+      () => quarantine(root, token, name),
+      (error) => {
+        assert.equal(error.code, 'WIKI_STATE_FILESYSTEM');
+        assertNoSecret(error, secret);
+        return true;
+      },
+    );
+  });
+});
+
+test('quarantineStoreEntry write-ahead and crash-seam marker states follow the transition table', () => {
+  const cases = [
+    { boundary: 'after-write-ahead', expectState: 'pending', tree: false, bundleDir: false },
+    { boundary: 'before-bundle-mkdir', expectState: null, tree: false, bundleDir: false },
+    { boundary: 'before-rename', expectState: null, tree: false, bundleDir: true },
+    { boundary: 'after-rename', expectState: 'pending', tree: true, bundleDir: true },
+    { boundary: 'after-tree-identity', expectState: 'incomplete', tree: true, bundleDir: true },
+    { boundary: 'before-reservation-rename', expectState: 'incomplete', tree: true, bundleDir: true },
+    { boundary: null, expectState: 'complete', tree: true, bundleDir: true },
+  ];
+  for (const item of cases) {
+    const root = wikiFixture();
+    const name = `scan-window-ensure-${hex40('22')}`;
+    seedStoreDirectory(root, name);
+    withLock(root, (token) => {
+      const run = () => quarantine(root, token, name, {
+        faultInjector(boundary) {
+          if (item.boundary && boundary === item.boundary) throw new Error(`stop:${boundary}`);
+        },
+      });
+      if (item.boundary) assert.throws(run, (error) => error.message === `stop:${item.boundary}`);
+      else {
+        const result = run();
+        assert.equal(result.status, 'quarantined');
+      }
+      const marker = debris.readMaintenanceMarker(root);
+      const records = marker ? marker.quarantine_bundles : [];
+      if (item.expectState === null) {
+        assert.equal(records.length, 0);
+      } else {
+        assert.equal(records.length, 1);
+        assert.equal(records[0].state, item.expectState);
+        const inventory = debris.listQuarantineBundleNames(root, { deadline: deadline() });
+        if (item.bundleDir) {
+          assert.equal(inventory.bundles.includes(records[0].bundle) || inventory.count >= 1, true);
+          const tree = path.join(markerFixture.quarantinePath(root), records[0].bundle, 'tree');
+          assert.equal(fs.existsSync(tree), item.tree);
+        } else {
+          assert.equal(inventory.bundles.length, 0);
+        }
+      }
+    });
+  }
+});
+
+test('quarantineStoreEntry resume of a reservation-only .prune-* yields a second bundle', () => {
+  const root = wikiFixture();
+  const operationId = `scan-window-ensure-${hex40('33')}`;
+  const pruneName = `.prune-${operationId.length}-${operationId}-2-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee`;
+  seedStoreDirectory(root, pruneName);
+  fs.writeFileSync(path.join(storePath(root), operationId), '{"reservation":true}\n');
+  withLock(root, (token) => {
+    const first = quarantine(root, token, pruneName);
+    assert.equal(first.status, 'quarantined');
+    assert.equal(fs.existsSync(path.join(markerFixture.quarantinePath(root), first.bundle, 'tree')), true);
+    fs.writeFileSync(path.join(storePath(root), operationId), '{"reservation":true}\n');
+    const resumed = quarantine(root, token, pruneName);
+    assert.equal(resumed.resumed, true);
+    assert.notEqual(resumed.bundle, first.bundle);
+    assert.equal(fs.existsSync(path.join(markerFixture.quarantinePath(root), resumed.bundle, 'reservation')), true);
+    assert.equal(fs.existsSync(path.join(markerFixture.quarantinePath(root), resumed.bundle, 'tree')), false);
+  });
+});
+
+test('quarantineStoreEntry records rollback follow_up and bound wrappers share the parser', () => {
+  const root = wikiFixture();
+  const name = 'rollback-01JZ7P9Q6MD7S5PB8H4Y40HJ83';
+  seedStoreDirectory(root, name);
+  withLock(root, (token) => {
+    const result = quarantine(root, token, name);
+    assert.match(result.follow_up, /01JZ7P9Q6MD7S5PB8H4Y40HJ83/);
+    const cliName = `scan-window-cli-${hex40('44')}`;
+    seedStoreDirectory(root, cliName);
+    const viaScan = scanWindow.quarantineStoreEntry({
+      wikiRoot: root,
+      token,
+      name: cliName,
+      classification: { method: 'none', estimated_entries: null },
+      reason: 'operator',
+      now: new Date('2026-08-25T00:00:00Z'),
+    });
+    assert.equal(viaScan.status, 'quarantined');
+  });
+  const repair = `lint-repair-${hex40('55')}`;
+  seedStoreDirectory(root, repair);
+  withLock(root, (token) => {
+    const viaState = wikiState.quarantineStoreEntry({
+      wikiRoot: root,
+      token,
+      name: repair,
+      classification: { method: 'none', estimated_entries: null },
+      reason: 'operator',
+      now: new Date('2026-08-25T00:00:00Z'),
+    });
+    assert.equal(viaState.status, 'quarantined');
+  });
+});
+
+test('generated quarantine bundle names match the shared inventory regex', () => {
+  const root = wikiFixture();
+  const name = `scan-window-ensure-${hex40('66')}`;
+  seedStoreDirectory(root, name);
+  withLock(root, (token) => {
+    const result = quarantine(root, token, name, {
+      pid: '1234567890',
+      randomUUID: () => '01234567-89ab-cdef-0123-456789abcdef',
+    });
+    assert.equal(debris.QUARANTINE_BUNDLE_NAME_RE.test(result.bundle), true);
+    assert.match(result.bundle, /^20260825T000000Z-1234567890-[0-9a-f]{32}$/);
+  });
+});
+
+

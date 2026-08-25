@@ -665,6 +665,10 @@ function runCommit(argv) {
   }
 }
 
+function quarantineStoreEntry(options = {}) {
+  return scanWindow.quarantineStoreEntry(options);
+}
+
 function runTransaction(argv) {
   const command = argv[0];
   if (command === 'prune') {
@@ -827,4 +831,5 @@ module.exports = {
   commitRetryHint,
   cleanupRuntimeManifests,
   runSnapshotWorker,
+  quarantineStoreEntry,
 };

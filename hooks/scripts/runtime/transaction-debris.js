@@ -1,5 +1,6 @@
 'use strict';
 
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 
@@ -42,6 +43,9 @@ const BUNDLE_REQUIRED_KEYS = ['bundle', 'source_name', 'state', 'at'];
 const BUNDLE_OPTIONAL_KEYS = ['resume'];
 const BUNDLE_STATES = new Set(['pending', 'incomplete', 'complete']);
 const PRUNE_FAILURE_KEYS = ['code', 'at'];
+const ISOLATABLE_NAME_RE = /^(?:scan-window-ensure-[0-9a-f]{40}|scan-window-cli-[0-9a-f]{40}|lint-repair-[0-9a-f]{40}|rollback-[0-9A-HJKMNP-TV-Z]{26})$/;
+const PRUNE_SUFFIX_RE = /^[0-9]{1,10}-[0-9a-f-]{36}$/;
+const ULID_FOLLOW_RE = /^rollback-([0-9A-HJKMNP-TV-Z]{26})$/;
 const FILE_TYPE_MASK = 0o170000n;
 const DIRECTORY_TYPE = 0o040000n;
 const ULID_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/;
@@ -925,6 +929,286 @@ function listQuarantineBundleNames(root, options = {}) {
   };
 }
 
+function classifyQuarantineName(name, parsePruneName) {
+  if (typeof name !== 'string' || name.length === 0 || path.basename(name) !== name) {
+    throw stateError('WIKI_STATE_INVALID', 'quarantine target name is invalid');
+  }
+  if (ISOLATABLE_NAME_RE.test(name)) {
+    return { kind: 'direct', sourceName: name, embeddedId: name };
+  }
+  if (!name.startsWith('.prune-')) {
+    throw stateError('WIKI_STATE_INVALID', 'quarantine target is not an isolatable class');
+  }
+  if (typeof parsePruneName !== 'function') {
+    throw stateError('WIKI_STATE_INVALID', 'prune-name parser is required');
+  }
+  const operationId = parsePruneName(name);
+  const prefix = `.prune-${operationId.length}-${operationId}-`;
+  if (!name.startsWith(prefix)) {
+    throw stateError('WIKI_STATE_INVALID', 'terminal quarantine name is invalid');
+  }
+  if (!PRUNE_SUFFIX_RE.test(name.slice(prefix.length))) {
+    throw stateError('WIKI_STATE_INVALID', 'terminal quarantine name is invalid');
+  }
+  if (!ISOLATABLE_NAME_RE.test(operationId)) {
+    throw stateError('WIKI_STATE_INVALID', 'terminal quarantine embedded id is not isolatable');
+  }
+  return { kind: 'prune', sourceName: name, embeddedId: operationId };
+}
+
+function quarantineStamp(date) {
+  return canonicalUtcZ(date).replaceAll('-', '').replaceAll(':', '');
+}
+
+function makeBundleName(now, pid, randomUUID) {
+  const uuid = String(randomUUID()).replaceAll('-', '');
+  const bundle = `${quarantineStamp(now)}-${pid}-${uuid}`;
+  if (!QUARANTINE_BUNDLE_NAME_RE.test(bundle)) {
+    throw stateError('WIKI_STATE_INVALID', 'quarantine bundle name is invalid');
+  }
+  return bundle;
+}
+
+function followUpFor(name) {
+  const match = ULID_FOLLOW_RE.exec(name);
+  if (!match) return undefined;
+  return `transaction recover --operation-id ${match[1]}`;
+}
+
+function directoryIdentity(pathname, label, fsImpl) {
+  return physicalDirectoryIdentity(pathname, label, false, fsImpl);
+}
+
+function writeQuarantineMeta(destination, payload, token, root, fsImpl) {
+  const bytes = Buffer.from(`${JSON.stringify(payload)}\n`, 'utf8');
+  atomicWriteFile(destination, bytes, {
+    fs: fsImpl,
+    createParent: false,
+    beforeRename: () => assertLockOwner({ wikiRoot: root, token }),
+    beforePublish: () => assertLockOwner({ wikiRoot: root, token }),
+  });
+}
+
+function reservationPath(store, embeddedId) {
+  return path.join(store, embeddedId);
+}
+
+function lstatRegularFile(pathname, fsImpl) {
+  let stat;
+  try { stat = fsImpl.lstatSync(pathname, { bigint: true }); }
+  catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+  if (!stat.isFile() || stat.isSymbolicLink()) return null;
+  return stat;
+}
+
+function quarantineStoreEntry(options = {}) {
+  const root = options.wikiRoot;
+  const token = options.token;
+  const fsImpl = options.fs || fs;
+  const now = options.now || new Date();
+  const pid = String(options.pid === undefined ? process.pid : options.pid);
+  const randomUUID = options.randomUUID || crypto.randomUUID;
+  const { faultInjector } = options;
+  const classified = classifyQuarantineName(options.name, options.parsePruneName);
+  const reason = options.reason === 'oversized' || options.reason === 'operator' ? options.reason : 'operator';
+  const classification = options.classification || { method: 'none', estimated_entries: null };
+  const followUp = followUpFor(classified.kind === 'prune' ? classified.embeddedId : classified.sourceName)
+    || followUpFor(classified.sourceName);
+
+  assertLockOwner({ wikiRoot: root, token });
+  const store = path.join(root, '.wiki-meta', '.transactions');
+  assertTransactionStoreAnchored(root);
+  const metaIdentity = directoryIdentity(path.join(root, '.wiki-meta'), '.wiki-meta', fsImpl);
+  const storeIdentity = directoryIdentity(store, '.wiki-meta/.transactions', fsImpl);
+  const source = path.join(store, classified.sourceName);
+  const reservation = classified.kind === 'prune' ? reservationPath(store, classified.embeddedId) : null;
+
+  let sourceIdentity = null;
+  try { sourceIdentity = physicalDirectoryIdentity(source, `.wiki-meta/.transactions/${classified.sourceName}`, true, fsImpl); }
+  catch (error) {
+    throw error;
+  }
+  const reservationStat = reservation ? lstatRegularFile(reservation, fsImpl) : null;
+
+  if (sourceIdentity === null && classified.kind === 'prune' && reservationStat) {
+    return resumeReservationOnly({
+      root, token, fsImpl, now, pid, randomUUID, faultInjector,
+      classified, reason, classification, followUp,
+      metaIdentity, storeIdentity, reservation,
+    });
+  }
+  if (sourceIdentity === null) {
+    throw stateError('TRANSACTION_NOT_FOUND', 'wiki-state transaction does not exist');
+  }
+
+  const bundle = makeBundleName(now, pid, randomUUID);
+  const at = canonicalUtcZ(now);
+  assertLockOwner({ wikiRoot: root, token });
+  if (!identityUnchanged(physicalDirectoryIdentity(path.join(root, '.wiki-meta'), '.wiki-meta', true, fsImpl), metaIdentity)) {
+    throw stateError('WIKI_STATE_FILESYSTEM', '.wiki-meta identity changed mid-quarantine');
+  }
+  const quarantineRoot = path.join(root, '.wiki-meta', '.quarantine');
+  try { fsImpl.mkdirSync(quarantineRoot, { recursive: false }); }
+  catch (error) { if (error.code !== 'EEXIST') throw error; }
+  const quarantineIdentity = directoryIdentity(quarantineRoot, '.wiki-meta/.quarantine', fsImpl);
+
+  writeMaintenanceMarker(root, token, (marker) => upsertQuarantineBundle(marker, {
+    bundle, source_name: classified.sourceName, state: 'pending', at,
+  }), { fs: fsImpl });
+  invokeMarkerFault(faultInjector, 'after-write-ahead');
+
+  const bundleDir = path.join(quarantineRoot, bundle);
+  const tree = path.join(bundleDir, 'tree');
+  const metaPayload = {
+    schema: 1,
+    quarantined_at: at,
+    source_name: classified.sourceName,
+    classification: {
+      method: classification.method,
+      estimated_entries: classification.estimated_entries ?? null,
+    },
+    reason,
+    paired_reservation: false,
+  };
+  if (followUp) metaPayload.follow_up = followUp;
+
+  try {
+    invokeMarkerFault(faultInjector, 'before-bundle-mkdir');
+    fsImpl.mkdirSync(bundleDir, { recursive: false });
+    writeQuarantineMeta(path.join(bundleDir, 'quarantine.meta.json'), metaPayload, token, root, fsImpl);
+    invokeMarkerFault(faultInjector, 'before-rename');
+    assertLockOwner({ wikiRoot: root, token });
+    if (!identityUnchanged(physicalDirectoryIdentity(source, `.wiki-meta/.transactions/${classified.sourceName}`, true, fsImpl), sourceIdentity)
+        || !identityUnchanged(physicalDirectoryIdentity(quarantineRoot, '.wiki-meta/.quarantine', true, fsImpl), quarantineIdentity)
+        || !identityUnchanged(physicalDirectoryIdentity(store, '.wiki-meta/.transactions', true, fsImpl), storeIdentity)) {
+      throw stateError('WIKI_STATE_FILESYSTEM', 'quarantine source identity changed before rename');
+    }
+    try { fsImpl.renameSync(source, tree); }
+    catch (error) {
+      if (error.code === 'EXDEV') {
+        throw stateError('WIKI_STATE_FILESYSTEM', 'quarantine rename cannot cross filesystems', error);
+      }
+      throw error;
+    }
+  } catch (error) {
+    try {
+      writeMaintenanceMarker(root, token, (marker) => removePendingQuarantineBundle(marker, bundle), { fs: fsImpl });
+    } catch { /* pending residual is harmless */ }
+    throw error;
+  }
+
+  invokeMarkerFault(faultInjector, 'after-rename');
+
+  try {
+    assertLockOwner({ wikiRoot: root, token });
+    const treeIdentity = directoryIdentity(tree, `.wiki-meta/.quarantine/${bundle}/tree`, fsImpl);
+    if (!identityUnchanged(treeIdentity, sourceIdentity)) {
+      throw stateError('WIKI_STATE_FILESYSTEM', 'quarantine tree identity does not match the captured source');
+    }
+    try {
+      fsImpl.lstatSync(source);
+      throw stateError('WIKI_STATE_FILESYSTEM', 'quarantine source still exists after rename');
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    invokeMarkerFault(faultInjector, 'after-tree-identity');
+    invokeMarkerFault(faultInjector, 'before-reservation-rename');
+
+    let paired = false;
+    if (reservation) {
+      const currentReservation = lstatRegularFile(reservation, fsImpl);
+      if (currentReservation) {
+        fsImpl.renameSync(reservation, path.join(bundleDir, 'reservation'));
+        paired = true;
+      }
+    }
+    if (paired) {
+      writeQuarantineMeta(path.join(bundleDir, 'quarantine.meta.json'), {
+        ...metaPayload,
+        paired_reservation: true,
+      }, token, root, fsImpl);
+    }
+
+    writeMaintenanceMarker(root, token, (marker) => upsertQuarantineBundle(marker, {
+      bundle, source_name: classified.sourceName, state: 'complete', at: canonicalUtcZ(now),
+    }), { fs: fsImpl });
+    const result = { status: 'quarantined', bundle };
+    if (followUp) result.follow_up = followUp;
+    return result;
+  } catch (error) {
+    try {
+      writeMaintenanceMarker(root, token, (marker) => upsertQuarantineBundle(marker, {
+        bundle, source_name: classified.sourceName, state: 'incomplete', at: canonicalUtcZ(now),
+      }), { fs: fsImpl });
+    } catch { /* inventory remains the source of truth */ }
+    throw error;
+  }
+}
+
+function resumeReservationOnly(context) {
+  const {
+    root, token, fsImpl, now, pid, randomUUID, faultInjector,
+    classified, reason, classification, followUp,
+    reservation,
+  } = context;
+  const bundle = makeBundleName(now, pid, randomUUID);
+  const at = canonicalUtcZ(now);
+  let renamed = false;
+  try {
+    const quarantineRoot = path.join(root, '.wiki-meta', '.quarantine');
+    try { fsImpl.mkdirSync(quarantineRoot, { recursive: false }); }
+    catch (error) { if (error.code !== 'EEXIST') throw error; }
+    directoryIdentity(quarantineRoot, '.wiki-meta/.quarantine', fsImpl);
+    writeMaintenanceMarker(root, token, (marker) => upsertQuarantineBundle(marker, {
+      bundle, source_name: classified.sourceName, state: 'pending', at, resume: true,
+    }), { fs: fsImpl });
+    invokeMarkerFault(faultInjector, 'after-write-ahead');
+    invokeMarkerFault(faultInjector, 'before-bundle-mkdir');
+    const bundleDir = path.join(quarantineRoot, bundle);
+    fsImpl.mkdirSync(bundleDir, { recursive: false });
+    const metaPayload = {
+      schema: 1,
+      quarantined_at: at,
+      source_name: classified.sourceName,
+      classification: {
+        method: classification.method,
+        estimated_entries: classification.estimated_entries ?? null,
+      },
+      reason,
+      paired_reservation: true,
+      resume: true,
+    };
+    if (followUp) metaPayload.follow_up = followUp;
+    writeQuarantineMeta(path.join(bundleDir, 'quarantine.meta.json'), metaPayload, token, root, fsImpl);
+    invokeMarkerFault(faultInjector, 'before-rename');
+    invokeMarkerFault(faultInjector, 'before-reservation-rename');
+    fsImpl.renameSync(reservation, path.join(bundleDir, 'reservation'));
+    renamed = true;
+    writeMaintenanceMarker(root, token, (marker) => upsertQuarantineBundle(marker, {
+      bundle, source_name: classified.sourceName, state: 'complete', at: canonicalUtcZ(now), resume: true,
+    }), { fs: fsImpl });
+    const result = { status: 'quarantined', bundle, resumed: true };
+    if (followUp) result.follow_up = followUp;
+    return result;
+  } catch (error) {
+    if (!renamed) {
+      try {
+        writeMaintenanceMarker(root, token, (marker) => removePendingQuarantineBundle(marker, bundle), { fs: fsImpl });
+      } catch { /* pending residual is harmless */ }
+    } else {
+      try {
+        writeMaintenanceMarker(root, token, (marker) => upsertQuarantineBundle(marker, {
+          bundle, source_name: classified.sourceName, state: 'incomplete', at: canonicalUtcZ(now), resume: true,
+        }), { fs: fsImpl });
+      } catch { /* inventory remains the source of truth */ }
+    }
+    throw error;
+  }
+}
+
 module.exports = {
   SWEEP_RESERVE_MS,
   PRESSURE_ENTRY_CAP,
@@ -940,6 +1224,7 @@ module.exports = {
   upsertQuarantineBundle,
   removePendingQuarantineBundle,
   listQuarantineBundleNames,
+  quarantineStoreEntry,
   validateTombstoneV1,
   sweepTransactionDebris,
   isTransactionStoreJunkName,

@@ -18,7 +18,7 @@ const {
   assertLockOwner,
   releaseLock,
 } = require('./lock.js');
-const { sweepTransactionDebris } = require('./transaction-debris.js');
+const { sweepTransactionDebris, quarantineStoreEntry: quarantineStoreEntryPrimitive } = require('./transaction-debris.js');
 
 const sleepArray = new Int32Array(new SharedArrayBuffer(4));
 const STAGES = ['pending-before', 'pending-after', 'last-before', 'last-after'];
@@ -2675,13 +2675,22 @@ function promotePendingScan(options = {}) {
   };
 }
 
+function quarantineStoreEntry(options = {}) {
+  return quarantineStoreEntryPrimitive({
+    ...options,
+    parsePruneName: options.parsePruneName || operationIdFromPruneName,
+  });
+}
+
 module.exports = {
   assertPruneTransactionNamesSupported,
   ensurePendingScan,
   inspectPruneMarkers,
+  operationIdFromPruneName,
   promotePendingScan,
   pruneScanWindowTransactions,
   recoverScanWindowTransaction,
   planScanWindowTransition,
   applyScanWindowTransition,
+  quarantineStoreEntry,
 };

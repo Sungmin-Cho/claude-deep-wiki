@@ -1929,18 +1929,35 @@ function fixWiki(options = {}) {
     try {
       tail = prune('tail', 64 - recovery.processed);
     } catch (tailError) {
+      const skipped = [...new Set([
+        ...(recovery.skipped_oversized || []),
+        ...((tailError.terminal_prune && tailError.terminal_prune.skipped_oversized) || []),
+      ])];
+      let promotion = { skipped_oversized: skipped };
+      try {
+        promotion = promoteOversizedNames({
+          wikiRoot: root,
+          token: owner.token,
+          names: skipped,
+          parsePruneName: scanWindow.operationIdFromPruneName,
+          classification: { method: 'stat', estimated_entries: null },
+          reason: 'oversized',
+          deadline,
+        });
+      } catch { /* authority may have been lost; telemetry still carries residue */ }
       const wrapped = stateError(
         'LINT_MAINTENANCE_FAILED_AFTER_COMMIT',
         `lint repair committed before terminal maintenance failed: ${tailError.message}`,
         tailError,
       );
       wrapped.lint_result = primary;
+      const skippedAfter = promotion.skipped_oversized || skipped;
       if (!tailError.terminal_prune) {
         wrapped.terminal_prune = {
           processed: recovery.processed,
           removed: [...recovery.removed],
           complete: false,
-          skipped_oversized: [...(recovery.skipped_oversized || [])],
+          skipped_oversized: skippedAfter,
         };
       }
       else {
@@ -1948,10 +1965,7 @@ function fixWiki(options = {}) {
           processed: recovery.processed + tailError.terminal_prune.processed,
           removed: recovery.removed.concat(tailError.terminal_prune.removed),
           complete: false,
-          skipped_oversized: [
-            ...(recovery.skipped_oversized || []),
-            ...(tailError.terminal_prune.skipped_oversized || []),
-          ],
+          skipped_oversized: skippedAfter,
         };
       }
       throw wrapped;

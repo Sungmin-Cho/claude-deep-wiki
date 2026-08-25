@@ -888,6 +888,7 @@ test('listQuarantineBundleNames truncates after 64 names', () => {
 
 const scanWindow = require('../hooks/scripts/runtime/scan-window.js');
 const wikiState = require('../hooks/scripts/runtime/wiki-state.js');
+const { createCompletedEnsures, repairClockFromJournal } = require('./helpers/wiki-lint-pruning-fixture.js');
 
 function hex40(seed = 'aa') {
   return seed.repeat(40).slice(0, 40);
@@ -1125,6 +1126,13 @@ test('quarantineStoreEntry resume of a reservation-only .prune-* yields a second
     assert.notEqual(resumed.bundle, first.bundle);
     assert.equal(fs.existsSync(path.join(markerFixture.quarantinePath(root), resumed.bundle, 'reservation')), true);
     assert.equal(fs.existsSync(path.join(markerFixture.quarantinePath(root), resumed.bundle, 'tree')), false);
+    const resumedMeta = JSON.parse(fs.readFileSync(path.join(
+      markerFixture.quarantinePath(root), resumed.bundle, 'quarantine.meta.json',
+    ), 'utf8'));
+    if (Object.hasOwn(resumedMeta, 'follow_up') || Object.hasOwn(resumed, 'follow_up')) {
+      assert.deepEqual(resumedMeta.follow_up_argv, resumed.follow_up_argv);
+      assert.equal(resumedMeta.follow_up, resumed.follow_up);
+    }
   });
 });
 
@@ -1141,6 +1149,11 @@ test('quarantineStoreEntry records rollback follow_up and bound wrappers share t
     assert.deepEqual(result.follow_up_argv, [
       'transaction', 'recover', '--wiki-root', root, '--operation-id', '01JZ7P9Q6MD7S5PB8H4Y40HJ83', '--json',
     ]);
+    const durable = JSON.parse(fs.readFileSync(path.join(
+      markerFixture.quarantinePath(root), result.bundle, 'quarantine.meta.json',
+    ), 'utf8'));
+    assert.deepEqual(durable.follow_up_argv, result.follow_up_argv);
+    assert.equal(durable.follow_up, result.follow_up);
     const cliName = `scan-window-cli-${hex40('44')}`;
     seedStoreDirectory(root, cliName);
     const viaScan = scanWindow.quarantineStoreEntry({
@@ -2244,6 +2257,87 @@ test('prune skips DT_UNKNOWN no-stat-signal .activate-* before pressure or inter
   });
 });
 
+test('quarantineStoreEntry fail-closes .wiki-meta swap at before-root-mkdir', () => {
+  for (const kind of ['internal', 'external', 'dangling']) {
+    const root = wikiFixture();
+    const secret = `meta-mkdir-${kind}-${Date.now()}`;
+    const name = `scan-window-ensure-${hex40('d1')}`;
+    const sourcePath = seedStoreDirectory(root, name);
+    const journal = fs.readFileSync(path.join(sourcePath, 'journal.json'));
+    withLock(root, (token) => {
+      let replacement;
+      try {
+        assert.throws(
+          () => quarantine(root, token, name, quarantineIdentityOptions({
+            faultInjector(boundary) {
+              if (boundary === 'before-root-mkdir') {
+                replacement = replaceWithKindedSymlink(
+                  path.join(root, '.wiki-meta'), kind, secret, root,
+                );
+              }
+            },
+          })),
+          (error) => {
+            assertPreRootMkdirRejected(error, secret);
+            return true;
+          },
+        );
+        assert.ok(replacement);
+        assertSentinelUnchanged(kind, replacement.target);
+        if (kind !== 'dangling') {
+          assert.equal(fs.existsSync(path.join(replacement.target, '.quarantine')), false);
+        }
+        const displacedSource = path.join(replacement.displaced, '.transactions', name);
+        assert.equal(fs.existsSync(displacedSource), true);
+        assert.deepEqual(fs.readFileSync(path.join(displacedSource, 'journal.json')), journal);
+      } finally {
+        restoreWikiMeta(root, replacement);
+      }
+    });
+  }
+});
+
+test('quarantineStoreEntry reservation-only path fail-closes .wiki-meta swap at before-root-mkdir', () => {
+  for (const kind of ['internal', 'external', 'dangling']) {
+    const root = wikiFixture();
+    const secret = `resume-root-${kind}-${Date.now()}`;
+    const pair = seedPrunePair(root, 'd2');
+    const reservationBytes = fs.readFileSync(pair.reservation);
+    withLock(root, (token) => {
+      const first = quarantine(root, token, pair.pruneName);
+      assert.equal(first.status, 'quarantined');
+      fs.writeFileSync(pair.reservation, reservationBytes);
+      let replacement;
+      try {
+        assert.throws(
+          () => quarantine(root, token, pair.pruneName, quarantineIdentityOptions({
+            randomUUID: () => '01234567-89ab-cdef-0123-456789abcde3',
+            faultInjector(boundary) {
+              if (boundary === 'before-root-mkdir') {
+                replacement = replaceWithKindedSymlink(
+                  path.join(root, '.wiki-meta'), kind, secret, root,
+                );
+              }
+            },
+          })),
+          (error) => {
+            assertPreRootMkdirRejected(error, secret);
+            return true;
+          },
+        );
+        assert.ok(replacement);
+        assertSentinelUnchanged(kind, replacement.target);
+        if (kind !== 'dangling') {
+          assert.equal(fs.existsSync(path.join(replacement.target, '.quarantine')), false);
+        }
+        assertReservationBytesUnchanged(root, replacement, pair.operationId, reservationBytes);
+      } finally {
+        restoreWikiMeta(root, replacement);
+      }
+    });
+  }
+});
+
 test('quarantineStoreEntry fail-closes .quarantine root-swap at before-bundle-mkdir', () => {
   for (const kind of ['internal', 'external', 'dangling']) {
     const root = wikiFixture();
@@ -2339,37 +2433,97 @@ function replaceReservationWith(kind, reservation, root) {
   return original;
 }
 
+function withInjectedDeviceNode(pathname, fn) {
+  const original = fs.lstatSync;
+  const target = path.resolve(pathname);
+  fs.lstatSync = function lstatSync(candidate, options) {
+    const stat = original.call(fs, candidate, options);
+    if (path.resolve(String(candidate)) !== target) return stat;
+    const bigint = Boolean(options && options.bigint);
+    return new Proxy(stat, {
+      get(inner, property, receiver) {
+        if (property === 'mode') return bigint ? 0o020666n : 0o020666;
+        if (property === 'isFile') return () => false;
+        if (property === 'isDirectory') return () => false;
+        if (property === 'isSymbolicLink') return () => false;
+        if (property === 'isCharacterDevice') return () => true;
+        if (property === 'isBlockDevice') return () => false;
+        if (property === 'isFIFO') return () => false;
+        if (property === 'isSocket') return () => false;
+        const value = Reflect.get(inner, property, receiver);
+        return typeof value === 'function' ? value.bind(inner) : value;
+      },
+    });
+  };
+  try { return fn(); }
+  finally { fs.lstatSync = original; }
+}
+
+function restoreWikiMeta(root, replacement) {
+  if (!replacement) return;
+  const meta = path.join(root, '.wiki-meta');
+  try {
+    const stat = fs.lstatSync(meta);
+    if (stat.isSymbolicLink()) fs.unlinkSync(meta);
+    else fs.rmSync(meta, { recursive: true, force: true });
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+  if (fs.existsSync(replacement.displaced)) fs.renameSync(replacement.displaced, meta);
+}
+
+function assertPreRootMkdirRejected(error, secret) {
+  assert.equal(error.code, 'WIKI_STATE_FILESYSTEM', error.code);
+  assertNoSecret(error, secret);
+}
+
+function assertReservationBytesUnchanged(root, replacement, operationId, originalBytes) {
+  const displacedReservation = path.join(replacement.displaced, '.transactions', operationId);
+  assert.equal(fs.existsSync(displacedReservation), true);
+  assert.deepEqual(fs.readFileSync(displacedReservation), originalBytes);
+}
+
+function assertNonRegularReservationUntouched(kind, reservation, original) {
+  if (kind === 'directory') {
+    assert.equal(fs.statSync(reservation).isDirectory(), true);
+  } else if (kind === 'symlink') {
+    assert.equal(fs.lstatSync(reservation).isSymbolicLink(), true);
+  } else if (kind === 'device') {
+    assert.deepEqual(fs.readFileSync(reservation), original);
+  } else {
+    assert.deepEqual(fs.readFileSync(reservation), original);
+    assert.equal(fs.lstatSync(reservation).nlink >= 2, true);
+  }
+}
+
 test('quarantineStoreEntry refuses a present non-regular paired reservation before mutation', () => {
-  const seeds = { symlink: 'b1', directory: 'b2', hardlink: 'b3' };
-  for (const kind of ['symlink', 'directory', 'hardlink']) {
+  const seeds = { symlink: 'b1', directory: 'b2', hardlink: 'b3', device: 'b4' };
+  for (const kind of ['symlink', 'directory', 'hardlink', 'device']) {
     const root = wikiFixture();
     const pair = seedPrunePair(root, seeds[kind]);
     const original = replaceReservationWith(kind, pair.reservation, root);
     if (kind === 'hardlink' && fs.lstatSync(pair.reservation).nlink < 2) continue;
     const sourcePath = path.join(storePath(root), pair.pruneName);
     const sourceBytes = fs.readFileSync(path.join(sourcePath, 'journal.json'));
-    withLock(root, (token) => {
-      assert.throws(
-        () => quarantine(root, token, pair.pruneName),
-        (error) => error.code === 'WIKI_STATE_FILESYSTEM',
-      );
-      assert.equal(fs.existsSync(sourcePath), true);
-      assert.deepEqual(fs.readFileSync(path.join(sourcePath, 'journal.json')), sourceBytes);
-      if (kind === 'directory') {
-        assert.equal(fs.statSync(pair.reservation).isDirectory(), true);
-      } else if (kind === 'symlink') {
-        assert.equal(fs.lstatSync(pair.reservation).isSymbolicLink(), true);
-      } else {
-        assert.deepEqual(fs.readFileSync(pair.reservation), original);
-        assert.equal(fs.lstatSync(pair.reservation).nlink >= 2, true);
-      }
-    });
+    const run = () => {
+      withLock(root, (token) => {
+        assert.throws(
+          () => quarantine(root, token, pair.pruneName),
+          (error) => error.code === 'WIKI_STATE_FILESYSTEM',
+        );
+        assert.equal(fs.existsSync(sourcePath), true);
+        assert.deepEqual(fs.readFileSync(path.join(sourcePath, 'journal.json')), sourceBytes);
+        assertNonRegularReservationUntouched(kind, pair.reservation, original);
+      });
+    };
+    if (kind === 'device') withInjectedDeviceNode(pair.reservation, run);
+    else run();
   }
 });
 
 test('quarantineStoreEntry reservation-only path refuses a present non-regular reservation before mutation', () => {
-  const seeds = { symlink: 'c1', directory: 'c2', hardlink: 'c3' };
-  for (const kind of ['symlink', 'directory', 'hardlink']) {
+  const seeds = { symlink: 'c1', directory: 'c2', hardlink: 'c3', device: 'c4' };
+  for (const kind of ['symlink', 'directory', 'hardlink', 'device']) {
     const root = wikiFixture();
     const pair = seedPrunePair(root, seeds[kind]);
     withLock(root, (token) => {
@@ -2378,18 +2532,15 @@ test('quarantineStoreEntry reservation-only path refuses a present non-regular r
       fs.writeFileSync(pair.reservation, '{"reservation":true}\n');
       const original = replaceReservationWith(kind, pair.reservation, root);
       if (kind === 'hardlink' && fs.lstatSync(pair.reservation).nlink < 2) return;
-      assert.throws(
-        () => quarantine(root, token, pair.pruneName),
-        (error) => error.code === 'WIKI_STATE_FILESYSTEM',
-      );
-      if (kind === 'directory') {
-        assert.equal(fs.statSync(pair.reservation).isDirectory(), true);
-      } else if (kind === 'symlink') {
-        assert.equal(fs.lstatSync(pair.reservation).isSymbolicLink(), true);
-      } else {
-        assert.deepEqual(fs.readFileSync(pair.reservation), original);
-        assert.equal(fs.lstatSync(pair.reservation).nlink >= 2, true);
-      }
+      const run = () => {
+        assert.throws(
+          () => quarantine(root, token, pair.pruneName),
+          (error) => error.code === 'WIKI_STATE_FILESYSTEM',
+        );
+        assertNonRegularReservationUntouched(kind, pair.reservation, original);
+      };
+      if (kind === 'device') withInjectedDeviceNode(pair.reservation, run);
+      else run();
     });
   }
 });
@@ -2406,6 +2557,51 @@ test('lint fix persists oversized .activate-* residue instead of returning fixed
   assert.ok(result.terminal_prune.skipped_oversized.includes(name), JSON.stringify(result.terminal_prune));
   const marker = debris.readMaintenanceMarker(root);
   assert.ok(marker, 'maintenance marker should record ineligible residue');
+  assert.ok(marker.skipped_oversized.includes(name), JSON.stringify(marker));
+  assert.equal(fs.existsSync(path.join(root, '.wiki-meta', '.wiki-lock')), false);
+});
+
+test('lint fix retains oversized residue when tail prune fails after discovery', () => {
+  const root = lintableWikiFixture();
+  const name = '.activate-oversized-first';
+  const directory = path.join(storePath(root), name);
+  fs.mkdirSync(directory, { recursive: true });
+  fillOversizedTier1Subdirs(directory);
+  const journals = createCompletedEnsures(root, [
+    { operationId: 'a-created-later', proposed: '2026-07-11T01:00:00Z' },
+    { operationId: 'b-preserved-later', proposed: '2026-07-11T02:00:00Z' },
+  ]);
+  const now = repairClockFromJournal(journals.map((entry) => entry.path));
+  const original = scanWindow.pruneScanWindowTransactions;
+  scanWindow.pruneScanWindowTransactions = (request) => original({
+    ...request,
+    faultInjector(boundary, context) {
+      if (request.resumableOnly) return;
+      if (boundary === 'before-transaction-quarantine-rename'
+          && context?.operationId === 'b-preserved-later') {
+        throw Object.assign(new Error('later fault after oversized discovery'), {
+          code: 'LOCK_TOKEN_MISMATCH',
+        });
+      }
+    },
+  });
+  try {
+    assert.throws(
+      () => wikiState.fixWiki({ wikiRoot: root, now }),
+      (error) => {
+        assert.equal(error.code, 'LINT_MAINTENANCE_FAILED_AFTER_COMMIT');
+        assert.ok(
+          error.terminal_prune.skipped_oversized.includes(name),
+          JSON.stringify(error.terminal_prune),
+        );
+        return true;
+      },
+    );
+  } finally {
+    scanWindow.pruneScanWindowTransactions = original;
+  }
+  const marker = debris.readMaintenanceMarker(root);
+  assert.ok(marker, 'maintenance marker should retain oversized residue after the later fault');
   assert.ok(marker.skipped_oversized.includes(name), JSON.stringify(marker));
   assert.equal(fs.existsSync(path.join(root, '.wiki-meta', '.wiki-lock')), false);
 });

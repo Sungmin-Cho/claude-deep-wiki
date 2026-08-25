@@ -714,11 +714,19 @@ function oversizedHint(error) {
   if (isolatable && root) {
     const quotedRoot = shellQuote(path.resolve(root));
     const quotedName = shellQuote(name);
+    const quarantineCmd = `transaction quarantine --wiki-root ${quotedRoot} --operation-id ${quotedName} --json`;
+    const powershell = process.platform === 'win32';
     if (rollback) {
       const recover = `node scripts/wiki-runtime.js transaction recover --wiki-root ${quotedRoot} --operation-id ${shellQuote(rollback[1])} --json`;
-      return `TRANSACTION_OVERSIZED is isolatable as a rollback remnant. Isolate it with transaction quarantine --wiki-root ${quotedRoot} --operation-id ${quotedName} --json, then ${recover}.`;
+      if (powershell) {
+        return `TRANSACTION_OVERSIZED is isolatable as a rollback remnant. Isolate it with (PowerShell): ${quarantineCmd}, then (PowerShell): ${recover}.`;
+      }
+      return `TRANSACTION_OVERSIZED is isolatable as a rollback remnant. Isolate it with ${quarantineCmd}, then ${recover}.`;
     }
-    return `TRANSACTION_OVERSIZED is isolatable. Run transaction quarantine --wiki-root ${quotedRoot} --operation-id ${quotedName} --json`;
+    if (powershell) {
+      return `TRANSACTION_OVERSIZED is isolatable. Run (PowerShell): ${quarantineCmd}`;
+    }
+    return `TRANSACTION_OVERSIZED is isolatable. Run ${quarantineCmd}`;
   }
   if (/^[0-9A-HJKMNP-TV-Z]{26}$/.test(name)) {
     return 'TRANSACTION_OVERSIZED for a pure ULID is not automatically isolatable; stop all hosts, restore filesystem readability, and if recover still cannot read the journal restore the authenticated backup.';

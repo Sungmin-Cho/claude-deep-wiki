@@ -2478,6 +2478,28 @@ test('ensurePendingScan creates one canonical line and a committed transaction',
   assert.equal(new Set(journal.transitions).size, journal.transitions.length);
 });
 
+test('ensurePendingScan keeps committed scan status if post-commit promotion throws', () => {
+  const debris = require(path.join(repoRoot, 'hooks', 'scripts', 'runtime', 'transaction-debris.js'));
+  const original = debris.promoteOversizedNames;
+  debris.promoteOversizedNames = () => {
+    throw Object.assign(new Error('injected post-commit promotion throw'), {
+      code: 'PROMOTION_INJECTED',
+    });
+  };
+  try {
+    const { ensurePendingScan, createDeadline } = modules();
+    const root = temporaryWiki('deep wiki promotion catch ');
+    const result = ensurePendingScan({
+      wikiRoot: root, proposed: T1, now: new Date(T1), deadline: createDeadline({ budgetMs: 12_000 }),
+    });
+    assert.notEqual(result.status, 'deferred');
+    assert.equal(result.status, 'created');
+    assert.equal(fs.existsSync(metaPath(root, '.pending-scan')), true);
+  } finally {
+    debris.promoteOversizedNames = original;
+  }
+});
+
 test('ensurePendingScan preserves a valid oldest pending value byte-identically', () => {
   const { ensurePendingScan, createDeadline } = modules();
   const root = temporaryWiki('deep wiki preserve pending ');

@@ -18,14 +18,14 @@ const {
   assertLockOwner,
   releaseLock,
 } = require('./lock.js');
+const transactionDebris = require('./transaction-debris.js');
 const {
   sweepTransactionDebris,
   quarantineStoreEntry: quarantineStoreEntryPrimitive,
   inspectDirectoryPressure,
   resolveUnknownDirent,
   writeMaintenanceMarker,
-  promoteOversizedNames: promoteOversizedNamesPrimitive,
-} = require('./transaction-debris.js');
+} = transactionDebris;
 
 const sleepArray = new Int32Array(new SharedArrayBuffer(4));
 const STAGES = ['pending-before', 'pending-after', 'last-before', 'last-after'];
@@ -2146,13 +2146,17 @@ function pruneScanWindowTransactions(options = {}) {
       assertBudget();
     };
   };
+  const skippedOversized = [];
   const throwWithTerminalPrune = (error) => {
     if (!error.terminal_prune) {
       error.terminal_prune = {
         processed: removed.length,
         removed: [...removed],
         complete: false,
+        skipped_oversized: [...skippedOversized],
       };
+    } else if (!Array.isArray(error.terminal_prune.skipped_oversized)) {
+      error.terminal_prune.skipped_oversized = [...skippedOversized];
     }
     throw error;
   };
@@ -2167,7 +2171,6 @@ function pruneScanWindowTransactions(options = {}) {
   };
 
   let complete = true;
-  const skippedOversized = [];
   const inspectPressure = options.inspectDirectoryPressure || inspectDirectoryPressure;
   for (const entry of entries) {
     if (remainingMs(deadline) < PRUNE_RESERVE_MS) {
@@ -2732,16 +2735,20 @@ function ensurePendingScan(options = {}) {
       ...((applied.maintenance && applied.maintenance.skipped_oversized) || []),
       ...(pruneResult.skipped_oversized || []),
     ];
-    promoteOversizedNamesPrimitive({
-      wikiRoot: physicalRoot,
-      token: owner.token,
-      names: skipped,
-      parsePruneName: operationIdFromPruneName,
-      classification: { method: 'stat', estimated_entries: null },
-      reason: 'oversized',
-      deadline: options.deadline,
-      limit: AUTOMATIC_PRUNE_LIMIT,
-    });
+    try {
+      transactionDebris.promoteOversizedNames({
+        wikiRoot: physicalRoot,
+        token: owner.token,
+        names: skipped,
+        parsePruneName: operationIdFromPruneName,
+        classification: { method: 'stat', estimated_entries: null },
+        reason: 'oversized',
+        deadline: options.deadline,
+        limit: AUTOMATIC_PRUNE_LIMIT,
+      });
+    } catch {
+      /* post-commit promotion must not demote an already persisted scan */
+    }
   } catch (error) {
     result = { status: 'deferred', reason: error.code || 'SCAN_WINDOW_FILESYSTEM' };
   } finally {
@@ -2794,7 +2801,7 @@ function quarantineStoreEntry(options = {}) {
 }
 
 function promoteOversizedNames(options = {}) {
-  return promoteOversizedNamesPrimitive({
+  return transactionDebris.promoteOversizedNames({
     ...options,
     parsePruneName: options.parsePruneName || operationIdFromPruneName,
   });

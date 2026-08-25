@@ -1364,11 +1364,40 @@ test('oversizedHint renders a PowerShell-safe literal on win32 for adversarial c
         operationId: isolatableName,
         wikiRoot: value,
       });
+      assert.match(hint, /\(PowerShell\)/);
       const wikiRootValue = decodePowershellSingleQuoted(extractQuotedFlagValue(hint, '--wiki-root'));
       assert.equal(wikiRootValue, path.resolve(value));
       const operationIdValue = decodePowershellSingleQuoted(extractQuotedFlagValue(hint, '--operation-id'));
       assert.equal(operationIdValue, isolatableName);
     }
+    const rollbackHint = oversizedHint({
+      code: 'TRANSACTION_OVERSIZED',
+      operationId: `rollback-${OPERATION_ID}`,
+      wikiRoot: adversarial[0],
+    });
+    assert.match(rollbackHint, /\(PowerShell\)/);
+    assert.match(rollbackHint, /transaction recover/);
+  } finally {
+    Object.defineProperty(process, 'platform', originalDescriptor);
+  }
+});
+
+test('rollback follow_up is labeled (PowerShell) on win32 and round-trips quoting', () => {
+  const debris = require('../hooks/scripts/runtime/transaction-debris.js');
+  const originalDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
+  Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+  try {
+    const command = debris.followUpRecoverCommand('C:\\Deep Wiki & evil "quoted"', OPERATION_ID);
+    assert.match(command, /\(PowerShell\)/);
+    const argv = debris.followUpRecoverArgv('C:\\Deep Wiki & evil "quoted"', OPERATION_ID);
+    assert.deepEqual(argv, [
+      'transaction', 'recover',
+      '--wiki-root', path.resolve('C:\\Deep Wiki & evil "quoted"'),
+      '--operation-id', OPERATION_ID,
+      '--json',
+    ]);
+    const wikiRootValue = decodePowershellSingleQuoted(extractQuotedFlagValue(command, '--wiki-root'));
+    assert.equal(wikiRootValue, path.resolve('C:\\Deep Wiki & evil "quoted"'));
   } finally {
     Object.defineProperty(process, 'platform', originalDescriptor);
   }

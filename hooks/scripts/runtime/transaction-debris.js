@@ -1141,18 +1141,53 @@ function followUpRecoverArgv(wikiRoot, operationId) {
   ];
 }
 
+function renderFollowUpCommand(argv) {
+  const root = argv[argv.indexOf('--wiki-root') + 1];
+  const operationId = argv[argv.indexOf('--operation-id') + 1];
+  const command = `node scripts/wiki-runtime.js transaction recover --wiki-root ${shellQuote(root)} --operation-id ${shellQuote(operationId)} --json`;
+  if (process.platform === 'win32') return `resume with (PowerShell):\n${command}`;
+  return command;
+}
+
 function followUpRecoverCommand(wikiRoot, operationId) {
-  const root = path.resolve(wikiRoot);
-  return `node scripts/wiki-runtime.js transaction recover --wiki-root ${shellQuote(root)} --operation-id ${shellQuote(operationId)} --json`;
+  return renderFollowUpCommand(followUpRecoverArgv(wikiRoot, operationId));
 }
 
 function followUpFor(name, wikiRoot) {
   const match = ULID_FOLLOW_RE.exec(name);
   if (!match || typeof wikiRoot !== 'string' || wikiRoot.length === 0) return undefined;
+  const followUpArgv = followUpRecoverArgv(wikiRoot, match[1]);
   return {
-    follow_up: followUpRecoverCommand(wikiRoot, match[1]),
-    follow_up_argv: followUpRecoverArgv(wikiRoot, match[1]),
+    follow_up: renderFollowUpCommand(followUpArgv),
+    follow_up_argv: followUpArgv,
   };
+}
+
+function attachFollowUpMetadata(payload, followUp, followUpArgv) {
+  if (Array.isArray(followUpArgv) && followUpArgv.length > 0) {
+    payload.follow_up_argv = [...followUpArgv];
+  }
+  if (followUp) payload.follow_up = followUp;
+  return payload;
+}
+
+function ensureSealedQuarantineRoot(root, token, captured, options = {}) {
+  const fsImpl = options.fs || fs;
+  invokeMarkerFault(options.faultInjector, 'before-root-mkdir');
+  assertDirectoryFence(captured.metaPath, '.wiki-meta', captured.metaIdentity, fsImpl);
+  assertDirectoryFence(captured.storePath, '.wiki-meta/.transactions', captured.storeIdentity, fsImpl);
+  if (captured.reservationIdentity) {
+    assertRegularFileFence(
+      captured.reservationPath,
+      'quarantine reservation',
+      captured.reservationIdentity,
+      fsImpl,
+    );
+  }
+  assertLockOwner({ wikiRoot: root, token });
+  try { fsImpl.mkdirSync(captured.quarantinePath, { recursive: false }); }
+  catch (error) { if (error.code !== 'EEXIST') throw error; }
+  return directoryIdentity(captured.quarantinePath, '.wiki-meta/.quarantine', fsImpl);
 }
 
 function attachIncompleteQuarantine(error, bundle, sourceName) {
@@ -1239,14 +1274,16 @@ function quarantineStoreEntry(options = {}) {
 
   const bundle = makeBundleName(now, pid, randomUUID);
   const at = canonicalUtcZ(now);
-  assertLockOwner({ wikiRoot: root, token });
-  if (!identityUnchanged(physicalDirectoryIdentity(metaPathname, '.wiki-meta', true, fsImpl), metaIdentity)) {
-    throw stateError('WIKI_STATE_FILESYSTEM', '.wiki-meta identity changed mid-quarantine');
-  }
   const quarantineRoot = path.join(root, '.wiki-meta', '.quarantine');
-  try { fsImpl.mkdirSync(quarantineRoot, { recursive: false }); }
-  catch (error) { if (error.code !== 'EEXIST') throw error; }
-  const quarantineIdentity = directoryIdentity(quarantineRoot, '.wiki-meta/.quarantine', fsImpl);
+  const quarantineIdentity = ensureSealedQuarantineRoot(root, token, {
+    metaPath: metaPathname,
+    metaIdentity,
+    quarantinePath: quarantineRoot,
+    storePath: store,
+    storeIdentity,
+    reservationPath: reservation,
+    reservationIdentity,
+  }, { fs: fsImpl, faultInjector });
 
   writeMaintenanceMarker(root, token, (marker) => upsertQuarantineBundle(marker, {
     bundle, source_name: classified.sourceName, state: 'pending', at,
@@ -1281,7 +1318,7 @@ function quarantineStoreEntry(options = {}) {
     reason,
     paired_reservation: false,
   };
-  if (followUp) metaPayload.follow_up = followUp;
+  attachFollowUpMetadata(metaPayload, followUp, followUpArgv);
 
   try {
     invokeMarkerFault(faultInjector, 'before-bundle-mkdir');
@@ -1378,9 +1415,15 @@ function resumeReservationOnly(context) {
     const metaPathname = path.join(root, '.wiki-meta');
     const store = path.join(metaPathname, '.transactions');
     const quarantineRoot = path.join(metaPathname, '.quarantine');
-    try { fsImpl.mkdirSync(quarantineRoot, { recursive: false }); }
-    catch (error) { if (error.code !== 'EEXIST') throw error; }
-    const quarantineIdentity = directoryIdentity(quarantineRoot, '.wiki-meta/.quarantine', fsImpl);
+    const quarantineIdentity = ensureSealedQuarantineRoot(root, token, {
+      metaPath: metaPathname,
+      metaIdentity,
+      quarantinePath: quarantineRoot,
+      storePath: store,
+      storeIdentity,
+      reservationPath: reservation,
+      reservationIdentity,
+    }, { fs: fsImpl, faultInjector });
     writeMaintenanceMarker(root, token, (marker) => upsertQuarantineBundle(marker, {
       bundle, source_name: classified.sourceName, state: 'pending', at, resume: true,
     }), { fs: fsImpl });
@@ -1416,7 +1459,7 @@ function resumeReservationOnly(context) {
       paired_reservation: true,
       resume: true,
     };
-    if (followUp) metaPayload.follow_up = followUp;
+    attachFollowUpMetadata(metaPayload, followUp, followUpArgv);
     invokeMarkerFault(faultInjector, 'before-meta-write');
     fence({ includeReservation: true });
     writeQuarantineMeta(

@@ -389,11 +389,11 @@ function sweepTransactionDebris(root, token, options = {}) {
   if ([...classes].some((name) => !SWEEP_CLASSES.has(name))) throw new TypeError('unknown transaction debris class');
   const transactions = path.join(root, '.wiki-meta', '.transactions');
   const anchor = transactionStoreAnchor(root, transactions);
-  if (anchor === null) return { processed: 0, removed: [], removed_junk: [] };
+  if (anchor === null) return { processed: 0, removed: [], removed_junk: [], skipped_oversized: [] };
   let entries;
   try { entries = fs.readdirSync(transactions, { withFileTypes: true }); }
   catch (error) {
-    if (error.code === 'ENOENT') return { processed: 0, removed: [], removed_junk: [] };
+    if (error.code === 'ENOENT') return { processed: 0, removed: [], removed_junk: [], skipped_oversized: [] };
     throw error;
   }
   // Every mutation in this module goes through `assertOwner`, so re-proving the store's identity
@@ -406,17 +406,35 @@ function sweepTransactionDebris(root, token, options = {}) {
   let junkAttempts = 0;
   const removed = [];
   const removedJunk = [];
-  const result = () => ({ processed, removed, removed_junk: removedJunk });
+  const skippedOversized = [];
+  const inspectPressure = options.inspectDirectoryPressure || inspectDirectoryPressure;
+  const result = () => ({
+    processed, removed, removed_junk: removedJunk, skipped_oversized: skippedOversized,
+  });
   // Transaction-class debris runs to completion first. Junk is inert; `cancelled` is the only class
   // that is fatal to a lock-free reader, so junk must never reach it first and spend the entry
   // budget or the deadline reserve on the way. Ordering — not a second budget — is what guarantees
   // that, so the documented per-pass cap stays a single `limit`.
   for (const entry of entries) {
-    if (entry.isSymbolicLink() || !entry.isDirectory()) continue;
+    if (entry.isSymbolicLink()) continue;
+    let kind;
+    if (entry.isDirectory()) kind = 'directory';
+    else if (direntTypeUnknown(entry)) kind = resolveUnknownDirent(transactions, entry, options.fs || fs).kind;
+    else continue;
+    if (kind !== 'directory') continue;
+    const transaction = path.join(transactions, entry.name);
+    const pressure = inspectPressure(transaction, {
+      deadline,
+      allowEnumeration: false,
+      fs: options.fs || fs,
+    });
+    if (pressure.oversized) {
+      skippedOversized.push(entry.name);
+      continue;
+    }
     if (processed >= limit) continue;
     if (entry.name.startsWith('.prune-')
         || entry.name.startsWith('.reservation-.prune-')) continue;
-    const transaction = path.join(transactions, entry.name);
     const journal = path.join(transaction, 'journal.json');
 
     let debrisClass = null;

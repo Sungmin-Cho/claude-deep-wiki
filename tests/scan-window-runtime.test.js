@@ -972,7 +972,7 @@ test('generic transaction debris sweep never consumes a terminal-prune phase dir
     assert.deepEqual(sweepTransactionDebris(root, owner.token, {
       deadline: createDeadline({ budgetMs: 12_000 }),
       classes: ['plain'],
-    }), { processed: 0, removed: [], removed_junk: [] });
+    }), { processed: 0, removed: [], removed_junk: [], skipped_oversized: [] });
   } finally {
     releaseLock({ wikiRoot: root, token: owner.token });
   }

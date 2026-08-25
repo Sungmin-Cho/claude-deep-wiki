@@ -1097,6 +1097,50 @@ test('quarantineStoreEntry records rollback follow_up and bound wrappers share t
   });
 });
 
+test('sweep reports oversized directories without entering them and still reports after the pass limit', () => {
+  const root = wikiFixture();
+  const store = path.join(root, '.wiki-meta', '.transactions');
+  fs.mkdirSync(store, { recursive: true });
+  for (const name of ['plain-ok', '.activate-oversized', '.prune-oversized', 'unknown-oversize']) {
+    fs.mkdirSync(path.join(store, name));
+    fs.writeFileSync(path.join(store, name, 'journal.json'), '{}\n');
+  }
+  const childLookups = [];
+  withLock(root, (token) => {
+    const result = debris.sweepTransactionDebris(root, token, {
+      deadline: deadline(),
+      limit: 0,
+      inspectDirectoryPressure(pathname) {
+        return path.basename(pathname) === 'plain-ok'
+          ? { oversized: false, method: 'none', estimatedEntries: null }
+          : { oversized: true, method: 'stat', estimatedEntries: 600 };
+      },
+      fs: {
+        ...fs,
+        lstatSync(target, options) {
+          const parent = path.dirname(target);
+          if (path.resolve(parent) !== path.resolve(store) && String(target).includes('.transactions')) {
+            childLookups.push(target);
+          }
+          return fs.lstatSync(target, options);
+        },
+        readdirSync(target, options) {
+          if (path.resolve(target) !== path.resolve(store)) childLookups.push(target);
+          return fs.readdirSync(target, options);
+        },
+      },
+    });
+    assert.deepEqual([...result.skipped_oversized].sort(), ['.activate-oversized', '.prune-oversized', 'unknown-oversize']);
+    assert.equal(result.processed, 0);
+    assert.equal(result.skipped_oversized.length, 3);
+    assert.equal(
+      childLookups.some((target) => ['.activate-oversized', '.prune-oversized', 'unknown-oversize']
+        .some((name) => String(target).includes(`${path.sep}${name}${path.sep}`))),
+      false,
+    );
+  });
+});
+
 test('generated quarantine bundle names match the shared inventory regex', () => {
   const root = wikiFixture();
   const name = `scan-window-ensure-${hex40('66')}`;

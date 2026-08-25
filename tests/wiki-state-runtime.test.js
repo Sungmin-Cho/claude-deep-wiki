@@ -167,7 +167,7 @@ test('wiki-state exports the one state surface and exact shared promotion identi
   const state = require(statePath);
   assert.deepEqual(Object.keys(state).sort(), [
     'applyCommit', 'cleanupInbox', 'fixWiki', 'inspectWiki', 'migrateAutoIngestPolicy', 'promotePendingScan',
-    'recoverTransaction', 'registerIngestFailure', 'setupWiki', 'snapshotWiki',
+    'quarantineStoreEntry', 'recoverTransaction', 'registerIngestFailure', 'setupWiki', 'snapshotWiki',
   ]);
   assert.equal(state.promotePendingScan, scanWindow.promotePendingScan);
   assert.equal(state.migrateAutoIngestPolicy, migrateAutoIngestPolicy);
@@ -1703,14 +1703,14 @@ test('debris removal is interruptible between entries when the clock advances mi
       deadline,
       faultInjector(boundary) { if (boundary === 'sweep-remove:1') clock.now = 2_001; },
     });
-    assert.deepEqual(result, { processed: 0, removed: [], removed_junk: [] });
+    assert.deepEqual(result, { processed: 0, removed: [], removed_junk: [], skipped_oversized: [] });
   });
   assert.equal(fs.existsSync(transaction), true);
   assert.equal(fs.readdirSync(transaction).length, 3);
 
   withLock(root, (token) => {
     const result = sweepTransactionDebris(root, token, { deadline: createDeadline({ budgetMs: 12_000 }) });
-    assert.deepEqual(result, { processed: 1, removed: ['plain-large'], removed_junk: [] });
+    assert.deepEqual(result, { processed: 1, removed: ['plain-large'], removed_junk: [], skipped_oversized: [] });
   });
   assert.equal(fs.existsSync(transaction), false);
 });
@@ -1779,7 +1779,7 @@ test('transaction debris sweep never removes an unrecognized non-directory entry
   withLock(root, (token) => {
     assert.deepEqual(
       sweepTransactionDebris(root, token, { deadline }),
-      { processed: 0, removed: [], removed_junk: [] },
+      { processed: 0, removed: [], removed_junk: [], skipped_oversized: [] },
     );
   });
   assert.equal(fs.readFileSync(path.join(transactions, 'evidence.json'), 'utf8'), 'preserve exactly\n');
@@ -1972,7 +1972,7 @@ test('the sweep never follows or removes a symlink wearing an OS metadata name',
   withLock(root, (token) => {
     assert.deepEqual(
       sweepTransactionDebris(root, token, { deadline }),
-      { processed: 0, removed: [], removed_junk: [] },
+      { processed: 0, removed: [], removed_junk: [], skipped_oversized: [] },
     );
   });
   assert.equal(fs.lstatSync(link).isSymbolicLink(), true);

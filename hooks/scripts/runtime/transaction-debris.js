@@ -4,7 +4,13 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const { assertBeforeDeadline, remainingMs } = require('./deadline.js');
-const { readMaybe, stateError } = require('./fs-safe.js');
+const {
+  atomicWriteFile,
+  descriptorMatchesPathIdentity,
+  readMaybe,
+  regularFileIdentity,
+  stateError,
+} = require('./fs-safe.js');
 const { assertLockOwner } = require('./lock.js');
 
 const SWEEP_RESERVE_MS = 10_000;
@@ -19,6 +25,23 @@ const PRESSURE_ENTRY_CAP = 4096;
 const PRESSURE_SIZE_THRESHOLD = 196608;
 const PRESSURE_NLINK_THRESHOLD = 512;
 const PRESSURE_BYTES_PER_ENTRY = 48n;
+const MAINTENANCE_MARKER_MAX_BYTES = 65536;
+const MAINTENANCE_MARKER_BASENAME = 'scan-window-maintenance.json';
+const QUARANTINE_BUNDLE_NAME_RE = /^[0-9]{8}T[0-9]{6}Z-[0-9]{1,10}-[0-9a-f]{32}$/;
+const QUARANTINE_INVENTORY_DISPLAY_LIMIT = 64;
+const QUARANTINE_BUNDLE_CAP = 64;
+const PROMOTED_CAP = 32;
+const SKIPPED_OVERSIZED_CAP = 32;
+const PRUNE_FAILURE_CAP = 8;
+const ISO_Z_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
+const PRUNE_FAILURE_CODE_RE = /^[A-Z_]+$/;
+const MARKER_KEYS = [
+  'schema', 'updated_at', 'prune_failures', 'promoted', 'skipped_oversized', 'quarantine_bundles',
+];
+const BUNDLE_REQUIRED_KEYS = ['bundle', 'source_name', 'state', 'at'];
+const BUNDLE_OPTIONAL_KEYS = ['resume'];
+const BUNDLE_STATES = new Set(['pending', 'incomplete', 'complete']);
+const PRUNE_FAILURE_KEYS = ['code', 'at'];
 const FILE_TYPE_MASK = 0o170000n;
 const DIRECTORY_TYPE = 0o040000n;
 const ULID_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/;
@@ -226,9 +249,9 @@ function entryExists(pathname) {
 // Every non-ENOENT failure becomes WIKI_STATE_FILESYSTEM. That is load-bearing: an `EACCES` from
 // this security check must never be mistakable for the foreign-hold codes that junk reclamation
 // tolerates, or the anchor would fail open exactly when the filesystem is behaving oddly.
-function physicalDirectoryIdentity(pathname, label, allowMissing) {
+function physicalDirectoryIdentity(pathname, label, allowMissing, fsImpl = fs) {
   let stat;
-  try { stat = fs.lstatSync(pathname, { bigint: true }); }
+  try { stat = fsImpl.lstatSync(pathname, { bigint: true }); }
   catch (error) {
     if (allowMissing && error.code === 'ENOENT') return null;
     throw stateError('WIKI_STATE_FILESYSTEM', `${label} identity is unavailable`, error);
@@ -237,8 +260,10 @@ function physicalDirectoryIdentity(pathname, label, allowMissing) {
       || stat.ino <= 0n || stat.dev < 0n) {
     throw stateError('WIKI_STATE_FILESYSTEM', `${label} must be a physical directory`);
   }
+  const realpathSync = fsImpl.realpathSync;
+  const realpathNative = realpathSync && (realpathSync.native || realpathSync);
   let physical;
-  try { physical = fs.realpathSync.native(pathname); }
+  try { physical = realpathNative.call(realpathSync || fsImpl, pathname); }
   catch (cause) {
     throw stateError('WIKI_STATE_FILESYSTEM', `${label} physical path is unavailable`, cause);
   }
@@ -472,14 +497,449 @@ function assertTransactionStoreAnchored(root) {
   transactionStoreAnchor(root, path.join(root, '.wiki-meta', '.transactions'));
 }
 
+function invokeMarkerFault(faultInjector, boundary) {
+  if (typeof faultInjector === 'function') faultInjector(boundary);
+}
+
+function canonicalUtcZ(date = new Date()) {
+  return date.toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+
+function isCanonicalUtcZ(value) {
+  if (typeof value !== 'string' || !ISO_Z_RE.test(value)) return false;
+  const parsed = new Date(value);
+  return Number.isFinite(parsed.getTime()) && canonicalUtcZ(parsed) === value;
+}
+
+function validStoreEntryName(value) {
+  return typeof value === 'string' && value.length > 0 && value === path.basename(value)
+    && !value.includes('\0') && value !== '.' && value !== '..';
+}
+
+function assertNoOperationId(value) {
+  if (!value || typeof value !== 'object') return;
+  if (Array.isArray(value)) {
+    for (const entry of value) assertNoOperationId(entry);
+    return;
+  }
+  if (Object.hasOwn(value, 'operation_id')) {
+    throw stateError('WIKI_STATE_INVALID', 'maintenance marker must not contain operation_id');
+  }
+  for (const nested of Object.values(value)) assertNoOperationId(nested);
+}
+
+function hasExactKeysAllowing(value, required, optional = []) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const allowed = new Set([...required, ...optional]);
+  const actual = Object.keys(value);
+  if (actual.some((key) => !allowed.has(key))) return false;
+  return required.every((key) => Object.hasOwn(value, key));
+}
+
+function cloneMarker(marker) {
+  return JSON.parse(JSON.stringify(marker));
+}
+
+function emptyMaintenanceMarker(updatedAt) {
+  return {
+    schema: 1,
+    updated_at: updatedAt,
+    prune_failures: [],
+    promoted: [],
+    skipped_oversized: [],
+    quarantine_bundles: [],
+  };
+}
+
+function validateBundleRecord(record) {
+  if (!hasExactKeysAllowing(record, BUNDLE_REQUIRED_KEYS, BUNDLE_OPTIONAL_KEYS)) return false;
+  if (!QUARANTINE_BUNDLE_NAME_RE.test(record.bundle)) return false;
+  if (!validStoreEntryName(record.source_name)) return false;
+  if (!BUNDLE_STATES.has(record.state) || !isCanonicalUtcZ(record.at)) return false;
+  if (Object.hasOwn(record, 'resume') && record.resume !== true) return false;
+  return true;
+}
+
+function validateMaintenanceMarker(value) {
+  assertNoOperationId(value);
+  if (!hasExactKeys(value, MARKER_KEYS) || value.schema !== 1 || !isCanonicalUtcZ(value.updated_at)) {
+    throw stateError('WIKI_STATE_INVALID', 'maintenance marker schema is invalid');
+  }
+  if (!Array.isArray(value.prune_failures) || value.prune_failures.length > PRUNE_FAILURE_CAP
+      || value.prune_failures.some((row) => !hasExactKeys(row, PRUNE_FAILURE_KEYS)
+        || !PRUNE_FAILURE_CODE_RE.test(row.code) || !isCanonicalUtcZ(row.at))) {
+    throw stateError('WIKI_STATE_INVALID', 'maintenance marker prune_failures are invalid');
+  }
+  if (!Array.isArray(value.promoted) || value.promoted.length > PROMOTED_CAP
+      || value.promoted.some((name) => !validStoreEntryName(name))) {
+    throw stateError('WIKI_STATE_INVALID', 'maintenance marker promoted names are invalid');
+  }
+  if (!Array.isArray(value.skipped_oversized) || value.skipped_oversized.length > SKIPPED_OVERSIZED_CAP
+      || value.skipped_oversized.some((name) => !validStoreEntryName(name))) {
+    throw stateError('WIKI_STATE_INVALID', 'maintenance marker skipped_oversized names are invalid');
+  }
+  if (!Array.isArray(value.quarantine_bundles) || value.quarantine_bundles.length > QUARANTINE_BUNDLE_CAP
+      || value.quarantine_bundles.some((row) => !validateBundleRecord(row))) {
+    throw stateError('WIKI_STATE_INVALID', 'maintenance marker quarantine_bundles are invalid');
+  }
+  return value;
+}
+
+function canonicalMaintenanceMarkerBytes(marker) {
+  const canonical = {
+    schema: marker.schema,
+    updated_at: marker.updated_at,
+    prune_failures: marker.prune_failures,
+    promoted: marker.promoted,
+    skipped_oversized: marker.skipped_oversized,
+    quarantine_bundles: marker.quarantine_bundles,
+  };
+  return Buffer.from(`${JSON.stringify(canonical)}\n`, 'utf8');
+}
+
+function capMarkerArrays(marker) {
+  while (marker.prune_failures.length > PRUNE_FAILURE_CAP) marker.prune_failures.shift();
+  while (marker.promoted.length > PROMOTED_CAP) marker.promoted.shift();
+  while (marker.skipped_oversized.length > SKIPPED_OVERSIZED_CAP) marker.skipped_oversized.shift();
+  while (marker.quarantine_bundles.length > QUARANTINE_BUNDLE_CAP) marker.quarantine_bundles.shift();
+}
+
+function eventRecordCount(marker) {
+  return marker.prune_failures.length + marker.promoted.length
+    + marker.skipped_oversized.length + marker.quarantine_bundles.length;
+}
+
+function evictOneMarkerRecord(marker, onEvict) {
+  const completeIndex = marker.quarantine_bundles.findIndex((row) => row.state === 'complete');
+  if (completeIndex >= 0) {
+    const [record] = marker.quarantine_bundles.splice(completeIndex, 1);
+    if (typeof onEvict === 'function') onEvict('complete', record.source_name || record.bundle);
+    return true;
+  }
+  if (marker.skipped_oversized.length > 0) {
+    const record = marker.skipped_oversized.shift();
+    if (typeof onEvict === 'function') onEvict('skipped_oversized', record);
+    return true;
+  }
+  if (marker.promoted.length > 0) {
+    const record = marker.promoted.shift();
+    if (typeof onEvict === 'function') onEvict('promoted', record);
+    return true;
+  }
+  if (marker.prune_failures.length > 0) {
+    const record = marker.prune_failures.shift();
+    if (typeof onEvict === 'function') onEvict('prune_failures', record.code);
+    return true;
+  }
+  const activeIndex = marker.quarantine_bundles.findIndex((row) => row.state === 'pending' || row.state === 'incomplete');
+  if (activeIndex >= 0) {
+    const [record] = marker.quarantine_bundles.splice(activeIndex, 1);
+    if (typeof onEvict === 'function') onEvict('active', record.source_name || record.bundle);
+    return true;
+  }
+  return false;
+}
+
+function fitMarkerToBudget(marker, maxBytes, onEvict) {
+  let bytes = canonicalMaintenanceMarkerBytes(marker);
+  while (bytes.length > maxBytes) {
+    if (eventRecordCount(marker) <= 1) {
+      throw stateError('WIKI_STATE_INVALID', 'maintenance marker exceeds byte budget');
+    }
+    if (!evictOneMarkerRecord(marker, onEvict)) {
+      throw stateError('WIKI_STATE_INVALID', 'maintenance marker exceeds byte budget');
+    }
+    bytes = canonicalMaintenanceMarkerBytes(marker);
+  }
+  return bytes;
+}
+
+function isIdleMarker(marker) {
+  return eventRecordCount(marker) === 0;
+}
+
+function markerFilePath(root) {
+  return path.join(root, '.wiki-meta', '.runtime', MAINTENANCE_MARKER_BASENAME);
+}
+
+function upsertQuarantineBundle(marker, record) {
+  const next = cloneMarker(marker);
+  if (!Array.isArray(next.quarantine_bundles)) next.quarantine_bundles = [];
+  const index = next.quarantine_bundles.findIndex((row) => row.bundle === record.bundle);
+  if (index >= 0) next.quarantine_bundles[index] = { ...record };
+  else next.quarantine_bundles.push({ ...record });
+  while (next.quarantine_bundles.length > QUARANTINE_BUNDLE_CAP) next.quarantine_bundles.shift();
+  return next;
+}
+
+function removePendingQuarantineBundle(marker, bundle) {
+  const next = cloneMarker(marker);
+  const index = next.quarantine_bundles.findIndex((row) => row.bundle === bundle);
+  if (index === -1) return next;
+  if (next.quarantine_bundles[index].state !== 'pending') return next;
+  next.quarantine_bundles.splice(index, 1);
+  return next;
+}
+
+function readExactDescriptorBytes(fsImpl, fd, size) {
+  const max = Number(size);
+  const buffer = Buffer.alloc(max);
+  let offset = 0;
+  while (offset < max) {
+    const count = fsImpl.readSync(fd, buffer, offset, max - offset, null);
+    if (count === 0) {
+      throw stateError('WIKI_STATE_FILESYSTEM', '.wiki-meta/.runtime/scan-window-maintenance.json shrank during read');
+    }
+    offset += count;
+  }
+  const probe = Buffer.alloc(1);
+  const extra = fsImpl.readSync(fd, probe, 0, 1, null);
+  if (extra > 0) {
+    throw stateError('WIKI_STATE_FILESYSTEM', '.wiki-meta/.runtime/scan-window-maintenance.json grew during read');
+  }
+  return buffer;
+}
+
+function readMaintenanceMarker(root, options = {}) {
+  const fsImpl = options.fs || fs;
+  const { faultInjector } = options;
+  const meta = path.join(root, '.wiki-meta');
+  const runtime = path.join(meta, '.runtime');
+  const marker = path.join(runtime, MAINTENANCE_MARKER_BASENAME);
+  const metaIdentity = physicalDirectoryIdentity(meta, '.wiki-meta', true, fsImpl);
+  if (metaIdentity === null) return null;
+  const runtimeIdentity = physicalDirectoryIdentity(runtime, '.wiki-meta/.runtime', true, fsImpl);
+  if (runtimeIdentity === null) return null;
+  invokeMarkerFault(faultInjector, 'after-parent-capture');
+
+  let pathStat;
+  try { pathStat = fsImpl.lstatSync(marker, { bigint: true }); }
+  catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw stateError('WIKI_STATE_FILESYSTEM', '.wiki-meta/.runtime/scan-window-maintenance.json is unavailable', error);
+  }
+  const pathIdentity = regularFileIdentity(pathStat);
+  if (!pathIdentity) {
+    throw stateError('WIKI_STATE_FILESYSTEM', '.wiki-meta/.runtime/scan-window-maintenance.json must be a regular non-symlink file');
+  }
+  invokeMarkerFault(faultInjector, 'after-leaf-lstat');
+
+  const constants = fsImpl.constants || fs.constants;
+  const flags = (constants.O_RDONLY ?? 0) | (constants.O_NOFOLLOW ?? 0);
+  let fd;
+  try {
+    fd = fsImpl.openSync(marker, flags);
+    const fdStat = fsImpl.fstatSync(fd, { bigint: true });
+    const fdIdentity = regularFileIdentity(fdStat);
+    if (!descriptorMatchesPathIdentity(fdIdentity, pathIdentity)) {
+      throw stateError('WIKI_STATE_FILESYSTEM', '.wiki-meta/.runtime/scan-window-maintenance.json identity changed mid-read');
+    }
+    invokeMarkerFault(faultInjector, 'after-fstat');
+    const size = typeof fdStat.size === 'bigint' ? fdStat.size : BigInt(fdStat.size);
+    const maxBytes = options.maxBytes === undefined ? MAINTENANCE_MARKER_MAX_BYTES : options.maxBytes;
+    if (size > BigInt(maxBytes)) {
+      throw stateError('WIKI_STATE_FILESYSTEM', '.wiki-meta/.runtime/scan-window-maintenance.json exceeds byte budget');
+    }
+    const bytes = readExactDescriptorBytes(fsImpl, fd, size);
+    fsImpl.closeSync(fd);
+    fd = undefined;
+    invokeMarkerFault(faultInjector, 'after-read');
+    const metaAfter = physicalDirectoryIdentity(meta, '.wiki-meta', true, fsImpl);
+    const runtimeAfter = physicalDirectoryIdentity(runtime, '.wiki-meta/.runtime', true, fsImpl);
+    let leafAfter;
+    try { leafAfter = regularFileIdentity(fsImpl.lstatSync(marker, { bigint: true })); }
+    catch (error) {
+      throw stateError('WIKI_STATE_FILESYSTEM', '.wiki-meta/.runtime/scan-window-maintenance.json identity changed mid-read', error);
+    }
+    if (!identityUnchanged(metaAfter, metaIdentity)
+        || !identityUnchanged(runtimeAfter, runtimeIdentity)
+        || !leafAfter
+        || leafAfter.ino !== pathIdentity.ino
+        || leafAfter.type !== pathIdentity.type
+        || leafAfter.birthtimeNs !== pathIdentity.birthtimeNs
+        || leafAfter.mtimeNs !== pathIdentity.mtimeNs
+        || leafAfter.nlink !== pathIdentity.nlink
+        || leafAfter.dev !== pathIdentity.dev) {
+      throw stateError('WIKI_STATE_FILESYSTEM', '.wiki-meta/.runtime/scan-window-maintenance.json identity changed mid-read');
+    }
+    let parsed;
+    try { parsed = JSON.parse(bytes.toString('utf8')); }
+    catch {
+      throw stateError('WIKI_STATE_INVALID', 'maintenance marker is unreadable');
+    }
+    return validateMaintenanceMarker(parsed);
+  } finally {
+    if (fd !== undefined) {
+      try { fsImpl.closeSync(fd); } catch { /* preserve the primary error */ }
+    }
+  }
+}
+
+function ensureRuntimeDirectory(root, fsImpl) {
+  const meta = path.join(root, '.wiki-meta');
+  physicalDirectoryIdentity(meta, '.wiki-meta', false, fsImpl);
+  const runtime = path.join(meta, '.runtime');
+  try { fsImpl.mkdirSync(runtime, { recursive: false }); }
+  catch (error) {
+    if (error.code !== 'EEXIST') {
+      throw stateError('WIKI_STATE_FILESYSTEM', '.wiki-meta/.runtime identity is unavailable', error);
+    }
+  }
+  return physicalDirectoryIdentity(runtime, '.wiki-meta/.runtime', false, fsImpl);
+}
+
+function writeMaintenanceMarker(root, token, mutate, options = {}) {
+  const fsImpl = options.fs || fs;
+  const writeFile = options.atomicWriteFile || atomicWriteFile;
+  const maxBytes = options.maxBytes === undefined ? MAINTENANCE_MARKER_MAX_BYTES : options.maxBytes;
+  const now = options.now || new Date();
+  assertLockOwner({ wikiRoot: root, token });
+  ensureRuntimeDirectory(root, fsImpl);
+  const current = readMaintenanceMarker(root, { fs: fsImpl, faultInjector: options.faultInjector })
+    || emptyMaintenanceMarker(canonicalUtcZ(now));
+  const draft = cloneMarker(current);
+  const mutated = typeof mutate === 'function' ? mutate(draft) : draft;
+  const next = mutated && typeof mutated === 'object' ? mutated : draft;
+  next.schema = 1;
+  next.updated_at = canonicalUtcZ(now);
+  if (!Array.isArray(next.prune_failures)) next.prune_failures = [];
+  if (!Array.isArray(next.promoted)) next.promoted = [];
+  if (!Array.isArray(next.skipped_oversized)) next.skipped_oversized = [];
+  if (!Array.isArray(next.quarantine_bundles)) next.quarantine_bundles = [];
+  capMarkerArrays(next);
+  const destination = markerFilePath(root);
+  if (isIdleMarker(next)) {
+    try { fsImpl.rmSync(destination, { force: true }); }
+    catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    return next;
+  }
+  const bytes = fitMarkerToBudget(next, maxBytes, options.onEvict);
+  validateMaintenanceMarker(next);
+  const meta = path.join(root, '.wiki-meta');
+  const runtime = path.join(meta, '.runtime');
+  const metaIdentity = physicalDirectoryIdentity(meta, '.wiki-meta', false, fsImpl);
+  const runtimeIdentity = physicalDirectoryIdentity(runtime, '.wiki-meta/.runtime', false, fsImpl);
+  const seal = () => {
+    assertLockOwner({ wikiRoot: root, token });
+    if (!identityUnchanged(physicalDirectoryIdentity(meta, '.wiki-meta', true, fsImpl), metaIdentity)
+        || !identityUnchanged(physicalDirectoryIdentity(runtime, '.wiki-meta/.runtime', true, fsImpl), runtimeIdentity)) {
+      throw stateError('WIKI_STATE_FILESYSTEM', '.wiki-meta/.runtime identity changed mid-write');
+    }
+    if (typeof options.beforePublish === 'function') options.beforePublish();
+  };
+  writeFile(destination, bytes, {
+    fs: fsImpl,
+    createParent: false,
+    beforeRename: seal,
+    beforePublish: seal,
+  });
+  return next;
+}
+
+function emptyInventoryResult() {
+  return {
+    bundles: [],
+    count: 0,
+    truncated: false,
+    unexpected: 0,
+    oversized: false,
+    method: 'none',
+    estimated_entries: null,
+  };
+}
+
+function listQuarantineBundleNames(root, options = {}) {
+  const fsImpl = options.fs || fs;
+  const { deadline, faultInjector } = options;
+  const meta = path.join(root, '.wiki-meta');
+  const quarantine = path.join(meta, '.quarantine');
+  const metaIdentity = physicalDirectoryIdentity(meta, '.wiki-meta', true, fsImpl);
+  if (metaIdentity === null) return emptyInventoryResult();
+  const quarantineIdentity = physicalDirectoryIdentity(quarantine, '.wiki-meta/.quarantine', true, fsImpl);
+  if (quarantineIdentity === null) return emptyInventoryResult();
+
+  const pressure = inspectDirectoryPressure(quarantine, {
+    deadline,
+    allowEnumeration: false,
+    fs: fsImpl,
+  });
+  if (pressure.oversized) {
+    return {
+      bundles: [],
+      count: 0,
+      truncated: false,
+      unexpected: 0,
+      oversized: true,
+      method: pressure.method,
+      estimated_entries: pressure.estimatedEntries,
+    };
+  }
+
+  let entries;
+  try { entries = fsImpl.readdirSync(quarantine, { withFileTypes: true }); }
+  catch (error) {
+    if (error.code === 'ENOENT') return emptyInventoryResult();
+    throw stateError('WIKI_STATE_FILESYSTEM', '.wiki-meta/.quarantine identity is unavailable', error);
+  }
+  invokeMarkerFault(faultInjector, 'after-readdir');
+
+  const bundles = [];
+  let unexpected = 0;
+  for (const entry of entries) {
+    assertBeforeDeadline(deadline, `quarantine-inventory:${entry.name}`);
+    if (entry.isSymbolicLink()) continue;
+    let kind;
+    if (entry.isDirectory()) kind = 'directory';
+    else if (direntTypeUnknown(entry)) kind = resolveUnknownDirent(quarantine, entry, fsImpl).kind;
+    else {
+      unexpected += 1;
+      continue;
+    }
+    if (kind !== 'directory') {
+      if (kind === 'symlink') continue;
+      unexpected += 1;
+      continue;
+    }
+    if (QUARANTINE_BUNDLE_NAME_RE.test(entry.name)) bundles.push(entry.name);
+    else unexpected += 1;
+  }
+
+  const metaAfter = physicalDirectoryIdentity(meta, '.wiki-meta', true, fsImpl);
+  const quarantineAfter = physicalDirectoryIdentity(quarantine, '.wiki-meta/.quarantine', true, fsImpl);
+  if (!identityUnchanged(metaAfter, metaIdentity) || !identityUnchanged(quarantineAfter, quarantineIdentity)) {
+    throw stateError('WIKI_STATE_FILESYSTEM', '.wiki-meta/.quarantine identity changed mid-inventory');
+  }
+
+  bundles.sort();
+  const truncated = bundles.length > QUARANTINE_INVENTORY_DISPLAY_LIMIT;
+  return {
+    bundles: truncated ? bundles.slice(0, QUARANTINE_INVENTORY_DISPLAY_LIMIT) : bundles,
+    count: bundles.length,
+    truncated,
+    unexpected,
+    oversized: false,
+    method: 'none',
+    estimated_entries: null,
+  };
+}
+
 module.exports = {
   SWEEP_RESERVE_MS,
   PRESSURE_ENTRY_CAP,
   PRESSURE_SIZE_THRESHOLD,
   PRESSURE_NLINK_THRESHOLD,
+  MAINTENANCE_MARKER_MAX_BYTES,
+  QUARANTINE_BUNDLE_NAME_RE,
   assertTransactionStoreAnchored,
   inspectDirectoryPressure,
   resolveUnknownDirent,
+  readMaintenanceMarker,
+  writeMaintenanceMarker,
+  upsertQuarantineBundle,
+  removePendingQuarantineBundle,
+  listQuarantineBundleNames,
   validateTombstoneV1,
   sweepTransactionDebris,
   isTransactionStoreJunkName,

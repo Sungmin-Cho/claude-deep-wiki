@@ -13,7 +13,9 @@ const versions = [
   readJson('.claude-plugin/plugin.json').version,
   readJson('.codex-plugin/plugin.json').version,
   readJson('package.json').version];
-test('1.10.0 release keeps every package version and changelog heading exact', () => { assert.strictEqual(versions.join(','), '1.10.0,1.10.0,1.10.0');
+test('1.10.1 release keeps every package version and changelog heading exact', () => { assert.strictEqual(versions.join(','), '1.10.1,1.10.1,1.10.1');
+  assert.match(readText('CHANGELOG.md'), /^## \[1\.10\.1\] — 2026-08-26 \(worker dispatch contract\)$/m);
+  assert.match(readText('CHANGELOG.ko.md'), /^## \[1\.10\.1\] — 2026-08-26 \(worker dispatch 계약\)$/m);
   assert.match(readText('CHANGELOG.md'), /^## \[1\.10\.0\] — 2026-08-25 \(oversized transaction isolation\)$/m);
   assert.match(readText('CHANGELOG.ko.md'), /^## \[1\.10\.0\] — 2026-08-25 \(oversized 트랜잭션 격리\)$/m);
   assert.match(readText('CHANGELOG.md'), /^## \[1\.9\.7\] — 2026-08-05 \(content metadata and nested prune safety\)$/m);

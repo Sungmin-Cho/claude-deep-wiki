@@ -7,6 +7,17 @@ deep-wiki의 주요 변경사항을 기록합니다.
 
 ## [Unreleased]
 
+## [1.10.1] — 2026-08-26 (worker dispatch 계약)
+
+### 수정
+
+- `config resolve --json`이 검증된 runtime 경로를 통해 기본값을 포함한 effective `a5_fanout_threshold`와 `a5_worker_timeout_sec`를 노출합니다. 두 knob는 양의 safe integer여야 하므로 Claude가 사용할 수 없는 fanout threshold나 wall-clock budget을 받지 않습니다.
+- Claude ingest dispatch는 각 qualified agent의 anchored input/output 계약을 정확히 읽습니다. named-agent resolution 실패와 invalid output은 계속 fail closed하고, effective timeout의 실제 non-response만 late output을 폐기한 뒤 affected work item을 stable main-caller `analyze` → `write` → `validate` route로 재처리합니다. complete manifest 검증 전에는 mutation하지 않습니다.
+
+### 변경
+
+- 이 수정은 두 plugin manifest와 package metadata 모두에서 별도 1.10.1 설치 식별자로 배포됩니다.
+
 ## [1.10.0] — 2026-08-25 (oversized 트랜잭션 격리)
 
 ### 수정

@@ -1737,6 +1737,7 @@ function fixWiki(options = {}) {
     try {
       before = inspectWiki({ wikiRoot: root, deadline });
     } catch (initial) {
+      let recoveryInitial = null;
       if (initial.code === 'TRANSACTION_OVERSIZED') {
         const store = path.join(root, '.wiki-meta', '.transactions');
         const parsePruneName = scanWindow.operationIdFromPruneName;
@@ -1791,58 +1792,63 @@ function fixWiki(options = {}) {
             before = inspectWiki({ wikiRoot: root, deadline });
             break;
           } catch (retry) {
+            if (retry.code === 'TRANSACTION_RECOVERY_REQUIRED') {
+              recoveryInitial = retry;
+              break;
+            }
             if (retry.code !== 'TRANSACTION_OVERSIZED') throw retry;
             current = retry;
           }
         }
-      } else if (initial.code !== 'TRANSACTION_RECOVERY_REQUIRED') throw initial;
-      else {
-      try {
-        recovery = prune('recovery', 64);
-      } catch (recoveryError) {
-        const wrapped = stateError(
-          recoveryError.code || 'FILESYSTEM',
-          `scan-window prune residue recovery failed: ${recoveryError.message}`,
-          initial,
-        );
-        if (recoveryError.terminal_prune) {
-          wrapped.terminal_prune = recoveryError.terminal_prune;
+      } else if (initial.code === 'TRANSACTION_RECOVERY_REQUIRED') recoveryInitial = initial;
+      else throw initial;
+      if (recoveryInitial) {
+        try {
+          recovery = prune('recovery', 64);
+        } catch (recoveryError) {
+          const wrapped = stateError(
+            recoveryError.code || 'FILESYSTEM',
+            `scan-window prune residue recovery failed: ${recoveryError.message}`,
+            recoveryInitial,
+          );
+          if (recoveryError.terminal_prune) {
+            wrapped.terminal_prune = recoveryError.terminal_prune;
+          }
+          throw wrapped;
         }
-        throw wrapped;
-      }
-      if (recovery.processed === 0 && recovery.complete === true) throw initial;
-      if (recovery.processed === 0 && recovery.complete === false) {
-        const wrapped = stateError(
-          initial.code || 'FILESYSTEM',
-          `scan-window prune residue recovery pass incomplete before inspection failed: ${initial.message}`,
-          initial,
-        );
-        wrapped.terminal_prune = recovery;
-        throw wrapped;
-      }
-      if (typeof recovery.complete !== 'boolean') {
-        const wrapped = stateError(
-          'FILESYSTEM',
-          'scan-window prune residue recovery returned an invalid completion result',
-          initial,
-        );
-        wrapped.terminal_prune = recovery;
-        throw wrapped;
-      }
-      try {
-        before = inspectWiki({ wikiRoot: root, deadline });
-      } catch (retryError) {
-        const prefix = recovery.complete === false
-          ? 'scan-window prune residue recovery pass incomplete before inspection failed: '
-          : 'scan-window prune residue recovery pass completed before inspection failed: ';
-        const wrapped = stateError(
-          retryError.code || 'FILESYSTEM',
-          `${prefix}${retryError.message}`,
-          retryError,
-        );
-        wrapped.terminal_prune = recovery;
-        throw wrapped;
-      }
+        if (recovery.processed === 0 && recovery.complete === true) throw recoveryInitial;
+        if (recovery.processed === 0 && recovery.complete === false) {
+          const wrapped = stateError(
+            recoveryInitial.code || 'FILESYSTEM',
+            `scan-window prune residue recovery pass incomplete before inspection failed: ${recoveryInitial.message}`,
+            recoveryInitial,
+          );
+          wrapped.terminal_prune = recovery;
+          throw wrapped;
+        }
+        if (typeof recovery.complete !== 'boolean') {
+          const wrapped = stateError(
+            'FILESYSTEM',
+            'scan-window prune residue recovery returned an invalid completion result',
+            recoveryInitial,
+          );
+          wrapped.terminal_prune = recovery;
+          throw wrapped;
+        }
+        try {
+          before = inspectWiki({ wikiRoot: root, deadline });
+        } catch (retryError) {
+          const prefix = recovery.complete === false
+            ? 'scan-window prune residue recovery pass incomplete before inspection failed: '
+            : 'scan-window prune residue recovery pass completed before inspection failed: ';
+          const wrapped = stateError(
+            retryError.code || 'FILESYSTEM',
+            `${prefix}${retryError.message}`,
+            retryError,
+          );
+          wrapped.terminal_prune = recovery;
+          throw wrapped;
+        }
       }
     }
     const pendingBytes = readMaybe(path.join(root, '.wiki-meta', '.pending-scan'));

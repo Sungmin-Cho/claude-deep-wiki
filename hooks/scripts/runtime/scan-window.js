@@ -2729,6 +2729,13 @@ function ensurePendingScan(options = {}) {
       });
     } catch (error) {
       result.prune_failure = error.code || 'SCAN_WINDOW_FILESYSTEM';
+      if (error.terminal_prune) {
+        pruneResult = {
+          skipped_oversized: Array.isArray(error.terminal_prune.skipped_oversized)
+            ? [...error.terminal_prune.skipped_oversized]
+            : [],
+        };
+      }
       try {
         writeMaintenanceMarker(physicalRoot, owner.token, (marker) => {
           marker.prune_failures.push({ code: String(error.code || 'SCAN_WINDOW_FILESYSTEM').replace(/[^A-Z_]/g, '_') || 'PRUNE_FAIL', at: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z') });

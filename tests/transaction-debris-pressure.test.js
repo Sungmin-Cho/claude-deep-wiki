@@ -888,7 +888,11 @@ test('listQuarantineBundleNames truncates after 64 names', () => {
 
 const scanWindow = require('../hooks/scripts/runtime/scan-window.js');
 const wikiState = require('../hooks/scripts/runtime/wiki-state.js');
-const { createCompletedEnsures, repairClockFromJournal } = require('./helpers/wiki-lint-pruning-fixture.js');
+const {
+  createCompletedEnsures,
+  createPreservedEnsureQuarantineResidue,
+  repairClockFromJournal,
+} = require('./helpers/wiki-lint-pruning-fixture.js');
 
 function hex40(seed = 'aa') {
   return seed.repeat(40).slice(0, 40);
@@ -2817,6 +2821,70 @@ test('lint fix retains oversized residue when a later pressure probe throws EACC
   const marker = debris.readMaintenanceMarker(root);
   assert.ok(marker, 'maintenance marker should persist oversized residue after a later probe fault');
   assert.ok(marker.skipped_oversized.includes(firstName), JSON.stringify(marker));
+  assert.equal(fs.existsSync(path.join(root, '.wiki-meta', '.wiki-lock')), false);
+});
+
+// --- issue-54 review fix9 ---
+
+test('ensurePendingScan carries thrown prune oversized residue into the durable marker', () => {
+  const root = wikiFixture();
+  const journals = createCompletedEnsures(root, [
+    { operationId: 'a-ensure-residue-created', proposed: '2026-07-11T01:00:00Z' },
+    { operationId: 'b-ensure-residue-preserved', proposed: '2026-07-11T02:00:00Z' },
+  ]);
+  const firstName = journals[0].operationId;
+  const secondName = journals[1].operationId;
+  const firstDir = path.dirname(journals[0].path);
+  const now = repairClockFromJournal(journals.map((entry) => entry.path));
+  const observed = [];
+  const probes = new Map();
+
+  const result = withReaddirOrder(storePath(root), [firstName, secondName], () => (
+    scanWindow.ensurePendingScan({
+      wikiRoot: root,
+      proposed: '2026-07-11T03:00:00Z',
+      now,
+      deadline: deadline(),
+      inspectDirectoryPressure(pathname, options) {
+        const name = path.basename(pathname);
+        observed.push(name);
+        const count = (probes.get(name) || 0) + 1;
+        probes.set(name, count);
+        if (name === firstName && count > 1) {
+          return { oversized: true, method: 'stat', estimatedEntries: 600 };
+        }
+        if (name === secondName && count > 1) {
+          throw Object.assign(new Error('EIO: ensure second pressure probe'), { code: 'EIO' });
+        }
+        return debris.inspectDirectoryPressure(pathname, options);
+      },
+    })
+  ));
+
+  assert.notEqual(result.status, 'deferred', JSON.stringify(result));
+  assert.equal(result.prune_failure, 'EIO', JSON.stringify({ result, observed }));
+  const marker = debris.readMaintenanceMarker(root);
+  assert.ok(marker, 'ensure should preserve residue from the thrown terminal-prune envelope');
+  assert.ok(marker.skipped_oversized.includes(firstName), JSON.stringify(marker));
+  assert.equal(fs.existsSync(firstDir), true);
+  assert.equal(fs.existsSync(path.join(root, '.wiki-meta', '.wiki-lock')), false);
+});
+
+test('fixWiki routes a post-quarantine recovery-required retry through prune recovery', () => {
+  const root = lintableWikiFixture();
+  const oversizedName = `scan-window-ensure-${hex40('f7')}`;
+  const oversized = seedStoreDirectory(root, oversizedName);
+  fillOversizedTier1Subdirs(oversized);
+  const residue = createPreservedEnsureQuarantineResidue(root);
+
+  const result = withReaddirOrder(storePath(root), [oversizedName], () => (
+    wikiState.fixWiki({ wikiRoot: root, now: residue.now })
+  ));
+
+  assert.equal(result.status, 'fixed');
+  assert.equal(fs.existsSync(oversized), false);
+  assert.ok(result.terminal_prune.processed > 0, JSON.stringify(result.terminal_prune));
+  assert.equal(fs.existsSync(residue.quarantine), false);
   assert.equal(fs.existsSync(path.join(root, '.wiki-meta', '.wiki-lock')), false);
 });
 

@@ -34,6 +34,18 @@ function executeCodexRoute(policy, plans) {
   return trace;
 }
 
+function executeClaudeNonResponse(policy, workItem) {
+  assert.equal(policy.fallback.trigger, 'non-response-only');
+  assert.equal(policy.non_response_after, 'a5_worker_timeout_sec');
+  assert.equal(policy.late_result, 'discard');
+  assert.equal(policy.fallback.scope, 'affected-work-item');
+  assert.equal(policy.fallback.mode, 'main-caller-sequential');
+  return [
+    `discard-late-result:${workItem}`,
+    ...policy.fallback.per_plan_phases.map((phase) => `${phase}:${workItem}`),
+  ];
+}
+
 test('Claude uses only qualified active Deep Wiki agents and inline remains dormant', () => {
   const ingest = read('skills/wiki-ingest/SKILL.md');
   for (const role of ['wiki-synthesizer-analysis', 'wiki-synthesizer-worker', 'wiki-page-writer']) {
@@ -42,6 +54,40 @@ test('Claude uses only qualified active Deep Wiki agents and inline remains dorm
   assert.doesNotMatch(ingest, /dispatch[^\n]*wiki-synthesizer-inline/i);
   assert.match(ingest, /named-agent resolution error[^\n]*fail/i);
   assert.match(frontmatter(read('agents/wiki-synthesizer-inline.md')), /status:\s*dormant/);
+});
+
+test('Claude dispatch reads exact agent contracts and effective A5 config from runtime output', () => {
+  const ingest = read('skills/wiki-ingest/SKILL.md');
+  const policy = dataObjects(ingest).find((value) => value.claude_route)?.claude_route;
+  assert.ok(policy);
+  assert.deepEqual(policy.agent_contracts, {
+    'deep-wiki:wiki-page-writer': '<plugin_root>/agents/wiki-page-writer.md',
+    'deep-wiki:wiki-synthesizer-analysis': '<plugin_root>/agents/wiki-synthesizer-analysis.md',
+    'deep-wiki:wiki-synthesizer-worker': '<plugin_root>/agents/wiki-synthesizer-worker.md',
+  });
+  assert.deepEqual(policy.config_fields, [
+    'a5_fanout_threshold',
+    'a5_worker_timeout_sec',
+  ]);
+  assert.equal(policy.config_source, 'config-resolve-output');
+  assert.equal(policy.contract_validation, 'exact-input-and-output');
+});
+
+test('Claude non-response discards late output and replays only affected work sequentially', () => {
+  const ingest = read('skills/wiki-ingest/SKILL.md');
+  const policy = dataObjects(ingest).find((value) => value.claude_route)?.claude_route;
+  assert.ok(policy);
+  assert.equal(policy.resolution_error, 'fail-affected-work');
+  assert.equal(policy.invalid_result, 'fail-affected-work');
+  assert.equal(policy.fallback.trigger, 'non-response-only');
+  assert.equal(policy.fallback.analysis_result, 'fix-page-plan-sequence-before-per-plan-phases');
+  assert.equal(policy.mutation_gate, 'complete-manifest-validated');
+  assert.deepEqual(executeClaudeNonResponse(policy, 'p2'), [
+    'discard-late-result:p2',
+    'analyze:p2',
+    'write:p2',
+    'validate:p2',
+  ]);
 });
 
 test('Codex route is unconditional single-caller sequential processing with exact trace', () => {

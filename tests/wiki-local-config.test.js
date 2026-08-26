@@ -92,6 +92,12 @@ test('loadWikiLocalConfig fails closed for unsafe or invalid local state', () =>
     ['invalid glob', '{"auto_ingest":{"ignore_globs":[""]}}'],
     ['invalid tag', '{"auto_ingest":{"require_tag":false}}'],
     ['invalid A5', '{"a5_fanout_threshold":1.5}'],
+    ['zero A5 fanout', '{"a5_fanout_threshold":0}'],
+    ['negative A5 fanout', '{"a5_fanout_threshold":-1}'],
+    ['unsafe A5 fanout', '{"a5_fanout_threshold":9007199254740992}'],
+    ['zero A5 timeout', '{"a5_worker_timeout_sec":0}'],
+    ['negative A5 timeout', '{"a5_worker_timeout_sec":-1}'],
+    ['unsafe A5 timeout', '{"a5_worker_timeout_sec":9007199254740992}'],
   ];
   for (const [name, source] of cases) {
     const wikiRoot = temporaryRoot();
@@ -242,5 +248,25 @@ test('config resolve JSON reports effective-policy metadata without writing a lo
   assert.equal(output.policy_source, 'global_legacy');
   assert.equal(output.migration_required, true);
   assert.equal(output.local_config_path, localPath(wikiRoot));
+  assert.equal(output.a5_fanout_threshold, 3);
+  assert.equal(output.a5_worker_timeout_sec, 90);
   assert.equal(fs.existsSync(localPath(wikiRoot)), false);
+
+  writeLocal(wikiRoot, '{"a5_fanout_threshold":7}\n');
+  const fanoutConfigured = spawnSync(process.execPath, [cli, 'config', 'resolve', '--json'], {
+    env: { ...process.env, DEEP_WIKI_CONFIG: global, HOME: root }, encoding: 'utf8',
+  });
+  assert.equal(fanoutConfigured.status, 0, fanoutConfigured.stderr);
+  const fanoutOutput = JSON.parse(fanoutConfigured.stdout);
+  assert.equal(fanoutOutput.a5_fanout_threshold, 7);
+  assert.equal(fanoutOutput.a5_worker_timeout_sec, 90);
+
+  writeLocal(wikiRoot, '{"a5_worker_timeout_sec":45}\n');
+  const timeoutConfigured = spawnSync(process.execPath, [cli, 'config', 'resolve', '--json'], {
+    env: { ...process.env, DEEP_WIKI_CONFIG: global, HOME: root }, encoding: 'utf8',
+  });
+  assert.equal(timeoutConfigured.status, 0, timeoutConfigured.stderr);
+  const timeoutOutput = JSON.parse(timeoutConfigured.stdout);
+  assert.equal(timeoutOutput.a5_fanout_threshold, 3);
+  assert.equal(timeoutOutput.a5_worker_timeout_sec, 45);
 });

@@ -16,7 +16,9 @@ are in the `wiki-schema` skill.
 ## 1. Resolve and inspect
 
 Resolve the shared Claude/Codex configuration. Missing or conflicting targets
-are hard errors.
+are hard errors. Keep the returned effective `a5_fanout_threshold` and
+`a5_worker_timeout_sec`; the runtime has already validated wiki-local config
+and applied the defaults. Never read `.wiki-meta/.config.json` directly.
 
 <!-- deep-wiki:exec -->
 ```deep-wiki-exec
@@ -78,7 +80,31 @@ Both hosts use identical page-plan and manifest schemas.
 | multi-source or collision analysis | qualified `deep-wiki:wiki-synthesizer-worker` | main caller processes inputs one at a time |
 | page body generation | qualified `deep-wiki:wiki-page-writer` | main caller synthesizes and validates one body at a time |
 
-Claude Code may fan out only to those three qualified names. A named-agent resolution error must fail the affected work; there is no unqualified or generic fallback. `wiki-synthesizer-inline` is dormant and is never dispatched.
+Claude Code may fan out only to those three qualified names. Before each
+dispatch, read the role's anchored `<plugin_root>/agents/*.md` file and build
+the payload from its Input contract exactly; accept only its Output contract.
+Pass the effective A5 values from `config resolve` where the role contract asks
+for them. A named-agent resolution error or invalid returned contract fails the
+affected work; there is no unqualified or generic-agent fallback.
+`wiki-synthesizer-inline` is dormant and is never dispatched.
+
+If a qualified worker produces no terminal result within the effective
+`a5_worker_timeout_sec`, abandon that dispatch and discard any result that
+arrives later. Replay only its affected source, shard, collision, or page plan
+in the main caller. For an analysis timeout, analyze that affected input first
+and fix its page-plan sequence; then preserve stable order while completing the
+same `analyze`, `write`, and `validate` phases for each plan before advancing.
+This is the documented sequential route, not a replacement-agent dispatch. The
+complete manifest must still validate before any mutation. An on-time invalid
+terminal result fails the affected work and never enters this replay path.
+
+The inert Claude policy record below is the authority for dispatch and
+non-response handling.
+
+<!-- deep-wiki:data -->
+```json
+{"claude_route":{"mode":"qualified-agent-or-main-caller-sequential","input_order":"stable","agent_contracts":{"deep-wiki:wiki-page-writer":"<plugin_root>/agents/wiki-page-writer.md","deep-wiki:wiki-synthesizer-analysis":"<plugin_root>/agents/wiki-synthesizer-analysis.md","deep-wiki:wiki-synthesizer-worker":"<plugin_root>/agents/wiki-synthesizer-worker.md"},"config_source":"config-resolve-output","config_fields":["a5_fanout_threshold","a5_worker_timeout_sec"],"contract_validation":"exact-input-and-output","resolution_error":"fail-affected-work","invalid_result":"fail-affected-work","non_response_after":"a5_worker_timeout_sec","late_result":"discard","fallback":{"trigger":"non-response-only","scope":"affected-work-item","mode":"main-caller-sequential","analysis_result":"fix-page-plan-sequence-before-per-plan-phases","per_plan_phases":["analyze","write","validate"]},"mutation_gate":"complete-manifest-validated"}}
+```
 
 For Codex, `codex_agent_fanout: disabled_for_1.8.0` is unconditional. The main
 caller fixes the page-plan sequence once in stable input order, then for each

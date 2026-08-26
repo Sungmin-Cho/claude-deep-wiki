@@ -151,13 +151,13 @@ test('portable npm test cannot discover the native installed-Codex release smoke
   assert.match(smoke, /windowsHide: true/);
 });
 
-test('1.10.0 release keeps package identity and bilingual changelogs exact', () => {
+test('1.10.1 release keeps package identity and bilingual changelogs exact', () => {
   const packageFiles = [
     '.claude-plugin/plugin.json',
     '.codex-plugin/plugin.json',
     'package.json',
   ];
-  for (const file of packageFiles) assert.equal(readJson(file).version, '1.10.0', file);
+  for (const file of packageFiles) assert.equal(readJson(file).version, '1.10.1', file);
 
   const releaseSection = (text, heading) => {
     const start = text.indexOf(heading);
@@ -167,6 +167,18 @@ test('1.10.0 release keeps package identity and bilingual changelogs exact', () 
   };
   const changelog = readText('CHANGELOG.md');
   const changelogKo = readText('CHANGELOG.ko.md');
+  const english1101 = releaseSection(changelog, '## [1.10.1] — 2026-08-26 (worker dispatch contract)');
+  const korean1101 = releaseSection(changelogKo, '## [1.10.1] — 2026-08-26 (worker dispatch 계약)');
+  assert.match(english1101, /effective `a5_fanout_threshold` and `a5_worker_timeout_sec`/);
+  assert.match(english1101, /positive safe integers/);
+  assert.match(english1101, /anchored input\/output contract/);
+  assert.match(english1101, /only a true non-response/);
+  assert.match(english1101, /distinct 1\.10\.1 installation identity/);
+  assert.match(korean1101, /effective `a5_fanout_threshold`와 `a5_worker_timeout_sec`/);
+  assert.match(korean1101, /양의 safe integer/);
+  assert.match(korean1101, /anchored input\/output 계약/);
+  assert.match(korean1101, /실제 non-response만/);
+  assert.match(korean1101, /별도 1\.10\.1 설치 식별자/);
   const english197 = releaseSection(changelog, '## [1.9.7] — 2026-08-05 (content metadata and nested prune safety)');
   const korean197 = releaseSection(changelogKo, '## [1.9.7] — 2026-08-05 (콘텐츠 메타데이터 및 중첩 prune 안전성)');
   assert.match(english197, /nested terminal and quarantine metadata/i);

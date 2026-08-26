@@ -8,6 +8,8 @@ const { assertBeforeDeadline } = require('./deadline.js');
 const { regularFileIdentity, regularFileIdentitiesMatch } = require('./fs-safe.js');
 
 const ISO_UTC_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
+const A5_FANOUT_THRESHOLD_DEFAULT = 3;
+const A5_WORKER_TIMEOUT_SEC_DEFAULT = 90;
 
 class ConfigError extends Error {
   constructor(code, message, cause) {
@@ -790,7 +792,9 @@ function loadWikiLocalConfig(wikiRoot, options = {}) {
   }
   for (const [jsonKey, configKey] of [['a5_fanout_threshold', 'a5FanoutThreshold'], ['a5_worker_timeout_sec', 'a5WorkerTimeoutSec']]) {
     if (!Object.hasOwn(parsed, jsonKey)) continue;
-    if (!Number.isInteger(parsed[jsonKey])) throw new ConfigError('CONFIG_INVALID', `${jsonKey} must be an integer`);
+    if (!Number.isSafeInteger(parsed[jsonKey]) || parsed[jsonKey] < 1) {
+      throw new ConfigError('CONFIG_INVALID', `${jsonKey} must be a positive safe integer`);
+    }
     result[configKey] = parsed[jsonKey];
   }
   return { status: 'present', path: target, autoIngestDefined, config: deepFreeze(result) };
@@ -931,6 +935,10 @@ function resolveConfig(env = process.env, options = {}) {
     policy_source: effective.policySource,
     migration_required: effective.migrationRequired,
     policy_digest: canonicalPolicyDigest(effective.policy),
+    a5_fanout_threshold: localConfig.config?.a5FanoutThreshold
+      ?? A5_FANOUT_THRESHOLD_DEFAULT,
+    a5_worker_timeout_sec: localConfig.config?.a5WorkerTimeoutSec
+      ?? A5_WORKER_TIMEOUT_SEC_DEFAULT,
   };
 }
 

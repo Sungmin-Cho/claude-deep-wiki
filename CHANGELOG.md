@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.1] — 2026-08-26 (worker dispatch contract)
+
+### Fixed
+
+- `config resolve --json` now exposes the effective `a5_fanout_threshold` and `a5_worker_timeout_sec`, including defaults, through the validated runtime path. Both knobs must be positive safe integers, so Claude never receives an unusable fanout threshold or wall-clock budget.
+- Claude ingest dispatch now reads each qualified agent's anchored input/output contract exactly. Named-agent resolution and invalid output remain fail-closed; only a true non-response at the effective timeout discards late output and replays the affected work item through the stable main-caller `analyze` → `write` → `validate` route before complete-manifest validation and mutation.
+
+### Changed
+
+- These fixes ship under a distinct 1.10.1 installation identity across both plugin manifests and package metadata.
+
 ## [1.10.0] — 2026-08-25 (oversized transaction isolation)
 
 ### Fixed

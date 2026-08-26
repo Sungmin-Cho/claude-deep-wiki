@@ -15,6 +15,12 @@ runtime_authority:
     receipt: .wiki-meta/.transaction-receipts/<operation_id>.json
     recovery_command: transaction recover
     terminal_prune_command: transaction prune
+    transaction_quarantine_command: transaction quarantine
+    quarantine_bundles: .wiki-meta/.quarantine/<stamp>-<pid>-<uuid>/
+    maintenance_marker: .wiki-meta/.runtime/scan-window-maintenance.json
+    quarantine_bundle_creators: ["scan-window ensure", "wiki-lint --fix", "transaction prune", "transaction quarantine"]
+    quarantine_follow_up_argv_field: follow_up_argv
+    terminal_prune_skipped_oversized_field: skipped_oversized
     terminal_prune_scope: validated-cleaned-scan-window-only
     terminal_prune_bounded: true
     terminal_prune_completion_field: complete

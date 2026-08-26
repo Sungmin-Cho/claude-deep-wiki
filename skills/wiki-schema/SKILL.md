@@ -29,6 +29,8 @@ WIKI_ROOT/
     .transaction-receipts/OPERATION_ID.json
     .pending-scan
     .last-scan
+    .quarantine/
+    .runtime/scan-window-maintenance.json
 ```
 
 Pages and source provenance are authoritative. `.wiki-meta/index.json`,
@@ -75,10 +77,15 @@ One manifest-backed commit owns page writes, version backups, source records,
 catalog refresh, and lifecycle records. The runtime writes a journal intent,
 applies expected-hash-guarded changes, and records terminal state. An
 interruption is resolved with `wiki-runtime.js transaction recover` using the
-same owner token and operation ID; a caller never creates split mutations.
+same operation ID. A caller that already holds the lock injects `--lock-token`;
+the public operator form omits the token and self-locks. A caller never creates
+split mutations.
 The shared terminal pruner has three callers: `scan-window ensure`,
 `wiki-lint --fix`, and the singular operator command `wiki-runtime.js
-transaction prune`. Ordinary selection removes only fully validated, terminal
+transaction prune`. Oversized isolatable store entries are relocated into
+`.wiki-meta/.quarantine/` bundles by those three callers plus the operator
+command `transaction quarantine`. Bundles are never auto-deleted; after
+resolution, stop all hosts and dispose of a bundle directory manually. Ordinary selection removes only fully validated, terminal
 scan-window journals older than the requested age while the caller still owns
 the lock. The lint recovery pass may bypass that ordinary age test only for
 authenticated residue from an already-started prune; it does not broaden

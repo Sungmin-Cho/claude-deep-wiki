@@ -167,7 +167,7 @@ test('wiki-state exports the one state surface and exact shared promotion identi
   const state = require(statePath);
   assert.deepEqual(Object.keys(state).sort(), [
     'applyCommit', 'cleanupInbox', 'fixWiki', 'inspectWiki', 'migrateAutoIngestPolicy', 'promotePendingScan',
-    'recoverTransaction', 'registerIngestFailure', 'setupWiki', 'snapshotWiki',
+    'quarantineStoreEntry', 'recoverTransaction', 'registerIngestFailure', 'setupWiki', 'snapshotWiki',
   ]);
   assert.equal(state.promotePendingScan, scanWindow.promotePendingScan);
   assert.equal(state.migrateAutoIngestPolicy, migrateAutoIngestPolicy);
@@ -1079,6 +1079,18 @@ function extractQuotedFlagValue(commandLine, flag) {
   throw new Error(`unterminated quoted value for ${flag}`);
 }
 
+function posixQuote(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
+function nodeCommandLines(text) {
+  return String(text).split('\n').map((line) => line.trim()).filter((line) => line.startsWith('node '));
+}
+
+function recoverRuntimePrefix() {
+  return `node ${posixQuote(cli)} `;
+}
+
 test('recover hint is appended to a DEADLINE_EXCEEDED commit failure and exit code stays 5', { skip: process.platform === 'win32' ? 'POSIX hint-label assertion; win32 label covered by the platform-mock tests' : false }, () => {
   const { main, recoverHint } = require('../scripts/wiki-runtime.js');
   const wikiRuntimeState = require('../hooks/scripts/runtime/wiki-state.js');
@@ -1090,7 +1102,7 @@ test('recover hint is appended to a DEADLINE_EXCEEDED commit failure and exit co
 
   assert.equal(
     recoverHint(root, OPERATION_ID),
-    `resume with:\nnode scripts/wiki-runtime.js transaction recover --wiki-root '${root}' --lock-token <token> --operation-id '${OPERATION_ID}' --json`,
+    `resume with:\n${recoverRuntimePrefix()}transaction recover --wiki-root '${root}' --lock-token <token> --operation-id '${OPERATION_ID}' --json`,
   );
 
   const originalApplyCommit = wikiRuntimeState.applyCommit;
@@ -1119,7 +1131,7 @@ test('recover hint is appended to a DEADLINE_EXCEEDED commit failure and exit co
     'DEADLINE_EXCEEDED: DEADLINE_EXCEEDED at wiki-state:catalog-seal:pages/x.md — resume with:\n',
   ));
   assert.ok(stderr.includes(
-    `node scripts/wiki-runtime.js transaction recover --wiki-root '${root}' --lock-token <token> --operation-id '${OPERATION_ID}' --json`,
+    `${recoverRuntimePrefix()}transaction recover --wiki-root '${root}' --lock-token <token> --operation-id '${OPERATION_ID}' --json`,
   ));
 });
 
@@ -1138,7 +1150,7 @@ test('recoverHint shell-escapes adversarial wiki roots and operation ids', (t) =
   for (const value of adversarial) {
     const hint = recoverHint(value, value);
     const commandLine = hint.slice(hint.indexOf('\n') + 1);
-    const argv = shellArgvAfterPrefix(commandLine, 'node scripts/wiki-runtime.js transaction recover ');
+    const argv = shellArgvAfterPrefix(commandLine, `${recoverRuntimePrefix()}transaction recover `);
     assert.equal(argAfterFlag(argv, '--wiki-root'), path.resolve(value));
     assert.equal(argAfterFlag(argv, '--operation-id'), value);
   }
@@ -1179,14 +1191,23 @@ test('shellQuote renders a PowerShell-safe literal on win32 for adversarial char
       'C:\\Deep Wiki ^caret',
       'C:\\Deep Wiki\nnewline',
     ];
+    const quotedRuntime = `'${cli.replace(/'/g, "''")}'`;
     for (const value of adversarial) {
       const hint = recoverHint(value, value);
       assert.ok(hint.startsWith('resume with (PowerShell):\n'), hint);
       const commandLine = hint.split('\n').slice(1).join('\n');
+      assert.ok(commandLine.startsWith(`node ${quotedRuntime} transaction recover `), commandLine);
+      assert.match(commandLine, /--lock-token <token>/);
       const wikiRootValue = decodePowershellSingleQuoted(extractQuotedFlagValue(commandLine, '--wiki-root'));
       assert.equal(wikiRootValue, path.resolve(value));
       const operationIdValue = decodePowershellSingleQuoted(extractQuotedFlagValue(commandLine, '--operation-id'));
       assert.equal(operationIdValue, value);
+
+      const tokenless = recoverHint(value, value, { includeLockToken: false });
+      assert.ok(tokenless.startsWith('resume with (PowerShell):\n'), tokenless);
+      const tokenlessLine = tokenless.split('\n').slice(1).join('\n');
+      assert.ok(tokenlessLine.startsWith(`node ${quotedRuntime} transaction recover `), tokenlessLine);
+      assert.equal(tokenlessLine.includes('--lock-token'), false);
 
       const retryHint = commitRetryHint(value, value);
       assert.ok(retryHint.startsWith('rerun with (PowerShell):\n'), retryHint);
@@ -1196,6 +1217,265 @@ test('shellQuote renders a PowerShell-safe literal on win32 for adversarial char
       const manifestValue = decodePowershellSingleQuoted(extractQuotedFlagValue(retryLine, '--manifest-file'));
       assert.equal(manifestValue, path.resolve(value));
     }
+  } finally {
+    Object.defineProperty(process, 'platform', originalDescriptor);
+  }
+});
+
+test('oversizedHint reuses the isolatable predicate and quotes every argv value', (t) => {
+  const probe = spawnSync('bash', ['-c', 'echo ok'], { encoding: 'utf8' });
+  if (probe.status !== 0) { t.skip('bash unavailable for POSIX shell-quoting verification'); return; }
+  const runtime = require('../scripts/wiki-runtime.js');
+  const debris = require('../hooks/scripts/runtime/transaction-debris.js');
+  const sentinelDir = fs.mkdtempSync(path.join(os.tmpdir(), 'deep-wiki-hint-sentinel-'));
+  roots.add(sentinelDir);
+  const sentinel = path.join(sentinelDir, 'SIDE_EFFECT');
+  const adversarial = [
+    `/tmp/deep wiki has space`,
+    `/tmp/deep wiki has"quote`,
+    `/tmp/deep wiki has'quote`,
+    `/tmp/deep wiki $(printf shell-injection-probe)`,
+    `/tmp/deep wiki; touch ${sentinel}`,
+    `/tmp/deep wiki & echo amp`,
+    `/tmp/deep wiki %PATH%`,
+    `/tmp/deep wiki has\nnewline`,
+  ];
+  const isolatableName = `scan-window-ensure-${'ab'.repeat(20)}`;
+  for (const value of adversarial) {
+    const hint = runtime.oversizedHint({
+      code: 'TRANSACTION_OVERSIZED',
+      operationId: isolatableName,
+      wikiRoot: value,
+    });
+    assert.match(hint, /transaction quarantine/);
+    const commandLine = hint.slice(hint.indexOf('transaction quarantine'));
+    const argv = shellArgvAfterPrefix(`node scripts/wiki-runtime.js ${commandLine}`, 'node scripts/wiki-runtime.js transaction quarantine ');
+    assert.equal(argAfterFlag(argv, '--wiki-root'), path.resolve(value));
+    assert.equal(argAfterFlag(argv, '--operation-id'), isolatableName);
+  }
+  assert.equal(fs.existsSync(sentinel), false);
+
+  const ulidHint = runtime.oversizedHint({
+    code: 'TRANSACTION_OVERSIZED',
+    operationId: OPERATION_ID,
+    wikiRoot: '/tmp/wiki',
+  });
+  assert.match(ulidHint, /pure ULID is not automatically isolatable/);
+  assert.equal(ulidHint.includes('transaction quarantine'), false);
+  assert.equal(debris.isIsolatableStoreName('.prune-oversized', scanWindow.operationIdFromPruneName), false);
+  const pruneHint = runtime.oversizedHint({
+    code: 'TRANSACTION_OVERSIZED',
+    operationId: '.prune-oversized',
+    wikiRoot: '/tmp/wiki',
+  });
+  assert.match(pruneHint, /not automatically isolatable/);
+  assert.doesNotMatch(pruneHint, /pure ULID/);
+  assert.equal(pruneHint.includes('transaction quarantine'), false);
+  const otherHint = runtime.oversizedHint({
+    code: 'TRANSACTION_OVERSIZED',
+    operationId: 'not-a-transaction',
+    wikiRoot: `/tmp/deep wiki; touch ${sentinel}`,
+  });
+  assert.match(otherHint, /not automatically isolatable/);
+  assert.doesNotMatch(otherHint, /pure ULID/);
+  assert.equal(otherHint.includes('transaction quarantine'), false);
+  assert.equal(fs.existsSync(sentinel), false);
+
+  const rollbackHint = runtime.oversizedHint({
+    code: 'TRANSACTION_OVERSIZED',
+    operationId: 'rollback-01JZ7P9Q6MD7S5PB8H4Y40HJ83',
+    wikiRoot: `/tmp/deep wiki; touch ${sentinel}`,
+  });
+  assert.match(rollbackHint, /rollback remnant/);
+  assert.match(rollbackHint, /transaction recover/);
+  assert.match(rollbackHint, /--wiki-root/);
+  assert.match(rollbackHint, /--operation-id/);
+  assert.doesNotMatch(rollbackHint, /then transaction recover --operation-id/);
+  assert.equal(fs.existsSync(sentinel), false);
+});
+
+test('rollback quarantine follow_up is a self-locking recover that snapshot can execute', () => {
+  const root = fixture('deep wiki rollback follow up ');
+  stageInterrupted(root, manifest());
+  const rollbackName = `rollback-${OPERATION_ID}`;
+  fs.mkdirSync(path.join(root, '.wiki-meta', '.transactions', rollbackName), { recursive: true });
+  fs.writeFileSync(path.join(root, '.wiki-meta', '.transactions', rollbackName, 'journal.json'), '{}\n');
+
+  const quarantined = spawnSync(process.execPath, [
+    cli, 'transaction', 'quarantine',
+    '--wiki-root', root, '--operation-id', rollbackName, '--json',
+  ], { encoding: 'utf8', shell: false });
+  assert.equal(quarantined.status, 0, quarantined.stderr);
+  const payload = JSON.parse(quarantined.stdout);
+  assert.equal(payload.status, 'quarantined');
+  assert.deepEqual(payload.follow_up_argv, [
+    'transaction', 'recover', '--wiki-root', root, '--operation-id', OPERATION_ID, '--json',
+  ]);
+  assert.match(payload.follow_up, /--wiki-root/);
+  assert.doesNotMatch(payload.follow_up, /--lock-token/);
+
+  const recovered = spawnSync('bash', ['-c', payload.follow_up], {
+    cwd: os.tmpdir(), encoding: 'utf8', shell: false,
+  });
+  assert.equal(recovered.status, 0, recovered.stderr);
+
+  const snapshot = spawnSync(process.execPath, [
+    cli, 'snapshot', '--wiki-root', root, '--json',
+  ], { encoding: 'utf8', shell: false });
+  assert.equal(snapshot.status, 0, snapshot.stderr);
+
+  const status = spawnSync(process.execPath, [
+    cli, 'lock', 'status', '--wiki-root', root, '--json',
+  ], { encoding: 'utf8', shell: false });
+  assert.equal(status.status, 0, status.stderr);
+  assert.equal(JSON.parse(status.stdout).locked, false);
+});
+
+test('rollback follow_up quotes a hostile wiki root and remains executable', (t) => {
+  const probe = spawnSync('bash', ['-c', 'echo ok'], { encoding: 'utf8' });
+  if (probe.status !== 0) { t.skip('bash unavailable for POSIX shell-quoting verification'); return; }
+  const root = fixture('deep wiki follow \'up $(printf injected) ');
+  stageInterrupted(root, manifest());
+  const rollbackName = `rollback-${OPERATION_ID}`;
+  fs.mkdirSync(path.join(root, '.wiki-meta', '.transactions', rollbackName), { recursive: true });
+  fs.writeFileSync(path.join(root, '.wiki-meta', '.transactions', rollbackName, 'journal.json'), '{}\n');
+  const quarantined = spawnSync(process.execPath, [
+    cli, 'transaction', 'quarantine',
+    '--wiki-root', root, '--operation-id', rollbackName, '--json',
+  ], { encoding: 'utf8', shell: false });
+  assert.equal(quarantined.status, 0, quarantined.stderr);
+  const payload = JSON.parse(quarantined.stdout);
+  const argv = shellArgvAfterPrefix(payload.follow_up, `node ${posixQuote(cli)} transaction recover `);
+  assert.equal(argAfterFlag(argv, '--wiki-root'), path.resolve(root));
+  assert.equal(argAfterFlag(argv, '--operation-id'), OPERATION_ID);
+  assert.equal(argv.includes('--lock-token'), false);
+
+  const recovered = spawnSync('bash', ['-c', payload.follow_up], {
+    cwd: os.tmpdir(), encoding: 'utf8', shell: false,
+  });
+  assert.equal(recovered.status, 0, recovered.stderr);
+  const snapshot = spawnSync(process.execPath, [
+    cli, 'snapshot', '--wiki-root', root, '--json',
+  ], { encoding: 'utf8', shell: false });
+  assert.equal(snapshot.status, 0, snapshot.stderr);
+  const status = spawnSync(process.execPath, [
+    cli, 'lock', 'status', '--wiki-root', root, '--json',
+  ], { encoding: 'utf8', shell: false });
+  assert.equal(JSON.parse(status.stdout).locked, false);
+});
+
+test('oversizedHint emits a complete executable runtime command without a synthetic prefix', {
+  skip: process.platform === 'win32' ? 'POSIX exact-command execution; win32 label covered by the platform-mock tests' : false,
+}, (t) => {
+  const probe = spawnSync('bash', ['-c', 'echo ok'], { encoding: 'utf8' });
+  if (probe.status !== 0) { t.skip('bash unavailable for exact-command execution'); return; }
+  const { oversizedHint } = require('../scripts/wiki-runtime.js');
+  const root = fixture('deep wiki oversized hint exec ');
+  const isolatableName = `scan-window-ensure-${'ab'.repeat(20)}`;
+  fs.mkdirSync(path.join(root, '.wiki-meta', '.transactions', isolatableName), { recursive: true });
+  fs.writeFileSync(path.join(root, '.wiki-meta', '.transactions', isolatableName, 'journal.json'), '{}\n');
+  const hint = oversizedHint({
+    code: 'TRANSACTION_OVERSIZED',
+    operationId: isolatableName,
+    wikiRoot: root,
+  });
+  const quotedRuntime = posixQuote(cli);
+  assert.match(hint, /TRANSACTION_OVERSIZED is isolatable\. Run:\nnode /);
+  const commands = nodeCommandLines(hint);
+  assert.equal(commands.length, 1, hint);
+  assert.ok(commands[0].startsWith(`node ${quotedRuntime} transaction quarantine `), commands[0]);
+  const executed = spawnSync('bash', ['-c', commands[0]], { encoding: 'utf8' });
+  assert.notEqual(executed.status, 127, executed.stderr);
+  assert.equal(executed.status, 0, executed.stderr);
+  const payload = JSON.parse(executed.stdout);
+  assert.equal(payload.status, 'quarantined');
+});
+
+test('oversizedHint rollback commands are independently copyable complete runtime invocations', {
+  skip: process.platform === 'win32' ? 'POSIX exact-command execution; win32 label covered by the platform-mock tests' : false,
+}, (t) => {
+  const probe = spawnSync('bash', ['-c', 'echo ok'], { encoding: 'utf8' });
+  if (probe.status !== 0) { t.skip('bash unavailable for exact-command execution'); return; }
+  const { oversizedHint } = require('../scripts/wiki-runtime.js');
+  const root = fixture('deep wiki oversized rollback hint exec ');
+  const rollbackName = `rollback-${OPERATION_ID}`;
+  fs.mkdirSync(path.join(root, '.wiki-meta', '.transactions', rollbackName), { recursive: true });
+  fs.writeFileSync(path.join(root, '.wiki-meta', '.transactions', rollbackName, 'journal.json'), '{}\n');
+  const hint = oversizedHint({
+    code: 'TRANSACTION_OVERSIZED',
+    operationId: rollbackName,
+    wikiRoot: root,
+  });
+  const quotedRuntime = posixQuote(cli);
+  assert.match(hint, /rollback remnant/);
+  const commands = nodeCommandLines(hint);
+  assert.equal(commands.length, 2, hint);
+  assert.ok(commands[0].startsWith(`node ${quotedRuntime} transaction quarantine `), commands[0]);
+  assert.ok(commands[1].startsWith(`node ${quotedRuntime} transaction recover `), commands[1]);
+  assert.equal(commands[1].includes('--lock-token'), false, commands[1]);
+  const quarantined = spawnSync('bash', ['-c', commands[0]], { encoding: 'utf8' });
+  assert.notEqual(quarantined.status, 127, quarantined.stderr);
+  assert.equal(quarantined.status, 0, quarantined.stderr);
+  const recovered = spawnSync('bash', ['-c', commands[1]], { encoding: 'utf8' });
+  assert.notEqual(recovered.status, 127, recovered.stderr);
+});
+
+test('oversizedHint renders a PowerShell-safe literal on win32 for adversarial characters', () => {
+  const { oversizedHint } = require('../scripts/wiki-runtime.js');
+  const originalDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
+  Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+  try {
+    const adversarial = [
+      'C:\\Deep Wiki has space',
+      'C:\\Deep Wiki & evil',
+      'C:\\Deep Wiki %PATH%',
+      'C:\\Deep Wiki "quoted"',
+      "C:\\Deep Wiki has'quote",
+      'C:\\Deep Wiki ^caret',
+      'C:\\Deep Wiki\nnewline',
+    ];
+    const isolatableName = `scan-window-ensure-${'cd'.repeat(20)}`;
+    for (const value of adversarial) {
+      const hint = oversizedHint({
+        code: 'TRANSACTION_OVERSIZED',
+        operationId: isolatableName,
+        wikiRoot: value,
+      });
+      assert.match(hint, /\(PowerShell\)/);
+      const wikiRootValue = decodePowershellSingleQuoted(extractQuotedFlagValue(hint, '--wiki-root'));
+      assert.equal(wikiRootValue, path.resolve(value));
+      const operationIdValue = decodePowershellSingleQuoted(extractQuotedFlagValue(hint, '--operation-id'));
+      assert.equal(operationIdValue, isolatableName);
+    }
+    const rollbackHint = oversizedHint({
+      code: 'TRANSACTION_OVERSIZED',
+      operationId: `rollback-${OPERATION_ID}`,
+      wikiRoot: adversarial[0],
+    });
+    assert.match(rollbackHint, /\(PowerShell\)/);
+    assert.match(rollbackHint, /transaction recover/);
+  } finally {
+    Object.defineProperty(process, 'platform', originalDescriptor);
+  }
+});
+
+test('rollback follow_up is labeled (PowerShell) on win32 and round-trips quoting', () => {
+  const debris = require('../hooks/scripts/runtime/transaction-debris.js');
+  const originalDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
+  Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+  try {
+    const command = debris.followUpRecoverCommand('C:\\Deep Wiki & evil "quoted"', OPERATION_ID);
+    assert.match(command, /\(PowerShell\)/);
+    assert.ok(command.includes(`node '${cli.replace(/'/g, "''")}' transaction recover `), command);
+    const argv = debris.followUpRecoverArgv('C:\\Deep Wiki & evil "quoted"', OPERATION_ID);
+    assert.deepEqual(argv, [
+      'transaction', 'recover',
+      '--wiki-root', path.resolve('C:\\Deep Wiki & evil "quoted"'),
+      '--operation-id', OPERATION_ID,
+      '--json',
+    ]);
+    const wikiRootValue = decodePowershellSingleQuoted(extractQuotedFlagValue(command, '--wiki-root'));
+    assert.equal(wikiRootValue, path.resolve('C:\\Deep Wiki & evil "quoted"'));
   } finally {
     Object.defineProperty(process, 'platform', originalDescriptor);
   }
@@ -1217,6 +1497,108 @@ test('shellQuote (Windows) round-trips through a real PowerShell when available'
   const result = spawnSync(shell, ['-NoProfile', '-Command', script], { encoding: 'utf8' });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout.trim(), decodePowershellSingleQuoted(wikiRootToken));
+});
+
+test('tokenless recover DEADLINE_EXCEEDED emits a self-locking retry and releases the lock', {
+  skip: process.platform === 'win32' ? 'POSIX hint-label assertion; win32 label covered by the platform-mock tests' : false,
+}, () => {
+  const { main } = require('../scripts/wiki-runtime.js');
+  const wikiRuntimeState = require('../hooks/scripts/runtime/wiki-state.js');
+  const { DeadlineExceeded } = require('../hooks/scripts/runtime/deadline.js');
+  const root = fixture('deep wiki tokenless recover deadline ');
+  const originalRecover = wikiRuntimeState.recoverTransaction;
+  const originalWrite = process.stderr.write;
+  const chunks = [];
+  wikiRuntimeState.recoverTransaction = () => {
+    throw new DeadlineExceeded('transaction-recover');
+  };
+  process.stderr.write = (chunk) => { chunks.push(chunk); return true; };
+  let exitCode;
+  try {
+    exitCode = main([
+      'transaction', 'recover', '--wiki-root', root, '--operation-id', OPERATION_ID, '--json',
+    ]);
+  } finally {
+    wikiRuntimeState.recoverTransaction = originalRecover;
+    process.stderr.write = originalWrite;
+  }
+  assert.equal(exitCode, 5);
+  const stderr = chunks.join('');
+  assert.match(stderr, /DEADLINE_EXCEEDED/);
+  assert.ok(stderr.includes(`resume with:\n${recoverRuntimePrefix()}transaction recover `), stderr);
+  assert.doesNotMatch(stderr, /--lock-token/);
+  assert.match(stderr, new RegExp(`--wiki-root '${root.replace(/'/g, "'\\\\''")}'`));
+  assert.match(stderr, new RegExp(`--operation-id '${OPERATION_ID}'`));
+  assert.equal(fs.existsSync(path.join(root, '.wiki-meta', '.wiki-lock')), false);
+});
+
+test('token-injected recover DEADLINE_EXCEEDED keeps the lock-token hint and leaves the lock held', {
+  skip: process.platform === 'win32' ? 'POSIX hint-label assertion; win32 label covered by the platform-mock tests' : false,
+}, () => {
+  const { main } = require('../scripts/wiki-runtime.js');
+  const wikiRuntimeState = require('../hooks/scripts/runtime/wiki-state.js');
+  const { DeadlineExceeded } = require('../hooks/scripts/runtime/deadline.js');
+  const root = fixture('deep wiki injected recover deadline ');
+  const owner = acquireLock({ wikiRoot: root, operation: 'injected-recover-deadline', now: new Date(TS) });
+  const originalRecover = wikiRuntimeState.recoverTransaction;
+  const originalWrite = process.stderr.write;
+  const chunks = [];
+  wikiRuntimeState.recoverTransaction = () => {
+    throw new DeadlineExceeded('transaction-recover');
+  };
+  process.stderr.write = (chunk) => { chunks.push(chunk); return true; };
+  let exitCode;
+  try {
+    exitCode = main([
+      'transaction', 'recover',
+      '--wiki-root', root,
+      '--lock-token', owner.token,
+      '--operation-id', OPERATION_ID,
+      '--json',
+    ]);
+  } finally {
+    wikiRuntimeState.recoverTransaction = originalRecover;
+    process.stderr.write = originalWrite;
+  }
+  try {
+    assert.equal(exitCode, 5);
+    const stderr = chunks.join('');
+    assert.match(stderr, /DEADLINE_EXCEEDED/);
+    assert.ok(stderr.includes(`resume with:\n${recoverRuntimePrefix()}transaction recover `), stderr);
+    assert.match(stderr, /--lock-token <token>/);
+    assert.equal(fs.existsSync(path.join(root, '.wiki-meta', '.wiki-lock')), true);
+  } finally {
+    releaseLock({ wikiRoot: root, token: owner.token });
+  }
+});
+
+test('tokenless recoverHint executes the exact emitted retry from a non-plugin cwd', {
+  skip: process.platform === 'win32' ? 'POSIX exact-command execution; win32 label covered by the platform-mock tests' : false,
+}, (t) => {
+  const probe = spawnSync('bash', ['-c', 'echo ok'], { encoding: 'utf8' });
+  if (probe.status !== 0) { t.skip('bash unavailable for exact-command execution'); return; }
+  const { recoverHint } = require('../scripts/wiki-runtime.js');
+  const root = fixture('deep wiki tokenless recover exec ');
+  stageInterrupted(root, manifest());
+  const hint = recoverHint(root, OPERATION_ID, { includeLockToken: false });
+  const commands = nodeCommandLines(hint);
+  assert.equal(commands.length, 1, hint);
+  assert.ok(commands[0].startsWith(`${recoverRuntimePrefix()}transaction recover `), commands[0]);
+  assert.equal(commands[0].includes('--lock-token'), false, commands[0]);
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'deep-wiki-non-plugin-cwd-'));
+  roots.add(outside);
+  const executed = spawnSync('bash', ['-c', commands[0]], {
+    encoding: 'utf8',
+    cwd: outside,
+    shell: false,
+  });
+  assert.notEqual(executed.status, 127, executed.stderr);
+  assert.doesNotMatch(executed.stderr, /MODULE_NOT_FOUND/);
+  assert.equal(executed.status, 0, `${executed.stdout}\n${executed.stderr}`);
+  const payload = JSON.parse(executed.stdout);
+  assert.equal(typeof payload, 'object');
+  assert.notEqual(payload, null);
+  assert.equal(fs.existsSync(transactionPath(root)), false);
 });
 
 test('commit at a pre-activation deadline instructs a plain rerun instead of an unusable recover hint', { skip: process.platform === 'win32' ? 'POSIX hint-label assertion; win32 label covered by the platform-mock tests' : false }, () => {
@@ -1440,6 +1822,127 @@ test('setup rejects an unauthenticated empty pages/meta scaffold', () => {
     (error) => error.code === 'WIKI_STATE_INVALID',
   );
   assert.deepEqual(fs.readdirSync(root).sort(), ['.wiki-meta', 'pages']);
+});
+
+test('authenticated partial setup accepts .quarantine and a valid .runtime marker and keeps the marker', () => {
+  const { setupWiki } = require(statePath);
+  const markerFixture = require('./helpers/maintenance-marker-fixture.js');
+  const home = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'deep wiki partial runtime home ')));
+  roots.add(home);
+  const root = path.join(home, 'Partial Wiki');
+  assert.throws(() => setupWiki({
+    wikiRoot: root,
+    env: setupEnv(home),
+    now: new Date(TS),
+    operationId: OPERATION_ID,
+    eventId: EVENT_ID,
+    faultInjector(boundary) { if (boundary === 'after-setup-intent') throw new Error('stop'); },
+  }));
+  markerFixture.ensureRuntime(root);
+  markerFixture.writeRawMarker(root, markerFixture.canonicalMarkerBytes(markerFixture.emptyMarker({
+    promoted: ['scan-window-ensure-aa'],
+  })));
+  fs.mkdirSync(markerFixture.quarantinePath(root), { recursive: true });
+  const result = setupWiki({ wikiRoot: root, env: setupEnv(home), now: new Date(TS) });
+  assert.equal(result.operationId, OPERATION_ID);
+  assert.equal(fs.existsSync(path.join(root, 'pages', 'welcome.md')), true);
+  assert.equal(fs.existsSync(markerFixture.markerPath(root)), true);
+});
+
+test('unauthenticated partial setup with a valid .runtime is still rejected as not authenticated', () => {
+  const { setupWiki } = require(statePath);
+  const markerFixture = require('./helpers/maintenance-marker-fixture.js');
+  const home = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'deep wiki unauth runtime home ')));
+  roots.add(home);
+  const root = path.join(home, 'wiki');
+  fs.mkdirSync(root);
+  fs.mkdirSync(path.join(root, 'pages'));
+  fs.mkdirSync(path.join(root, '.wiki-meta'));
+  markerFixture.ensureRuntime(root);
+  markerFixture.writeRawMarker(root, markerFixture.canonicalMarkerBytes(markerFixture.emptyMarker({
+    promoted: ['keep'],
+  })));
+  assert.throws(
+    () => setupWiki({ wikiRoot: root, env: setupEnv(home), now: new Date(TS) }),
+    (error) => error.code === 'WIKI_STATE_INVALID'
+      && /not authenticated by setup intent or journal/.test(error.message),
+  );
+});
+
+test('authenticated partial setup rejects invalid .runtime and .quarantine shapes', () => {
+  const { setupWiki } = require(statePath);
+  const markerFixture = require('./helpers/maintenance-marker-fixture.js');
+  const cases = [
+    {
+      name: 'runtime-symlink',
+      plant(root) {
+        const target = path.join(root, 'runtime-target');
+        fs.mkdirSync(target);
+        fs.symlinkSync(target, markerFixture.runtimePath(root));
+      },
+    },
+    {
+      name: 'runtime-file',
+      plant(root) {
+        fs.writeFileSync(markerFixture.runtimePath(root), 'not-a-directory\n');
+      },
+    },
+    {
+      name: 'runtime-extra-name',
+      plant(root) {
+        markerFixture.ensureRuntime(root);
+        fs.writeFileSync(path.join(markerFixture.runtimePath(root), 'leftover-manifest.json'), '{}\n');
+      },
+    },
+    {
+      name: 'marker-symlink',
+      plant(root) {
+        markerFixture.ensureRuntime(root);
+        const target = path.join(root, 'marker-target.json');
+        fs.writeFileSync(target, '{}\n');
+        fs.symlinkSync(target, markerFixture.markerPath(root));
+      },
+    },
+    {
+      name: 'marker-json-broken',
+      plant(root) {
+        markerFixture.writeRawMarker(root, Buffer.from('{not json\n'));
+      },
+    },
+    {
+      name: 'marker-operation-id',
+      plant(root) {
+        markerFixture.writeRawMarker(root, Buffer.from(`${JSON.stringify({
+          schema: 1,
+          updated_at: '2026-08-25T00:00:00Z',
+          operation_id: 'nope',
+          prune_failures: [],
+          promoted: [],
+          skipped_oversized: [],
+          quarantine_bundles: [],
+        })}\n`));
+      },
+    },
+  ];
+  for (const item of cases) {
+    const home = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), `deep wiki partial ${item.name} `)));
+    roots.add(home);
+    const root = path.join(home, 'Partial Wiki');
+    assert.throws(() => setupWiki({
+      wikiRoot: root,
+      env: setupEnv(home),
+      now: new Date(TS),
+      operationId: OPERATION_ID,
+      eventId: EVENT_ID,
+      faultInjector(boundary) { if (boundary === 'after-setup-intent') throw new Error('stop'); },
+    }));
+    item.plant(root);
+    assert.throws(
+      () => setupWiki({ wikiRoot: root, env: setupEnv(home), now: new Date(TS) }),
+      (error) => error.code === 'WIKI_STATE_INVALID',
+      item.name,
+    );
+  }
 });
 
 test('setup CLI exposes only explicit stopped-host rebind and returns public authority generation', () => {
@@ -1703,14 +2206,14 @@ test('debris removal is interruptible between entries when the clock advances mi
       deadline,
       faultInjector(boundary) { if (boundary === 'sweep-remove:1') clock.now = 2_001; },
     });
-    assert.deepEqual(result, { processed: 0, removed: [], removed_junk: [] });
+    assert.deepEqual(result, { processed: 0, removed: [], removed_junk: [], skipped_oversized: [] });
   });
   assert.equal(fs.existsSync(transaction), true);
   assert.equal(fs.readdirSync(transaction).length, 3);
 
   withLock(root, (token) => {
     const result = sweepTransactionDebris(root, token, { deadline: createDeadline({ budgetMs: 12_000 }) });
-    assert.deepEqual(result, { processed: 1, removed: ['plain-large'], removed_junk: [] });
+    assert.deepEqual(result, { processed: 1, removed: ['plain-large'], removed_junk: [], skipped_oversized: [] });
   });
   assert.equal(fs.existsSync(transaction), false);
 });
@@ -1779,7 +2282,7 @@ test('transaction debris sweep never removes an unrecognized non-directory entry
   withLock(root, (token) => {
     assert.deepEqual(
       sweepTransactionDebris(root, token, { deadline }),
-      { processed: 0, removed: [], removed_junk: [] },
+      { processed: 0, removed: [], removed_junk: [], skipped_oversized: [] },
     );
   });
   assert.equal(fs.readFileSync(path.join(transactions, 'evidence.json'), 'utf8'), 'preserve exactly\n');
@@ -1972,7 +2475,7 @@ test('the sweep never follows or removes a symlink wearing an OS metadata name',
   withLock(root, (token) => {
     assert.deepEqual(
       sweepTransactionDebris(root, token, { deadline }),
-      { processed: 0, removed: [], removed_junk: [] },
+      { processed: 0, removed: [], removed_junk: [], skipped_oversized: [] },
     );
   });
   assert.equal(fs.lstatSync(link).isSymbolicLink(), true);

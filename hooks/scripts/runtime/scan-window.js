@@ -18,7 +18,14 @@ const {
   assertLockOwner,
   releaseLock,
 } = require('./lock.js');
-const { sweepTransactionDebris } = require('./transaction-debris.js');
+const transactionDebris = require('./transaction-debris.js');
+const {
+  sweepTransactionDebris,
+  quarantineStoreEntry: quarantineStoreEntryPrimitive,
+  inspectDirectoryPressure,
+  resolveUnknownDirent,
+  writeMaintenanceMarker,
+} = transactionDebris;
 
 const sleepArray = new Int32Array(new SharedArrayBuffer(4));
 const STAGES = ['pending-before', 'pending-after', 'last-before', 'last-after'];
@@ -1807,6 +1814,7 @@ function applyScanWindowTransition(options = {}) {
   assertPersistenceDeadline(options.deadline, 'transaction-entry');
   const adapter = adapterFor(physicalRoot, operationId, options.journalAdapter);
   const control = adapter[DEFAULT_ADAPTER_CONTROL];
+  let skippedOversized = [];
   if (control) {
     const assertOwner = () => assertLockOwner({ wikiRoot: physicalRoot, token });
     const maintenanceDeadline = options.deadline
@@ -1817,10 +1825,25 @@ function applyScanWindowTransition(options = {}) {
       deadline: maintenanceDeadline,
     });
     control.prepareDebrisSweep(assertOwner);
-    sweepTransactionDebris(physicalRoot, token, {
+    const debrisReport = sweepTransactionDebris(physicalRoot, token, {
       deadline: maintenanceDeadline,
       classes: ['activation', 'plain', 'junk'],
+      inspectDirectoryPressure: options.inspectDirectoryPressure,
     });
+    skippedOversized = [...(debrisReport.skipped_oversized || [])];
+  }
+  const selfPath = path.join(physicalRoot, '.wiki-meta', '.transactions', operationId);
+  const selfPressure = (options.inspectDirectoryPressure || inspectDirectoryPressure)(selfPath, {
+    deadline: options.deadline,
+    allowEnumeration: false,
+  });
+  if (selfPressure.oversized) {
+    const error = scanError('TRANSACTION_OVERSIZED', `scan-window transaction ${operationId} is oversized`);
+    error.operationId = operationId;
+    error.estimatedEntries = selfPressure.estimatedEntries;
+    error.method = selfPressure.method;
+    error.wikiRoot = physicalRoot;
+    throw error;
   }
   const transactionOptions = { ...options, wikiRoot: physicalRoot, token };
   let journal = adapter.readJournal();
@@ -1855,7 +1878,9 @@ function applyScanWindowTransition(options = {}) {
   }
   const cleaned = journal.transitions.includes('cleaned');
   verifyDestinationStates(adapter, journal, cleaned);
-  if (cleaned) return { status: journal.result_status, operationId, journal };
+  if (cleaned) {
+    return { status: journal.result_status, operationId, journal, maintenance: { skipped_oversized: skippedOversized } };
+  }
   stageTransaction(adapter, journal, transactionOptions);
   verifyStages(adapter, journal);
   applyDestination(adapter, journal, transactionOptions, 'last');
@@ -1865,13 +1890,26 @@ function applyScanWindowTransition(options = {}) {
   invokeFault(options.faultInjector, 'after-scan-window-committed');
   assertPersistenceDeadline(options.deadline, 'scan-window-committed:after-fault');
   cleanTransaction(adapter, journal, transactionOptions);
-  return { status: journal.result_status, operationId, journal };
+  return { status: journal.result_status, operationId, journal, maintenance: { skipped_oversized: skippedOversized } };
 }
 
 function recoverScanWindowTransaction(options = {}) {
   const physicalRoot = physicalWikiRoot(options.wikiRoot);
   const operationId = validateOperationId(options.operationId);
   assertLockOwner({ wikiRoot: physicalRoot, token: options.token });
+  const recoverPath = path.join(physicalRoot, '.wiki-meta', '.transactions', operationId);
+  const recoverPressure = (options.inspectDirectoryPressure || inspectDirectoryPressure)(recoverPath, {
+    deadline: options.deadline,
+    allowEnumeration: false,
+  });
+  if (recoverPressure.oversized) {
+    const error = scanError('TRANSACTION_OVERSIZED', `scan-window transaction ${operationId} is oversized`);
+    error.operationId = operationId;
+    error.estimatedEntries = recoverPressure.estimatedEntries;
+    error.method = recoverPressure.method;
+    error.wikiRoot = physicalRoot;
+    throw error;
+  }
   const adapter = adapterFor(physicalRoot, operationId, options.journalAdapter);
   const journal = validateJournal(adapter.readJournal(), operationId, physicalRoot);
   return applyScanWindowTransition({
@@ -2012,7 +2050,7 @@ function pruneScanWindowTransactions(options = {}) {
     };
     if (transactionsIdentity === null) {
       closeOuterObservation(null);
-      return { processed: 0, removed: [], complete: true };
+      return { processed: 0, removed: [], complete: true, skipped_oversized: [] };
     }
     assertBudget();
     try {
@@ -2025,7 +2063,7 @@ function pruneScanWindowTransactions(options = {}) {
     closeOuterObservation(enumerationError);
   } catch (error) {
     if (error.code === 'DEADLINE_EXCEEDED') {
-      return { processed: 0, removed: [], complete: false };
+      return { processed: 0, removed: [], complete: false, skipped_oversized: [] };
     }
     throw error;
   }
@@ -2108,13 +2146,17 @@ function pruneScanWindowTransactions(options = {}) {
       assertBudget();
     };
   };
+  const skippedOversized = [];
   const throwWithTerminalPrune = (error) => {
     if (!error.terminal_prune) {
       error.terminal_prune = {
         processed: removed.length,
         removed: [...removed],
         complete: false,
+        skipped_oversized: [...skippedOversized],
       };
+    } else if (!Array.isArray(error.terminal_prune.skipped_oversized)) {
+      error.terminal_prune.skipped_oversized = [...skippedOversized];
     }
     throw error;
   };
@@ -2129,13 +2171,18 @@ function pruneScanWindowTransactions(options = {}) {
   };
 
   let complete = true;
+  const inspectPressure = options.inspectDirectoryPressure || inspectDirectoryPressure;
   for (const entry of entries) {
-    if (removed.length + nestedJunkAttempts.attempts >= limit
-        || remainingMs(deadline) < PRUNE_RESERVE_MS) {
+    if (remainingMs(deadline) < PRUNE_RESERVE_MS) {
       complete = false;
       break;
     }
+    const atMutationLimit = removed.length + nestedJunkAttempts.attempts >= limit;
     if (entry.isFile()) {
+      if (atMutationLimit) {
+        complete = false;
+        continue;
+      }
       const reservation = path.join(transactions, entry.name);
       let reservationIdentity;
       let reservationBytes;
@@ -2225,8 +2272,32 @@ function pruneScanWindowTransactions(options = {}) {
       }
       continue;
     }
-    if (!entry.isDirectory() || entry.isSymbolicLink()
-        || entry.name === excludeOperationId) continue;
+    let kind;
+    if (entry.isSymbolicLink()) continue;
+    if (entry.isDirectory()) kind = 'directory';
+    else if (!entry.isFile() && !entry.isBlockDevice() && !entry.isCharacterDevice()
+        && !entry.isFIFO() && !entry.isSocket()) {
+      kind = resolveUnknownDirent(transactions, entry).kind;
+    } else continue;
+    if (kind !== 'directory') continue;
+    if (entry.name === excludeOperationId) continue;
+    let pressure;
+    try {
+      pressure = inspectPressure(path.join(transactions, entry.name), {
+        deadline,
+        allowEnumeration: false,
+      });
+    } catch (error) {
+      throwWithTerminalPrune(error);
+    }
+    if (pressure.oversized) {
+      skippedOversized.push(entry.name);
+      continue;
+    }
+    if (atMutationLimit) {
+      complete = false;
+      continue;
+    }
     if (entry.name.startsWith('.prune-')) {
       const quarantine = path.join(transactions, entry.name);
       const quarantinedJournal = path.join(quarantine, 'journal.json');
@@ -2563,7 +2634,7 @@ function pruneScanWindowTransactions(options = {}) {
       throwWithTerminalPrune(error);
     }
   }
-  return { processed: removed.length, removed, complete };
+  return { processed: removed.length, removed, complete, skipped_oversized: skippedOversized };
 }
 
 function deterministicEnsureId(wikiRoot, proposed) {
@@ -2611,17 +2682,41 @@ function ensurePendingScan(options = {}) {
       kind: 'ensure',
       proposed: options.proposed,
     });
-    const applied = applyScanWindowTransition({
-      wikiRoot: physicalRoot,
-      token: owner.token,
-      plan,
-      operationId,
-      faultInjector: options.faultInjector,
-      deadline: options.deadline,
-    });
-    result = { status: applied.status, operationId };
+    let applied;
     try {
-      pruneScanWindowTransactions({
+      applied = applyScanWindowTransition({
+        wikiRoot: physicalRoot,
+        token: owner.token,
+        plan,
+        operationId,
+        faultInjector: options.faultInjector,
+        deadline: options.deadline,
+        inspectDirectoryPressure: options.inspectDirectoryPressure,
+      });
+    } catch (error) {
+      if (error.code === 'TRANSACTION_OVERSIZED' && error.operationId === operationId) {
+        quarantineStoreEntry({
+          wikiRoot: physicalRoot,
+          token: owner.token,
+          name: operationId,
+          classification: { method: error.method || 'stat', estimated_entries: error.estimatedEntries ?? null },
+          reason: 'oversized',
+        });
+        applied = applyScanWindowTransition({
+          wikiRoot: physicalRoot,
+          token: owner.token,
+          plan,
+          operationId,
+          faultInjector: options.faultInjector,
+          deadline: options.deadline,
+          inspectDirectoryPressure: options.inspectDirectoryPressure,
+        });
+      } else throw error;
+    }
+    result = { status: applied.status, operationId };
+    let pruneResult = { skipped_oversized: [] };
+    try {
+      pruneResult = pruneScanWindowTransactions({
         wikiRoot: physicalRoot,
         token: owner.token,
         maxAgeDays: 0,
@@ -2630,8 +2725,42 @@ function ensurePendingScan(options = {}) {
         deadline: options.deadline,
         kinds: ['ensure'],
         excludeOperationId: operationId,
+        inspectDirectoryPressure: options.inspectDirectoryPressure,
       });
-    } catch { /* terminal maintenance never suppresses the persisted scan window */ }
+    } catch (error) {
+      result.prune_failure = error.code || 'SCAN_WINDOW_FILESYSTEM';
+      if (error.terminal_prune) {
+        pruneResult = {
+          skipped_oversized: Array.isArray(error.terminal_prune.skipped_oversized)
+            ? [...error.terminal_prune.skipped_oversized]
+            : [],
+        };
+      }
+      try {
+        writeMaintenanceMarker(physicalRoot, owner.token, (marker) => {
+          marker.prune_failures.push({ code: String(error.code || 'SCAN_WINDOW_FILESYSTEM').replace(/[^A-Z_]/g, '_') || 'PRUNE_FAIL', at: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z') });
+          return marker;
+        });
+      } catch { /* marker is best-effort */ }
+    }
+    const skipped = [
+      ...((applied.maintenance && applied.maintenance.skipped_oversized) || []),
+      ...(pruneResult.skipped_oversized || []),
+    ];
+    try {
+      transactionDebris.promoteOversizedNames({
+        wikiRoot: physicalRoot,
+        token: owner.token,
+        names: skipped,
+        parsePruneName: operationIdFromPruneName,
+        classification: { method: 'stat', estimated_entries: null },
+        reason: 'oversized',
+        deadline: options.deadline,
+        limit: AUTOMATIC_PRUNE_LIMIT,
+      });
+    } catch {
+      /* post-commit promotion must not demote an already persisted scan */
+    }
   } catch (error) {
     result = { status: 'deferred', reason: error.code || 'SCAN_WINDOW_FILESYSTEM' };
   } finally {
@@ -2672,16 +2801,34 @@ function promotePendingScan(options = {}) {
     operationId,
     lastScan: timestampFromBytes(lastBytes),
     pendingPreserved: pendingBytes !== null,
+    maintenance: applied.maintenance || { skipped_oversized: [] },
   };
+}
+
+function quarantineStoreEntry(options = {}) {
+  return quarantineStoreEntryPrimitive({
+    ...options,
+    parsePruneName: options.parsePruneName || operationIdFromPruneName,
+  });
+}
+
+function promoteOversizedNames(options = {}) {
+  return transactionDebris.promoteOversizedNames({
+    ...options,
+    parsePruneName: options.parsePruneName || operationIdFromPruneName,
+  });
 }
 
 module.exports = {
   assertPruneTransactionNamesSupported,
   ensurePendingScan,
   inspectPruneMarkers,
+  operationIdFromPruneName,
   promotePendingScan,
+  promoteOversizedNames,
   pruneScanWindowTransactions,
   recoverScanWindowTransaction,
   planScanWindowTransition,
   applyScanWindowTransition,
+  quarantineStoreEntry,
 };

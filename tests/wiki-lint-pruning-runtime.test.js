@@ -118,7 +118,7 @@ function createQuarantineOnlyResidue(root, kind) {
       },
     });
     assert.equal(reached, true);
-    assert.deepEqual(seeded, { processed: 0, removed: [], complete: false });
+    assert.deepEqual(seeded, { processed: 0, removed: [], complete: false, skipped_oversized: [] });
   } finally {
     releaseLock({ wikiRoot: root, token: owner.token });
   }
@@ -152,6 +152,7 @@ test('lint fix reports only reclaimed no-op ensure evidence and preserves unprom
     processed: 1,
     removed: [statuses.get('preserved')],
     complete: true,
+    skipped_oversized: [],
   });
   assert.equal(completedEnsureCount(root), 1);
   assert.equal(fs.existsSync(path.join(
@@ -205,6 +206,7 @@ test('lint repair carries either initially invalid marker as whole-pass ensure s
         processed: 0,
         removed: [],
         complete: true,
+        skipped_oversized: [],
         suppressed_reason: 'initial-invalid-scan-marker',
       });
     });
@@ -230,6 +232,7 @@ test('lint repair canonicalizes its text predicate and reports sticky invalid-ma
     processed: 0,
     removed: [],
     complete: true,
+    skipped_oversized: [],
     suppressed_reason: 'initial-invalid-scan-marker',
   });
 
@@ -238,6 +241,7 @@ test('lint repair canonicalizes its text predicate and reports sticky invalid-ma
     processed: 1,
     removed: [statuses.get('preserved')],
     complete: true,
+    skipped_oversized: [],
   });
   assert.equal(completedEnsureCount(root), 1);
   assert.equal(fs.existsSync(path.join(
@@ -265,6 +269,7 @@ test('lint repair preserves a physically ambiguous invalid marker for stopped-ho
     processed: 0,
     removed: [],
     complete: true,
+    skipped_oversized: [],
     suppressed_reason: 'initial-invalid-scan-marker',
   });
 });
@@ -394,6 +399,7 @@ test('lint fix recovers quarantine-only promote and repair residue before inspec
         processed: 1,
         removed: [residue.operationId],
         complete: true,
+        skipped_oversized: [],
       });
       assert.equal(fs.existsSync(residue.quarantine), false);
       assert.equal(fs.existsSync(path.join(root, '.wiki-meta', '.wiki-lock')), false);
@@ -427,6 +433,7 @@ test('kind-filtered recovery ignores protected ensure quarantine residue', () =>
       processed: 1,
       removed: [promoted.operationId],
       complete: true,
+      skipped_oversized: [],
     });
   } finally {
     releaseLock({ wikiRoot: root, token: owner.token });
@@ -507,7 +514,7 @@ test('lint fix forwards one original clock and deadline through its mandatory en
   const original = scanWindow.pruneScanWindowTransactions;
   scanWindow.pruneScanWindowTransactions = (request) => {
     calls.push(request);
-    return { processed: 0, removed: [], complete: true };
+    return { processed: 0, removed: [], complete: true, skipped_oversized: [] };
   };
   try {
     const result = fixWiki({ wikiRoot: root, now, deadline });
@@ -548,7 +555,7 @@ test('fractional lint clock emits canonical seconds and same-second owners commi
 test('zero-progress incomplete recovery preserves the initial diagnosis and exact continuation result', () => {
   const root = wiki();
   fs.writeFileSync(path.join(root, '.wiki-meta', '.transactions', 'blocking-entry'), 'blocked\n');
-  const recovery = { processed: 0, removed: [], complete: false };
+  const recovery = { processed: 0, removed: [], complete: false, skipped_oversized: [] };
   const original = scanWindow.pruneScanWindowTransactions;
   scanWindow.pruneScanWindowTransactions = () => recovery;
   try {
@@ -586,7 +593,7 @@ test('positive recovery and post-commit maintenance failure expose both truthful
   const root = wiki();
   const blocker = path.join(root, '.wiki-meta', '.transactions', 'blocking-entry');
   fs.writeFileSync(blocker, 'blocked\n');
-  const recovery = { processed: 1, removed: ['blocking-entry'], complete: true };
+  const recovery = { processed: 1, removed: ['blocking-entry'], complete: true, skipped_oversized: [] };
   const injected = Object.assign(new Error('tail failure'), { code: 'TEST_PRUNER_FAILURE' });
   let call = 0;
   const original = scanWindow.pruneScanWindowTransactions;
@@ -611,6 +618,7 @@ test('positive recovery and post-commit maintenance failure expose both truthful
         processed: 1,
         removed: ['blocking-entry'],
         complete: false,
+        skipped_oversized: [],
       }) === undefined
       && error.lint_result?.status === 'fixed');
   } finally {
@@ -820,7 +828,7 @@ test('direct pre-delete owner fences preserve prior same-pass prune progress', a
           throw error;
         },
       });
-      assert.deepEqual(seeded, { processed: 0, removed: [], complete: false });
+      assert.deepEqual(seeded, { processed: 0, removed: [], complete: false, skipped_oversized: [] });
     } finally {
       releaseLock({ wikiRoot: root, token: seedOwner.token });
     }
@@ -892,7 +900,7 @@ test('direct pre-delete owner fences preserve prior same-pass prune progress', a
           throw error;
         },
       });
-      assert.deepEqual(seeded, { processed: 0, removed: [], complete: false });
+      assert.deepEqual(seeded, { processed: 0, removed: [], complete: false, skipped_oversized: [] });
     } finally {
       releaseLock({ wikiRoot: root, token: seedOwner.token });
     }
@@ -953,7 +961,7 @@ test('direct pre-delete owner fences preserve prior same-pass prune progress', a
           throw error;
         },
       });
-      assert.deepEqual(seeded, { processed: 0, removed: [], complete: false });
+      assert.deepEqual(seeded, { processed: 0, removed: [], complete: false, skipped_oversized: [] });
     } finally {
       releaseLock({ wikiRoot: root, token: promoteOwner.token });
     }
@@ -991,7 +999,7 @@ test('direct pre-delete owner fences preserve prior same-pass prune progress', a
           throw error;
         },
       });
-      assert.deepEqual(seeded, { processed: 0, removed: [], complete: false });
+      assert.deepEqual(seeded, { processed: 0, removed: [], complete: false, skipped_oversized: [] });
     } finally {
       releaseLock({ wikiRoot: root, token: ensureOwner.token });
     }
@@ -1038,6 +1046,7 @@ test('post-final-unlink fences report the current committed prune', async (t) =>
         processed: 1,
         removed: [operationId],
         complete: false,
+        skipped_oversized: [],
       });
       return;
     }
@@ -1130,7 +1139,7 @@ test('post-final-unlink fences report the current committed prune', async (t) =>
             throw error;
           },
         });
-        assert.deepEqual(seeded, { processed: 0, removed: [], complete: false });
+        assert.deepEqual(seeded, { processed: 0, removed: [], complete: false, skipped_oversized: [] });
       } finally {
         releaseLock({ wikiRoot: root, token: seedOwner.token });
       }
@@ -1187,7 +1196,7 @@ test('post-final-unlink fences report the current committed prune', async (t) =>
             throw error;
           },
         });
-        assert.deepEqual(seeded, { processed: 0, removed: [], complete: false });
+        assert.deepEqual(seeded, { processed: 0, removed: [], complete: false, skipped_oversized: [] });
       } finally {
         releaseLock({ wikiRoot: root, token: seedOwner.token });
       }
@@ -1301,7 +1310,7 @@ test('lint recovery plus ordinary tail share one aggregate limit of 64 real tran
       },
     });
     assert.equal(residueCreated, true);
-    assert.deepEqual(seeded, { processed: 0, removed: [], complete: false });
+    assert.deepEqual(seeded, { processed: 0, removed: [], complete: false, skipped_oversized: [] });
   } finally {
     releaseLock({ wikiRoot: root, token: owner.token });
   }
@@ -1311,6 +1320,7 @@ test('lint recovery plus ordinary tail share one aggregate limit of 64 real tran
     processed: 64,
     removed: preservedIds,
     complete: false,
+    skipped_oversized: [],
   });
   assert.equal(completedEnsureCount(root), 1);
 
@@ -1319,6 +1329,7 @@ test('lint recovery plus ordinary tail share one aggregate limit of 64 real tran
     processed: 0,
     removed: [],
     complete: true,
+    skipped_oversized: [],
   });
   assert.equal(completedEnsureCount(root), 1);
   assert.equal(fs.existsSync(path.join(root, '.wiki-meta', '.wiki-lock')), false);

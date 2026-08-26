@@ -19,7 +19,10 @@ const { acquireLock, assertLockOwner, releaseLock } = require('./lock.js');
 const scanWindow = require('./scan-window.js');
 const {
   sweepTransactionDebris, validateTombstoneV1, isReclaimableJunkEntry,
-  assertTransactionStoreAnchored,
+  assertTransactionStoreAnchored, quarantineStoreEntry: quarantineStoreEntryPrimitive,
+  inspectDirectoryPressure, resolveUnknownDirent, readMaintenanceMarker,
+  listQuarantineBundleNames, isIsolatableStoreName, promoteOversizedNames,
+  QUARANTINE_PROMOTION_LIMIT,
 } = require('./transaction-debris.js');
 
 const { promotePendingScan } = scanWindow;
@@ -301,8 +304,24 @@ function readReceipt(locations, manifestHash) {
   return receipt;
 }
 
+function assertTransactionNotOversized(root, name, options = {}) {
+  const pathname = path.join(root, '.wiki-meta', '.transactions', name);
+  const pressure = (options.inspectDirectoryPressure || inspectDirectoryPressure)(pathname, {
+    deadline: options.deadline,
+    allowEnumeration: false,
+  });
+  if (!pressure.oversized) return pressure;
+  const error = stateError('TRANSACTION_OVERSIZED', `transaction directory ${name} is oversized`);
+  error.operationId = name;
+  error.estimatedEntries = pressure.estimatedEntries;
+  error.method = pressure.method;
+  error.wikiRoot = root;
+  throw error;
+}
+
 function compactReceiptTransaction(root, token, locations, receipt) {
   if (!fs.existsSync(locations.transaction)) return;
+  assertTransactionNotOversized(root, path.basename(locations.transaction));
   assertTransactionStoreAnchored(root);
   const journal = readJournal(locations.journal);
   if (!journal) {
@@ -332,20 +351,51 @@ function inspectTransactions(root, allowedOperationId = null, deadline = operati
   catch (error) { if (error.code === 'ENOENT') return; throw error; }
   for (const entry of entries) {
     assertBeforeDeadline(deadline, `wiki-state:inspect-transaction:${entry.name}`);
-    if (entry.name.startsWith('.activate-') && entry.isDirectory() && !entry.isSymbolicLink()) continue;
-    if (!entry.isDirectory() || entry.isSymbolicLink()) {
+    let kind;
+    if (entry.isSymbolicLink()) kind = 'symlink';
+    else if (entry.isDirectory()) kind = 'directory';
+    else if (!entry.isFile() && !entry.isBlockDevice() && !entry.isCharacterDevice()
+        && !entry.isFIFO() && !entry.isSocket()) {
+      kind = resolveUnknownDirent(directory, entry).kind;
+    } else kind = 'other';
+    if (kind === 'directory' && entry.name.startsWith('.activate-')) continue;
+    if (kind !== 'directory') {
       // Recognized OS/sync-client metadata is inert debris, not lost transaction state. Readers
       // run lock-free and cannot remove it; the lock-held debris sweep reclaims it.
       if (isReclaimableJunkEntry(entry, directory)) continue;
       throw stateError('TRANSACTION_RECOVERY_REQUIRED', 'transaction store contains a non-directory entry');
     }
+    const transaction = path.join(directory, entry.name);
     if (entry.name.startsWith('.prune-')) {
+      const prunePressure = inspectDirectoryPressure(transaction, {
+        deadline,
+        allowEnumeration: false,
+      });
+      if (prunePressure.oversized) {
+        const error = stateError('TRANSACTION_OVERSIZED', `transaction directory ${entry.name} is oversized`);
+        error.operationId = entry.name;
+        error.estimatedEntries = prunePressure.estimatedEntries;
+        error.method = prunePressure.method;
+        error.wikiRoot = root;
+        throw error;
+      }
       throw stateError(
         'TRANSACTION_RECOVERY_REQUIRED',
         'a terminal scan-window prune quarantine requires recovery; run wiki-lint --fix, and if it makes no progress stop all hosts and follow the stopped-host procedure',
       );
     }
-    const transaction = path.join(directory, entry.name);
+    const livePressure = inspectDirectoryPressure(transaction, {
+      deadline,
+      allowEnumeration: true,
+    });
+    if (livePressure.oversized) {
+      const error = stateError('TRANSACTION_OVERSIZED', `transaction directory ${entry.name} is oversized`);
+      error.operationId = entry.name;
+      error.estimatedEntries = livePressure.estimatedEntries;
+      error.method = livePressure.method;
+      error.wikiRoot = root;
+      throw error;
+    }
     const journalPath = path.join(transaction, 'journal.json');
     let journal;
     try { journal = readJournal(journalPath); }
@@ -915,6 +965,7 @@ function transactionCancelled(tombstone) {
 }
 
 function teardownCancelledTransaction(root, token, locations, tombstone, faultInjector) {
+  assertTransactionNotOversized(root, path.basename(locations.transaction));
   const assertOwner = () => assertLockOwner({ wikiRoot: root, token });
   for (const entry of fs.readdirSync(locations.transaction)) {
     if (entry === 'cancelled.json') continue;
@@ -964,6 +1015,7 @@ function cancelTransaction(root, token, locations, journal, faultInjector, deadl
 }
 
 function cleanupTransaction(root, token, locations, journal, faultInjector) {
+  assertTransactionNotOversized(root, path.basename(locations.transaction));
   if (!journal.transitions.includes('cleaned')) {
     invokeFault(faultInjector, 'before-cleanup');
     assertLockOwner({ wikiRoot: root, token });
@@ -1249,6 +1301,26 @@ function writeSetupIntent(root, token, manifest) {
   return value;
 }
 
+function assertValidRuntimeMarkerDirectory(root, runtimePath) {
+  let stat;
+  try { stat = fs.lstatSync(runtimePath); }
+  catch (error) {
+    throw stateError('WIKI_STATE_INVALID', 'partial setup contains unexpected metadata', error);
+  }
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw stateError('WIKI_STATE_INVALID', 'partial setup contains unexpected metadata');
+  }
+  const names = fs.readdirSync(runtimePath);
+  if (names.length === 0) return;
+  if (names.length !== 1 || names[0] !== 'scan-window-maintenance.json') {
+    throw stateError('WIKI_STATE_INVALID', 'partial setup contains unexpected metadata');
+  }
+  try { readMaintenanceMarker(root); }
+  catch (error) {
+    throw stateError('WIKI_STATE_INVALID', 'partial setup contains unexpected metadata', error);
+  }
+}
+
 function setupTargetState(root) {
   if (!fs.existsSync(root)) return 'new';
   const stat = fs.lstatSync(root);
@@ -1276,10 +1348,17 @@ function setupTargetState(root) {
   if (fs.existsSync(meta)) {
     const allowedMeta = new Set([
       'sources', '.versions', '.transactions', '.transaction-receipts', '.wiki-lock', 'index.json',
-      '.setup-intent.json',
+      '.setup-intent.json', '.quarantine',
     ]);
-    if (fs.readdirSync(meta).some((entry) => !allowedMeta.has(entry))) {
-      throw stateError('WIKI_STATE_INVALID', 'partial setup contains unexpected metadata');
+    const metaNames = fs.readdirSync(meta);
+    for (const entry of metaNames) {
+      if (entry === '.runtime') {
+        assertValidRuntimeMarkerDirectory(root, path.join(meta, '.runtime'));
+        continue;
+      }
+      if (!allowedMeta.has(entry)) {
+        throw stateError('WIKI_STATE_INVALID', 'partial setup contains unexpected metadata');
+      }
     }
   }
   const authenticated = interruptedSetupManifest(root) !== null || readSetupIntent(root) !== null;
@@ -1298,8 +1377,16 @@ function interruptedSetupManifest(root) {
   try { entries = fs.readdirSync(transactions, { withFileTypes: true }); }
   catch (error) { if (error.code === 'ENOENT') return null; throw error; }
   for (const entry of entries) {
-    if (entry.name.startsWith('.activate-')) continue;
-    if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+    let kind;
+    if (entry.isSymbolicLink()) kind = 'symlink';
+    else if (entry.isDirectory()) kind = 'directory';
+    else if (!entry.isFile() && !entry.isBlockDevice() && !entry.isCharacterDevice()
+        && !entry.isFIFO() && !entry.isSocket()) {
+      kind = resolveUnknownDirent(transactions, entry).kind;
+    } else kind = 'other';
+    if (kind === 'directory' && entry.name.startsWith('.activate-')) continue;
+    if (kind !== 'directory') continue;
+    assertTransactionNotOversized(root, entry.name);
     const journal = readJournal(path.join(transactions, entry.name, 'journal.json'));
     if (journal?.engine === 'wiki-state' && journal.manifest?.operation === 'setup'
         && !journal.transitions?.includes('committed')) return journal.manifest;
@@ -1565,12 +1652,28 @@ function inspectWiki(options = {}) {
     sources: collectIgnoredOsMetadata(path.join(root, '.wiki-meta', 'sources'), 'sources', deadline),
     versions: collectIgnoredOsMetadata(path.join(root, '.wiki-meta', '.versions'), 'versions', deadline),
   };
+  const marker = readMaintenanceMarker(root);
+  const inventory = listQuarantineBundleNames(root, { deadline });
+  const maintenance_residue = {
+    prune_failures: marker ? marker.prune_failures : [],
+    promoted: marker ? marker.promoted : [],
+    skipped_oversized: marker ? marker.skipped_oversized : [],
+    quarantine_bundles: marker ? marker.quarantine_bundles : [],
+    bundles: inventory.bundles,
+    count: inventory.count,
+    truncated: inventory.truncated,
+    unexpected: inventory.unexpected,
+    oversized: inventory.oversized,
+    method: inventory.method,
+    estimated_entries: inventory.estimated_entries,
+  };
   return {
     ok: issues.length === 0,
     pages: snapshot.pages.length,
     events: snapshot.events.length,
     issues,
     ignored_os_metadata,
+    maintenance_residue,
   };
 }
 
@@ -1634,52 +1737,118 @@ function fixWiki(options = {}) {
     try {
       before = inspectWiki({ wikiRoot: root, deadline });
     } catch (initial) {
-      if (initial.code !== 'TRANSACTION_RECOVERY_REQUIRED') throw initial;
-      try {
-        recovery = prune('recovery', 64);
-      } catch (recoveryError) {
-        const wrapped = stateError(
-          recoveryError.code || 'FILESYSTEM',
-          `scan-window prune residue recovery failed: ${recoveryError.message}`,
-          initial,
-        );
-        if (recoveryError.terminal_prune) {
-          wrapped.terminal_prune = recoveryError.terminal_prune;
+      let recoveryInitial = null;
+      if (initial.code === 'TRANSACTION_OVERSIZED') {
+        const store = path.join(root, '.wiki-meta', '.transactions');
+        const parsePruneName = scanWindow.operationIdFromPruneName;
+        const tried = new Set();
+        let remainingAttempts = QUARANTINE_PROMOTION_LIMIT;
+        let current = initial;
+        for (;;) {
+          if (remainingAttempts <= 0) throw current;
+          const names = [];
+          if (typeof current.operationId === 'string'
+              && !tried.has(current.operationId)
+              && isIsolatableStoreName(current.operationId, parsePruneName)) {
+            names.push(current.operationId);
+          }
+          let entries = [];
+          try { entries = fs.readdirSync(store, { withFileTypes: true }); }
+          catch { throw current; }
+          for (const entry of entries) {
+            if (deadline) {
+              try { assertBeforeDeadline(deadline, `lint-fix-oversized:${entry.name}`); }
+              catch (error) {
+                if (error.code === 'DEADLINE_EXCEEDED') break;
+                throw error;
+              }
+            }
+            if (tried.has(entry.name) || names.includes(entry.name)) continue;
+            if (!isIsolatableStoreName(entry.name, parsePruneName)) continue;
+            const pressure = inspectDirectoryPressure(path.join(store, entry.name), {
+              deadline,
+              allowEnumeration: false,
+            });
+            if (pressure.oversized) names.push(entry.name);
+          }
+          if (names.length === 0) throw current;
+          const promotion = promoteOversizedNames({
+            wikiRoot: root,
+            token: owner.token,
+            names,
+            parsePruneName,
+            classification: {
+              method: current.method || 'stat',
+              estimated_entries: current.estimatedEntries ?? null,
+            },
+            reason: 'oversized',
+            deadline,
+            limit: remainingAttempts,
+          });
+          remainingAttempts -= promotion.attempted || 0;
+          for (const name of promotion.attempted_names || []) tried.add(name);
+          if ((promotion.attempted || 0) === 0) throw current;
+          try {
+            before = inspectWiki({ wikiRoot: root, deadline });
+            break;
+          } catch (retry) {
+            if (retry.code === 'TRANSACTION_RECOVERY_REQUIRED') {
+              recoveryInitial = retry;
+              break;
+            }
+            if (retry.code !== 'TRANSACTION_OVERSIZED') throw retry;
+            current = retry;
+          }
         }
-        throw wrapped;
-      }
-      if (recovery.processed === 0 && recovery.complete === true) throw initial;
-      if (recovery.processed === 0 && recovery.complete === false) {
-        const wrapped = stateError(
-          initial.code || 'FILESYSTEM',
-          `scan-window prune residue recovery pass incomplete before inspection failed: ${initial.message}`,
-          initial,
-        );
-        wrapped.terminal_prune = recovery;
-        throw wrapped;
-      }
-      if (typeof recovery.complete !== 'boolean') {
-        const wrapped = stateError(
-          'FILESYSTEM',
-          'scan-window prune residue recovery returned an invalid completion result',
-          initial,
-        );
-        wrapped.terminal_prune = recovery;
-        throw wrapped;
-      }
-      try {
-        before = inspectWiki({ wikiRoot: root, deadline });
-      } catch (retryError) {
-        const prefix = recovery.complete === false
-          ? 'scan-window prune residue recovery pass incomplete before inspection failed: '
-          : 'scan-window prune residue recovery pass completed before inspection failed: ';
-        const wrapped = stateError(
-          retryError.code || 'FILESYSTEM',
-          `${prefix}${retryError.message}`,
-          retryError,
-        );
-        wrapped.terminal_prune = recovery;
-        throw wrapped;
+      } else if (initial.code === 'TRANSACTION_RECOVERY_REQUIRED') recoveryInitial = initial;
+      else throw initial;
+      if (recoveryInitial) {
+        try {
+          recovery = prune('recovery', 64);
+        } catch (recoveryError) {
+          const wrapped = stateError(
+            recoveryError.code || 'FILESYSTEM',
+            `scan-window prune residue recovery failed: ${recoveryError.message}`,
+            recoveryInitial,
+          );
+          if (recoveryError.terminal_prune) {
+            wrapped.terminal_prune = recoveryError.terminal_prune;
+          }
+          throw wrapped;
+        }
+        if (recovery.processed === 0 && recovery.complete === true) throw recoveryInitial;
+        if (recovery.processed === 0 && recovery.complete === false) {
+          const wrapped = stateError(
+            recoveryInitial.code || 'FILESYSTEM',
+            `scan-window prune residue recovery pass incomplete before inspection failed: ${recoveryInitial.message}`,
+            recoveryInitial,
+          );
+          wrapped.terminal_prune = recovery;
+          throw wrapped;
+        }
+        if (typeof recovery.complete !== 'boolean') {
+          const wrapped = stateError(
+            'FILESYSTEM',
+            'scan-window prune residue recovery returned an invalid completion result',
+            recoveryInitial,
+          );
+          wrapped.terminal_prune = recovery;
+          throw wrapped;
+        }
+        try {
+          before = inspectWiki({ wikiRoot: root, deadline });
+        } catch (retryError) {
+          const prefix = recovery.complete === false
+            ? 'scan-window prune residue recovery pass incomplete before inspection failed: '
+            : 'scan-window prune residue recovery pass completed before inspection failed: ';
+          const wrapped = stateError(
+            retryError.code || 'FILESYSTEM',
+            `${prefix}${retryError.message}`,
+            retryError,
+          );
+          wrapped.terminal_prune = recovery;
+          throw wrapped;
+        }
       }
     }
     const pendingBytes = readMaybe(path.join(root, '.wiki-meta', '.pending-scan'));
@@ -1766,17 +1935,35 @@ function fixWiki(options = {}) {
     try {
       tail = prune('tail', 64 - recovery.processed);
     } catch (tailError) {
+      const skipped = [...new Set([
+        ...(recovery.skipped_oversized || []),
+        ...((tailError.terminal_prune && tailError.terminal_prune.skipped_oversized) || []),
+      ])];
+      let promotion = { skipped_oversized: skipped };
+      try {
+        promotion = promoteOversizedNames({
+          wikiRoot: root,
+          token: owner.token,
+          names: skipped,
+          parsePruneName: scanWindow.operationIdFromPruneName,
+          classification: { method: 'stat', estimated_entries: null },
+          reason: 'oversized',
+          deadline,
+        });
+      } catch { /* authority may have been lost; telemetry still carries residue */ }
       const wrapped = stateError(
         'LINT_MAINTENANCE_FAILED_AFTER_COMMIT',
         `lint repair committed before terminal maintenance failed: ${tailError.message}`,
         tailError,
       );
       wrapped.lint_result = primary;
+      const skippedAfter = promotion.skipped_oversized || skipped;
       if (!tailError.terminal_prune) {
         wrapped.terminal_prune = {
           processed: recovery.processed,
           removed: [...recovery.removed],
           complete: false,
+          skipped_oversized: skippedAfter,
         };
       }
       else {
@@ -1784,14 +1971,29 @@ function fixWiki(options = {}) {
           processed: recovery.processed + tailError.terminal_prune.processed,
           removed: recovery.removed.concat(tailError.terminal_prune.removed),
           complete: false,
+          skipped_oversized: skippedAfter,
         };
       }
       throw wrapped;
     }
+    const skipped = [...new Set([
+      ...(recovery.skipped_oversized || []),
+      ...(tail.skipped_oversized || []),
+    ])];
+    const promotion = promoteOversizedNames({
+      wikiRoot: root,
+      token: owner.token,
+      names: skipped,
+      parsePruneName: scanWindow.operationIdFromPruneName,
+      classification: { method: 'stat', estimated_entries: null },
+      reason: 'oversized',
+      deadline,
+    });
     const terminalPrune = {
       processed: recovery.processed + tail.processed,
       removed: recovery.removed.concat(tail.removed),
       complete: recovery.complete && tail.complete,
+      skipped_oversized: promotion.skipped_oversized,
     };
     if (suppressEnsurePrune) {
       terminalPrune.suppressed_reason = 'initial-invalid-scan-marker';
@@ -1823,6 +2025,13 @@ function fixWiki(options = {}) {
   }
 }
 
+function quarantineStoreEntry(options = {}) {
+  return quarantineStoreEntryPrimitive({
+    ...options,
+    parsePruneName: options.parsePruneName || scanWindow.operationIdFromPruneName,
+  });
+}
+
 module.exports = {
   setupWiki,
   snapshotWiki,
@@ -1834,4 +2043,5 @@ module.exports = {
   inspectWiki,
   fixWiki,
   migrateAutoIngestPolicy,
+  quarantineStoreEntry,
 };

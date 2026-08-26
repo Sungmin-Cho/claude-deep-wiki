@@ -46,8 +46,10 @@ Usage:
   node scripts/wiki-runtime.js obsidian tags --json
   node scripts/wiki-runtime.js snapshot --wiki-root <absolute> --json
   node scripts/wiki-runtime.js commit --wiki-root <absolute> --lock-token <token> --manifest-file <absolute-json> --json
+  node scripts/wiki-runtime.js transaction recover --wiki-root <absolute> --operation-id <id> --json
   node scripts/wiki-runtime.js transaction recover --wiki-root <absolute> --lock-token <token> --operation-id <id> --json
   node scripts/wiki-runtime.js transaction prune --wiki-root <absolute> --lock-token <token> --max-age-days <integer> --json
+  node scripts/wiki-runtime.js transaction quarantine --wiki-root <absolute> --operation-id <id-or-prune-name> --json
   node scripts/wiki-runtime.js index read --wiki-root <absolute> --json
   node scripts/wiki-runtime.js scan-window promote --wiki-root <absolute> --lock-token <token> --expected <UTC-Z> --json
   node scripts/wiki-runtime.js scan-window fail --wiki-root <absolute> --lock-token <token> --source <slug> --json
@@ -306,7 +308,31 @@ function runObsidianBridge(argv) {
   }));
 }
 
-function parseSnapshotWorkerOutput(stdout, status) {
+function parseSnapshotWorkerDetail(detail) {
+  if (detail === undefined) return null;
+  if (!detail || typeof detail !== 'object' || Array.isArray(detail)) {
+    throw stateError('WIKI_STATE_FILESYSTEM', 'snapshot worker error violates its contract');
+  }
+  const keys = Object.keys(detail).sort();
+  if (JSON.stringify(keys) !== JSON.stringify(['estimated_entries', 'method', 'operation_id'])) {
+    throw stateError('WIKI_STATE_FILESYSTEM', 'snapshot worker error violates its contract');
+  }
+  const operationId = detail.operation_id;
+  if (typeof operationId !== 'string' || operationId.length < 1 || operationId.length > 256
+      || !/^[.]?[A-Za-z0-9._-]+$/.test(operationId)) {
+    throw stateError('WIKI_STATE_FILESYSTEM', 'snapshot worker error violates its contract');
+  }
+  if (!['stat', 'enumeration', 'none'].includes(detail.method)) {
+    throw stateError('WIKI_STATE_FILESYSTEM', 'snapshot worker error violates its contract');
+  }
+  const estimated = detail.estimated_entries;
+  if (!(estimated === null || (Number.isSafeInteger(estimated) && estimated >= 0))) {
+    throw stateError('WIKI_STATE_FILESYSTEM', 'snapshot worker error violates its contract');
+  }
+  return detail;
+}
+
+function parseSnapshotWorkerOutput(stdout, status, wikiRoot) {
   if (typeof stdout !== 'string' || !stdout.endsWith('\n')
       || stdout.slice(0, -1).includes('\n') || stdout.includes('\r')) {
     throw stateError('WIKI_STATE_FILESYSTEM', 'snapshot worker returned an invalid result');
@@ -327,15 +353,25 @@ function parseSnapshotWorkerOutput(stdout, status) {
     }
     return envelope.snapshot;
   }
+  const errorKeys = Object.keys(envelope.error || {}).sort();
+  const withoutDetail = errorKeys.filter((key) => key !== 'detail');
   if (status !== 1
       || JSON.stringify(keys) !== JSON.stringify(['contract_version', 'error', 'status'])
       || !envelope.error || typeof envelope.error !== 'object' || Array.isArray(envelope.error)
-      || JSON.stringify(Object.keys(envelope.error).sort()) !== JSON.stringify(['code', 'message'])
+      || JSON.stringify(withoutDetail) !== JSON.stringify(['code', 'message'])
       || typeof envelope.error.code !== 'string' || !/^[A-Z][A-Z0-9_]*$/.test(envelope.error.code)
       || typeof envelope.error.message !== 'string' || envelope.error.message.length === 0) {
     throw stateError('WIKI_STATE_FILESYSTEM', 'snapshot worker error violates its contract');
   }
-  throw stateError(envelope.error.code, envelope.error.message);
+  const parsed = parseSnapshotWorkerDetail(envelope.error.detail);
+  const error = stateError(envelope.error.code, envelope.error.message);
+  if (parsed) {
+    error.operationId = parsed.operation_id;
+    error.estimatedEntries = parsed.estimated_entries;
+    error.method = parsed.method;
+  }
+  if (typeof wikiRoot === 'string' && wikiRoot.length > 0) error.wikiRoot = wikiRoot;
+  throw error;
 }
 
 function abandonSnapshotWorker(child) {
@@ -411,7 +447,7 @@ function snapshotDeadlineError(wikiRoot, timeoutMs, terminationState) {
     'DEADLINE_EXCEEDED',
     `snapshot transaction inspection exceeded ${timeoutMs}ms at ${transactions}; `
       + `worker tree ${terminationState}; stop all hosts, restore filesystem readability, `
-      + 'then rerun snapshot before recovery',
+      + 'then rerun snapshot before recovery; if a prior inspection failed with TRANSACTION_OVERSIZED, follow the guidance that error printed',
   );
 }
 
@@ -551,7 +587,7 @@ function runSnapshotWorker(options = {}) {
         return;
       }
       try {
-        const snapshot = parseSnapshotWorkerOutput(Buffer.concat(stdout).toString('utf8'), code);
+        const snapshot = parseSnapshotWorkerOutput(Buffer.concat(stdout).toString('utf8'), code, wikiRoot);
         terminal = true;
         resolve(snapshot);
       } catch (error) {
@@ -613,10 +649,15 @@ function shellQuote(value) {
   return `'${String(value).replace(/'/g, "'\\''")}'`;
 }
 
-function recoverHint(wikiRoot, operationId) {
+function recoverHint(wikiRoot, operationId, options = {}) {
   const root = path.resolve(wikiRoot);
   const label = process.platform === 'win32' ? 'resume with (PowerShell):' : 'resume with:';
-  return `${label}\nnode scripts/wiki-runtime.js transaction recover --wiki-root ${shellQuote(root)} --lock-token <token> --operation-id ${shellQuote(operationId)} --json`;
+  const tokenPart = options.includeLockToken === false ? '' : ' --lock-token <token>';
+  return `${label}\n${runtimeCommandPrefix()} transaction recover --wiki-root ${shellQuote(root)}${tokenPart} --operation-id ${shellQuote(operationId)} --json`;
+}
+
+function runtimeCommandPrefix() {
+  return `node ${shellQuote(path.resolve(__filename))}`;
 }
 
 function transactionDurablyExists(wikiRoot, operationId) {
@@ -665,8 +706,65 @@ function runCommit(argv) {
   }
 }
 
+function quarantineStoreEntry(options = {}) {
+  return scanWindow.quarantineStoreEntry(options);
+}
+
+function oversizedHint(error) {
+  const name = error.operationId || '';
+  const root = error.wikiRoot;
+  const { isIsolatableStoreName } = require(path.join(runtimeRoot, 'transaction-debris.js'));
+  const isolatable = isIsolatableStoreName(name, scanWindow.operationIdFromPruneName);
+  const rollback = /^rollback-([0-9A-HJKMNP-TV-Z]{26})$/.exec(name);
+  if (isolatable && root) {
+    const quotedRoot = shellQuote(path.resolve(root));
+    const quotedName = shellQuote(name);
+    const prefix = runtimeCommandPrefix();
+    const quarantineCmd = `${prefix} transaction quarantine --wiki-root ${quotedRoot} --operation-id ${quotedName} --json`;
+    const powershell = process.platform === 'win32';
+    const runLabel = powershell ? 'Run (PowerShell):' : 'Run:';
+    if (rollback) {
+      const recover = `${prefix} transaction recover --wiki-root ${quotedRoot} --operation-id ${shellQuote(rollback[1])} --json`;
+      const isolateLabel = powershell ? 'Isolate it with (PowerShell):' : 'Isolate it with:';
+      const thenLabel = powershell ? 'then (PowerShell):' : 'then:';
+      return `TRANSACTION_OVERSIZED is isolatable as a rollback remnant. ${isolateLabel}\n${quarantineCmd}\n${thenLabel}\n${recover}`;
+    }
+    return `TRANSACTION_OVERSIZED is isolatable. ${runLabel}\n${quarantineCmd}`;
+  }
+  if (/^[0-9A-HJKMNP-TV-Z]{26}$/.test(name)) {
+    return 'TRANSACTION_OVERSIZED for a pure ULID is not automatically isolatable; stop all hosts, restore filesystem readability, and if recover still cannot read the journal restore the authenticated backup.';
+  }
+  return 'TRANSACTION_OVERSIZED is not automatically isolatable; stop all hosts, restore filesystem readability, then rerun.';
+}
+
 function runTransaction(argv) {
   const command = argv[0];
+  if (command === 'quarantine') {
+    const flags = wikiFlags(argv.slice(1), { '--operation-id': 'value' });
+    const wikiRoot = flags['--wiki-root'];
+    let owner;
+    try {
+      owner = acquireLock({ wikiRoot, operation: 'transaction-quarantine' });
+    } catch (error) {
+      if (error.code === 'LOCK_CONTENDED') {
+        emit({ status: 'skipped', reason: 'LOCK_CONTENDED' });
+        return;
+      }
+      throw error;
+    }
+    try {
+      emit(quarantineStoreEntry({
+        wikiRoot,
+        token: owner.token,
+        name: requireFlag(flags, '--operation-id'),
+        classification: { method: 'none', estimated_entries: null },
+        reason: 'operator',
+      }));
+    } finally {
+      releaseLock({ wikiRoot, token: owner.token });
+    }
+    return;
+  }
   if (command === 'prune') {
     const flags = wikiFlags(argv.slice(1), {
       '--lock-token': 'value',
@@ -677,40 +775,81 @@ function runTransaction(argv) {
     if (!/^\d+$/.test(raw) || !Number.isSafeInteger(maxAgeDays)) {
       throw new UsageError('--max-age-days must be a nonnegative safe integer');
     }
-    emit(scanWindow.pruneScanWindowTransactions({
-      wikiRoot: flags['--wiki-root'],
-      token: requireFlag(flags, '--lock-token'),
+    const token = requireFlag(flags, '--lock-token');
+    const wikiRoot = flags['--wiki-root'];
+    const deadline = createDeadline({ budgetMs: 12_000 });
+    const pruneResult = scanWindow.pruneScanWindowTransactions({
+      wikiRoot,
+      token,
       maxAgeDays,
       limit: 64,
-      deadline: createDeadline({ budgetMs: 12_000 }),
-    }));
+      deadline,
+    });
+    const skipped = pruneResult.skipped_oversized || [];
+    const promotion = scanWindow.promoteOversizedNames({
+      wikiRoot,
+      token,
+      names: skipped,
+      classification: { method: 'stat', estimated_entries: null },
+      reason: 'oversized',
+      deadline,
+      limit: 8,
+    });
+    emit({
+      ...pruneResult,
+      skipped_oversized: promotion.skipped_oversized,
+      promoted: promotion.promoted,
+      promotion_failures: promotion.failures,
+      telemetry_error: promotion.telemetry_error || undefined,
+    });
     return;
   }
   if (command === 'recover') {
     const flags = wikiFlags(argv.slice(1), { '--lock-token': 'value', '--operation-id': 'value' });
-    const token = requireFlag(flags, '--lock-token');
     const operationId = requireFlag(flags, '--operation-id');
-    let result;
-    try {
-      result = wikiState.recoverTransaction({
-        wikiRoot: flags['--wiki-root'], token, operationId,
-      });
-    } catch (error) {
-      if (error.code === 'DEADLINE_EXCEEDED') {
-        error.message = `${error.message} — ${recoverHint(flags['--wiki-root'], operationId)}`;
+    const wikiRoot = flags['--wiki-root'];
+    const injected = flags['--lock-token'];
+    let token = injected;
+    let acquired = null;
+    if (!injected) {
+      try {
+        acquired = acquireLock({ wikiRoot, operation: 'transaction-recover' });
+      } catch (error) {
+        if (error.code === 'LOCK_CONTENDED') {
+          emit({ status: 'skipped', reason: 'LOCK_CONTENDED' });
+          return;
+        }
+        throw error;
       }
-      throw error;
+      token = acquired.token;
     }
-    emit(result);
     try {
-      cleanupRuntimeManifests(flags['--wiki-root'], token, operationId);
-    } catch (error) {
-      if (error.code !== 'LOCK_TOKEN_MISMATCH') throw error;
-      process.stderr.write(`WARNING: runtime manifest cleanup skipped after lock ownership changed: ${error.message}\n`);
+      let result;
+      try {
+        result = wikiState.recoverTransaction({
+          wikiRoot, token, operationId,
+        });
+      } catch (error) {
+        if (error.code === 'DEADLINE_EXCEEDED') {
+          error.message = `${error.message} — ${recoverHint(wikiRoot, operationId, {
+            includeLockToken: acquired == null,
+          })}`;
+        }
+        throw error;
+      }
+      emit(result);
+      try {
+        cleanupRuntimeManifests(wikiRoot, token, operationId);
+      } catch (error) {
+        if (error.code !== 'LOCK_TOKEN_MISMATCH') throw error;
+        process.stderr.write(`WARNING: runtime manifest cleanup skipped after lock ownership changed: ${error.message}\n`);
+      }
+    } finally {
+      if (acquired) releaseLock({ wikiRoot, token: acquired.token });
     }
     return;
   }
-  throw new UsageError('transaction requires recover or prune');
+  throw new UsageError('transaction requires recover, prune, or quarantine');
 }
 
 function runIndex(argv) {
@@ -775,6 +914,9 @@ function exitCode(error) {
 
 function reportMainError(error) {
   emitError(error);
+  if (error && error.code === 'TRANSACTION_OVERSIZED') {
+    process.stderr.write(`${oversizedHint(error)}\n`);
+  }
   return exitCode(error);
 }
 
@@ -825,6 +967,10 @@ module.exports = {
   main,
   recoverHint,
   commitRetryHint,
+  oversizedHint,
   cleanupRuntimeManifests,
   runSnapshotWorker,
+  quarantineStoreEntry,
+  parseSnapshotWorkerOutput,
+  snapshotDeadlineError,
 };

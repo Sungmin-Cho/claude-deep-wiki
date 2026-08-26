@@ -83,6 +83,16 @@ function regularFileIdentitiesMatch(left, right) {
     && left.nlink === right.nlink;
 }
 
+function descriptorMatchesPathIdentity(descriptorIdentity, pathIdentity) {
+  if (!descriptorIdentity || !pathIdentity) return false;
+  return devicesCompatible(descriptorIdentity.dev, pathIdentity.dev)
+    && descriptorIdentity.ino === pathIdentity.ino
+    && descriptorIdentity.type === pathIdentity.type
+    && descriptorIdentity.birthtimeNs === pathIdentity.birthtimeNs
+    && descriptorIdentity.mtimeNs === pathIdentity.mtimeNs
+    && descriptorIdentity.nlink === pathIdentity.nlink;
+}
+
 const DEVICE_LOW_32_MASK = 0xFFFFFFFFn;
 
 // libuv >=1.49 on Windows can report st_dev for the very same file two different ways
@@ -285,5 +295,7 @@ module.exports = {
   stateError,
   regularFileIdentity,
   regularFileIdentitiesMatch,
+  devicesCompatible,
+  descriptorMatchesPathIdentity,
   SHA_RE,
 };

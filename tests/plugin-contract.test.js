@@ -151,13 +151,13 @@ test('portable npm test cannot discover the native installed-Codex release smoke
   assert.match(smoke, /windowsHide: true/);
 });
 
-test('1.9.7 release keeps package identity and bilingual changelogs exact', () => {
+test('1.10.0 release keeps package identity and bilingual changelogs exact', () => {
   const packageFiles = [
     '.claude-plugin/plugin.json',
     '.codex-plugin/plugin.json',
     'package.json',
   ];
-  for (const file of packageFiles) assert.equal(readJson(file).version, '1.9.7', file);
+  for (const file of packageFiles) assert.equal(readJson(file).version, '1.10.0', file);
 
   const releaseSection = (text, heading) => {
     const start = text.indexOf(heading);
@@ -406,25 +406,35 @@ test('wiki-local auto-ingest and setup-authority operator docs stay aligned', ()
   assert.match(koreanReadme, /local-vs-legacy policy value/);
   assert.match(koreanReadme, /`CONFIG_CONFLICT candidates=[^`]+`는 cross-host candidate YAML file divergence/);
 
-  const changelogUnreleased = changelogSection(readText('CHANGELOG.md'), '## [Unreleased]');
-  assert.match(changelogUnreleased, /setup lifecycle event.*`YYYY-MM-DDTHH:MM:SSZ`.*`MANIFEST_INVALID`/);
-  assert.doesNotMatch(changelogUnreleased, /scan-window metadata/);
-  assert.match(changelogUnreleased, /`auto_ingest` policy now lives in `<wiki_root>\/\.wiki-meta\/\.config\.json`/);
-  assert.match(changelogUnreleased, /`\/wiki-setup` and SessionStart create it by migrating an equivalent global YAML block/);
-  assert.match(changelogUnreleased, /`\/wiki-setup` also creates `~\/\.deep-wiki-setup-authority\.json` and `~\/\.deep-wiki-setup\.reserve\/`/);
-  assert.match(changelogUnreleased, /Divergent local\/legacy policy and representative invalid local config shapes now fail closed/);
+  const changelogCurrent = changelogSection(readText('CHANGELOG.md'), '## [1.10.0] — 2026-08-25 (oversized transaction isolation)');
+  assert.match(changelogCurrent, /setup lifecycle event.*`YYYY-MM-DDTHH:MM:SSZ`.*`MANIFEST_INVALID`/);
+  assert.doesNotMatch(changelogCurrent, /scan-window metadata/);
+  assert.match(changelogCurrent, /`auto_ingest` policy now lives in `<wiki_root>\/\.wiki-meta\/\.config\.json`/);
+  assert.match(changelogCurrent, /`\/wiki-setup` and SessionStart create it by migrating an equivalent global YAML block/);
+  assert.match(changelogCurrent, /`\/wiki-setup` also creates `~\/\.deep-wiki-setup-authority\.json` and `~\/\.deep-wiki-setup\.reserve\/`/);
+  assert.match(changelogCurrent, /Divergent local\/legacy policy and representative invalid local config shapes now fail closed/);
+  assert.match(changelogCurrent, /TRANSACTION_OVERSIZED/);
+  assert.match(changelogCurrent, /transaction quarantine/);
+  assert.match(changelogCurrent, /SessionStart ensure, lint fix, transaction prune, and transaction quarantine/);
+  assert.match(changelogCurrent, /automatically relocate isolatable oversized trees/);
+  assert.match(changelogCurrent, /never auto-deleted/);
 
   const changelogHistorical = readText('CHANGELOG.md');
   assert.doesNotMatch(changelogHistorical, /no shipped code reads that file/);
   assert.match(changelogHistorical, /At 1\.9\.2 release time, no shipped code read that file/);
 
-  const koreanChangelogUnreleased = changelogSection(readText('CHANGELOG.ko.md'), '## [Unreleased]');
-  assert.match(koreanChangelogUnreleased, /setup lifecycle event.*`YYYY-MM-DDTHH:MM:SSZ`.*`MANIFEST_INVALID`/);
-  assert.doesNotMatch(koreanChangelogUnreleased, /scan-window metadata/);
-  assert.match(koreanChangelogUnreleased, /`auto_ingest` policy는 이제 `<wiki_root>\/\.wiki-meta\/\.config\.json`에 저장/);
-  assert.match(koreanChangelogUnreleased, /`\/wiki-setup`과 SessionStart가 동등한 global YAML block을 migration해 생성/);
-  assert.match(koreanChangelogUnreleased, /`\/wiki-setup`은 `~\/\.deep-wiki-setup-authority\.json`와 `~\/\.deep-wiki-setup\.reserve\/`도 생성/);
-  assert.match(koreanChangelogUnreleased, /divergent local\/legacy policy와 대표 invalid local config shape는 fail closed/);
+  const koreanChangelogCurrent = changelogSection(readText('CHANGELOG.ko.md'), '## [1.10.0] — 2026-08-25 (oversized 트랜잭션 격리)');
+  assert.match(koreanChangelogCurrent, /setup lifecycle event.*`YYYY-MM-DDTHH:MM:SSZ`.*`MANIFEST_INVALID`/);
+  assert.doesNotMatch(koreanChangelogCurrent, /scan-window metadata/);
+  assert.match(koreanChangelogCurrent, /`auto_ingest` policy는 이제 `<wiki_root>\/\.wiki-meta\/\.config\.json`에 저장/);
+  assert.match(koreanChangelogCurrent, /`\/wiki-setup`과 SessionStart가 동등한 global YAML block을 migration해 생성/);
+  assert.match(koreanChangelogCurrent, /`\/wiki-setup`은 `~\/\.deep-wiki-setup-authority\.json`와 `~\/\.deep-wiki-setup\.reserve\/`도 생성/);
+  assert.match(koreanChangelogCurrent, /divergent local\/legacy policy와 대표 invalid local config shape는 fail closed/);
+  assert.match(koreanChangelogCurrent, /TRANSACTION_OVERSIZED/);
+  assert.match(koreanChangelogCurrent, /transaction quarantine/);
+  assert.match(koreanChangelogCurrent, /SessionStart ensure, lint fix, transaction prune, transaction quarantine/);
+  assert.match(koreanChangelogCurrent, /isolatable oversized tree를 자동으로 옮깁니다/);
+  assert.match(koreanChangelogCurrent, /자동 삭제하지 않습니다/);
 
   const koreanChangelogHistorical = readText('CHANGELOG.ko.md');
   assert.doesNotMatch(koreanChangelogHistorical, /배포되는 코드 중 이 파일을 읽는 곳은 없습니다/);

@@ -7,14 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.0] — 2026-08-25 (oversized transaction isolation)
+
 ### Fixed
 
 - `/wiki-setup` now emits its setup lifecycle event with the canonical `YYYY-MM-DDTHH:MM:SSZ` timestamp, so the documented setup route no longer fails with `MANIFEST_INVALID`.
+- An oversized leftover transaction directory no longer wedges every runtime inspection with a permanent `DEADLINE_EXCEEDED`. Readers classify it as `TRANSACTION_OVERSIZED`, lock-held writers skip the interior, and isolatable names can be moved with `transaction quarantine` without deleting the tree. SessionStart ensure, lint fix, transaction prune, and transaction quarantine automatically relocate isolatable oversized trees into `.wiki-meta/.quarantine/` bundles that are never auto-deleted; after resolution, stop all hosts and dispose of a bundle manually.
+- `transaction recover --wiki-root … --operation-id … --json` is self-locking when `--lock-token` is omitted, so rollback quarantine `follow_up` is an executable second stage. Callers that already hold a lock may still inject `--lock-token`. A public recover that self-acquired the lock and hits `DEADLINE_EXCEEDED` now emits a tokenless self-locking retry; only token-injected callers receive `--lock-token <token>`. Both retry hints use the same absolute, shell-quoted `scripts/wiki-runtime.js` path as isolatable oversized hints, so the exact command is executable from a non-plugin cwd.
+- Reservation-only quarantine re-proves that the `.prune-*` source is still absent immediately before creating `.quarantine` and before every later bundle, metadata, or reservation mutation. The final complete marker publish re-proves that absence through `writeMaintenanceMarker` `beforePublish`. A reappeared source fails `WIKI_STATE_FILESYSTEM` as committed/incomplete after the reservation has moved; it never records a false complete.
+- Isolatable `TRANSACTION_OVERSIZED` hints now include a complete `node` invocation of the actual `scripts/wiki-runtime.js` path. Direct and rollback commands each live on independently copyable lines for POSIX and labeled PowerShell.
+- Per-directory prune pressure-probe failures (`EACCES`/`EIO` and other non-ENOENT errors) now travel through `terminal_prune` with accumulated `processed`, `removed`, `complete: false`, and `skipped_oversized`, so lint repair can persist or promote that residue under a still-valid lock before rethrowing.
 
 ### Changed
 
 - `auto_ingest` policy now lives in `<wiki_root>/.wiki-meta/.config.json`; `/wiki-setup` and SessionStart create it by migrating an equivalent global YAML block. `/wiki-setup` also creates `~/.deep-wiki-setup-authority.json` and `~/.deep-wiki-setup.reserve/`. Divergent local/legacy policy and representative invalid local config shapes now fail closed.
 - Operator docs now describe the bootstrap/legacy YAML alias, `CONFIG_CONFLICT` and `CONFIG_INVALID` recovery boundaries, stopped-host direct edits, divergent physical homes, explicit rebind, and backup-only downgrade safety.
+- Lint inspect reports isolation history in informational `maintenance_residue` without flipping `ok`. Partial setup accepts `.quarantine` and a validated engine-owned `.runtime/scan-window-maintenance.json`.
 
 ## [1.9.7] — 2026-08-05 (content metadata and nested prune safety)
 

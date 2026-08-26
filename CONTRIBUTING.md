@@ -43,6 +43,8 @@ Use `node:` APIs, preserve drive/UNC paths, and launch children with `shell:fals
 - A post-1.9 rollback is likewise backup-only: all hosts stop, 1.9 completes
   recovery, then restore the authenticated pre-upgrade backup and start 1.8.2.
   A 1.9 in-flight journal (`contract_version` 2) is unrecoverable by 1.8.x.
+- A post-1.10 rollback is likewise backup-only: all hosts stop, 1.10 completes
+  recovery, then restore the authenticated pre-upgrade backup and start 1.9.x.
 
 ## Conventions
 

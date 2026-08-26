@@ -275,7 +275,8 @@ deep-work 세션 리포트를 위키로 ingest:
   downgrade를 수행해야 합니다. 1.9도 동일합니다: 1.9가 state를 쓴 뒤에는 중지
   상태에서 1.9로 recovery하고, 인증된 업그레이드 전 backup을 복원한 뒤 1.8.2를
   시작하세요 — 1.9의 in-flight journal(`contract_version` 2)은 1.8.x가 recover할
-  수 없습니다.
+  수 없습니다. 1.10이 state를 쓴 뒤에는 중지 상태에서 1.10으로 recovery하고,
+  인증된 업그레이드 전 backup을 복원한 뒤 1.9.x를 시작하세요.
 
 ## 철학
 
